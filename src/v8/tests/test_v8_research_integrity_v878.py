@@ -96,7 +96,7 @@ class ResearchIntegrityV878Tests(unittest.TestCase):
         self.assertEqual(digest["distinct_source_worlds"], 2)
         self.assertEqual(digest["distinct_target_worlds"], 1)
         self.assertNotIn("distinct_source_games", digest)
-        self.assertIn("instance/seed-scoped", digest["provenance_scope_note"])
+        self.assertIn("environment-scoped", digest["provenance_scope_note"])
 
     def test_optimizer_metrics_explain_source_validation_scope(self):
         payload = v878._optimizer_with_scope(

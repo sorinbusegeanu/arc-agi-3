@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from v8.model import MemoryLevel, MemoryType, MemoryUid, stable_u64
+from v8.persistent_identity import world_id
 
 
 _INSTALLED = False
@@ -1126,7 +1127,7 @@ def _resolve_target_outcome(
         from v8 import behavior_recovery as behavior
         from v8.normalized_memory_v086_fixups import _grounded_context
 
-        source_hash = stable_u64(candidate.source.anchor.source_id, person=b"v8-game")
+        source_hash = world_id(candidate.source.anchor.source_id)
         raw_context = int(result.terminal_context)
         contexts = (
             int(_grounded_context(source_hash, raw_context)),

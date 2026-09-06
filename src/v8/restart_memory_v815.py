@@ -9,6 +9,7 @@ from dataclasses import replace
 from typing import Iterable
 
 from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid, RelationType, stable_u64
+from v8.persistent_identity import world_id
 
 
 _INSTALLED = False
@@ -41,7 +42,7 @@ def _current_game_id() -> str:
 
 def _current_game_hash() -> int:
     game_id = _current_game_id()
-    return 0 if not game_id else int(stable_u64(game_id, person=b"v8-game"))
+    return 0 if not game_id else int(world_id(game_id))
 
 
 def _is_grounded_m1(row) -> bool:

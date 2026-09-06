@@ -12,7 +12,7 @@ class EpisodeId:
 
 
 class EnvironmentIdentityRegistry:
-    STATE_VERSION = 1
+    STATE_VERSION = 2
 
     def __init__(self) -> None:
         self._identities: dict[int, EnvironmentIdentity] = {}

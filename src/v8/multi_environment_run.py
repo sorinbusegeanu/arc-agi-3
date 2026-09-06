@@ -8,6 +8,7 @@ from random import Random
 from v8 import ContinuousMemoryRuntime, V8RuntimeConfig
 from v8.environments import ChessAdapter, GymDiscreteAdapter, SudokuAdapter
 from v8.model import stable_u64
+from v8.persistent_identity import trajectory_identity
 
 
 def make_adapter(name: str, *, seed: int, slippery: bool = False, chess_opponent: str = "random"):
@@ -53,6 +54,7 @@ def run_environment(
     shards: int = 2,
     stage_workers: int = 1,
     enable_peers: bool = True,
+    reset_persistent_identity: bool = False,
 ) -> dict[str, object]:
     if int(steps) <= 0:
         raise ValueError("steps must be positive")
@@ -69,12 +71,19 @@ def run_environment(
             stage_workers=int(stage_workers),
             enable_snapshots=False,
             restore=True,
+            reset_persistent_identity=bool(reset_persistent_identity),
             enable_peers=bool(enable_peers),
         )
     )
     rng = Random(int(seed))
     episodes = wins = losses = draws = submitted = 0
-    trajectory = stable_u64(adapter.identity.source_hash, seed, person=b"v8.58-env-trajectory")
+    trajectory = trajectory_identity(
+        adapter.identity.source_hash,
+        producer_id=1,
+        episode_ordinal=0,
+        sequence_base=0,
+        namespace=b"v8.58-env-trajectory",
+    )
     try:
         runtime.start()
         for sequence in range(1, int(steps) + 1):
@@ -83,11 +92,12 @@ def run_environment(
             if not before_actions:
                 adapter.reset()
                 episodes += 1
-                trajectory = stable_u64(
+                trajectory = trajectory_identity(
                     adapter.identity.source_hash,
-                    seed,
-                    episodes,
-                    person=b"v8.58-env-trajectory",
+                    producer_id=1,
+                    episode_ordinal=episodes,
+                    sequence_base=0,
+                    namespace=b"v8.58-env-trajectory",
                 )
                 continue
             context = int(adapter.observation_signature(before))
@@ -151,11 +161,12 @@ def run_environment(
                 else:
                     draws += 1
                 adapter.reset()
-                trajectory = stable_u64(
+                trajectory = trajectory_identity(
                     adapter.identity.source_hash,
-                    seed,
-                    episodes,
-                    person=b"v8.58-env-trajectory",
+                    producer_id=1,
+                    episode_ordinal=episodes,
+                    sequence_base=sequence,
+                    namespace=b"v8.58-env-trajectory",
                 )
         runtime.wait_quiescent(timeout=120.0)
         metrics = runtime.metrics()
@@ -196,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--shards", type=int, default=2)
     parser.add_argument("--stage-workers", type=int, default=1)
     parser.add_argument("--no-peers", action="store_true")
+    parser.add_argument("--reset-persistent-identity", action="store_true")
     args = parser.parse_args(argv)
     summary = run_environment(
         environment=args.environment,
@@ -208,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
         shards=args.shards,
         stage_workers=args.stage_workers,
         enable_peers=not args.no_peers,
+        reset_persistent_identity=args.reset_persistent_identity,
     )
     print(json.dumps(summary, sort_keys=True), flush=True)
     return 0

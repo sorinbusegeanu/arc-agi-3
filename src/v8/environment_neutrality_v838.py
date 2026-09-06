@@ -28,6 +28,7 @@ from v8.environment_contract import (
     target_boundary,
 )
 from v8.model import MemoryUid, stable_u64
+from v8.persistent_identity import world_id
 from v8.environment_neutrality_v837 import V837TrajectoryTarget
 
 
@@ -348,7 +349,7 @@ def _runtime_outcome_matcher(runtime, environment_scope, context, action, outcom
         from v8 import behavior_recovery as behavior
         from v8.normalized_memory_v086_fixups import _grounded_context
 
-        source_hash = stable_u64(str(environment_scope), person=b"v8-game")
+        source_hash = world_id(str(environment_scope))
         contexts = (
             int(_grounded_context(source_hash, int(context))),
             int(context),

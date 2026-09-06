@@ -13,6 +13,7 @@ import os
 from dataclasses import dataclass
 
 from v8.model import stable_u64
+from v8.persistent_identity import world_id
 
 
 _INSTALLED = False
@@ -226,7 +227,7 @@ def _plan_chain_v855(self, context_signature, action_ids, **kwargs):
         stats["consecutive_exploration"] += 1.0
         return ()
 
-    game_hash = int(stable_u64(game, person=b"v8-game"))
+    game_hash = int(world_id(game))
     plans = tuple(
         plan for plan in plans if _same_world(self, plan.strategy_uid, game_hash)
     )

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from v8.model import stable_u64
+from v8.persistent_identity import environment_world_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -11,6 +12,11 @@ class EnvironmentIdentity:
     environment_type: str
     config: str = "default"
     instance: str = "default"
+
+    def __post_init__(self) -> None:
+        # Runtime seeds and episode instances are intentionally not part of the
+        # persisted environment identity.
+        object.__setattr__(self, "instance", "default")
 
     @property
     def family_id(self) -> int:
@@ -22,22 +28,11 @@ class EnvironmentIdentity:
 
     @property
     def config_id(self) -> int:
-        return stable_u64(
-            self.family,
-            self.environment_type,
-            self.config,
-            person=b"v8.58-env-config",
-        )
+        return environment_world_id(self.family, self.environment_type, self.config)
 
     @property
     def instance_id(self) -> int:
-        return stable_u64(
-            self.family,
-            self.environment_type,
-            self.config,
-            self.instance,
-            person=b"v8.58-env-instance",
-        )
+        return self.config_id
 
     @property
     def source_hash(self) -> int:

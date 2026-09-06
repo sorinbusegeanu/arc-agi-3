@@ -28,7 +28,7 @@ _OPTIMIZER_SCOPE_NOTE = (
 )
 _PROVENANCE_SCOPE_NOTE = (
     "source/target hashes identify provenance worlds, not selected game IDs: ARC "
-    "sources are game-scoped, while generic sources are environment-instance/seed-scoped."
+    "sources are game-scoped, while generic sources are environment-scoped."
 )
 
 

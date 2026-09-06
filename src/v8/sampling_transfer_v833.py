@@ -14,6 +14,8 @@ authority and the v8.31 10% random exploration floor remains intact.
 
 import math
 
+from v8.persistent_identity import world_id
+
 _INSTALLED = False
 _BASE_BEGIN_LEASE = None
 _BASE_ON_EXTERNAL_RESET = None
@@ -61,10 +63,10 @@ def _current_view():
 
 def _lineage_transfer_index(view, game_id: str) -> dict[int, tuple[tuple[float, object, str], ...]]:
     from v8 import behavior_recovery as behavior
-    from v8.model import RelationType, stable_u64
+    from v8.model import RelationType
 
     view._refresh_strategy_cache()
-    current_game = int(stable_u64(str(game_id), person=b"v8-game"))
+    current_game = int(world_id(str(game_id)))
     version = tuple(getattr(view, "_strategy_version", ()))
     cache_key = (version, current_game)
     if getattr(view, "_v833_transfer_index_key", None) == cache_key:

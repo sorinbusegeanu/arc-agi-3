@@ -7,6 +7,7 @@ from struct import Struct
 
 from v8 import arena as _arena
 from v8 import model as _model
+from v8.persistent_identity import world_id
 
 
 # v0.5.3 primary-valence semantics.  The environment supplies only a signed
@@ -797,7 +798,7 @@ def _install_runtime_learning_semantics() -> None:
         results = tuple(results); original_record(self, results)
         if not hasattr(self, "_primary_valence_sequence"): self._primary_valence_sequence = 0
         for result in results:
-            game_hash = _model.stable_u64(result.game_id, person=b"v8-game")
+            game_hash = world_id(result.game_id)
             for credit in getattr(result, "primary_valence_credits", ()):
                 self._primary_valence_sequence += 1
                 proposal = MemoryProposal(uid=credit.uid, fingerprint=int(credit.fingerprint),

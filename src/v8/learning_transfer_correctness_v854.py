@@ -25,6 +25,7 @@ from v8.model import (
     stable_u64,
     u64,
 )
+from v8.persistent_identity import world_id
 
 _INSTALLED = False
 _RELATION_SCHEMA = 1
@@ -284,7 +285,7 @@ def _ordered_sequences(view, game_id: str) -> tuple[OrderedTransferSequence, ...
         behavior._refresh_behavior_indexes(view)
     except BaseException:
         pass
-    current_game = int(stable_u64(str(game_id), person=b"v8-game"))
+    current_game = int(world_id(str(game_id)))
     key = (tuple(getattr(view, "_strategy_version", ())), current_game)
     if getattr(view, "_v854_ordered_key", None) == key:
         return tuple(getattr(view, "_v854_ordered", ()))
@@ -394,7 +395,7 @@ def _grounded_transfer_v854(view, game_id: str):
     from v8 import learning_blockers_v055 as blockers
 
     m7, m1n = _BASE_GROUNDED_TRANSFER(view, game_id)
-    current_game = int(stable_u64(str(game_id), person=b"v8-game"))
+    current_game = int(world_id(str(game_id)))
     nodes = getattr(view, "_node_by_uid", {})
     cleaned = {}
     for action, rows in m7.items():

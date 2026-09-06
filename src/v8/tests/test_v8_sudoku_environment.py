@@ -60,11 +60,14 @@ class SudokuEnvironmentTests(unittest.TestCase):
         finally:
             adapter.close()
 
-    def test_different_actor_seeds_have_distinct_provenance(self):
+    def test_different_actor_seeds_share_persistent_provenance(self):
         left = SudokuAdapter(seed=1)
         right = SudokuAdapter(seed=2)
         try:
-            self.assertNotEqual(left.identity.source_hash, right.identity.source_hash)
+            self.assertEqual(left.identity.source_hash, right.identity.source_hash)
+            self.assertEqual(left.seed, 1)
+            self.assertEqual(right.seed, 2)
+            self.assertNotEqual(left.observe(), right.observe())
         finally:
             left.close()
             right.close()

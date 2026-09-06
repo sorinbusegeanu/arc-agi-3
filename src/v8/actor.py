@@ -19,6 +19,7 @@ from v8.model import (
     encode_pipeline,
     stable_u64,
 )
+from v8.persistent_identity import arc_world_id, trajectory_identity
 from v8.publication import LiveReadView, ShardReadDescriptor
 from v8.ring import SharedRingBuffer
 
@@ -419,7 +420,14 @@ def actor_worker(
     sequence = 0
     with watermark.get_lock():
         sequence_base = int(watermark.value)
-    rolling_trajectory = stable_u64(job.actor_id, job.seed, sequence_base, person=b"v8-traj-seed")
+    source_world_id = arc_world_id(job.game_id)
+    rolling_trajectory = trajectory_identity(
+        source_world_id,
+        producer_id=job.actor_id,
+        episode_ordinal=0,
+        sequence_base=sequence_base,
+        namespace=b"v8-traj-seed",
+    )
     local_overlay: dict[tuple[int, int], tuple[int, float]] = {}
     recent_contexts: deque[int] = deque(maxlen=8)
     wins = failures = levels_completed = 0
@@ -570,7 +578,7 @@ def actor_worker(
                     watermark=current_watermark,
                     producer_id=job.actor_id,
                     producer_sequence=producer_sequence,
-                    source_game_hash=stable_u64(job.game_id, person=b"v8-game"),
+                    source_game_hash=source_world_id,
                     global_step=current_watermark,
                     context_signature=context,
                     action_id=action,

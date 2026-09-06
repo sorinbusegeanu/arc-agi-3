@@ -9,13 +9,11 @@ def install_trajectory_optimizer_v818_fixups() -> None:
     if _INSTALLED:
         return
 
-    from v8 import actor as actor_module
     from v8 import trajectory_optimizer_v814 as optimizer
     from v8 import trajectory_optimizer_v818 as v818
     from v8.trajectory_validation_v814 import validate_arc_candidate
 
     base_game_validate = v818._GameReplayValidator.validate
-    base_actor_stable_u64 = actor_module.stable_u64
 
     def game_validate(self, candidate):
         validator = getattr(self.service, "validator", None)
@@ -73,16 +71,7 @@ def install_trajectory_optimizer_v818_fixups() -> None:
         optimizer._ACTOR_ACTION_HISTORY = []
         optimizer._ACTOR_RESET_EPOCH += 1
 
-    def actor_stable_u64(*parts, person=b"v8-stable"):
-        # actor.py historically seeded the rolling trajectory identifier with
-        # job.seed. Drop that execution-only value for the trajectory signature
-        # while preserving stable_u64 semantics for every other actor hash.
-        if person == b"v8-traj-seed" and len(parts) >= 3:
-            parts = (parts[0], *parts[2:])
-        return base_actor_stable_u64(*parts, person=person)
-
     v818._GameReplayValidator.validate = game_validate
     optimizer.select_validated_variant = select_variant
     optimizer._reset_capture = reset_capture
-    actor_module.stable_u64 = actor_stable_u64
     _INSTALLED = True

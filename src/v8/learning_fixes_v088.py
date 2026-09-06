@@ -17,6 +17,7 @@ from v8.model import (
     signed_u64,
     stable_u64,
 )
+from v8.persistent_identity import world_id
 
 
 _INSTALLED = False
@@ -898,7 +899,7 @@ def _source_trajectory_index(games: tuple[str, ...]) -> dict[int, dict[str, obje
                         "kind": "source_trajectory",
                         "action_ids": list(actions),
                         "source_game_id": str(game_id),
-                        "source_world_hash": stable_u64(str(game_id), person=b"v8-game"),
+                        "source_world_hash": world_id(str(game_id)),
                         "trajectory_id": str(
                             raw.get("trajectory_id", raw.get("variant_id", ""))
                         ) or None,
@@ -924,7 +925,7 @@ def _source_trajectory_index(games: tuple[str, ...]) -> dict[int, dict[str, obje
                     "kind": "source_trajectory",
                     "action_ids": list(actions),
                     "source_game_id": game_id,
-                    "source_world_hash": stable_u64(game_id, person=b"v8-game"),
+                    "source_world_hash": world_id(game_id),
                     "trajectory_id": str(raw.get("variant_id", "")) or None,
                     "trajectory_source": "validated.json",
                 }
@@ -1496,7 +1497,7 @@ def _run_automatic_transfer_experiments_v088(
     scheduling_examples: list[dict[str, object]] = []
     eligibility_probes = 0
     eligibility_probe_limit = max(1, int(max_trials))
-    game_hashes = {game: stable_u64(game, person=b"v8-game") for game in holdouts}
+    game_hashes = {game: world_id(game) for game in holdouts}
     target_inventories = _direct_target_memory_inventories(
         runtime.read_view, nodes, tuple(game_hashes.values())
     )
@@ -2029,7 +2030,7 @@ def _record_terminal_efficiency_feedback(runtime, rows) -> None:
     # feedback worker busy past the five-minute shutdown deadline.
     by_uid = getattr(runtime.read_view, "_node_by_uid", {})
     for result in rows:
-        game_hash = stable_u64(result.game_id, person=b"v8-game")
+        game_hash = world_id(result.game_id)
         for credit in getattr(result, "primary_valence_credits", ()):
             if (
                 int(credit.level) != int(MemoryLevel.M7)

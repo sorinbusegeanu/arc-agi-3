@@ -11,6 +11,7 @@ from v8.actor import ActorJob, run_actor_jobs
 from v8.capacity import plan_capacities
 from v8.experiments import ExperimentSummary, run_automatic_transfer_experiments
 from v8.lifecycle_switch_v827 import LIFECYCLE_ENV
+from v8.persistent_identity import prepare_persistent_identity_root
 from v8.reporter import DedicatedReporter, load_continuous_progress_baseline
 from v8.runtime import ContinuousMemoryRuntime, V8RuntimeConfig
 from v8.snapshot import latest_complete_snapshot
@@ -20,6 +21,13 @@ _GAME_WAIT_ENV = "ARC_AGI3_GAME_WAIT_SECONDS"
 
 
 def _runtime_config(args, *, total_steps: int = 0) -> V8RuntimeConfig:
+    reset_identity = bool(getattr(args, "reset_persistent_identity", False))
+    archive = prepare_persistent_identity_root(
+        args.root,
+        reset_legacy=reset_identity,
+    )
+    if archive is not None:
+        print(f"archived legacy v8 store: {archive}", flush=True)
     plan = plan_capacities(
         total_steps=int(total_steps),
         shards=int(args.shards),
@@ -41,6 +49,7 @@ def _runtime_config(args, *, total_steps: int = 0) -> V8RuntimeConfig:
         snapshot_interval_seconds=args.snapshot_interval_seconds,
         enable_snapshots=not args.no_snapshots,
         restore=not args.no_restore,
+        reset_persistent_identity=reset_identity,
         enable_peers=not args.no_peers,
         peer_interval_seconds=args.peer_interval_seconds,
     )
@@ -58,6 +67,14 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--snapshot-interval-seconds", type=float, default=60.0)
     parser.add_argument("--peer-interval-seconds", type=float, default=0.5)
     parser.add_argument("--no-restore", action="store_true")
+    parser.add_argument(
+        "--reset-persistent-identity",
+        action="store_true",
+        help=(
+            "archive a legacy seed-scoped v8 store and start a consistent "
+            "environment-scoped store"
+        ),
+    )
     parser.add_argument("--no-snapshots", action="store_true")
     parser.add_argument("--no-peers", action="store_true")
 
@@ -178,8 +195,8 @@ def run_continuous(args) -> int:
     )
     total_steps = sum(int(job.steps) for job in jobs)
     restore_enabled = not args.no_restore
-    restore_source = latest_complete_snapshot(args.root) if restore_enabled else None
     runtime = ContinuousMemoryRuntime(_runtime_config(args, total_steps=total_steps))
+    restore_source = latest_complete_snapshot(args.root) if restore_enabled else None
     loaded_nodes = runtime.read_view.memory_count
     experiments = ExperimentSummary(0, 0, 0)
     reporter: DedicatedReporter | None = None

@@ -21,6 +21,7 @@ from v8.model import (
     proposal_fingerprint,
     stable_u64,
 )
+from v8.persistent_identity import world_id
 
 
 _INSTALLED = False
@@ -60,7 +61,6 @@ class ReplayAnchor:
     def to_dict(self) -> dict[str, object]:
         return {
             "source_id": self.source_id,
-            "seed": int(self.seed),
             "prefix_actions": list(self.prefix_actions),
             "env_root": self.env_root,
         }
@@ -69,7 +69,7 @@ class ReplayAnchor:
     def from_dict(cls, raw: dict[str, object]) -> "ReplayAnchor":
         return cls(
             str(raw.get("source_id", "")),
-            int(raw.get("seed", 0)),
+            0,
             tuple(int(value) for value in raw.get("prefix_actions", ())),
             None if raw.get("env_root") is None else str(raw.get("env_root")),
         )
@@ -115,7 +115,6 @@ def action_sequence_hash(actions: Iterable[int]) -> int:
 def _anchor_hash(anchor: ReplayAnchor, target: TrajectoryTarget) -> int:
     return stable_u64(
         anchor.source_id,
-        int(anchor.seed),
         action_sequence_hash(anchor.prefix_actions),
         int(target.levels_completed),
         str(target.terminal_state),
@@ -437,7 +436,6 @@ def select_validated_variant(
         for row in rows
         if row.variant_id not in blocked
         and row.anchor.source_id == str(source_id)
-        and int(row.anchor.seed) == int(seed)
         and tuple(row.anchor.prefix_actions) == history
         and row.actions
     ]
@@ -774,7 +772,7 @@ def _reset_capture(job=None) -> None:
     global _CAPTURE_PREFIX, _CAPTURE_SEGMENT, _ACTOR_ACTION_HISTORY, _ACTOR_RESET_EPOCH
     _CAPTURE_ACTIVE = job is not None
     _CAPTURE_SOURCE_ID = "" if job is None else str(job.game_id)
-    _CAPTURE_SEED = 0 if job is None else int(job.seed)
+    _CAPTURE_SEED = 0
     _CAPTURE_ENV_ROOT = None if job is None else job.env_root
     _CAPTURE_PREFIX = []
     _CAPTURE_SEGMENT = []
@@ -980,7 +978,7 @@ def _runtime_validation_callback(runtime, candidate, result, validated) -> None:
     from v8.evidence import EvidenceRecord
 
     watermark = int(runtime.watermark)
-    source_hash = stable_u64(candidate.source.anchor.source_id, person=b"v8-game")
+    source_hash = world_id(candidate.source.anchor.source_id)
     uid = variant_strategy_uid(candidate)
     reduction = max(
         0.0,

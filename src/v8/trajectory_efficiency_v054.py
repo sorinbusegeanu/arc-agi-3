@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 
 from v8 import primary_valence as _primary
 from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid, stable_u64
+from v8.persistent_identity import world_id
 
 
 _RELATIVE_EFFICIENCY_WEIGHT = 0.15
@@ -322,7 +323,7 @@ def _record_actor_results_v054(self, results):
     from v8.evidence import EvidenceRecord
 
     for result in results:
-        game_hash = stable_u64(result.game_id, person=b"v8-game")
+        game_hash = world_id(result.game_id)
         for credit in getattr(result, "primary_valence_credits", ()):
             if int(credit.level) != int(MemoryLevel.M7):
                 continue

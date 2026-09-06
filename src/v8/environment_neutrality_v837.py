@@ -21,6 +21,7 @@ from v8.environment_contract import (
     optimization_scope_for,
     target_boundary,
 )
+from v8.persistent_identity import world_id
 
 
 _INSTALLED = False
@@ -268,10 +269,10 @@ def _current_game_id() -> str:
 def _grounded_transfer_index(view, game_id: str):
     from v8 import behavior_recovery as behavior
     from v8 import normalized_memory_v086 as normalized
-    from v8.model import MemoryLevel, RelationType, signed_u64, stable_u64
+    from v8.model import MemoryLevel, RelationType, signed_u64
 
     view._refresh_strategy_cache()
-    current_game = int(stable_u64(str(game_id), person=b"v8-game"))
+    current_game = int(world_id(str(game_id)))
     version = tuple(getattr(view, "_strategy_version", ()))
     cache_key = (version, current_game)
     if getattr(view, "_v837_transfer_index_key", None) == cache_key:

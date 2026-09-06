@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from v8.model import MemoryLevel, MemoryUid, stable_u64
+from v8.model import MemoryLevel, MemoryUid
+from v8.persistent_identity import world_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +83,7 @@ def run_automatic_transfer_experiments(
         provenance=runtime.read_view.source_games,
     )
     attempted = completed = passed = 0
-    game_hashes = {game: stable_u64(game, person=b"v8-game") for game in games}
+    game_hashes = {game: world_id(game) for game in games}
     for candidate in sorted(candidates, key=lambda row: (-row.structural_score, row.uid)):
         formation = tuple(candidate.formation_games)
         for game_id in games:

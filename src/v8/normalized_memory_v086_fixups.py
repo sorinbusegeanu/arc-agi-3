@@ -17,6 +17,7 @@ from v8.normalized_memory_v086 import (
     _BASE_PIPELINE_PACKET_SIZE,
     stage_worker_v086,
 )
+from v8.persistent_identity import world_id
 from v8.structural_events import is_normalized_fact_token, native_action_set_signature
 
 
@@ -93,7 +94,7 @@ def install_normalized_memory_v086_fixups() -> None:
             person=b"v8.6-action-context",
         )
         scope = os.environ.get(_CONTROL_SCOPE_ENV, "")
-        game_hash = stable_u64(scope, person=b"v8-game") if scope else 0
+        game_hash = world_id(scope) if scope else 0
         return _grounded_context(game_hash, observable)
 
     adapter.ArcGridEnvironment.available_actions = available_actions

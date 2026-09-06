@@ -4,7 +4,9 @@ import unittest
 from types import SimpleNamespace
 
 import v8
-from v8 import actor as actor_module
+from v8.environments.schemas import EnvironmentIdentity
+from v8.model import stable_u64
+from v8.persistent_identity import trajectory_identity
 from v8 import trajectory_optimizer_v814 as optimizer
 
 
@@ -36,13 +38,31 @@ class SeedlessTrajectoryCaptureV818Tests(unittest.TestCase):
             optimizer._ACTOR_ACTION_HISTORY = prior[6]
 
     def test_actor_trajectory_signature_ignores_execution_seed(self) -> None:
-        first = actor_module.stable_u64(7, 101, 33, person=b"v8-traj-seed")
-        second = actor_module.stable_u64(7, 909, 33, person=b"v8-traj-seed")
+        first_world = EnvironmentIdentity(
+            "gymnasium", "FrozenLake-v1", "default", "seed=101"
+        ).source_hash
+        second_world = EnvironmentIdentity(
+            "gymnasium", "FrozenLake-v1", "default", "seed=909"
+        ).source_hash
+        first = trajectory_identity(
+            first_world,
+            producer_id=4,
+            episode_ordinal=0,
+            sequence_base=33,
+            namespace=b"v8-traj-seed",
+        )
+        second = trajectory_identity(
+            second_world,
+            producer_id=4,
+            episode_ordinal=0,
+            sequence_base=33,
+            namespace=b"v8-traj-seed",
+        )
         self.assertEqual(first, second)
 
     def test_other_actor_hashes_still_include_all_parts(self) -> None:
-        first = actor_module.stable_u64(7, 101, 33, person=b"v8-other")
-        second = actor_module.stable_u64(7, 909, 33, person=b"v8-other")
+        first = stable_u64(7, 101, 33, person=b"v8-other")
+        second = stable_u64(7, 909, 33, person=b"v8-other")
         self.assertNotEqual(first, second)
 
 

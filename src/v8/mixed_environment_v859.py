@@ -16,6 +16,7 @@ from v8.actor import (
 from v8.experiments import ExperimentSummary, run_automatic_transfer_experiments
 from v8.model import stable_u64
 from v8.multi_environment_run import make_adapter
+from v8.persistent_identity import trajectory_identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,12 +197,12 @@ def run_generic_actor_job(runtime, job: ActorJob, *, reporting_queue=None) -> Ac
     rng = Random(int(job.seed))
     sequence = wins = failures = resets = planned_steps = 0
     sequence_base = max(0, int(getattr(runtime, "watermark", 0)))
-    trajectory = stable_u64(
+    trajectory = trajectory_identity(
         adapter.identity.source_hash,
-        job.actor_id,
-        job.seed,
-        sequence_base,
-        person=b"v8.59-mix-trajectory",
+        producer_id=job.actor_id,
+        episode_ordinal=0,
+        sequence_base=sequence_base,
+        namespace=b"v8.59-mix-trajectory",
     )
     next_progress = time.monotonic() + 5.0
     graph_check_steps = max(1, int(job.graph_check_steps))
@@ -218,12 +219,12 @@ def run_generic_actor_job(runtime, job: ActorJob, *, reporting_queue=None) -> Ac
             if not before_actions:
                 adapter.reset()
                 resets += 1
-                trajectory = stable_u64(
+                trajectory = trajectory_identity(
                     adapter.identity.source_hash,
-                    job.seed,
-                    resets,
-                    sequence_base,
-                    person=b"v8.59-mix-trajectory",
+                    producer_id=job.actor_id,
+                    episode_ordinal=resets,
+                    sequence_base=sequence_base,
+                    namespace=b"v8.59-mix-trajectory",
                 )
                 continue
             context = int(adapter.observation_signature(before))
@@ -300,12 +301,12 @@ def run_generic_actor_job(runtime, job: ActorJob, *, reporting_queue=None) -> Ac
                 restored_active = False
                 adapter.reset()
                 resets += 1
-                trajectory = stable_u64(
+                trajectory = trajectory_identity(
                     adapter.identity.source_hash,
-                    job.seed,
-                    resets,
-                    producer_sequence,
-                    person=b"v8.59-mix-trajectory",
+                    producer_id=job.actor_id,
+                    episode_ordinal=resets,
+                    sequence_base=producer_sequence,
+                    namespace=b"v8.59-mix-trajectory",
                 )
             elif restored_active and restored_index >= len(restored_actions):
                 # A restored trajectory earns no competence credit unless its final
@@ -314,12 +315,12 @@ def run_generic_actor_job(runtime, job: ActorJob, *, reporting_queue=None) -> Ac
                 restored_active = False
                 adapter.reset()
                 resets += 1
-                trajectory = stable_u64(
+                trajectory = trajectory_identity(
                     adapter.identity.source_hash,
-                    job.seed,
-                    resets,
-                    producer_sequence,
-                    person=b"v8.59-mix-trajectory",
+                    producer_id=job.actor_id,
+                    episode_ordinal=resets,
+                    sequence_base=producer_sequence,
+                    namespace=b"v8.59-mix-trajectory",
                 )
             now = time.monotonic()
             if now >= next_progress:

@@ -28,6 +28,7 @@ from v8.model import (
     stable_u64,
 )
 from v8.peers import DevelopmentalPeerSupervisor
+from v8.persistent_identity import prepare_persistent_identity_root, world_id
 from v8.publication import LiveReadView, ShardReadDescriptor
 from v8.reporting_snapshot import capture_reporting_cut
 from v8.ring import SharedRingBuffer
@@ -69,6 +70,7 @@ class V8RuntimeConfig:
     snapshot_interval_seconds: float = 60.0
     enable_snapshots: bool = True
     restore: bool = True
+    reset_persistent_identity: bool = False
     enable_peers: bool = True
     peer_interval_seconds: float = 0.5
     multiprocessing_start_method: str | None = None
@@ -94,7 +96,10 @@ class ContinuousMemoryRuntime:
     def __init__(self, config: V8RuntimeConfig) -> None:
         self.config = config
         self.root = config.root
-        self.root.mkdir(parents=True, exist_ok=True)
+        prepare_persistent_identity_root(
+            self.root,
+            reset_legacy=bool(config.reset_persistent_identity),
+        )
         self._mp_ctx = _safe_mp_context(config.multiprocessing_start_method)
         self._stop = self._mp_ctx.Event()
         self._snapshot_freeze = self._mp_ctx.Event()
@@ -608,7 +613,7 @@ class ContinuousMemoryRuntime:
         if self.peers is None:
             return
         for result in results:
-            game_hash = stable_u64(result.game_id, person=b"v8-game")
+            game_hash = world_id(result.game_id)
             for stat in getattr(result, "strategy_stats", ()):
                 self.peers.record_strategy_statistics(
                     stat.strategy_uid,

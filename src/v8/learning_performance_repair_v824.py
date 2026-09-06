@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import time
 
+from v8.persistent_identity import world_id
+
 
 _INSTALLED = False
 _UNSOLVED_LEASE_STEPS = 2048
@@ -61,9 +63,7 @@ def _prewin_submit_v824(service, trajectory) -> bool:
 
 
 def _game_hash(game_id: str) -> int:
-    from v8.model import stable_u64
-
-    return int(stable_u64(str(game_id), person=b"v8-game"))
+    return int(world_id(str(game_id)))
 
 
 def _foreign_key(game_id: str, strategy_uid) -> tuple[int, int, int]:
