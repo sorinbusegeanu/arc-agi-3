@@ -4,6 +4,7 @@ import threading
 import time
 from collections import Counter
 from dataclasses import dataclass
+from typing import Callable
 
 from v8.carriers import CarrierEstimator
 from v8.concept_validation import ConceptValidator
@@ -380,6 +381,87 @@ class V82DevelopmentalPeerSupervisor(DevelopmentalPeerSupervisor):
         finally:
             self.read_view = live_read_view
             self._v82_run_lock.release()
+
+    def run_until_stable(
+        self,
+        max_cycles: int = 8,
+        *,
+        commit_proposals: Callable[[], None],
+        timeout: float = 60.0,
+    ) -> str:
+        """Drain at most eight complete immutable cuts through a commit barrier."""
+        from v8 import information_flow_diagnostics as flow
+
+        limit = min(8, max(1, int(max_cycles)))
+        was_paused = self._pause.is_set()
+        self.pause()
+        cancel = getattr(self, "_v841_peer_cancel", None)
+        was_cancelled = bool(cancel is not None and cancel.is_set())
+        submit = self.submit_proposal
+        prior_stabilizing = getattr(self, "_v82_stabilizing", False)
+        try:
+            if not self.wait_idle(timeout):
+                raise TimeoutError("v8 peers did not become idle before stabilization")
+            if cancel is not None:
+                cancel.clear()
+            self._v82_stabilizing = True
+            commit_proposals()
+            for cycle in range(1, limit + 1):
+                submitted: dict[MemoryUid, str] = {}
+
+                def track(proposal: MemoryProposal) -> None:
+                    submit(proposal)
+                    level = int(proposal.level)
+                    kind = int(proposal.memory_type)
+                    if level == int(MemoryLevel.M2):
+                        submitted[proposal.uid] = "new_m2_count"
+                    elif level == int(MemoryLevel.M3):
+                        if kind == int(MemoryType.CARRIER):
+                            submitted[proposal.uid] = "new_m3_carrier_count"
+                        elif kind == int(MemoryType.ROLE):
+                            submitted[proposal.uid] = "new_m3_role_count"
+                    elif level == int(MemoryLevel.M4):
+                        submitted[proposal.uid] = "new_m4_count"
+
+                before_cut = self.last_developmental_cut
+                before_cycles = self._cycles
+                self._v841_last_input_token = None
+                self.submit_proposal = track
+                try:
+                    self.run_once()
+                finally:
+                    self.submit_proposal = submit
+                cut = self.last_developmental_cut
+                if cut is None or cut is before_cut or self._cycles == before_cycles:
+                    raise RuntimeError("v8 stabilization did not complete a developmental cut")
+                commit_proposals()
+                existing = {row.uid for row in cut.nodes}
+                counts = Counter(kind for uid, kind in submitted.items() if uid not in existing)
+                total = sum(counts.values())
+                reason = "stable" if total == 0 else "max_cycles" if cycle == limit else None
+                fields: dict[str, object] = {
+                    "stabilization_cycle": cycle,
+                    "new_m2_count": counts["new_m2_count"],
+                    "new_m3_carrier_count": counts["new_m3_carrier_count"],
+                    "new_m3_role_count": counts["new_m3_role_count"],
+                    "new_m4_count": counts["new_m4_count"],
+                }
+                if reason is not None:
+                    fields["stop_reason"] = reason
+                flow.emit(
+                    "developmental", "stabilization", input_count=len(cut.nodes),
+                    output_count=total,
+                    fields=fields,
+                )
+                if reason is not None:
+                    return reason
+        finally:
+            self.submit_proposal = submit
+            self._v82_stabilizing = prior_stabilizing
+            if cancel is not None and was_cancelled:
+                cancel.set()
+            if not was_paused:
+                self.resume()
 
     def record_transfer_trial(
         self,

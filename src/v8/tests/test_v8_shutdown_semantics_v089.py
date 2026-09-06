@@ -31,13 +31,21 @@ class ShutdownSemanticsV089Tests(unittest.TestCase):
         self.assertTrue(runtime._sampling_complete)
         runtime.peers.pause.assert_called_once_with()
 
-    def test_post_sampling_drain_never_schedules_another_peer_cycle(self) -> None:
+    def test_post_sampling_drain_uses_bounded_stabilization(self) -> None:
         runtime = self._runtime_stub(sampling_complete=True)
+
+        def stabilize(*, max_cycles, commit_proposals, timeout):
+            self.assertEqual(max_cycles, 8)
+            commit_proposals()
+            return "stable"
+
+        runtime.peers.run_until_stable.side_effect = stabilize
 
         runtime.wait_quiescent(timeout=0.2, stable_checks=2)
 
-        runtime.peers.pause.assert_called_once_with()
+        self.assertTrue(runtime.peers.pause.called)
         runtime.peers.wait_idle.assert_called_once()
+        runtime.peers.run_until_stable.assert_called_once()
         runtime.peers.run_once.assert_not_called()
         runtime.peers.resume.assert_not_called()
         self.assertGreaterEqual(runtime._is_quiescent.call_count, 2)

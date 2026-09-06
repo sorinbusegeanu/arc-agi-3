@@ -106,6 +106,8 @@ def _arena_backed(values) -> bool:
 
 
 def _peer_run_once_v862(self):
+    if bool(getattr(self, "_v82_stabilizing", False)):
+        return _BASE_PEER_RUN_ONCE(self)
     view = getattr(self, "_v813_live_read_view", None) or getattr(self, "read_view", None)
     if view is None:
         return _BASE_PEER_RUN_ONCE(self)
@@ -172,13 +174,35 @@ def _runtime_wait_quiescent_v862(
     resume_peers: bool = True,
     settle_peers: bool = True,
 ):
-    # After sampling/admission ends, quiescence means already-admitted canonical
-    # work is drained. It must not recursively derive the entire graph to a fixed
-    # point. Persisted peer offsets resume unfinished maintenance on the next run.
-    if bool(getattr(self, "_sampling_complete", False)) or not bool(
+    final_drain = bool(getattr(self, "_sampling_complete", False)) or not bool(
         getattr(self, "_accepting", True)
-    ):
+    )
+    if final_drain:
         settle_peers = False
+        resume_peers = False
+        peers = getattr(self, "peers", None)
+        stabilize = getattr(peers, "run_until_stable", None)
+        generation = int(getattr(self, "generation", -1))
+        last_generation = getattr(self, "_v82_developmental_finalized_generation", None)
+        if callable(stabilize) and (
+            not getattr(self, "_v82_developmental_finalized", False)
+            or last_generation != generation
+        ):
+            peers.pause()
+            deadline = time.monotonic() + max(0.0, float(timeout))
+
+            def commit_proposals() -> None:
+                _BASE_RUNTIME_WAIT(
+                    self, timeout=max(0.0, deadline - time.monotonic()),
+                    stable_checks=stable_checks, resume_peers=False, settle_peers=False,
+                )
+
+            stabilize(max_cycles=8, commit_proposals=commit_proposals, timeout=timeout)
+            self._v82_developmental_finalized = True
+            self._v82_developmental_finalized_generation = int(
+                getattr(self, "generation", generation)
+            )
+            return
     return _BASE_RUNTIME_WAIT(
         self,
         timeout=timeout,
