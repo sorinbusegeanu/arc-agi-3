@@ -5,8 +5,12 @@ from types import SimpleNamespace
 
 from v8.evaluation import ScientificHypothesisEvaluator
 from v8.evidence import EvidenceRecord
-from v8.model import MemoryLevel, MemoryType, MemoryUid
-from v8.outcome_holdout_v828 import _derive_class, _select_occurrence_holdout_class
+from v8.model import MemoryLevel, MemoryType, MemoryUid, RelationType
+from v8.outcome_holdout_v828 import (
+    _derive_class,
+    _lineage_occurrences_by_world,
+    _select_occurrence_holdout_class,
+)
 from v8.outcomes import OutcomeEquivalenceEstimator
 
 
@@ -16,6 +20,14 @@ def _row(uid_lo: int, *, support: int, variant: int):
         support_count=support,
         key_parts=(1, 2, variant),
     )
+
+
+class _ReadView:
+    def __init__(self, edges):
+        self._edges = tuple(edges)
+
+    def edge_records(self):
+        return self._edges
 
 
 class OutcomeHoldoutV828Tests(unittest.TestCase):
@@ -32,6 +44,33 @@ class OutcomeHoldoutV828Tests(unittest.TestCase):
             version=1,
             estimator=self.estimator,
         )
+
+    def test_lineage_provenance_is_counted_without_requiring_m0(self) -> None:
+        root = MemoryUid(1, 1)
+        m5 = MemoryUid(1, 2)
+        m3 = MemoryUid(1, 3)
+        world = 77
+        edges = (
+            SimpleNamespace(source_uid=root, target_uid=m5, relation_type=int(RelationType.EXPLAINS)),
+            SimpleNamespace(source_uid=m5, target_uid=m3, relation_type=int(RelationType.EXPLAINS)),
+            SimpleNamespace(source_uid=m3, target_uid=MemoryUid(0, world), relation_type=int(RelationType.GAME_PROVENANCE)),
+        )
+        occurrences = _lineage_occurrences_by_world(_ReadView(edges), (root,))
+        self.assertEqual(occurrences[root], {world: 1})
+
+    def test_multiple_direct_provenance_nodes_on_lineage_count_as_occurrences(self) -> None:
+        root = MemoryUid(2, 1)
+        left = MemoryUid(2, 2)
+        right = MemoryUid(2, 3)
+        world = 88
+        edges = (
+            SimpleNamespace(source_uid=root, target_uid=left, relation_type=int(RelationType.EXPLAINS)),
+            SimpleNamespace(source_uid=root, target_uid=right, relation_type=int(RelationType.DEPENDS_ON)),
+            SimpleNamespace(source_uid=left, target_uid=MemoryUid(0, world), relation_type=int(RelationType.GAME_PROVENANCE)),
+            SimpleNamespace(source_uid=right, target_uid=MemoryUid(0, world), relation_type=int(RelationType.GAME_PROVENANCE)),
+        )
+        occurrences = _lineage_occurrences_by_world(_ReadView(edges), (root,))
+        self.assertEqual(occurrences[root], {world: 2})
 
     def test_target_world_occurrences_are_excluded_before_validation_formation(self) -> None:
         rows = (_row(1, support=6, variant=1), _row(2, support=6, variant=1))
@@ -102,7 +141,7 @@ class OutcomeHoldoutV828Tests(unittest.TestCase):
             validation_state=1,
             target_game_hash=30,
             provenance_games=(10, 20),
-            causal_intervention="m6_m0_world_occurrence_holdout",
+            causal_intervention="m6_lineage_world_occurrence_holdout",
             effect_direction=1,
         )
         decisions = ScientificHypothesisEvaluator().evaluate((evidence,))
