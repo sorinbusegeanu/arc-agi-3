@@ -9,6 +9,9 @@ from v8.learning_fixes_v088_target_grounding_fix import (
 from v8.learning_fixes_v088_target_lineage_grounding_fix import (
     install_target_lineage_grounding_fix,
 )
+from v8.learning_fixes_v088_target_ephemeral_production_grounding_fix import (
+    install_target_ephemeral_production_grounding_fix,
+)
 
 
 _INSTALLED = False
@@ -175,4 +178,5 @@ def install_learning_fixes_v088_fixups() -> None:
     _install_fresh_transfer_experiment_cut()
     install_target_local_transfer_grounding_fix()
     install_target_lineage_grounding_fix()
+    install_target_ephemeral_production_grounding_fix()
     _INSTALLED = True
