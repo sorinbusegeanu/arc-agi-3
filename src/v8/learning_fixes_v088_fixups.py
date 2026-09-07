@@ -155,10 +155,28 @@ def _install_cross_context_probe_fallback() -> None:
     LiveReadView.plan_candidates = plan_candidates
 
 
+def _install_fresh_transfer_experiment_cut() -> None:
+    """Refresh the coherent read cut before final held-out transfer discovery."""
+    from v8 import learning_fixes_v088 as learning_module
+
+    current_cut = learning_module._coherent_cached_transfer_cut
+
+    def coherent_cached_transfer_cut(view):
+        invalidate = getattr(view, "invalidate_strategy_cache", None)
+        refresh = getattr(view, "_refresh_strategy_cache", None)
+        if callable(invalidate) and callable(refresh):
+            invalidate()
+            refresh()
+        return current_cut(view)
+
+    learning_module._coherent_cached_transfer_cut = coherent_cached_transfer_cut
+
+
 def install_learning_fixes_v088_fixups() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
     _install_outcome_conditioned_efficiency()
     _install_cross_context_probe_fallback()
+    _install_fresh_transfer_experiment_cut()
     _INSTALLED = True
