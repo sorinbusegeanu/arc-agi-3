@@ -144,12 +144,12 @@ def _install_ephemeral_production_grounding() -> None:
         if not isinstance(template, dict) or not references:
             return current_capture(game_id=game_id, env_root=env_root, seed=seed)
 
-        # Obtain the exact base capture while preventing the older target-grounding
-        # wrapper from consuming the pending template a second time.
         captured = current_capture(game_id=game_id, env_root=env_root, seed=seed)
         env = copy.deepcopy(captured.environment)
         rng = Random(int(seed) ^ 0x54A2)
         matched = None
+        matched_environment = None
+        matched_prefix_steps = 0
         grounding_steps = 0
         attempts: list[dict[str, object]] = []
         carriers_by_role_group: dict[tuple[int, int], set[int]] = defaultdict(set)
@@ -160,6 +160,7 @@ def _install_ephemeral_production_grounding() -> None:
             if not before_actions:
                 env.reset()
                 continue
+            pre_action_environment = copy.deepcopy(env)
             action = learning._memory_free_action(before_actions, rng)
             env.step(action)
             grounding_steps += 1
@@ -242,6 +243,8 @@ def _install_ephemeral_production_grounding() -> None:
             matched = {
                 **template,
                 "derived_target_action": int(action),
+                "target_grounding_context_signature": int(context),
+                "target_grounding_next_context_signature": int(next_context),
                 "observed_target_transformation_family_signature": family_diagnostic,
                 "observed_target_carrier_signature": None if raw_carrier is None else int(raw_carrier),
                 "target_ephemeral_m1_key": [int(v) for v in identity["m1_key"]],
@@ -253,42 +256,47 @@ def _install_ephemeral_production_grounding() -> None:
                 "correspondence_conditioned_mapping": True,
                 "grounding_step_index": int(step_index),
                 "grounding_identity_rule": "production_m1_m2_m3_canonical_identity",
+                "grounding_state_rule": "exact_pre_action_target_state",
                 "structural_match": dict(best),
             }
+            matched_environment = pre_action_environment
+            matched_prefix_steps = max(0, int(grounding_steps) - 1)
             break
 
-        if matched is None:
+        if matched is None or matched_environment is None:
             grounding._CAPTURE_GROUNDINGS[captured.capture_id] = {
                 "evidence": None,
                 "grounding_prefix_steps": int(grounding_steps),
+                "grounding_probe_steps": int(grounding_steps),
                 "grounding_policy": "shared_memory_free_prefix",
                 "grounding_attempts": attempts,
                 "failure_reason": "no_target_transition_passed_production_structural_gates",
             }
             return captured
 
-        state = env.observe()
-        actions = tuple(sorted(set(int(value) for value in env.available_actions())))
+        state = matched_environment.observe()
+        actions = tuple(sorted(set(int(value) for value in matched_environment.available_actions())))
         signature = int(grid_signature(state))
         capture_hash = stable_u64(
             str(game_id),
             int(seed),
             signature,
             *actions,
-            grounding_steps,
+            matched_prefix_steps,
             person=b"v8-xfer-grounded-state",
         )
         capture_id = f"{capture_hash:016x}"
         grounding._CAPTURE_GROUNDINGS[capture_id] = {
             "evidence": matched,
-            "grounding_prefix_steps": int(grounding_steps),
+            "grounding_prefix_steps": int(matched_prefix_steps),
+            "grounding_probe_steps": int(grounding_steps),
             "grounding_policy": "shared_memory_free_prefix",
             "grounding_attempts": attempts,
             "failure_reason": None,
         }
         return replace(
             captured,
-            environment=env,
+            environment=matched_environment,
             capture_id=capture_id,
             initial_state_signature=signature,
             initial_available_actions=actions,
