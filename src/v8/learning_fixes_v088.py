@@ -519,6 +519,9 @@ def _probe_policy_v088(
                     "source_actions_not_supported_by_target": sorted(
                         rejected_evidence_actions
                     )[:32],
+                    "derived_target_actions_not_available": sorted(
+                        rejected_evidence_actions
+                    )[:32],
                     "target_world": str(game_id),
                     "probe_seed": int(seed),
                     "target_state_capture_id": target_state_capture_id,
@@ -551,11 +554,13 @@ def _probe_policy_v088(
                         if evidence_used > 0
                         else []
                     ),
-                    "grounded_correspondence_memory_ids_actually_used": [
-                        str(row.get("target_grounded_memory_uid"))
-                        for row in applied_transfer_mappings
-                        if row.get("target_grounded_memory_uid") is not None
-                    ][:8],
+                    "grounded_correspondence_memory_ids_actually_used": list(
+                        dict.fromkeys(
+                            str(row.get("target_grounded_memory_uid"))
+                            for row in applied_transfer_mappings
+                            if row.get("target_grounded_memory_uid") is not None
+                        )
+                    )[:8],
                     "selected_execution_evidence": dict(selected_evidence),
                     "observed_context_signatures": sorted(observed_contexts)[:8],
                     "observed_context_buckets": sorted(
@@ -1742,8 +1747,8 @@ def _run_automatic_transfer_experiments_v088(
     trajectories = _trajectory_inventory(holdouts)
     source_trajectories = _source_trajectory_index(tuple(games))
     executable_reference = _executable_reference(runtime.read_view, nodes)
-    candidate_execution: dict[MemoryUid, dict[str, object]] = {}
-    candidate_evidence: dict[MemoryUid, dict[str, object]] = {}
+    candidate_execution: dict[tuple[MemoryUid, int], dict[str, object]] = {}
+    candidate_evidence: dict[tuple[MemoryUid, int], dict[str, object]] = {}
     mapped_sequence_targets: dict[tuple[int, ...], set[str]] = {}
 
     def reject(reason: str) -> None:
@@ -1838,7 +1843,8 @@ def _run_automatic_transfer_experiments_v088(
             eligibility_probes += 1
             trial_seed = int(seed) + (completed + 1) * 7919
             probe_diagnostic: dict[str, object] = {}
-            execution_evidence = candidate_evidence.get(candidate.uid)
+            evidence_key = (candidate.uid, target_hash)
+            execution_evidence = candidate_evidence.get(evidence_key)
             if execution_evidence is None:
                 execution_evidence = _transfer_execution_evidence(
                     runtime.read_view,
@@ -1846,8 +1852,9 @@ def _run_automatic_transfer_experiments_v088(
                     edges,
                     candidate,
                     source_trajectories,
+                    target_game_hash=target_hash,
                 )
-                candidate_evidence[candidate.uid] = execution_evidence
+                candidate_evidence[evidence_key] = execution_evidence
             try:
                 captured_target = _capture_target_probe_state(
                     game_id=game_id,
@@ -1902,7 +1909,7 @@ def _run_automatic_transfer_experiments_v088(
                 environment=_restore_target_probe_state(captured_target),
                 target_state_capture_id=captured_target.capture_id,
             )
-            candidate_snapshot = candidate_execution.get(candidate.uid)
+            candidate_snapshot = candidate_execution.get(evidence_key)
             if candidate_snapshot is None:
                 candidate_snapshot = _candidate_execution_snapshot(
                     runtime.read_view,
@@ -1910,7 +1917,23 @@ def _run_automatic_transfer_experiments_v088(
                     candidate.uid,
                     execution_evidence,
                 )
-                candidate_execution[candidate.uid] = candidate_snapshot
+                candidate_snapshot["required_executable_fields"] = [
+                    "explicit source structural role or entity",
+                    "explicit TRANSFER_CORRESPONDENCE target role or entity",
+                    "target-side grounded memory or executable structure",
+                    "derived target action available in the current target state",
+                ]
+                if not execution_evidence.get(
+                    "correspondence_conditioned_mapping"
+                ):
+                    candidate_snapshot["executable_predicate_failure_reason"] = str(
+                        execution_evidence.get("failure_reason")
+                        or "no_target_conditioned_structural_action_mapping"
+                    )
+                    candidate_snapshot["missing_or_invalid_executable_fields"] = [
+                        "target-conditioned structural action mapping"
+                    ]
+                candidate_execution[evidence_key] = candidate_snapshot
             resolution = _target_resolution_event(
                 read_view=runtime.read_view,
                 nodes=nodes,
@@ -1936,6 +1959,33 @@ def _run_automatic_transfer_experiments_v088(
                 executable_reference=executable_reference,
                 used=used,
             )
+            structural_actions_executed = int(
+                probe_diagnostic.get(
+                    "correspondence_conditioned_actions_executed", 0
+                )
+            )
+            resolution["target_memory_id"] = _uid_value(
+                candidate.correspondence_uid
+            )
+            resolution["target_memory_role"] = (
+                "explicit target structural counterpart selected by "
+                "TRANSFER_CORRESPONDENCE"
+            )
+            resolution["target_specific_memory_lookup_performed"] = True
+            resolution["executable_predicate"] = (
+                "at least one correspondence-conditioned target-local action was "
+                "executed"
+            )
+            if structural_actions_executed <= 0:
+                resolution["exact_executable_predicate_failure_reason"] = (
+                    "target_conditioned_action_unavailable"
+                    if execution_evidence.get("correspondence_conditioned_mapping")
+                    else str(
+                        execution_evidence.get("failure_reason")
+                        or "no_correspondence_conditioned_target_action_executed"
+                    )
+                )
+                resolution["executable_predicate_result"] = False
             flow.emit_bounded(
                 "transfer",
                 "target_memory_resolution",
@@ -1987,10 +2037,23 @@ def _run_automatic_transfer_experiments_v088(
             transfer_structure_ids = list(
                 probe_diagnostic.get("selected_transfer_structure_uids", ())
             )
+            applied_mappings = list(
+                probe_diagnostic.get("applied_transfer_mappings", ())
+            )
+            correspondence_applied = bool(
+                used > 0
+                and structural_actions_executed > 0
+                and applied_mappings
+                and all(
+                    isinstance(row, dict)
+                    and row.get("correspondence_conditioned_mapping") is True
+                    for row in applied_mappings
+                )
+            )
             selected_transfer_uid = (
                 str(transfer_structure_ids[0])
                 if transfer_structure_ids
-                else (_uid_value(candidate.uid) if used > 0 else None)
+                else None
             )
             intervention_fields = {
                 "selected_source_memory_uid": _uid_value(candidate.uid),
@@ -2000,15 +2063,21 @@ def _run_automatic_transfer_experiments_v088(
                 "selected_transfer_structure_uid": selected_transfer_uid,
                 "baseline_action": baseline_action,
                 "transfer_informed_action": transfer_informed_action,
-                "transfer_memory_influenced_action_selection": bool(used > 0),
+                "transfer_memory_influenced_action_selection": correspondence_applied,
                 "selected_action_changed_due_to_transfer": bool(action_changed),
+                "applied_transfer_mappings": applied_mappings,
+                "correspondence_conditioned_actions_executed": (
+                    structural_actions_executed
+                ),
                 "intervention_outcome": dict(probe_diagnostic.get("outcome", {})),
                 "control_outcome": dict(control_diagnostic.get("outcome", {})),
                 "only_transfer_policy_differs": bool(
                     matched_control["only_transfer_policy_differs"]
                 ),
             }
-            if used <= 0 or not matched_control["only_transfer_policy_differs"]:
+            if not correspondence_applied or not matched_control[
+                "only_transfer_policy_differs"
+            ]:
                 rejection_reason = (
                     "INVALID_MATCHED_TARGET_STATE"
                     if not matched_control["only_transfer_policy_differs"]

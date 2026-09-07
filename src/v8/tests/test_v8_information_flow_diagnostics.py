@@ -156,8 +156,28 @@ def test_accepted_transfer_candidate_is_counted_without_scheduler_change() -> No
         view = SimpleNamespace(node_records=lambda: (row,), source_games=lambda _uid: frozenset())
         runtime = SimpleNamespace(peers=peers, read_view=view, generation=1)
 
+        def probe_policy(**kwargs):
+            diagnostic = kwargs["diagnostic"]
+            if kwargs["required_ancestor"] is None:
+                diagnostic.update(
+                    executed_target_actions=[1],
+                    baseline_target_actions=[1],
+                )
+                return 0.0, 0
+            diagnostic.update(
+                executed_target_actions=[2],
+                baseline_target_actions=[1],
+                transfer_applied_step_indexes=[0],
+                selected_transfer_structure_uids=["target-memory"],
+                correspondence_conditioned_actions_executed=1,
+                applied_transfer_mappings=[
+                    {"correspondence_conditioned_mapping": True}
+                ],
+            )
+            return 1.0, 1
+
         with patch.object(learning, "_held_out_games", return_value=("held-out",)), patch.object(
-            learning, "_probe_policy_v088", side_effect=((1.0, 1), (0.0, 0))
+            learning, "_probe_policy_v088", side_effect=probe_policy
         ) as probe, patch.object(
             learning, "_capture_target_probe_state",
             return_value=SimpleNamespace(environment=object(), capture_id="captured"),

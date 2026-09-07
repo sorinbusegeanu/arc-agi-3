@@ -56,7 +56,7 @@ def _candidate(row: NodeRecord) -> TransferCandidate:
         1.0,
         (stable_u64("source", person=b"v8-game"),),
         MemoryUid.from_key(MemoryLevel.M3, MemoryType.ROLE, (999,)),
-        (stable_u64("correspondence", person=b"v8-game"),),
+        (stable_u64("target", person=b"v8-game"),),
     )
 
 
@@ -280,7 +280,7 @@ def test_resolution_instrumentation_does_not_change_scheduler_result() -> None:
 
     assert (result.attempted, result.completed, result.passed) == (0, 0, 0)
     assert detail[0]["exact_executable_predicate_failure_reason"] == (
-        "no_grounded_action_evidence_for_transfer_ancestor"
+        "no_target_conditioned_structural_action_mapping"
     )
     assert detail[0]["target_memory_level"] == "M3"
 
@@ -378,7 +378,15 @@ def _transfer_runtime(candidate_row, lineage_rows, parents):
             return tuple(lineage_rows)
 
         def source_games(self, uid):
-            return frozenset(candidate.formation_games) if uid == candidate.uid else frozenset()
+            if uid == candidate.uid:
+                return frozenset(candidate.formation_games)
+            if uid == candidate.correspondence_uid:
+                return frozenset(candidate.correspondence_games)
+            if uid in parents.get(candidate.uid, ()):
+                return frozenset(candidate.formation_games)
+            if uid in parents.get(candidate.correspondence_uid, ()):
+                return frozenset(candidate.correspondence_games)
+            return frozenset()
 
         def planned_action(self, *_args, **_kwargs):
             return None
@@ -391,7 +399,7 @@ def _transfer_runtime(candidate_row, lineage_rows, parents):
     return SimpleNamespace(peers=peers, read_view=View()), recorded, evidence
 
 
-def test_grounded_m3_lineage_schedules_without_m7() -> None:
+def test_identical_numeric_source_action_without_mapping_is_not_transfer() -> None:
     grounded = _memory(
         60,
         MemoryLevel.M1,
@@ -432,15 +440,17 @@ def test_grounded_m3_lineage_schedules_without_m7() -> None:
     resolution = next(
         row for row in records if row["stage"] == "target_memory_resolution"
     )
-    assert (result.attempted, result.completed, result.passed) == (1, 1, 0)
+    assert (result.attempted, result.completed, result.passed) == (0, 0, 0)
     assert snapshot["m7_descendant_count"] == 0
     assert snapshot["cached_executable_descendant_count"] == 0
-    assert resolution["probe_observations"]["execution_evidence_kind"] == (
-        "grounded_source_lineage"
-    )
-    assert len(recorded) == 1
-    assert recorded[0].passed is False
-    assert "transfer_trial_fail" in evidence
+    assert resolution["probe_observations"]["execution_evidence_kind"] is None
+    replay = resolution["required_ancestor_resolution"][
+        "lower_level_execution_evidence"
+    ]["diagnostic_replay_evidence"]
+    assert replay[0]["kind"] == "grounded_source_lineage"
+    assert replay[0]["action_ids"] == [2]
+    assert not recorded
+    assert "transfer_trial_fail" not in evidence
     assert "transfer_trial_pass" not in evidence
 
 
@@ -480,15 +490,14 @@ def test_candidate_without_grounded_or_trajectory_evidence_remains_rejected() ->
     assert evaluation["transfer_memory_influenced_action_selection"] is False
     assert evaluation["computed_transfer_effect"] is None
     assert detail[0]["exact_executable_predicate_failure_reason"] == (
-        "no_grounded_action_evidence_for_transfer_ancestor"
+        "no_target_conditioned_structural_action_mapping"
     )
     assert detail[0]["lower_level_resolution_failures"] == [
-        "no_grounded_action_evidence_for_transfer_ancestor",
-        "no_replayable_source_trajectory",
+        "no_target_conditioned_structural_action_mapping",
     ]
 
 
-def test_m4_replayable_source_trajectory_schedules_without_m7() -> None:
+def test_replayable_source_trajectory_does_not_count_as_transfer_use() -> None:
     ancestor = _memory(75, MemoryLevel.M4, MemoryType.CONCEPT)
     with tempfile.TemporaryDirectory() as raw_root, patch.dict(
         os.environ, {"ARC_AGI3_V8_ROOT": raw_root}, clear=False
@@ -534,12 +543,16 @@ def test_m4_replayable_source_trajectory_schedules_without_m7() -> None:
     resolution = next(
         row for row in records if row["stage"] == "target_memory_resolution"
     )
-    assert (result.attempted, result.completed, result.passed) == (1, 1, 0)
+    assert (result.attempted, result.completed, result.passed) == (0, 0, 0)
     assert resolution["required_ancestor_resolution"]["m7_descendant_count"] == 0
-    assert resolution["probe_observations"]["execution_evidence_kind"] == (
-        "replayable_source_trajectory"
-    )
-    assert len(recorded) == 1
+    assert resolution["probe_observations"]["execution_evidence_kind"] is None
+    replay = resolution["required_ancestor_resolution"][
+        "lower_level_execution_evidence"
+    ]["diagnostic_replay_evidence"]
+    assert replay[0]["kind"] == "replayable_source_trajectory"
+    assert resolution["probe_observations"]["planned_steps"] == 0
+    assert not recorded
+    assert "transfer_trial_fail" not in evidence
     assert "transfer_trial_pass" not in evidence
 
 
@@ -551,12 +564,6 @@ def test_grounded_actions_unsupported_by_target_are_rejected_exactly() -> None:
         (101, 9, 202, 303),
     )
     ancestor = _memory(77, MemoryLevel.M3, MemoryType.ROLE)
-    partially_supported = _memory(
-        79,
-        MemoryLevel.M1,
-        MemoryType.CONTINGENCY,
-        (102, 2, 203, 304),
-    )
     mapped = _memory(
         78,
         MemoryLevel.M1,
@@ -564,12 +571,6 @@ def test_grounded_actions_unsupported_by_target_are_rejected_exactly() -> None:
         (401, 9, 402, 403),
     )
     correspondence = _correspondence_ancestor()
-    mapped_partially_supported = _memory(
-        80,
-        MemoryLevel.M1,
-        MemoryType.CONTINGENCY,
-        (402, 2, 403, 404),
-    )
     with tempfile.TemporaryDirectory() as raw_root, patch.dict(
         os.environ, {"ARC_AGI3_V8_ROOT": raw_root}, clear=False
     ), patch.object(
@@ -582,15 +583,13 @@ def test_grounded_actions_unsupported_by_target_are_rejected_exactly() -> None:
             ancestor,
             (
                 grounded,
-                partially_supported,
                 mapped,
-                mapped_partially_supported,
                 ancestor,
                 correspondence,
             ),
             {
-                ancestor.uid: {grounded.uid, partially_supported.uid},
-                correspondence.uid: {mapped.uid, mapped_partially_supported.uid},
+                ancestor.uid: {grounded.uid},
+                correspondence.uid: {mapped.uid},
             },
         )
         result = learning._run_automatic_transfer_experiments_v088(
@@ -612,14 +611,11 @@ def test_grounded_actions_unsupported_by_target_are_rejected_exactly() -> None:
     assert "transfer_trial_pass" not in evidence
     assert "transfer_trial_fail" not in evidence
     assert detail[0]["exact_executable_predicate_failure_reason"] == (
-        "source_actions_not_supported_by_target"
+        "target_conditioned_action_unavailable"
     )
     assert detail[0]["probe_observations"][
-        "source_actions_not_supported_by_target"
+        "derived_target_actions_not_available"
     ] == [9]
-    assert detail[0]["target_action_failure_detail"] == (
-        "mapped_action_not_in_target_action_set"
-    )
 
 
 def test_formation_provenance_still_excludes_held_out_target() -> None:
@@ -675,7 +671,7 @@ def test_formation_provenance_still_excludes_held_out_target() -> None:
     assert (result.attempted, result.completed, result.passed) == (0, 0, 0)
 
 
-def test_existing_m7_plan_remains_first_execution_path() -> None:
+def test_unmapped_m7_plan_does_not_count_as_transfer_use() -> None:
     strategy_uid = MemoryUid.from_key(MemoryLevel.M7, MemoryType.STRATEGY, (2, 3, 4, 5))
     plan = PlannedAction(2, MemoryUid.zero(), strategy_uid, 1.0)
     view = SimpleNamespace(planned_action=lambda *_args, **_kwargs: plan)
@@ -694,9 +690,10 @@ def test_existing_m7_plan_remains_first_execution_path() -> None:
         )
 
     assert metric == 0.0
-    assert used == 4
-    assert diagnostic["m7_planned_steps"] == 4
+    assert used == 0
+    assert diagnostic["m7_planned_steps"] == 0
     assert diagnostic["lower_level_evidence_steps"] == 0
+    assert diagnostic["planned_strategy_ids"] == [strategy_uid.hex()]
 
 
 def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
@@ -764,6 +761,15 @@ def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
     assert evaluation["exact_source_action_sequence"] == [9]
     assert evaluation["exact_actions_executed_on_target"] == [2, 2, 2, 2]
     assert evaluation["correspondence_mapping"]["mapped_action_sequence"] == [2]
+    assert evaluation["correspondence_mapping"]["source_memory_ids"] == [
+        ancestor.uid.hex(), source_grounded.uid.hex(),
+    ]
+    assert evaluation["correspondence_mapping"]["correspondence_memory_ids"] == [
+        correspondence.uid.hex()
+    ]
+    assert evaluation["correspondence_mapping"]["target_grounded_memory_ids"] == [
+        mapped_grounded.uid.hex()
+    ]
     assert evaluation["correspondence_conditioned_mapping"] is True
     assert evaluation["generic_source_actions_reused_without_correspondence"] is False
     assert evaluation["grounded_source_memory_ids_actually_used"] == [
@@ -810,6 +816,18 @@ def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
     assert evaluation["transfer_informed_action"] == 2
     assert evaluation["transfer_memory_influenced_action_selection"] is True
     assert evaluation["selected_action_changed_due_to_transfer"] is True
+    assert evaluation["correspondence_conditioned_actions_executed"] == 4
+    applied = evaluation["applied_transfer_mappings"]
+    assert len(applied) == 4
+    assert applied[0]["source_structural_memory_uid"] == ancestor.uid.hex()
+    assert applied[0]["correspondence_uid"] == correspondence.uid.hex()
+    assert applied[0]["target_grounded_memory_uid"] == mapped_grounded.uid.hex()
+    assert applied[0]["source_role_entity"]["memory_uid"] == ancestor.uid.hex()
+    assert applied[0]["target_role_entity"]["memory_uid"] == correspondence.uid.hex()
+    assert applied[0]["derived_target_action"] == 2
+    assert applied[0]["mapping_kind"] == (
+        "explicit_structural_role_to_target_grounding"
+    )
     assert evaluation["intervention_outcome"] == {
         "wins": 4, "failures": 0, "level_gain": 0,
     }
