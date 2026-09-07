@@ -155,8 +155,9 @@ def install_current_runtime_stack_v88() -> None:
     if _peer_run_once_v845 is not None:
         peers_v82.V82DevelopmentalPeerSupervisor.run_once = _peer_run_once_v845
 
-    # H13 validation must wrap the final public peer entrypoint so the withheld M6
-    # member is excluded from the actual production merge support and the evidence
-    # is emitted only after that training-only class has formed.
+    # H13 validation wraps the final public peer entrypoint and runs on a shadow
+    # estimator after production M6/M7 formation. Diagnostics are installed last and
+    # are logging-only: they never alter evidence or memory decisions.
     _installer("outcome_holdout_v828")()
+    _installer("outcome_holdout_diagnostics_v828")()
     _INSTALLED = True
