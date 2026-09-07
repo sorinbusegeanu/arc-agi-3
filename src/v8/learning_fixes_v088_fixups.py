@@ -15,6 +15,9 @@ from v8.learning_fixes_v088_target_ephemeral_production_grounding_fix import (
 from v8.learning_fixes_v088_target_mapping_lifetime_fix import (
     install_target_mapping_lifetime_fix,
 )
+from v8.learning_fixes_v088_immediate_structural_transfer_fix import (
+    install_immediate_structural_transfer_fix,
+)
 
 
 _INSTALLED = False
@@ -183,4 +186,5 @@ def install_learning_fixes_v088_fixups() -> None:
     install_target_lineage_grounding_fix()
     install_target_ephemeral_production_grounding_fix()
     install_target_mapping_lifetime_fix()
+    install_immediate_structural_transfer_fix()
     _INSTALLED = True
