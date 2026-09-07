@@ -257,6 +257,11 @@ def test_resolution_instrumentation_does_not_change_scheduler_result() -> None:
 
         with patch.object(learning, "_held_out_games", return_value=("target",)), patch.object(
             learning, "_probe_policy_v088", return_value=(0.0, 0)
+        ), patch.object(
+            learning, "_capture_target_probe_state",
+            return_value=SimpleNamespace(environment=object(), capture_id="captured"),
+        ), patch.object(
+            learning, "_restore_target_probe_state", return_value=object()
         ):
             result = learning._run_automatic_transfer_experiments_v088(
                 runtime,
@@ -323,7 +328,10 @@ class _TransferProbeEnvironment:
 
 
 class _EffectProbeEnvironment:
+    created = 0
+
     def __init__(self, *, game_id, seed, **_kwargs):
+        type(self).created += 1
         self.game_id = str(game_id)
         self.seed = int(seed)
         self.last_levels_completed = 0
@@ -465,6 +473,12 @@ def test_candidate_without_grounded_or_trajectory_evidence_remains_rejected() ->
     assert not recorded
     assert "transfer_trial_pass" not in evidence
     assert "transfer_trial_fail" not in evidence
+    evaluation = next(
+        row for row in records if row["stage"] == "transfer_trial_evaluation"
+    )
+    assert evaluation["trial_classification"] == "TRANSFER_NOT_APPLIED"
+    assert evaluation["transfer_memory_influenced_action_selection"] is False
+    assert evaluation["computed_transfer_effect"] is None
     assert detail[0]["exact_executable_predicate_failure_reason"] == (
         "no_grounded_action_evidence_for_transfer_ancestor"
     )
@@ -715,6 +729,7 @@ def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
     ), patch(
         "v7.environment.arc_adapter.ArcGridEnvironment", _EffectProbeEnvironment
     ):
+        _EffectProbeEnvironment.created = 0
         flow.reset_for_tests()
         runtime, recorded, evidence = _transfer_runtime(ancestor, rows, parents)
         result = learning._run_automatic_transfer_experiments_v088(
@@ -739,6 +754,7 @@ def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
         row for row in records if row["stage"] == "transfer_experiment_scheduling"
     )
     assert (result.attempted, result.completed, result.passed) == (1, 1, 1)
+    assert _EffectProbeEnvironment.created == 1
     assert len(recorded) == 1
     assert recorded[0].effect == 5.0
     assert recorded[0].passed is True
@@ -762,6 +778,9 @@ def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
     assert evaluation["intervention"]["initial_state_signature"] == evaluation[
         "matched_memory_free_control"
     ]["initial_state_signature"]
+    assert evaluation["intervention"]["initial_target_state_signature"] == evaluation[
+        "matched_memory_free_control"
+    ]["initial_target_state_signature"]
     assert evaluation["intervention"]["initial_available_action_ids"] == [1, 2]
     assert evaluation["matched_memory_free_control"][
         "initial_available_action_ids"
@@ -775,6 +794,7 @@ def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
         "same_target_world": True,
         "same_initial_target_state": True,
         "same_initial_available_actions": True,
+        "same_captured_target_state": True,
         "same_seed": True,
         "same_horizon": True,
         "intervention_memory_policy_enabled": True,
@@ -783,6 +803,86 @@ def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
         "control_target_memory_leakage": False,
         "only_transfer_policy_differs": True,
     }
+    assert evaluation["selected_source_memory_uid"] == ancestor.uid.hex()
+    assert evaluation["selected_correspondence_uid"] == correspondence.uid.hex()
+    assert evaluation["selected_transfer_structure_uid"] == mapped_grounded.uid.hex()
+    assert evaluation["baseline_action"] == 1
+    assert evaluation["transfer_informed_action"] == 2
+    assert evaluation["transfer_memory_influenced_action_selection"] is True
+    assert evaluation["selected_action_changed_due_to_transfer"] is True
+    assert evaluation["intervention_outcome"] == {
+        "wins": 4, "failures": 0, "level_gain": 0,
+    }
+    assert evaluation["control_outcome"] == {
+        "wins": 0, "failures": 0, "level_gain": 0,
+    }
+
+
+def test_different_restored_target_state_is_invalid_and_has_no_effect() -> None:
+    source_grounded = _memory(
+        110,
+        MemoryLevel.M1,
+        MemoryType.CONTINGENCY,
+        (101, 9, 202, 303),
+    )
+    ancestor = _memory(111, MemoryLevel.M3, MemoryType.ROLE)
+    mapped_grounded = _memory(
+        112,
+        MemoryLevel.M1,
+        MemoryType.CONTINGENCY,
+        (401, 2, 402, 403),
+    )
+    correspondence = _correspondence_ancestor()
+    rows = (source_grounded, mapped_grounded, ancestor, correspondence)
+    parents = {
+        ancestor.uid: {source_grounded.uid},
+        correspondence.uid: {mapped_grounded.uid},
+    }
+    intervention_env = _EffectProbeEnvironment(game_id="target", seed=10)
+    control_env = _EffectProbeEnvironment(game_id="target", seed=10)
+    control_env.observe = lambda: ((99,),)
+    captured = SimpleNamespace(environment=object(), capture_id="one-captured-state")
+
+    with tempfile.TemporaryDirectory() as raw_root, patch.dict(
+        os.environ, {"ARC_AGI3_V8_ROOT": raw_root}, clear=False
+    ), patch.object(
+        learning, "_held_out_games", return_value=("target",)
+    ), patch.object(
+        learning, "_memory_free_action", return_value=1
+    ), patch.object(
+        learning, "_capture_target_probe_state", return_value=captured
+    ), patch.object(
+        learning, "_restore_target_probe_state",
+        side_effect=(intervention_env, control_env),
+    ):
+        flow.reset_for_tests()
+        runtime, recorded, evidence = _transfer_runtime(ancestor, rows, parents)
+        result = learning._run_automatic_transfer_experiments_v088(
+            runtime,
+            games=("source",),
+            env_root=None,
+            seed=10,
+            steps_per_trial=4,
+            max_trials=1,
+        )
+        records = [
+            json.loads(line)
+            for line in (Path(raw_root) / flow.LOG_NAME)
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+
+    evaluation = next(
+        row for row in records if row["stage"] == "transfer_trial_evaluation"
+    )
+    assert (result.attempted, result.completed, result.passed) == (0, 0, 0)
+    assert not recorded
+    assert "transfer_trial_pass" not in evidence
+    assert "transfer_trial_fail" not in evidence
+    assert evaluation["trial_classification"] == "INVALID_MATCHED_TARGET_STATE"
+    assert evaluation["matched_control_checks"]["same_initial_target_state"] is False
+    assert evaluation["only_transfer_policy_differs"] is False
+    assert evaluation["computed_transfer_effect"] is None
 
 
 def test_transfer_effect_calculation_preserves_strict_existing_threshold() -> None:

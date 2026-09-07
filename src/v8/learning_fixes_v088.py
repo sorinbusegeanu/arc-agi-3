@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import queue
@@ -58,6 +59,14 @@ class ActorProgress:
     first_win_step: int = 0
     best_win_steps: int = 0
     last_win_steps: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedTargetProbeState:
+    environment: object
+    capture_id: str
+    initial_state_signature: int
+    initial_available_actions: tuple[int, ...]
 
 
 def _provisional_concept_ready(row) -> bool:
@@ -303,6 +312,32 @@ def _execution_evidence_sequences(
     return ({**evidence, "action_ids": list(actions)},)
 
 
+def _capture_target_probe_state(
+    *,
+    game_id: str,
+    env_root: str | None,
+    seed: int,
+) -> _CapturedTargetProbeState:
+    """Create one target state whose immutable copy seeds both trial branches."""
+    from v7.environment.arc_adapter import ArcGridEnvironment
+    from v7.environment.encoding import grid_signature
+
+    environment = ArcGridEnvironment(game_id=game_id, seed=seed, env_root=env_root)
+    snapshot = copy.deepcopy(environment)
+    signature = int(grid_signature(snapshot.observe()))
+    actions = tuple(sorted(set(int(value) for value in snapshot.available_actions())))
+    capture_hash = stable_u64(
+        str(game_id), int(seed), signature, *actions, person=b'v8-xfer-state'
+    )
+    capture_id = f"{capture_hash:016x}"
+    return _CapturedTargetProbeState(snapshot, capture_id, signature, actions)
+
+
+def _restore_target_probe_state(captured: _CapturedTargetProbeState):
+    """Restore a branch from the exact target snapshot, including hidden RNG state."""
+    return copy.deepcopy(captured.environment)
+
+
 def _probe_policy_v088(
     *,
     read_view,
@@ -313,17 +348,23 @@ def _probe_policy_v088(
     required_ancestor: MemoryUid | None,
     execution_evidence: dict[str, object] | None = None,
     diagnostic: dict[str, object] | None = None,
+    environment=None,
+    target_state_capture_id: str | None = None,
 ) -> tuple[float, int]:
     """Matched intervention: target-memory ON versus genuinely memory-free OFF."""
     from v7.environment.arc_adapter import ArcGridEnvironment
-    from v7.environment.encoding import structural_grid_signature
+    from v7.environment.encoding import grid_signature, structural_grid_signature
 
-    env = ArcGridEnvironment(game_id=game_id, seed=seed, env_root=env_root)
+    restored_from_capture = environment is not None and target_state_capture_id is not None
+    env = environment
+    if env is None:
+        env = ArcGridEnvironment(game_id=game_id, seed=seed, env_root=env_root)
     rng = Random(int(seed) ^ 0x8A11)
     wins = failures = level_gain = used = 0
     observed_contexts: set[int] = set()
     observed_actions: set[int] = set()
     executed_actions: list[int] = []
+    baseline_actions: list[int] = []
     executed_action_count = 0
     lower_actions_used: set[int] = set()
     plan_misses = 0
@@ -332,12 +373,15 @@ def _probe_policy_v088(
     evidence_used = 0
     evidence_unsupported_steps = 0
     planned_strategy_ids: set[str] = set()
+    transfer_structure_ids: list[str] = []
+    transfer_applied_steps: list[int] = []
     evidence_candidates = _execution_evidence_sequences(execution_evidence)
     evidence_actions: tuple[int, ...] = ()
     selected_evidence: dict[str, object] = {}
     rejected_evidence_actions: set[int] = set()
     evidence_selection_complete = False
     initial_state_signature = None
+    initial_target_state_signature = None
     initial_available_actions: tuple[int, ...] = ()
     last_levels = int(env.last_levels_completed)
     for _ in range(max(1, int(steps))):
@@ -345,6 +389,7 @@ def _probe_policy_v088(
         actions = tuple(sorted(set(int(value) for value in env.available_actions())))
         if initial_state_signature is None:
             initial_state_signature = int(structural_grid_signature(before))
+            initial_target_state_signature = int(grid_signature(before))
             initial_available_actions = actions
         if not actions:
             env.reset()
@@ -363,8 +408,11 @@ def _probe_policy_v088(
                 break
             evidence_selection_complete = True
         observed_actions.update(actions)
+        baseline_action = _memory_free_action(actions, rng)
+        if len(baseline_actions) < _MAX_TRANSFER_DIAGNOSTIC_ACTIONS:
+            baseline_actions.append(int(baseline_action))
         if required_ancestor is None:
-            action = _memory_free_action(actions, rng)
+            action = baseline_action
         else:
             context = int(structural_grid_signature(before))
             observed_contexts.add(context)
@@ -382,16 +430,31 @@ def _probe_policy_v088(
                 )
                 if mapped is None:
                     evidence_unsupported_steps += int(bool(evidence_actions))
-                    action = _memory_free_action(actions, rng)
+                    action = baseline_action
                 else:
                     action = int(mapped)
                     used += 1
                     evidence_used += 1
                     lower_actions_used.add(int(mapped))
+                    transfer_applied_steps.append(int(executed_action_count))
+                    matched_evidence = next(
+                        (
+                            row
+                            for row in selected_evidence.get("mapped_action_evidence", ())
+                            if int(row.get("action_id", -1)) == int(mapped)
+                            and row.get("memory_id") is not None
+                        ),
+                        None,
+                    )
+                    if matched_evidence is not None:
+                        transfer_structure_ids.append(str(matched_evidence["memory_id"]))
             else:
                 action = int(plan.action_id)
                 used += 1
-                planned_strategy_ids.add(str(plan.strategy_uid.hex()))
+                strategy_id = str(plan.strategy_uid.hex())
+                planned_strategy_ids.add(strategy_id)
+                transfer_structure_ids.append(strategy_id)
+                transfer_applied_steps.append(int(executed_action_count))
         env.step(action)
         executed_action_count += 1
         if len(executed_actions) < _MAX_TRANSFER_DIAGNOSTIC_ACTIONS:
@@ -424,9 +487,13 @@ def _probe_policy_v088(
                     )[:32],
                     "target_world": str(game_id),
                     "probe_seed": int(seed),
+                    "target_state_capture_id": target_state_capture_id,
+                    "restored_from_captured_target_state": bool(restored_from_capture),
                     "initial_state_signature": initial_state_signature,
+                    "initial_target_state_signature": initial_target_state_signature,
                     "initial_available_action_ids": list(initial_available_actions),
                     "executed_target_actions": list(executed_actions),
+                    "baseline_target_actions": list(baseline_actions),
                     "executed_target_action_count": int(executed_action_count),
                     "executed_target_actions_truncated": bool(
                         executed_action_count > len(executed_actions)
@@ -466,6 +533,11 @@ def _probe_policy_v088(
                     )[:8],
                     "available_action_ids": sorted(observed_actions)[:32],
                     "planned_strategy_ids": sorted(planned_strategy_ids)[:8],
+                    "selected_transfer_structure_uids": list(
+                        dict.fromkeys(transfer_structure_ids)
+                    )[:8],
+                    "transfer_applied_step_indexes": transfer_applied_steps[:32],
+                    "transfer_memory_influenced_action_selection": bool(used > 0),
                 }
             )
         except BaseException:
@@ -1407,26 +1479,48 @@ def _matched_probe_diagnostic(
     intervention: dict[str, object],
     control: dict[str, object],
 ) -> dict[str, object]:
-    same_target = intervention.get("target_world") == control.get("target_world")
-    same_seed = intervention.get("probe_seed") == control.get("probe_seed")
-    same_horizon = intervention.get("probe_steps") == control.get("probe_steps")
+    same_target = bool(intervention.get("target_world")) and (
+        intervention.get("target_world") == control.get("target_world")
+    )
+    same_seed = intervention.get("probe_seed") is not None and (
+        intervention.get("probe_seed") == control.get("probe_seed")
+    )
+    same_horizon = intervention.get("probe_steps") is not None and (
+        intervention.get("probe_steps") == control.get("probe_steps")
+    )
+    intervention_state = intervention.get(
+        "initial_target_state_signature", intervention.get("initial_state_signature")
+    )
+    control_state = control.get(
+        "initial_target_state_signature", control.get("initial_state_signature")
+    )
     same_initial_state = (
-        intervention.get("initial_state_signature")
-        == control.get("initial_state_signature")
+        intervention_state is not None and intervention_state == control_state
     )
     same_initial_actions = (
-        intervention.get("initial_available_action_ids")
+        "initial_available_action_ids" in intervention
+        and "initial_available_action_ids" in control
+        and intervention.get("initial_available_action_ids")
         == control.get("initial_available_action_ids")
+    )
+    same_captured_state = bool(
+        intervention.get("target_state_capture_id")
+        and intervention.get("target_state_capture_id")
+        == control.get("target_state_capture_id")
+        and intervention.get("restored_from_captured_target_state") is True
+        and control.get("restored_from_captured_target_state") is True
     )
     control_memory_free = (
         control.get("memory_policy_enabled") is False
         and int(control.get("target_memory_query_count", 0)) == 0
         and control.get("execution_evidence_kind") is None
     )
+    intervention_memory_enabled = intervention.get("memory_policy_enabled") is True
     return {
         "same_target_world": bool(same_target),
         "same_initial_target_state": bool(same_initial_state),
         "same_initial_available_actions": bool(same_initial_actions),
+        "same_captured_target_state": same_captured_state,
         "same_seed": bool(same_seed),
         "same_horizon": bool(same_horizon),
         "intervention_memory_policy_enabled": bool(
@@ -1439,10 +1533,12 @@ def _matched_probe_diagnostic(
         "control_target_memory_leakage": not bool(control_memory_free),
         "only_transfer_policy_differs": bool(
             same_target
+            and same_captured_state
             and same_initial_state
             and same_initial_actions
             and same_seed
             and same_horizon
+            and intervention_memory_enabled
             and control_memory_free
         ),
     }
@@ -1610,6 +1706,36 @@ def _run_automatic_transfer_experiments_v088(
                     source_trajectories,
                 )
                 candidate_evidence[candidate.uid] = execution_evidence
+            try:
+                captured_target = _capture_target_probe_state(
+                    game_id=game_id,
+                    env_root=env_root,
+                    seed=trial_seed,
+                )
+            except Exception as exc:
+                rejection_reason = "TARGET_STATE_CAPTURE_FAILED"
+                reject(rejection_reason)
+                add_example(
+                    candidate, game_id, target_hash, eligible=False,
+                    decision="invalid", reason=rejection_reason,
+                )
+                flow.emit(
+                    "transfer", "transfer_trial_evaluation", input_count=1,
+                    output_count=0, rejection_counts={rejection_reason: 1},
+                    fields={
+                        "trial_classification": rejection_reason,
+                        "target_world": str(game_id),
+                        "selected_source_memory_uid": _uid_value(candidate.uid),
+                        "selected_correspondence_uid": _uid_value(
+                            candidate.correspondence_uid
+                        ),
+                        "selected_transfer_structure_uid": None,
+                        "computed_transfer_effect": None,
+                        "only_transfer_policy_differs": False,
+                        "capture_error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+                continue
             on_metric, used = _probe_policy_v088(
                 read_view=runtime.read_view,
                 game_id=game_id,
@@ -1619,6 +1745,20 @@ def _run_automatic_transfer_experiments_v088(
                 required_ancestor=candidate.uid,
                 execution_evidence=execution_evidence,
                 diagnostic=probe_diagnostic,
+                environment=_restore_target_probe_state(captured_target),
+                target_state_capture_id=captured_target.capture_id,
+            )
+            control_diagnostic: dict[str, object] = {}
+            off_metric, _ = _probe_policy_v088(
+                read_view=runtime.read_view,
+                game_id=game_id,
+                env_root=env_root,
+                seed=trial_seed,
+                steps=steps_per_trial,
+                required_ancestor=None,
+                diagnostic=control_diagnostic,
+                environment=_restore_target_probe_state(captured_target),
+                target_state_capture_id=captured_target.capture_id,
             )
             candidate_snapshot = candidate_execution.get(candidate.uid)
             if candidate_snapshot is None:
@@ -1672,27 +1812,94 @@ def _run_automatic_transfer_experiments_v088(
                 ),
                 fields=resolution,
             )
-            if used <= 0:
-                rejection_reason = str(
-                    resolution.get("exact_executable_predicate_failure_reason")
-                    or "no_grounded_action_evidence_for_transfer_ancestor"
+            matched_control = _matched_probe_diagnostic(
+                probe_diagnostic, control_diagnostic
+            )
+            intervention_actions = list(
+                probe_diagnostic.get("executed_target_actions", ())
+            )
+            intervention_baselines = list(
+                probe_diagnostic.get("baseline_target_actions", ())
+            )
+            applied_steps = [
+                int(value)
+                for value in probe_diagnostic.get("transfer_applied_step_indexes", ())
+            ]
+            first_applied = applied_steps[0] if applied_steps else None
+            baseline_action = (
+                int(intervention_baselines[first_applied])
+                if first_applied is not None and first_applied < len(intervention_baselines)
+                else None
+            )
+            transfer_informed_action = (
+                int(intervention_actions[first_applied])
+                if first_applied is not None and first_applied < len(intervention_actions)
+                else None
+            )
+            action_changed = any(
+                index < len(intervention_actions)
+                and index < len(intervention_baselines)
+                and intervention_actions[index] != intervention_baselines[index]
+                for index in applied_steps
+            )
+            transfer_structure_ids = list(
+                probe_diagnostic.get("selected_transfer_structure_uids", ())
+            )
+            selected_transfer_uid = (
+                str(transfer_structure_ids[0])
+                if transfer_structure_ids
+                else (_uid_value(candidate.uid) if used > 0 else None)
+            )
+            intervention_fields = {
+                "selected_source_memory_uid": _uid_value(candidate.uid),
+                "selected_correspondence_uid": _uid_value(
+                    candidate.correspondence_uid
+                ),
+                "selected_transfer_structure_uid": selected_transfer_uid,
+                "baseline_action": baseline_action,
+                "transfer_informed_action": transfer_informed_action,
+                "transfer_memory_influenced_action_selection": bool(used > 0),
+                "selected_action_changed_due_to_transfer": bool(action_changed),
+                "intervention_outcome": dict(probe_diagnostic.get("outcome", {})),
+                "control_outcome": dict(control_diagnostic.get("outcome", {})),
+                "only_transfer_policy_differs": bool(
+                    matched_control["only_transfer_policy_differs"]
+                ),
+            }
+            if used <= 0 or not matched_control["only_transfer_policy_differs"]:
+                rejection_reason = (
+                    "INVALID_MATCHED_TARGET_STATE"
+                    if not matched_control["only_transfer_policy_differs"]
+                    else "TRANSFER_NOT_APPLIED"
                 )
                 reject(rejection_reason)
-                add_example(candidate, game_id, target_hash, eligible=False,
-                            decision="not_scheduled", reason=rejection_reason)
+                flow.emit(
+                    "transfer", "transfer_trial_evaluation", input_count=1,
+                    output_count=0, rejection_counts={rejection_reason: 1},
+                    examples=({
+                        "source_ancestor_id": _uid_value(candidate.uid),
+                        "target_world": str(game_id),
+                        "trial_classification": rejection_reason,
+                    },),
+                    fields={
+                        **intervention_fields,
+                        "source_ancestor_id": _uid_value(candidate.uid),
+                        "target_world": str(game_id),
+                        "target_state_capture_id": captured_target.capture_id,
+                        "trial_classification": rejection_reason,
+                        "matched_control_checks": matched_control,
+                        "computed_transfer_effect": None,
+                        "passed": False,
+                        "exact_failure_reason": rejection_reason,
+                    },
+                )
+                add_example(
+                    candidate, game_id, target_hash, eligible=False,
+                    decision=rejection_reason, reason=rejection_reason,
+                )
                 continue
             eligible_target_worlds += 1
             attempted += 1
-            control_diagnostic: dict[str, object] = {}
-            off_metric, _ = _probe_policy_v088(
-                read_view=runtime.read_view,
-                game_id=game_id,
-                env_root=env_root,
-                seed=trial_seed,
-                steps=steps_per_trial,
-                required_ancestor=None,
-                diagnostic=control_diagnostic,
-            )
             trial = runtime.peers.record_transfer_trial(
                 candidate.uid,
                 target_game_hash=target_hash,
@@ -1718,10 +1925,7 @@ def _run_automatic_transfer_experiments_v088(
             reused_mapping = bool(
                 prior_mapping_targets and str(game_id) not in prior_mapping_targets
             )
-            matched_control = _matched_probe_diagnostic(
-                probe_diagnostic, control_diagnostic
-            )
-            flow.emit_bounded(
+            flow.emit(
                 "transfer",
                 "transfer_trial_evaluation",
                 input_count=1,
@@ -1736,6 +1940,7 @@ def _run_automatic_transfer_experiments_v088(
                     },
                 ),
                 fields={
+                    **intervention_fields,
                     "source_ancestor_id": _uid_value(candidate.uid),
                     "source_ancestor_level": _enum_name(
                         MemoryLevel, getattr(by_uid.get(candidate.uid), "level", -1)
@@ -1785,6 +1990,7 @@ def _run_automatic_transfer_experiments_v088(
                     )[:8],
                     "target_world": str(game_id),
                     "target_world_hash": int(target_hash),
+                    "target_state_capture_id": captured_target.capture_id,
                     "intervention": {
                         "outcome": dict(probe_diagnostic.get("outcome", {})),
                         "score": float(on_metric),
@@ -1792,6 +1998,9 @@ def _run_automatic_transfer_experiments_v088(
                         "horizon": int(steps_per_trial),
                         "initial_state_signature": probe_diagnostic.get(
                             "initial_state_signature"
+                        ),
+                        "initial_target_state_signature": probe_diagnostic.get(
+                            "initial_target_state_signature"
                         ),
                         "initial_available_action_ids": list(
                             probe_diagnostic.get("initial_available_action_ids", ())
@@ -1807,6 +2016,9 @@ def _run_automatic_transfer_experiments_v088(
                         "horizon": int(steps_per_trial),
                         "initial_state_signature": control_diagnostic.get(
                             "initial_state_signature"
+                        ),
+                        "initial_target_state_signature": control_diagnostic.get(
+                            "initial_target_state_signature"
                         ),
                         "initial_available_action_ids": list(
                             control_diagnostic.get("initial_available_action_ids", ())
@@ -1826,6 +2038,11 @@ def _run_automatic_transfer_experiments_v088(
                     "existing_pass_threshold": threshold,
                     "pass_predicate": "held_out and effect > effect_threshold",
                     "passed": bool(trial.passed),
+                    "trial_classification": (
+                        "transfer_trial_pass"
+                        if trial.passed
+                        else "transfer_trial_fail"
+                    ),
                     "exact_failure_reason": failure_reason,
                 },
             )

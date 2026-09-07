@@ -158,7 +158,19 @@ def test_accepted_transfer_candidate_is_counted_without_scheduler_change() -> No
 
         with patch.object(learning, "_held_out_games", return_value=("held-out",)), patch.object(
             learning, "_probe_policy_v088", side_effect=((1.0, 1), (0.0, 0))
-        ) as probe:
+        ) as probe, patch.object(
+            learning, "_capture_target_probe_state",
+            return_value=SimpleNamespace(environment=object(), capture_id="captured"),
+        ), patch.object(
+            learning, "_restore_target_probe_state", return_value=object()
+        ), patch.object(
+            learning,
+            "_matched_probe_diagnostic",
+            return_value={
+                "only_transfer_policy_differs": True,
+                "control_target_memory_leakage": False,
+            },
+        ):
             result = learning._run_automatic_transfer_experiments_v088(
                 runtime, games=("train",), env_root=None, seed=1,
                 steps_per_trial=4, max_trials=1,

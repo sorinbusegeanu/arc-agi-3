@@ -389,6 +389,11 @@ class V088LearningFixTests(unittest.TestCase):
 
         with patch("v8.learning_fixes_v088._held_out_games", return_value=("hold01",)), patch(
             "v8.learning_fixes_v088._probe_policy_v088", return_value=(0.0, 0)
+        ), patch(
+            "v8.learning_fixes_v088._capture_target_probe_state",
+            return_value=SimpleNamespace(environment=object(), capture_id="captured"),
+        ), patch(
+            "v8.learning_fixes_v088._restore_target_probe_state", return_value=object()
         ):
             summary = _run_automatic_transfer_experiments_v088(
                 Runtime(),
@@ -445,6 +450,11 @@ class V088LearningFixTests(unittest.TestCase):
             "v8.learning_fixes_v088._held_out_games", return_value=("hold01",)
         ), patch(
             "v8.learning_fixes_v088._probe_policy_v088", return_value=(0.0, 0)
+        ), patch(
+            "v8.learning_fixes_v088._capture_target_probe_state",
+            return_value=SimpleNamespace(environment=object(), capture_id="captured"),
+        ), patch(
+            "v8.learning_fixes_v088._restore_target_probe_state", return_value=object()
         ) as probe:
             summary = _run_automatic_transfer_experiments_v088(
                 Runtime(),
@@ -457,7 +467,7 @@ class V088LearningFixTests(unittest.TestCase):
 
         self.assertEqual(summary.attempted, 0)
         self.assertEqual(summary.completed, 0)
-        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(probe.call_count, 4)
 
     def test_efficiency_is_relative_to_same_outcome_alternatives(self):
         from v8 import behavior_recovery as behavior_module
