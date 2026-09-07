@@ -10,6 +10,7 @@ from v8.outcome_holdout_v828 import (
     _derive_class,
     _lineage_occurrences_by_world,
     _select_occurrence_holdout_class,
+    _shadow_estimator,
 )
 from v8.outcomes import OutcomeEquivalenceEstimator
 
@@ -71,6 +72,28 @@ class OutcomeHoldoutV828Tests(unittest.TestCase):
         )
         occurrences = _lineage_occurrences_by_world(_ReadView(edges), (root,))
         self.assertEqual(occurrences[root], {world: 2})
+
+    def test_shadow_estimator_copies_criteria_without_sharing_state(self) -> None:
+        live = OutcomeEquivalenceEstimator(
+            min_support=7,
+            stability_threshold=0.61,
+            context_consistency_threshold=0.62,
+            max_diameter=0.63,
+            interchangeability_threshold=0.64,
+        )
+        live._version = 17
+        live._signature = ((1, 2, (MemoryUid(0, 1),)),)
+        shadow = _shadow_estimator(live)
+        self.assertIsNot(shadow, live)
+        self.assertEqual(shadow.min_support, live.min_support)
+        self.assertEqual(shadow.stability_threshold, live.stability_threshold)
+        self.assertEqual(shadow.context_consistency_threshold, live.context_consistency_threshold)
+        self.assertEqual(shadow.max_diameter, live.max_diameter)
+        self.assertEqual(shadow.interchangeability_threshold, live.interchangeability_threshold)
+        shadow._version = 99
+        shadow._signature = ()
+        self.assertEqual(live._version, 17)
+        self.assertEqual(live._signature, ((1, 2, (MemoryUid(0, 1),)),))
 
     def test_target_world_occurrences_are_excluded_before_validation_formation(self) -> None:
         rows = (_row(1, support=6, variant=1), _row(2, support=6, variant=1))
