@@ -82,13 +82,7 @@ def _lineage_occurrences_by_world(
     *,
     max_depth: int = 8,
 ):
-    """Count direct game-provenance-bearing lineage occurrences for each fine M6 root.
-
-    Production provenance is not guaranteed to terminate at M0.  A canonical memory
-    can inherit its world through any lower-level lineage node carrying a direct
-    GAME_PROVENANCE edge.  Count those direct provenance-bearing nodes wherever they
-    occur on the ancestry path, while visiting each lineage node at most once per root.
-    """
+    """Count direct game-provenance-bearing lineage occurrences for each fine M6 root."""
     parents: dict[MemoryUid, set[MemoryUid]] = defaultdict(set)
     direct_games: dict[MemoryUid, set[int]] = defaultdict(set)
     for edge in read_view.edge_records():
@@ -123,7 +117,6 @@ def _lineage_occurrences_by_world(
     return result
 
 
-# Compatibility alias retained for tests/imports from the first H13 occurrence patch.
 _m0_occurrences_by_world = _lineage_occurrences_by_world
 
 
@@ -221,10 +214,22 @@ def _consistency_score(outcome: OutcomeClass) -> float:
     )
 
 
+def _shadow_estimator(live: OutcomeEquivalenceEstimator) -> OutcomeEquivalenceEstimator:
+    """Create an H13-only estimator with identical production criteria and no shared state."""
+    return OutcomeEquivalenceEstimator(
+        min_support=int(live.min_support),
+        stability_threshold=float(live.stability_threshold),
+        context_consistency_threshold=float(live.context_consistency_threshold),
+        max_diameter=float(live.max_diameter),
+        interchangeability_threshold=float(live.interchangeability_threshold),
+    )
+
+
 def _build_validations(supervisor: DevelopmentalPeerSupervisor):
     nodes = tuple(supervisor.read_view.node_records())
     by_uid = {row.uid: row for row in nodes}
-    classes = tuple(supervisor.outcomes.rebuild(nodes))
+    estimator = _shadow_estimator(supervisor.outcomes)
+    classes = tuple(estimator.rebuild(nodes))
     roots = tuple(
         uid
         for outcome in classes
@@ -235,7 +240,7 @@ def _build_validations(supervisor: DevelopmentalPeerSupervisor):
     validations = []
     for outcome in classes:
         validation = _select_occurrence_holdout_class(
-            supervisor.outcomes, outcome, by_uid, occurrences
+            estimator, outcome, by_uid, occurrences
         )
         if validation is not None:
             validations.append(validation)
@@ -332,8 +337,8 @@ def install_outcome_holdout_v828() -> None:
     original_base_run_once = DevelopmentalPeerSupervisor.run_once
 
     def base_run_once(self: DevelopmentalPeerSupervisor):
-        validations = _build_validations(self)
         result = original_base_run_once(self)
+        validations = _build_validations(self)
         _emit_holdout_evidence(self, validations)
         return result
 
