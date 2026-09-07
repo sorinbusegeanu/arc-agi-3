@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Callable
 
 from v8.model import MemoryLevel, MemoryType, MemoryUid, RelationType, ValidationState
 from v8.outcomes import OutcomeClass, OutcomeEquivalenceEstimator
 from v8.peers import DevelopmentalPeerSupervisor
-from v8.peers_v82 import V82DevelopmentalPeerSupervisor
+
+
+_LINEAGE_RELATIONS = {
+    int(RelationType.PROVENANCE),
+    int(RelationType.EXPLAINS),
+    int(RelationType.LEADS_TO),
+    int(RelationType.CONTEXT_REFINES),
+    int(RelationType.DEPENDS_ON),
+}
 
 
 @dataclass(slots=True)
@@ -23,11 +31,8 @@ class OutcomeHoldoutValidation:
     holdout_consistent: bool
     training_class: OutcomeClass
     full_class: OutcomeClass
-    formed: bool = False
-
-    @property
-    def holdout_uid(self) -> MemoryUid:
-        return self.holdout_members[0]
+    training_occurrences: int
+    holdout_occurrences: int
 
 
 def _derive_class(
@@ -71,72 +76,130 @@ def _derive_class(
     )
 
 
-def _select_holdout_class(
+def _m0_occurrences_by_world(read_view, roots: tuple[MemoryUid, ...], *, max_depth: int = 8):
+    """Return exact M0 episode occurrences reachable from each fine M6 root.
+
+    This intentionally avoids ``source_games(root)`` because that provenance is already
+    unioned after canonical memories aggregate across worlds.  The validation unit is
+    the lower-level episode carrying a direct GAME_PROVENANCE edge.
+    """
+    rows = {row.uid: row for row in read_view.node_records()}
+    parents: dict[MemoryUid, set[MemoryUid]] = defaultdict(set)
+    direct_games: dict[MemoryUid, set[int]] = defaultdict(set)
+    for edge in read_view.edge_records():
+        relation = int(edge.relation_type)
+        if relation == int(RelationType.GAME_PROVENANCE) and int(edge.target_uid.hi) == 0:
+            direct_games[edge.source_uid].add(int(edge.target_uid.lo))
+        elif relation in _LINEAGE_RELATIONS:
+            parents[edge.source_uid].add(edge.target_uid)
+
+    result: dict[MemoryUid, dict[int, int]] = {}
+    for root in roots:
+        frontier = {root}
+        visited = {root}
+        episodes_by_game: dict[int, set[MemoryUid]] = defaultdict(set)
+        for _depth in range(max(0, int(max_depth)) + 1):
+            following: set[MemoryUid] = set()
+            for uid in frontier:
+                row = rows.get(uid)
+                if row is not None and int(row.level) == int(MemoryLevel.M0):
+                    for game in direct_games.get(uid, ()):
+                        episodes_by_game[int(game)].add(uid)
+                    continue
+                for parent in parents.get(uid, ()):
+                    if parent not in visited:
+                        visited.add(parent)
+                        following.add(parent)
+            if not following:
+                break
+            frontier = following
+        result[root] = {
+            int(game): len(episodes)
+            for game, episodes in episodes_by_game.items()
+            if episodes
+        }
+    return result
+
+
+def _pseudo_row(root, game: int, support: int):
+    return SimpleNamespace(
+        uid=MemoryUid.from_key(
+            MemoryLevel.M6,
+            MemoryType.OUTCOME,
+            tuple(int(v) for v in root.key_parts[:3]) + (int(game),),
+        ),
+        support_count=max(1, int(support)),
+        key_parts=tuple(int(v) for v in root.key_parts),
+    )
+
+
+def _select_occurrence_holdout_class(
     estimator: OutcomeEquivalenceEstimator,
     full_class: OutcomeClass,
     by_uid: dict[MemoryUid, object],
-    provenance: Callable[[MemoryUid], frozenset[int] | set[int] | tuple[int, ...]],
-) -> tuple[OutcomeClass, OutcomeHoldoutValidation | None]:
-    """Withhold one complete world before the coarse M6 merge.
-
-    Fine M6 nodes may already carry provenance from multiple worlds.  Holding out one
-    fine node can therefore leak the target world through another member.  Select a
-    target world first, exclude every fine member containing that world from training,
-    and form the coarse M6 class only from the remaining members.
-    """
-    candidate_uids = tuple(
+    occurrences: dict[MemoryUid, dict[int, int]],
+) -> OutcomeHoldoutValidation | None:
+    fine_uids = tuple(
         uid for uid in full_class.members if uid != full_class.uid and uid in by_uid
     )
-    if len(candidate_uids) < 3:
-        return full_class, None
+    if len(fine_uids) < 2:
+        return None
 
-    games_by_uid = {
-        uid: frozenset(int(v) for v in provenance(uid)) for uid in candidate_uids
-    }
-    candidate_games = sorted({game for games in games_by_uid.values() for game in games})
-    partitions: list[tuple[int, int, tuple[MemoryUid, ...], tuple[MemoryUid, ...]]] = []
+    candidate_games = sorted(
+        {game for uid in fine_uids for game in occurrences.get(uid, {})}
+    )
     for target_game in candidate_games:
-        holdout_uids = tuple(uid for uid in candidate_uids if target_game in games_by_uid[uid])
-        training_uids = tuple(uid for uid in candidate_uids if target_game not in games_by_uid[uid])
-        if not holdout_uids or len(training_uids) < 2:
+        training_rows = []
+        holdout_rows = []
+        training_members: set[MemoryUid] = set()
+        holdout_members: set[MemoryUid] = set()
+        training_games: set[int] = set()
+        for uid in fine_uids:
+            root = by_uid[uid]
+            for game, support in sorted(occurrences.get(uid, {}).items()):
+                row = _pseudo_row(root, game, support)
+                if int(game) == int(target_game):
+                    holdout_rows.append(row)
+                    holdout_members.add(uid)
+                else:
+                    training_rows.append(row)
+                    training_members.add(uid)
+                    training_games.add(int(game))
+        if not holdout_rows or len(training_members) < 2 or not training_games:
             continue
-        partitions.append((len(holdout_uids), int(target_game), training_uids, holdout_uids))
 
-    for _size, target_game, training_uids, holdout_uids in sorted(partitions):
-        training_rows = tuple(by_uid[uid] for uid in training_uids)
         training_class = _derive_class(
             full_class.descriptor,
-            training_rows,
+            tuple(training_rows),
             uid=full_class.uid,
             version=full_class.version,
             estimator=estimator,
         )
         if not training_class.persistent:
             continue
-        training_games: set[int] = set()
-        for uid in training_uids:
-            training_games.update(games_by_uid[uid])
-        if target_game in training_games:
-            continue
-        holdout_games: set[int] = set()
-        for uid in holdout_uids:
-            holdout_games.update(games_by_uid[uid])
-
-        return training_class, OutcomeHoldoutValidation(
+        full_shadow = _derive_class(
+            full_class.descriptor,
+            tuple(training_rows + holdout_rows),
+            uid=full_class.uid,
+            version=full_class.version,
+            estimator=estimator,
+        )
+        return OutcomeHoldoutValidation(
             class_uid=full_class.uid,
             descriptor=full_class.descriptor,
-            training_members=tuple(sorted(training_uids)),
-            holdout_members=tuple(sorted(holdout_uids)),
+            training_members=tuple(sorted(training_members)),
+            holdout_members=tuple(sorted(holdout_members)),
             training_games=tuple(sorted(training_games)),
-            holdout_games=tuple(sorted(holdout_games)),
+            holdout_games=(int(target_game),),
             target_game_hash=int(target_game),
             training_persistent=True,
-            holdout_consistent=bool(full_class.persistent),
+            holdout_consistent=bool(full_shadow.persistent),
             training_class=training_class,
-            full_class=full_class,
+            full_class=full_shadow,
+            training_occurrences=sum(int(row.support_count) for row in training_rows),
+            holdout_occurrences=sum(int(row.support_count) for row in holdout_rows),
         )
-
-    return full_class, None
+    return None
 
 
 def _consistency_score(outcome: OutcomeClass) -> float:
@@ -152,21 +215,31 @@ def _consistency_score(outcome: OutcomeClass) -> float:
     )
 
 
-def _heldout_m5_parents(read_view, holdout_uids: tuple[MemoryUid, ...]) -> tuple[MemoryUid, ...]:
-    by_uid = {row.uid: row for row in read_view.node_records()}
-    wanted = set(holdout_uids)
-    result: set[MemoryUid] = set()
-    for edge in read_view.edge_records():
-        if edge.source_uid not in wanted or int(edge.relation_type) != int(RelationType.EXPLAINS):
-            continue
-        target = by_uid.get(edge.target_uid)
-        if target is not None and int(target.level) == int(MemoryLevel.M5):
-            result.add(target.uid)
-    return tuple(sorted(result))
+def _build_validations(supervisor: DevelopmentalPeerSupervisor):
+    nodes = tuple(supervisor.read_view.node_records())
+    by_uid = {row.uid: row for row in nodes}
+    classes = tuple(supervisor.outcomes.rebuild(nodes))
+    roots = tuple(
+        uid
+        for outcome in classes
+        for uid in outcome.members
+        if uid != outcome.uid and uid in by_uid
+    )
+    occurrences = _m0_occurrences_by_world(supervisor.read_view, roots)
+    validations = []
+    for outcome in classes:
+        validation = _select_occurrence_holdout_class(
+            supervisor.outcomes, outcome, by_uid, occurrences
+        )
+        if validation is not None:
+            validations.append(validation)
+    return tuple(validations)
 
 
-def _emit_holdout_evidence(supervisor: V82DevelopmentalPeerSupervisor) -> None:
-    validations = tuple(getattr(supervisor.outcomes, "_v828_holdout_validations", ()))
+def _emit_holdout_evidence(
+    supervisor: DevelopmentalPeerSupervisor,
+    validations: tuple[OutcomeHoldoutValidation, ...],
+) -> None:
     if not validations:
         return
     rows = {row.uid: row for row in supervisor.read_view.node_records()}
@@ -176,27 +249,31 @@ def _emit_holdout_evidence(supervisor: V82DevelopmentalPeerSupervisor) -> None:
         flow = None
 
     for validation in validations:
-        if not validation.formed or not validation.training_persistent:
-            continue
-        holdout_rows = [rows[uid] for uid in validation.holdout_members if uid in rows]
-        if not holdout_rows:
-            continue
+        member_rows = [
+            rows[uid]
+            for uid in set(validation.training_members) | set(validation.holdout_members)
+            if uid in rows
+        ]
         watermark = max(
-            [int(row.updated_watermark) for row in holdout_rows]
-            + [int(rows[uid].updated_watermark) for uid in validation.training_members if uid in rows]
+            (int(row.updated_watermark) for row in member_rows),
+            default=int(supervisor.current_watermark()),
         )
-        kind = "outcome_consistency_holdout" if validation.holdout_consistent else "outcome_consistency_fail"
+        kind = (
+            "outcome_consistency_holdout"
+            if validation.holdout_consistent
+            else "outcome_consistency_fail"
+        )
         freshness = (
-            f"v828:{kind}:{validation.descriptor[0]}:{validation.descriptor[1]}:"
-            f"{validation.target_game_hash}"
+            f"v828-occurrence:{kind}:{validation.descriptor[0]}:"
+            f"{validation.descriptor[1]}:{validation.target_game_hash}"
         )
+        if not supervisor._fresh(freshness, validation.class_uid, watermark):
+            continue
         proxy = SimpleNamespace(
             uid=validation.class_uid,
             level=MemoryLevel.M6,
             validation_state=int(ValidationState.STRUCTURAL),
         )
-        if not supervisor._fresh(freshness, validation.class_uid, watermark):
-            continue
         score = _consistency_score(validation.full_class)
         value = score if validation.holdout_consistent else max(1e-9, 1.0 - score)
         supervisor._append_evidence(
@@ -207,30 +284,28 @@ def _emit_holdout_evidence(supervisor: V82DevelopmentalPeerSupervisor) -> None:
             unique=True,
             target_game_hash=validation.target_game_hash,
             provenance_games=validation.training_games,
-            causal_intervention="m6_world_withheld_before_coarse_merge",
+            causal_intervention="m6_m0_world_occurrence_holdout",
             effect_direction=1 if validation.holdout_consistent else -1,
         )
         if flow is not None:
-            heldout_m5 = _heldout_m5_parents(supervisor.read_view, validation.holdout_members)
             flow.emit(
                 "outcomes",
                 kind,
-                input_count=len(validation.holdout_members),
+                input_count=validation.holdout_occurrences,
                 output_count=1,
                 examples=[
                     {
                         "m6_uid": validation.class_uid.hex(),
-                        "heldout_m6_uids": [uid.hex() for uid in validation.holdout_members],
-                        "heldout_m5_uids": [uid.hex() for uid in heldout_m5],
                         "heldout_target_world": validation.target_game_hash,
                         "formation_provenance_games": list(validation.training_games),
                         "holdout_games": list(validation.holdout_games),
-                        "target_world_excluded_from_all_training_members": True,
-                        "holdout_excluded_from_formation_support": True,
-                        "training_persistent": validation.training_persistent,
-                        "holdout_consistent": validation.holdout_consistent,
+                        "training_m0_occurrences": validation.training_occurrences,
+                        "holdout_m0_occurrences": validation.holdout_occurrences,
                         "training_member_count": len(validation.training_members),
                         "holdout_member_count": len(validation.holdout_members),
+                        "target_world_excluded_from_validation_formation_support": True,
+                        "training_persistent": validation.training_persistent,
+                        "holdout_consistent": validation.holdout_consistent,
                         "training_support": validation.training_class.support,
                         "full_support": validation.full_class.support,
                         "training_diameter": validation.training_class.within_class_diameter,
@@ -238,6 +313,7 @@ def _emit_holdout_evidence(supervisor: V82DevelopmentalPeerSupervisor) -> None:
                         "training_interchangeability": validation.training_class.predictive_interchangeability,
                         "full_interchangeability": validation.full_class.predictive_interchangeability,
                         "criterion": "existing_m6_persistence_diameter_interchangeability",
+                        "validation_unit": "direct_game_provenanced_m0_episode",
                     }
                 ],
             )
@@ -247,43 +323,13 @@ def install_outcome_holdout_v828() -> None:
     if getattr(OutcomeEquivalenceEstimator, "_v828_holdout_installed", False):
         return
 
-    original_rebuild = OutcomeEquivalenceEstimator.rebuild
-    original_merge_revision = OutcomeEquivalenceEstimator.merge_revision
     original_base_run_once = DevelopmentalPeerSupervisor.run_once
 
-    def rebuild(self: OutcomeEquivalenceEstimator, rows):
-        full_classes = tuple(original_rebuild(self, rows))
-        provenance = getattr(self, "_v828_provenance", None)
-        if provenance is None:
-            self._v828_holdout_validations = ()
-            return full_classes
-        by_uid = {row.uid: row for row in rows}
-        transformed: list[OutcomeClass] = []
-        validations: list[OutcomeHoldoutValidation] = []
-        for full_class in full_classes:
-            training_class, validation = _select_holdout_class(self, full_class, by_uid, provenance)
-            transformed.append(training_class)
-            if validation is not None:
-                validations.append(validation)
-        self._classes = {item.descriptor: item for item in transformed}
-        self._v828_holdout_validations = tuple(validations)
-        return tuple(transformed)
-
-    def merge_revision(self: OutcomeEquivalenceEstimator, outcome: OutcomeClass):
-        revision = original_merge_revision(self, outcome)
-        if revision is not None:
-            for validation in getattr(self, "_v828_holdout_validations", ()):
-                if validation.class_uid == outcome.uid and validation.descriptor == outcome.descriptor:
-                    validation.formed = True
-        return revision
-
     def base_run_once(self: DevelopmentalPeerSupervisor):
-        self.outcomes._v828_provenance = lambda uid: self.read_view.source_games(uid)
+        validations = _build_validations(self)
         result = original_base_run_once(self)
-        _emit_holdout_evidence(self)
+        _emit_holdout_evidence(self, validations)
         return result
 
-    OutcomeEquivalenceEstimator.rebuild = rebuild
-    OutcomeEquivalenceEstimator.merge_revision = merge_revision
     DevelopmentalPeerSupervisor.run_once = base_run_once
     OutcomeEquivalenceEstimator._v828_holdout_installed = True
