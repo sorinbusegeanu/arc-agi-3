@@ -35,33 +35,61 @@ class OutcomeHoldoutV828Tests(unittest.TestCase):
             estimator=self.estimator,
         )
 
-    def test_matching_holdout_is_excluded_from_training_class(self) -> None:
-        rows = (_row(1, support=4, variant=1), _row(2, support=1, variant=1), _row(3, support=1, variant=1))
+    def test_matching_world_holdout_is_excluded_from_training_class(self) -> None:
+        rows = (
+            _row(1, support=4, variant=1),
+            _row(2, support=1, variant=1),
+            _row(3, support=1, variant=1),
+        )
         by_uid = {row.uid: row for row in rows}
         provenance = {rows[0].uid: {10}, rows[1].uid: {20}, rows[2].uid: {30}}
         training, validation = _select_holdout_class(
-            self.estimator,
-            self._class(rows),
-            by_uid,
-            lambda uid: provenance[uid],
+            self.estimator, self._class(rows), by_uid, lambda uid: provenance[uid]
         )
         self.assertIsNotNone(validation)
         assert validation is not None
-        self.assertNotIn(validation.holdout_uid, training.members)
-        self.assertEqual(validation.target_game_hash, 30)
-        self.assertEqual(set(validation.training_games), {10, 20})
         self.assertTrue(validation.training_persistent)
         self.assertTrue(validation.holdout_consistent)
+        self.assertNotIn(validation.target_game_hash, validation.training_games)
+        for uid in training.members:
+            self.assertNotIn(validation.target_game_hash, provenance[uid])
+        for uid in validation.holdout_members:
+            self.assertIn(validation.target_game_hash, provenance[uid])
+
+    def test_every_member_carrying_target_world_is_removed_from_training(self) -> None:
+        rows = (
+            _row(1, support=3, variant=1),
+            _row(2, support=1, variant=1),
+            _row(3, support=3, variant=1),
+            _row(4, support=1, variant=1),
+        )
+        by_uid = {row.uid: row for row in rows}
+        provenance = {
+            rows[0].uid: {10, 20},
+            rows[1].uid: {10},
+            rows[2].uid: {30},
+            rows[3].uid: {30},
+        }
+        training, validation = _select_holdout_class(
+            self.estimator, self._class(rows), by_uid, lambda uid: provenance[uid]
+        )
+        self.assertIsNotNone(validation)
+        assert validation is not None
+        target = validation.target_game_hash
+        self.assertNotIn(target, validation.training_games)
+        self.assertTrue(all(target not in provenance[uid] for uid in training.members))
+        self.assertTrue(all(target in provenance[uid] for uid in validation.holdout_members))
 
     def test_contradictory_holdout_fails_existing_m6_criterion(self) -> None:
-        rows = (_row(1, support=4, variant=1), _row(2, support=1, variant=1), _row(3, support=1, variant=5))
+        rows = (
+            _row(1, support=4, variant=1),
+            _row(2, support=1, variant=1),
+            _row(3, support=1, variant=5),
+        )
         by_uid = {row.uid: row for row in rows}
         provenance = {rows[0].uid: {10}, rows[1].uid: {20}, rows[2].uid: {30}}
         training, validation = _select_holdout_class(
-            self.estimator,
-            self._class(rows),
-            by_uid,
-            lambda uid: provenance[uid],
+            self.estimator, self._class(rows), by_uid, lambda uid: provenance[uid]
         )
         self.assertIsNotNone(validation)
         assert validation is not None
@@ -69,21 +97,19 @@ class OutcomeHoldoutV828Tests(unittest.TestCase):
         self.assertFalse(validation.full_class.persistent)
         self.assertFalse(validation.holdout_consistent)
 
-    def test_insufficient_training_support_cannot_validate_holdout(self) -> None:
-        rows = (_row(1, support=1, variant=1), _row(2, support=1, variant=1), _row(3, support=1, variant=1))
+    def test_insufficient_training_support_emits_no_validation(self) -> None:
+        rows = (
+            _row(1, support=1, variant=1),
+            _row(2, support=1, variant=1),
+            _row(3, support=1, variant=1),
+        )
         by_uid = {row.uid: row for row in rows}
         provenance = {rows[0].uid: {10}, rows[1].uid: {20}, rows[2].uid: {30}}
         training, validation = _select_holdout_class(
-            self.estimator,
-            self._class(rows),
-            by_uid,
-            lambda uid: provenance[uid],
+            self.estimator, self._class(rows), by_uid, lambda uid: provenance[uid]
         )
-        self.assertIsNotNone(validation)
-        assert validation is not None
-        self.assertFalse(training.persistent)
-        self.assertFalse(validation.training_persistent)
-        self.assertFalse(validation.holdout_consistent)
+        self.assertIsNone(validation)
+        self.assertEqual(training, self._class(rows))
 
     def test_h13_accepts_distinct_heldout_target(self) -> None:
         evidence = EvidenceRecord.for_uid(
@@ -97,7 +123,7 @@ class OutcomeHoldoutV828Tests(unittest.TestCase):
             validation_state=1,
             target_game_hash=30,
             provenance_games=(10, 20),
-            causal_intervention="m6_withheld_member_validation",
+            causal_intervention="m6_world_withheld_before_coarse_merge",
             effect_direction=1,
         )
         decisions = ScientificHypothesisEvaluator().evaluate((evidence,))
