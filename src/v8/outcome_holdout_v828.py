@@ -6,6 +6,7 @@ from typing import Callable
 
 from v8.model import MemoryLevel, MemoryType, MemoryUid, RelationType, ValidationState
 from v8.outcomes import OutcomeClass, OutcomeEquivalenceEstimator
+from v8.peers import DevelopmentalPeerSupervisor
 from v8.peers_v82 import V82DevelopmentalPeerSupervisor
 
 
@@ -222,7 +223,7 @@ def install_outcome_holdout_v828() -> None:
 
     original_rebuild = OutcomeEquivalenceEstimator.rebuild
     original_merge_revision = OutcomeEquivalenceEstimator.merge_revision
-    original_run_once = V82DevelopmentalPeerSupervisor.run_once
+    original_base_run_once = DevelopmentalPeerSupervisor.run_once
 
     def rebuild(self: OutcomeEquivalenceEstimator, rows):
         full_classes = tuple(original_rebuild(self, rows))
@@ -252,13 +253,13 @@ def install_outcome_holdout_v828() -> None:
                     validation.formed = True
         return revision
 
-    def run_once(self: V82DevelopmentalPeerSupervisor):
+    def base_run_once(self: DevelopmentalPeerSupervisor):
         self.outcomes._v828_provenance = lambda uid: self.read_view.source_games(uid)
-        result = original_run_once(self)
+        result = original_base_run_once(self)
         _emit_holdout_evidence(self)
         return result
 
     OutcomeEquivalenceEstimator.rebuild = rebuild
     OutcomeEquivalenceEstimator.merge_revision = merge_revision
-    V82DevelopmentalPeerSupervisor.run_once = run_once
+    DevelopmentalPeerSupervisor.run_once = base_run_once
     OutcomeEquivalenceEstimator._v828_holdout_installed = True
