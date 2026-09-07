@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from v8.model import MemoryLevel
+
 
 _INSTALLED = False
 
@@ -39,16 +41,26 @@ def _persist_new_passed_trials(runtime, before_counts: dict[object, int]) -> int
             effect = float(getattr(trial, "effect", 0.0))
             if effect <= float(getattr(transfer, "effect_threshold", 0.0)):
                 continue
+            common = {
+                "unique": True,
+                "target_game_hash": int(trial.target_game_hash),
+                "provenance_games": tuple(int(v) for v in trial.formation_games),
+                "causal_intervention": str(trial.intervention),
+                "effect_direction": 1,
+            }
             runtime.peers._append_evidence(
                 "transfer_trial_pass",
                 row,
                 effect,
-                unique=True,
-                target_game_hash=int(trial.target_game_hash),
-                provenance_games=tuple(int(v) for v in trial.formation_games),
-                causal_intervention=str(trial.intervention),
-                effect_direction=1,
+                **common,
             )
+            if int(getattr(row, "level", -1)) == int(MemoryLevel.M4):
+                runtime.peers._append_evidence(
+                    "concept_transfer_pass",
+                    row,
+                    effect,
+                    **common,
+                )
             written += 1
     return written
 
