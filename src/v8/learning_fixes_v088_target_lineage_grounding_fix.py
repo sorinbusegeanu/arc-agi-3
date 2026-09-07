@@ -47,6 +47,38 @@ def _role_lineage_rows(
     return tuple(found[uid] for uid in sorted(found))
 
 
+def _canonical_role_rows(
+    root_row: object | None,
+    by_uid: dict[MemoryUid, object],
+) -> tuple[object, ...]:
+    """Recover a persisted M4 concept's M3 role from the production canonical key.
+
+    Production M4 formation copies the first two role key parts into the concept key.
+    This is a strict compatibility fallback for persisted concepts whose original
+    EXPLAINS parent edge is absent from the currently restored graph cut.
+    """
+    if root_row is None:
+        return ()
+    if int(getattr(root_row, "level", -1)) != int(MemoryLevel.M4):
+        return ()
+    if int(getattr(root_row, "memory_type", -1)) != int(MemoryType.CONCEPT):
+        return ()
+    root_key = tuple(int(v) for v in getattr(root_row, "key_parts", ())[:2])
+    if not root_key:
+        return ()
+
+    matches: list[object] = []
+    for row in by_uid.values():
+        if int(getattr(row, "level", -1)) != int(MemoryLevel.M3):
+            continue
+        if int(getattr(row, "memory_type", -1)) not in _ROLE_TYPES:
+            continue
+        role_key = tuple(int(v) for v in getattr(row, "key_parts", ())[:2])
+        if role_key == root_key:
+            matches.append(row)
+    return tuple(sorted(matches, key=lambda row: row.uid))
+
+
 def _normalized_role_reference(row) -> dict[str, object]:
     """Represent a mature role by the minimum structural motif that forms a role."""
     count = _MIN_ROLE_CARRIERS
@@ -121,9 +153,17 @@ def _install_target_lineage_grounding() -> None:
         graph_edges = tuple(edges or ())
 
         role_rows: dict[MemoryUid, object] = {}
-        for root_uid in (candidate.uid, candidate.correspondence_uid):
+        lineage_resolution = "explicit_explains"
+        roots = (candidate.uid, candidate.correspondence_uid)
+        for root_uid in roots:
             for role in _role_lineage_rows(root_uid, by_uid, graph_edges):
                 role_rows[role.uid] = role
+
+        if not role_rows:
+            lineage_resolution = "canonical_m4_role_key"
+            for root_uid in roots:
+                for role in _canonical_role_rows(by_uid.get(root_uid), by_uid):
+                    role_rows[role.uid] = role
 
         if not role_rows:
             grounding._PENDING_TARGET_STRUCTURES.pop(target_hash, None)
@@ -147,6 +187,7 @@ def _install_target_lineage_grounding() -> None:
                 "grounding_reference_uids": [
                     str(reference["uid"]) for reference in references
                 ],
+                "lineage_resolution": lineage_resolution,
                 "grounding_rule": "production_m3_role_lineage_minimum_carrier_motif",
             }
         )
