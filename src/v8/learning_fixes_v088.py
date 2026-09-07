@@ -274,21 +274,38 @@ def _memory_free_action(actions, rng: Random) -> int:
 
 
 def _mapped_evidence_action(
-    evidence_actions: tuple[int, ...],
+    target_action_evidence: tuple[dict[str, object], ...],
     available_actions: tuple[int, ...],
     cursor: int,
-) -> tuple[int | None, int]:
-    """Map one existing source action by exact target action identity."""
-    if not evidence_actions:
-        return None, int(cursor)
+) -> tuple[int | None, int, dict[str, object] | None]:
+    """Select an already-derived, structurally mapped target action."""
+    valid = tuple(
+        row
+        for row in target_action_evidence
+        if isinstance(row, dict)
+        and row.get("correspondence_conditioned_mapping") is True
+        and row.get("source_structural_memory_uid")
+        and row.get("correspondence_uid")
+        and isinstance(row.get("source_role_entity"), dict)
+        and isinstance(row.get("target_role_entity"), dict)
+        and row.get("mapping_kind")
+        and (
+            row.get("target_grounded_memory_uid")
+            or row.get("target_executable_structure_uid")
+        )
+        and row.get("derived_target_action") is not None
+    )
+    if not valid:
+        return None, int(cursor), None
     available = {int(value) for value in available_actions}
-    start = int(cursor) % len(evidence_actions)
-    for offset in range(len(evidence_actions)):
-        index = (start + offset) % len(evidence_actions)
-        action = int(evidence_actions[index])
+    start = int(cursor) % len(valid)
+    for offset in range(len(valid)):
+        index = (start + offset) % len(valid)
+        row = valid[index]
+        action = int(row["derived_target_action"])
         if action in available:
-            return action, (index + 1) % len(evidence_actions)
-    return None, start
+            return action, (index + 1) % len(valid), dict(row)
+    return None, start, None
 
 
 def _execution_evidence_sequences(
@@ -366,17 +383,25 @@ def _probe_policy_v088(
     executed_actions: list[int] = []
     baseline_actions: list[int] = []
     executed_action_count = 0
-    lower_actions_used: set[int] = set()
     plan_misses = 0
     memory_queries = 0
     evidence_cursor = 0
     evidence_used = 0
+    mapped_strategy_steps = 0
     evidence_unsupported_steps = 0
     planned_strategy_ids: set[str] = set()
     transfer_structure_ids: list[str] = []
     transfer_applied_steps: list[int] = []
-    evidence_candidates = _execution_evidence_sequences(execution_evidence)
+    applied_transfer_mappings: list[dict[str, object]] = []
+    evidence_candidates = tuple(
+        row
+        for row in _execution_evidence_sequences(execution_evidence)
+        if row.get("correspondence_conditioned_mapping") is True
+        and isinstance(row.get("target_action_evidence"), (list, tuple))
+        and row.get("target_action_evidence")
+    )
     evidence_actions: tuple[int, ...] = ()
+    target_action_evidence: tuple[dict[str, object], ...] = ()
     selected_evidence: dict[str, object] = {}
     rejected_evidence_actions: set[int] = set()
     evidence_selection_complete = False
@@ -396,15 +421,18 @@ def _probe_policy_v088(
             last_levels = int(env.last_levels_completed)
             continue
         if not evidence_selection_complete:
-            available = set(actions)
             for row in evidence_candidates:
-                sequence = tuple(int(value) for value in row.get("action_ids", ()))
-                unsupported = {value for value in sequence if value not in available}
-                if unsupported:
-                    rejected_evidence_actions.update(unsupported)
-                    continue
                 selected_evidence = row
-                evidence_actions = sequence
+                target_action_evidence = tuple(
+                    dict(value)
+                    for value in row.get("target_action_evidence", ())
+                    if isinstance(value, dict)
+                )
+                evidence_actions = tuple(
+                    int(value["derived_target_action"])
+                    for value in target_action_evidence
+                    if value.get("derived_target_action") is not None
+                )
                 break
             evidence_selection_complete = True
         observed_actions.update(actions)
@@ -425,36 +453,40 @@ def _probe_policy_v088(
             )
             if plan is None:
                 plan_misses += 1
-                mapped, evidence_cursor = _mapped_evidence_action(
-                    evidence_actions, actions, evidence_cursor
-                )
-                if mapped is None:
-                    evidence_unsupported_steps += int(bool(evidence_actions))
-                    action = baseline_action
-                else:
-                    action = int(mapped)
-                    used += 1
-                    evidence_used += 1
-                    lower_actions_used.add(int(mapped))
-                    transfer_applied_steps.append(int(executed_action_count))
-                    matched_evidence = next(
-                        (
-                            row
-                            for row in selected_evidence.get("mapped_action_evidence", ())
-                            if int(row.get("action_id", -1)) == int(mapped)
-                            and row.get("memory_id") is not None
-                        ),
-                        None,
-                    )
-                    if matched_evidence is not None:
-                        transfer_structure_ids.append(str(matched_evidence["memory_id"]))
             else:
-                action = int(plan.action_id)
+                planned_strategy_ids.add(str(plan.strategy_uid.hex()))
+            available = set(actions)
+            rejected_evidence_actions.update(
+                int(row["derived_target_action"])
+                for row in target_action_evidence
+                if row.get("derived_target_action") is not None
+                and int(row["derived_target_action"]) not in available
+            )
+            mapped, evidence_cursor, applied = _mapped_evidence_action(
+                target_action_evidence, actions, evidence_cursor
+            )
+            if mapped is None or applied is None:
+                evidence_unsupported_steps += int(bool(target_action_evidence))
+                action = baseline_action
+            else:
+                action = int(mapped)
                 used += 1
-                strategy_id = str(plan.strategy_uid.hex())
-                planned_strategy_ids.add(strategy_id)
-                transfer_structure_ids.append(strategy_id)
+                evidence_used += 1
+                mapped_strategy_steps += int(
+                    bool(applied.get("target_executable_structure_uid"))
+                )
                 transfer_applied_steps.append(int(executed_action_count))
+                applied_row = {
+                    **applied,
+                    "step_index": int(executed_action_count),
+                }
+                applied_transfer_mappings.append(applied_row)
+                transfer_uid = (
+                    applied.get("target_grounded_memory_uid")
+                    or applied.get("target_executable_structure_uid")
+                )
+                if transfer_uid:
+                    transfer_structure_ids.append(str(transfer_uid))
         env.step(action)
         executed_action_count += 1
         if len(executed_actions) < _MAX_TRANSFER_DIAGNOSTIC_ACTIONS:
@@ -475,8 +507,10 @@ def _probe_policy_v088(
                     "probe_steps": max(1, int(steps)),
                     "plan_misses": int(plan_misses),
                     "planned_steps": int(used),
-                    "m7_planned_steps": int(used - evidence_used),
-                    "lower_level_evidence_steps": int(evidence_used),
+                    "m7_planned_steps": int(mapped_strategy_steps),
+                    "lower_level_evidence_steps": int(
+                        evidence_used - mapped_strategy_steps
+                    ),
                     "lower_level_evidence_unsupported_steps": int(
                         evidence_unsupported_steps
                     ),
@@ -518,12 +552,9 @@ def _probe_policy_v088(
                         else []
                     ),
                     "grounded_correspondence_memory_ids_actually_used": [
-                        str(row.get("memory_id"))
-                        for row in selected_evidence.get(
-                            "mapped_action_evidence", ()
-                        )
-                        if int(row.get("action_id", 0)) in lower_actions_used
-                        and row.get("memory_id") is not None
+                        str(row.get("target_grounded_memory_uid"))
+                        for row in applied_transfer_mappings
+                        if row.get("target_grounded_memory_uid") is not None
                     ][:8],
                     "selected_execution_evidence": dict(selected_evidence),
                     "observed_context_signatures": sorted(observed_contexts)[:8],
@@ -537,6 +568,10 @@ def _probe_policy_v088(
                         dict.fromkeys(transfer_structure_ids)
                     )[:8],
                     "transfer_applied_step_indexes": transfer_applied_steps[:32],
+                    "applied_transfer_mappings": applied_transfer_mappings[:32],
+                    "correspondence_conditioned_actions_executed": len(
+                        applied_transfer_mappings
+                    ),
                     "transfer_memory_influenced_action_selection": bool(used > 0),
                 }
             )
@@ -1027,7 +1062,15 @@ def _transfer_execution_evidence(
     edges,
     candidate,
     source_trajectories: dict[int, dict[str, object]],
+    *,
+    target_game_hash: int,
 ) -> dict[str, object]:
+    """Resolve explicit structural correspondence into target-local actions."""
+    node_by_uid = getattr(read_view, "_node_by_uid", None)
+    if not isinstance(node_by_uid, dict):
+        node_by_uid = {row.uid: row for row in nodes}
+    source_structural = node_by_uid.get(candidate.uid)
+    target_structural = node_by_uid.get(candidate.correspondence_uid)
     source_grounded = _grounded_lineage_action_evidence(
         read_view, nodes, edges, candidate.uid
     )
@@ -1051,22 +1094,6 @@ def _transfer_execution_evidence(
         if trajectory_source_actions
         else "grounded_source_lineage"
     )
-    if not source_actions:
-        return {
-            **source_grounded,
-            "kind": None,
-            "action_ids": [],
-            "source_action_sequence": [],
-            "source_trajectory": None,
-            "correspondence_conditioned_mapping": False,
-            "resolution_status": "no_executable_lower_level_transfer_evidence",
-            "failure_reason": "no_grounded_action_evidence_for_transfer_ancestor",
-            "lower_level_resolution_failures": [
-                "no_grounded_action_evidence_for_transfer_ancestor",
-                "no_replayable_source_trajectory",
-            ],
-        }
-
     correspondence_uid = candidate.correspondence_uid
     correspondence_grounded = _grounded_lineage_action_evidence(
         read_view, nodes, edges, correspondence_uid
@@ -1079,130 +1106,245 @@ def _transfer_execution_evidence(
         ),
         None,
     )
-    grounded_correspondence_actions = tuple(
-        int(value) for value in correspondence_grounded.get("action_ids", ())
-    )
     trajectory_correspondence_actions = tuple(
         int(value)
         for value in (correspondence_trajectory or {}).get("action_ids", ())
     )
-
-    def mapping(actions: tuple[int, ...], *, kind: str, conditioned: bool):
-        return {
-            "kind": kind,
-            "source_ancestor_id": _uid_value(candidate.uid),
-            "correspondence_ancestor_id": _uid_value(candidate.correspondence_uid),
-            "correspondence_score": float(candidate.structural_score),
-            "source_action_sequence": list(source_actions[:64]),
-            "mapped_action_sequence": list(actions[:64]),
-            "selection_rule": (
-                "execute existing grounded actions from the formally corresponding "
-                "ancestor lineage; require every action to exist in the target action space"
-                if conditioned
-                else "preserve exact source action identity; perform no semantic action inference"
-            ),
+    source_ref = (
+        None
+        if source_structural is None
+        else {
+            "memory_uid": _uid_value(source_structural.uid),
+            "memory_level": _enum_name(MemoryLevel, source_structural.level),
+            "memory_kind": _enum_name(MemoryType, source_structural.memory_type),
+            "structural_key": [int(value) for value in source_structural.key_parts],
         }
+    )
+    target_ref = (
+        None
+        if target_structural is None
+        else {
+            "memory_uid": _uid_value(target_structural.uid),
+            "memory_level": _enum_name(MemoryLevel, target_structural.level),
+            "memory_kind": _enum_name(MemoryType, target_structural.memory_type),
+            "structural_key": [int(value) for value in target_structural.key_parts],
+        }
+    )
+    structural_levels = {int(MemoryLevel.M3), int(MemoryLevel.M4)}
+    endpoints_valid = bool(
+        source_structural is not None
+        and target_structural is not None
+        and int(source_structural.level) in structural_levels
+        and int(target_structural.level) in structural_levels
+        and not candidate.correspondence_uid.is_zero
+        and int(target_game_hash) in {
+            int(value) for value in candidate.correspondence_games
+        }
+    )
 
-    candidates: list[dict[str, object]] = []
-    if grounded_correspondence_actions:
-        candidates.append(
-            {
-                "kind": "grounded_correspondence_lineage",
-                "action_ids": list(grounded_correspondence_actions[:64]),
-                "mapped_action_evidence": list(
-                    correspondence_grounded.get("action_evidence", ())
-                )[:64],
-                "source_grounded_memory_ids": list(
-                    source_grounded.get("grounded_memory_ids", ())
-                )[:8],
-                "correspondence_grounded_memory_ids": list(
-                    correspondence_grounded.get("grounded_memory_ids", ())
-                )[:8],
-                "correspondence_conditioned_mapping": True,
-                "correspondence_mapping": mapping(
-                    grounded_correspondence_actions,
-                    kind="formal_correspondence_to_grounded_counterpart_lineage",
-                    conditioned=True,
-                ),
-            }
+    source_games = getattr(read_view, "source_games", None)
+
+    def grounded_on_target(memory_id: object) -> bool:
+        if not callable(source_games) or not memory_id:
+            return False
+        uid = next(
+            (
+                row.uid
+                for row in nodes
+                if _uid_value(row.uid) == str(memory_id)
+            ),
+            None,
         )
-    if trajectory_correspondence_actions:
-        candidates.append(
-            {
-                "kind": "replayable_correspondence_trajectory",
-                "action_ids": list(trajectory_correspondence_actions[:64]),
-                "mapped_action_evidence": [
-                    {
-                        "action_id": int(value),
-                        "memory_id": None,
-                        "trajectory_id": correspondence_trajectory.get("trajectory_id"),
-                    }
-                    for value in trajectory_correspondence_actions[:64]
-                ],
-                "source_grounded_memory_ids": list(
-                    source_grounded.get("grounded_memory_ids", ())
-                )[:8],
-                "correspondence_grounded_memory_ids": [],
-                "correspondence_conditioned_mapping": True,
-                "correspondence_mapping": mapping(
-                    trajectory_correspondence_actions,
-                    kind="formal_correspondence_to_replayable_counterpart_trajectory",
-                    conditioned=True,
-                ),
+        if uid is None:
+            return False
+        try:
+            return int(target_game_hash) in {
+                int(value) for value in source_games(uid)
             }
+        except BaseException:
+            return False
+
+    target_action_evidence: list[dict[str, object]] = []
+    if endpoints_valid:
+        for row in correspondence_grounded.get("action_evidence", ()):
+            memory_id = row.get("memory_id")
+            if not grounded_on_target(memory_id):
+                continue
+            target_action_evidence.append(
+                {
+                    "source_structural_memory_uid": _uid_value(candidate.uid),
+                    "correspondence_uid": _uid_value(correspondence_uid),
+                    "target_grounded_memory_uid": str(memory_id),
+                    "target_executable_structure_uid": None,
+                    "source_role_entity": dict(source_ref or {}),
+                    "target_role_entity": dict(target_ref or {}),
+                    "derived_target_action": int(row["action_id"]),
+                    "mapping_kind": "explicit_structural_role_to_target_grounding",
+                    "correspondence_conditioned_mapping": True,
+                }
+            )
+
+        parents = getattr(read_view, "_parents", {})
+        if not isinstance(parents, dict):
+            parents = {}
+        for strategy in _strategy_cache_rows(read_view):
+            if not _has_cached_ancestor(
+                parents, strategy.strategy_uid, correspondence_uid
+            ):
+                continue
+            try:
+                target_games = {int(value) for value in source_games(strategy.strategy_uid)}
+            except BaseException:
+                target_games = set()
+            if int(target_game_hash) not in target_games:
+                continue
+            target_action_evidence.append(
+                {
+                    "source_structural_memory_uid": _uid_value(candidate.uid),
+                    "correspondence_uid": _uid_value(correspondence_uid),
+                    "target_grounded_memory_uid": None,
+                    "target_executable_structure_uid": _uid_value(
+                        strategy.strategy_uid
+                    ),
+                    "source_role_entity": dict(source_ref or {}),
+                    "target_role_entity": dict(target_ref or {}),
+                    "derived_target_action": int(strategy.action_id),
+                    "mapping_kind": "explicit_structural_role_to_target_executable_structure",
+                    "correspondence_conditioned_mapping": True,
+                }
+            )
+
+    deduplicated: list[dict[str, object]] = []
+    seen_target_evidence: set[tuple[int, str, str]] = set()
+    for row in target_action_evidence:
+        key = (
+            int(row["derived_target_action"]),
+            str(row.get("target_grounded_memory_uid") or ""),
+            str(row.get("target_executable_structure_uid") or ""),
         )
+        if key in seen_target_evidence:
+            continue
+        seen_target_evidence.add(key)
+        deduplicated.append(row)
+    target_action_evidence = deduplicated[:64]
+
+    mapping = {
+        "kind": "explicit_source_role_to_target_role",
+        "relation_type": RelationType.TRANSFER_CORRESPONDENCE.name,
+        "source_role_entity": source_ref,
+        "target_role_entity": target_ref,
+        "source_ancestor_id": _uid_value(candidate.uid),
+        "correspondence_ancestor_id": _uid_value(correspondence_uid),
+        "correspondence_score": float(candidate.structural_score),
+        "source_memory_ids": [
+            _uid_value(candidate.uid),
+            *list(source_grounded.get("grounded_memory_ids", ()))[:8],
+        ],
+        "correspondence_memory_ids": [_uid_value(correspondence_uid)],
+        "target_grounded_memory_ids": [
+            str(row["target_grounded_memory_uid"])
+            for row in target_action_evidence
+            if row.get("target_grounded_memory_uid")
+        ],
+        "target_executable_structure_ids": [
+            str(row["target_executable_structure_uid"])
+            for row in target_action_evidence
+            if row.get("target_executable_structure_uid")
+        ],
+        "source_action_sequence": list(source_actions[:64]),
+        "mapped_action_sequence": [
+            int(row["derived_target_action"]) for row in target_action_evidence
+        ],
+        "selection_rule": (
+            "select only target-local grounded or executable action evidence below "
+            "the explicitly corresponding target structural role"
+        ),
+    }
+    diagnostic_replay = []
     if trajectory_source_actions:
-        candidates.append(
+        diagnostic_replay.append(
             {
                 "kind": "replayable_source_trajectory",
                 "action_ids": list(trajectory_source_actions[:64]),
-                "mapped_action_evidence": [
-                    {
-                        "action_id": int(value),
-                        "memory_id": None,
-                        "trajectory_id": source_trajectory.get("trajectory_id"),
-                    }
-                    for value in trajectory_source_actions[:64]
-                ],
-                "source_grounded_memory_ids": [],
-                "correspondence_grounded_memory_ids": [],
                 "correspondence_conditioned_mapping": False,
-                "correspondence_mapping": mapping(
-                    trajectory_source_actions,
-                    kind="exact_replayable_source_action_identity",
-                    conditioned=False,
-                ),
+                "trajectory_id": source_trajectory.get("trajectory_id"),
             }
         )
     if grounded_source_actions:
-        candidates.append(
+        diagnostic_replay.append(
             {
                 "kind": "grounded_source_lineage",
                 "action_ids": list(grounded_source_actions[:64]),
-                "mapped_action_evidence": list(
-                    source_grounded.get("action_evidence", ())
-                )[:64],
+                "correspondence_conditioned_mapping": False,
                 "source_grounded_memory_ids": list(
                     source_grounded.get("grounded_memory_ids", ())
                 )[:8],
-                "correspondence_grounded_memory_ids": [],
+            }
+        )
+    if trajectory_correspondence_actions:
+        diagnostic_replay.append(
+            {
+                "kind": "replayable_correspondence_trajectory",
+                "action_ids": list(trajectory_correspondence_actions[:64]),
                 "correspondence_conditioned_mapping": False,
-                "correspondence_mapping": mapping(
-                    grounded_source_actions,
-                    kind="exact_grounded_source_action_identity",
-                    conditioned=False,
-                ),
+                "trajectory_id": correspondence_trajectory.get("trajectory_id"),
             }
         )
 
-    primary = candidates[0]
+    if not target_action_evidence:
+        return {
+            "kind": None,
+            "action_ids": [],
+            "mapped_action_evidence": [],
+            "target_action_evidence": [],
+            "action_sequence_candidates": diagnostic_replay,
+            "diagnostic_replay_evidence": diagnostic_replay,
+            "source_action_sequence": list(source_actions[:64]),
+            "source_evidence_kind": source_kind if source_actions else None,
+            "source_grounded_memory_ids": list(
+                source_grounded.get("grounded_memory_ids", ())
+            )[:8],
+            "source_trajectory": source_trajectory,
+            "correspondence_ancestor_id": _uid_value(correspondence_uid),
+            "correspondence_grounded_memory_ids": list(
+                correspondence_grounded.get("grounded_memory_ids", ())
+            )[:8],
+            "correspondence_trajectory": correspondence_trajectory,
+            "correspondence_mapping": mapping,
+            "correspondence_conditioned_mapping": False,
+            "generic_source_actions_reused_without_correspondence": False,
+            "resolution_status": "no_target_conditioned_structural_action_mapping",
+            "failure_reason": "no_target_conditioned_structural_action_mapping",
+            "lower_level_resolution_failures": [
+                "no_target_conditioned_structural_action_mapping"
+            ],
+        }
+
+    primary = {
+        "kind": "target_conditioned_structural_action_mapping",
+        "action_ids": [
+            int(row["derived_target_action"]) for row in target_action_evidence
+        ],
+        "mapped_action_evidence": target_action_evidence,
+        "target_action_evidence": target_action_evidence,
+        "source_grounded_memory_ids": list(
+            source_grounded.get("grounded_memory_ids", ())
+        )[:8],
+        "correspondence_grounded_memory_ids": list(
+            mapping["target_grounded_memory_ids"]
+        ),
+        "correspondence_conditioned_mapping": True,
+        "correspondence_mapping": mapping,
+    }
     return {
         "kind": primary["kind"],
         "action_ids": list(primary["action_ids"]),
         "mapped_action_evidence": list(primary["mapped_action_evidence"]),
-        "action_sequence_candidates": candidates,
+        "target_action_evidence": list(primary["target_action_evidence"]),
+        "action_sequence_candidates": [primary],
+        "diagnostic_replay_evidence": diagnostic_replay,
         "source_action_sequence": list(source_actions[:64]),
-        "source_evidence_kind": source_kind,
+        "source_evidence_kind": source_kind if source_actions else None,
         "source_grounded_memory_ids": list(
             source_grounded.get("grounded_memory_ids", ())
         )[:8],
