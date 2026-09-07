@@ -76,14 +76,19 @@ def _derive_class(
     )
 
 
-def _m0_occurrences_by_world(read_view, roots: tuple[MemoryUid, ...], *, max_depth: int = 8):
-    """Return exact M0 episode occurrences reachable from each fine M6 root.
+def _lineage_occurrences_by_world(
+    read_view,
+    roots: tuple[MemoryUid, ...],
+    *,
+    max_depth: int = 8,
+):
+    """Count direct game-provenance-bearing lineage occurrences for each fine M6 root.
 
-    This intentionally avoids ``source_games(root)`` because that provenance is already
-    unioned after canonical memories aggregate across worlds.  The validation unit is
-    the lower-level episode carrying a direct GAME_PROVENANCE edge.
+    Production provenance is not guaranteed to terminate at M0.  A canonical memory
+    can inherit its world through any lower-level lineage node carrying a direct
+    GAME_PROVENANCE edge.  Count those direct provenance-bearing nodes wherever they
+    occur on the ancestry path, while visiting each lineage node at most once per root.
     """
-    rows = {row.uid: row for row in read_view.node_records()}
     parents: dict[MemoryUid, set[MemoryUid]] = defaultdict(set)
     direct_games: dict[MemoryUid, set[int]] = defaultdict(set)
     for edge in read_view.edge_records():
@@ -97,15 +102,12 @@ def _m0_occurrences_by_world(read_view, roots: tuple[MemoryUid, ...], *, max_dep
     for root in roots:
         frontier = {root}
         visited = {root}
-        episodes_by_game: dict[int, set[MemoryUid]] = defaultdict(set)
+        occurrences_by_game: dict[int, set[MemoryUid]] = defaultdict(set)
         for _depth in range(max(0, int(max_depth)) + 1):
             following: set[MemoryUid] = set()
             for uid in frontier:
-                row = rows.get(uid)
-                if row is not None and int(row.level) == int(MemoryLevel.M0):
-                    for game in direct_games.get(uid, ()):
-                        episodes_by_game[int(game)].add(uid)
-                    continue
+                for game in direct_games.get(uid, ()):
+                    occurrences_by_game[int(game)].add(uid)
                 for parent in parents.get(uid, ()):
                     if parent not in visited:
                         visited.add(parent)
@@ -114,11 +116,15 @@ def _m0_occurrences_by_world(read_view, roots: tuple[MemoryUid, ...], *, max_dep
                 break
             frontier = following
         result[root] = {
-            int(game): len(episodes)
-            for game, episodes in episodes_by_game.items()
-            if episodes
+            int(game): len(occurrences)
+            for game, occurrences in occurrences_by_game.items()
+            if occurrences
         }
     return result
+
+
+# Compatibility alias retained for tests/imports from the first H13 occurrence patch.
+_m0_occurrences_by_world = _lineage_occurrences_by_world
 
 
 def _pseudo_row(root, game: int, support: int):
@@ -225,7 +231,7 @@ def _build_validations(supervisor: DevelopmentalPeerSupervisor):
         for uid in outcome.members
         if uid != outcome.uid and uid in by_uid
     )
-    occurrences = _m0_occurrences_by_world(supervisor.read_view, roots)
+    occurrences = _lineage_occurrences_by_world(supervisor.read_view, roots)
     validations = []
     for outcome in classes:
         validation = _select_occurrence_holdout_class(
@@ -284,7 +290,7 @@ def _emit_holdout_evidence(
             unique=True,
             target_game_hash=validation.target_game_hash,
             provenance_games=validation.training_games,
-            causal_intervention="m6_m0_world_occurrence_holdout",
+            causal_intervention="m6_lineage_world_occurrence_holdout",
             effect_direction=1 if validation.holdout_consistent else -1,
         )
         if flow is not None:
@@ -299,8 +305,8 @@ def _emit_holdout_evidence(
                         "heldout_target_world": validation.target_game_hash,
                         "formation_provenance_games": list(validation.training_games),
                         "holdout_games": list(validation.holdout_games),
-                        "training_m0_occurrences": validation.training_occurrences,
-                        "holdout_m0_occurrences": validation.holdout_occurrences,
+                        "training_lineage_occurrences": validation.training_occurrences,
+                        "holdout_lineage_occurrences": validation.holdout_occurrences,
                         "training_member_count": len(validation.training_members),
                         "holdout_member_count": len(validation.holdout_members),
                         "target_world_excluded_from_validation_formation_support": True,
@@ -313,7 +319,7 @@ def _emit_holdout_evidence(
                         "training_interchangeability": validation.training_class.predictive_interchangeability,
                         "full_interchangeability": validation.full_class.predictive_interchangeability,
                         "criterion": "existing_m6_persistence_diameter_interchangeability",
-                        "validation_unit": "direct_game_provenanced_m0_episode",
+                        "validation_unit": "direct_game_provenance_bearing_lineage_node",
                     }
                 ],
             )
