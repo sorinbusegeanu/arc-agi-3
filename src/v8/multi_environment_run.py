@@ -209,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-peers", action="store_true")
     parser.add_argument("--reset-persistent-identity", action="store_true")
     args = parser.parse_args(argv)
-    summary = run_environment(
+    run_environment(
         environment=args.environment,
         root=args.root,
         steps=args.steps,
@@ -222,7 +222,6 @@ def main(argv: list[str] | None = None) -> int:
         enable_peers=not args.no_peers,
         reset_persistent_identity=args.reset_persistent_identity,
     )
-    print(json.dumps(summary, sort_keys=True), flush=True)
     return 0
 
 

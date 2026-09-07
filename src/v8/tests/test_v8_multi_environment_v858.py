@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import io
 import unittest
+from contextlib import redirect_stdout
+from unittest.mock import patch
 
 import numpy as np
 
@@ -18,6 +21,22 @@ from v8.structural_events import is_normalized_fact_token
 
 
 class MultiEnvironmentV858Tests(unittest.TestCase):
+    def test_multi_environment_cli_does_not_dump_summary_to_stdout(self) -> None:
+        from v8 import multi_environment_run
+
+        stdout = io.StringIO()
+        with patch.object(
+            multi_environment_run,
+            "run_environment",
+            return_value={"environment": "frozenlake", "memories": 10},
+        ), redirect_stdout(stdout):
+            result = multi_environment_run.main(
+                ["--environment", "frozenlake", "--steps", "1"]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout.getvalue(), "")
+
     def test_discrete_codecs_are_reversible_and_schema_scoped(self) -> None:
         actions4 = DiscreteActionCodec(4)
         actions6 = DiscreteActionCodec(6)
