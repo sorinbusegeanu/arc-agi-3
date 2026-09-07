@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 
 from v8.model import stable_u64
+from v8.learning_fixes_v088_target_grounding_fix import (
+    install_target_local_transfer_grounding_fix,
+)
 
 
 _INSTALLED = False
@@ -14,9 +17,6 @@ def _install_outcome_conditioned_efficiency() -> None:
     from v8 import behavior_recovery as behavior_module
     from v8 import learning_blockers_v055 as blocker_module
 
-    # v8.8 initially restored the pre-v8.4 absolute cost term to regain search
-    # pressure. Search is now explicit, so remove that term again and retain the
-    # v8.4 outcome-conditioned relative efficiency semantics.
     current_score_rows = behavior_module._score_strategy_rows
 
     def score_rows(view, rows, **kwargs):
@@ -36,9 +36,6 @@ def _install_outcome_conditioned_efficiency() -> None:
 
     behavior_module._score_strategy_rows = score_rows
 
-    # v8.5 composite plans also carried an unconditional 1/path-length bonus, and
-    # v8.8 initially added empirical absolute cost on top. Remove both and add a
-    # relative term only when at least two procedures target the same M6 outcome.
     current_composites = blocker_module._composite_plans
 
     def composite_plans(view, context_signature, action_ids):
@@ -98,16 +95,10 @@ def _install_cross_context_probe_fallback() -> None:
         required_ancestor = kwargs.get("required_ancestor")
 
         if required_ancestor is None:
-            # Preserve actor epsilon/efficiency-search randomization even when the
-            # v8.5 composite planner found a replayable procedure after the base
-            # behavior layer deliberately requested random exploration.
             if bool(getattr(self, "_behavior_force_random", False)):
                 self._behavior_last_plans = ()
                 return ()
 
-            # v8.5 composite planning admitted probationary composites directly.
-            # Keep those available for an explicit validation probe, but never let
-            # them bypass the normal behavioral control gate.
             by_uid = getattr(self, "_node_by_uid", {})
             admitted = []
             for plan in plans:
@@ -179,4 +170,5 @@ def install_learning_fixes_v088_fixups() -> None:
     _install_outcome_conditioned_efficiency()
     _install_cross_context_probe_fallback()
     _install_fresh_transfer_experiment_cut()
+    install_target_local_transfer_grounding_fix()
     _INSTALLED = True
