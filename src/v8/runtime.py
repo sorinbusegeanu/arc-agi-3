@@ -476,7 +476,7 @@ class ContinuousMemoryRuntime:
                     if stable >= int(stable_checks):
                         return
                 time.sleep(0.01)
-            raise TimeoutError("v8 did not reach quiescence; " + json.dumps(self.metrics(), sort_keys=True))
+            raise TimeoutError("v8 did not reach quiescence")
         finally:
             if self.peers is not None and resume_peers and not self._snapshot_freeze.is_set():
                 self.peers.resume()
@@ -537,9 +537,6 @@ class ContinuousMemoryRuntime:
                     max(0.0, deadline - time.monotonic())
                 ):
                     raise TimeoutError("v8 peers did not pause for consistent snapshot")
-                # A peer cycle can take much longer than the arena capture. Actors
-                # may keep sampling while that already-paused cycle reaches idle;
-                # freeze them only for the canonical drain and coherent copy.
                 self._snapshot_freeze.set()
                 self.wait_quiescent(
                     timeout=max(0.0, deadline - time.monotonic()),
@@ -560,8 +557,6 @@ class ContinuousMemoryRuntime:
                 self._snapshot_freeze.clear()
 
     def request_async_snapshot(self) -> None:
-        """Queue a latest-wins periodic snapshot without pausing actor sampling."""
-
         if self.snapshot_service is None:
             return
         with self._maintenance_lock:
