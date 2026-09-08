@@ -18,7 +18,6 @@ _INSTALLED = False
 _BASE_COHERENT_CHECKPOINT = None
 _GENERATIONS = 4
 _COMMIT_TIMEOUT_SECONDS = 5.0
-_COMMIT_STABLE_CHECKS = 2
 _COMMIT_POLL_SECONDS = 0.005
 
 
@@ -27,55 +26,78 @@ def _runtime_for(supervisor):
     runtime = getattr(submit, "__self__", None)
     if runtime is None:
         return None
-    if not hasattr(runtime, "_shard_rings") or not hasattr(runtime, "_shard_inflight"):
+    required = ("_shard_rings", "_node_arenas")
+    if any(not hasattr(runtime, name) for name in required):
         return None
     return runtime
 
 
-def _peer_proposals_committed(runtime) -> bool:
-    """Return true when canonical shard proposal queues are momentarily drained.
+def _capture_fence(runtime):
+    """Capture per-shard enqueue cursors and arena generations for one checkpoint.
 
-    Active actors may continue feeding the experience pipeline.  A developmental
-    generation only needs the peer proposals submitted directly to shard rings to be
-    committed before the next immutable cut.  Waiting for global runtime quiescence
-    is incorrect during active sampling because actors intentionally keep stage
-    queues non-empty.
+    The ring tail is the number of packets enqueued so far.  A later barrier only
+    needs each shard worker to consume through the tail produced by this checkpoint;
+    unrelated packets arriving afterwards must not block the developmental chain.
+    The node-arena seqlock confirms that the batch containing the fence has completed
+    its canonical write, rather than merely having been dequeued.
     """
     rings = tuple(getattr(runtime, "_shard_rings", ()))
-    inflight = tuple(getattr(runtime, "_shard_inflight", ()))
-    if not rings or not inflight:
-        return False
-    if any(not bool(getattr(ring, "empty", False)) for ring in rings):
-        return False
-    return all(int(getattr(value, "value", 0)) == 0 for value in inflight)
+    arenas = tuple(getattr(runtime, "_node_arenas", ()))
+    if not rings or len(rings) != len(arenas):
+        return None
+    tails = tuple(int(getattr(ring._tail, "value", 0)) for ring in rings)
+    sequences = tuple(int(arena.sequence) for arena in arenas)
+    return tails, sequences
 
 
-def _commit_barrier(supervisor) -> bool:
-    """Wait only for canonical shard proposal commit; never global quiescence."""
+def _fence_committed(runtime, before_fence, after_fence) -> bool:
+    rings = tuple(getattr(runtime, "_shard_rings", ()))
+    arenas = tuple(getattr(runtime, "_node_arenas", ()))
+    if before_fence is None or after_fence is None:
+        return False
+    before_tails, before_sequences = before_fence
+    target_tails, _after_sequences = after_fence
+    if len(rings) != len(target_tails) or len(arenas) != len(target_tails):
+        return False
+
+    for index, (ring, arena) in enumerate(zip(rings, arenas, strict=True)):
+        target = int(target_tails[index])
+        if target <= int(before_tails[index]):
+            continue
+        head = int(getattr(ring._head, "value", 0))
+        sequence = int(arena.sequence)
+        if head < target:
+            return False
+        if sequence & 1:
+            return False
+        if sequence <= int(before_sequences[index]):
+            return False
+    return True
+
+
+def _commit_barrier(supervisor, before_fence, after_fence) -> bool:
+    """Wait for this checkpoint's proposal fence, never global shard emptiness."""
     runtime = _runtime_for(supervisor)
     if runtime is None:
         return False
     deadline = time.monotonic() + _COMMIT_TIMEOUT_SECONDS
-    stable = 0
     while time.monotonic() < deadline:
         raise_errors = getattr(runtime, "raise_worker_errors", None)
         if callable(raise_errors):
             raise_errors()
-        if _peer_proposals_committed(runtime):
-            stable += 1
-            if stable >= _COMMIT_STABLE_CHECKS:
-                return True
-        else:
-            stable = 0
+        if _fence_committed(runtime, before_fence, after_fence):
+            return True
         time.sleep(_COMMIT_POLL_SECONDS)
-    # A busy active-sampling runtime is not a fatal error. Stop this bounded chain
-    # and let the next scheduled coherent checkpoint continue development.
+    # A busy runtime is not fatal. Stop this bounded chain and let the next
+    # scheduled checkpoint continue development.
     return False
 
 
 def _coherent_checkpoint_v882(supervisor, *, before_cycles: int, before_cut) -> None:
-    """Run bounded immutable generations with canonical queue barriers between them."""
+    """Run bounded immutable generations with checkpoint-scoped commit barriers."""
+    runtime = _runtime_for(supervisor)
     for generation in range(_GENERATIONS):
+        before_fence = _capture_fence(runtime) if runtime is not None else None
         _BASE_COHERENT_CHECKPOINT(
             supervisor,
             before_cycles=before_cycles,
@@ -83,7 +105,10 @@ def _coherent_checkpoint_v882(supervisor, *, before_cycles: int, before_cut) -> 
         )
         if generation + 1 >= _GENERATIONS:
             break
-        if not _commit_barrier(supervisor):
+        if runtime is None:
+            break
+        after_fence = _capture_fence(runtime)
+        if not _commit_barrier(supervisor, before_fence, after_fence):
             break
 
 
