@@ -67,6 +67,7 @@ class IncrementalPeerDrainV862Tests(unittest.TestCase):
             _cycles=10,
             _last_developmental_cut=object(),
             _v862_edge_wrapped_since_cycle=False,
+            current_watermark=lambda: 100,
         )
         original_base = v862._BASE_PEER_RUN_ONCE
         captured = {}
@@ -86,6 +87,80 @@ class IncrementalPeerDrainV862Tests(unittest.TestCase):
         self.assertEqual(captured["nodes"], v862._NODE_SLICE)
         self.assertEqual(captured["edges"], v862._EDGE_SLICE)
         self.assertEqual(supervisor._cycles, 10)
+
+    def test_watermark_cadence_runs_full_checkpoint_before_sweep_wrap(self):
+        class View:
+            def __init__(self):
+                self._nodes = (_Arena(_Row(i) for i in range(v862._NODE_SLICE * 4)),)
+                self._edges = (_Arena(_Row(i) for i in range(v862._EDGE_SLICE * 4)),)
+
+            def node_records(self, *, level=None):
+                rows = tuple(row for arena in self._nodes for row in arena._rows)
+                if level is None:
+                    return rows
+                return tuple(row for row in rows if int(row.level) == int(level))
+
+            def edge_records(self):
+                return tuple(row for arena in self._edges for row in arena._rows)
+
+        view = View()
+        supervisor = types.SimpleNamespace(
+            read_view=view,
+            _seen={},
+            _cycles=4,
+            _last_developmental_cut="before",
+            _v862_edge_wrapped_since_cycle=False,
+            _v82_stabilizing=False,
+            _v862_last_coherent_checkpoint_time=0.0,
+            _v862_last_coherent_checkpoint_watermark=1000,
+            current_watermark=lambda: 11000,
+        )
+        original_base = v862._BASE_PEER_RUN_ONCE
+        original_time = v862.time.monotonic
+        calls = []
+
+        def base(self):
+            calls.append((
+                bool(getattr(self, "_v82_stabilizing", False)),
+                len(self.read_view.node_records()),
+                len(self.read_view.edge_records()),
+            ))
+            self._cycles += 1
+            self._last_developmental_cut = "after"
+
+        try:
+            v862._BASE_PEER_RUN_ONCE = base
+            v862.time.monotonic = lambda: 1.0
+            v862._peer_run_once_v862(supervisor)
+        finally:
+            v862._BASE_PEER_RUN_ONCE = original_base
+            v862.time.monotonic = original_time
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], (False, v862._NODE_SLICE, v862._EDGE_SLICE))
+        self.assertEqual(
+            calls[1],
+            (True, v862._NODE_SLICE * 4, v862._EDGE_SLICE * 4),
+        )
+        self.assertEqual(supervisor._cycles, 5)
+        self.assertEqual(supervisor._last_developmental_cut, "after")
+        self.assertEqual(supervisor._v862_last_coherent_checkpoint_watermark, 11000)
+        self.assertEqual(
+            v862._saved_offset(supervisor, v862._NODE_OFFSET_KEY),
+            v862._NODE_SLICE,
+        )
+
+    def test_time_cadence_requires_real_watermark_progress(self):
+        supervisor = types.SimpleNamespace(
+            _v862_last_coherent_checkpoint_time=10.0,
+            _v862_last_coherent_checkpoint_watermark=5000,
+        )
+        self.assertFalse(
+            v862._coherent_checkpoint_due(supervisor, watermark=6000, now=40.0)
+        )
+        self.assertTrue(
+            v862._coherent_checkpoint_due(supervisor, watermark=7000, now=40.0)
+        )
 
     def test_completed_large_sweep_runs_one_coherent_full_checkpoint(self):
         class View:
@@ -113,6 +188,7 @@ class IncrementalPeerDrainV862Tests(unittest.TestCase):
             _last_developmental_cut="before",
             _v862_edge_wrapped_since_cycle=False,
             _v82_stabilizing=False,
+            current_watermark=lambda: 9000,
         )
         original_base = v862._BASE_PEER_RUN_ONCE
         calls = []
