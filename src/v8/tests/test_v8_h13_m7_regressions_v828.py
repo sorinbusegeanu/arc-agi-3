@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid
+from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid, RelationType
 from v8.outcome_holdout_member_aggregation_fix_v828 import (
     _select_occurrence_holdout_class,
 )
@@ -57,6 +57,14 @@ def _m5_row(lo: int):
     )
 
 
+def _edge(source: MemoryUid, target: MemoryUid):
+    return SimpleNamespace(
+        source_uid=source,
+        target_uid=target,
+        relation_type=int(RelationType.LEADS_TO),
+    )
+
+
 class H13M7RegressionTests(unittest.TestCase):
     def test_h13_world_split_preserves_member_level_context_consistency(self) -> None:
         estimator = OutcomeEquivalenceEstimator()
@@ -79,16 +87,31 @@ class H13M7RegressionTests(unittest.TestCase):
         self.assertTrue(validation.training_persistent)
         self.assertEqual(len(validation.training_class.members), 2)
 
-    def test_m7_is_not_starved_when_m6_candidates_fill_budget(self) -> None:
+    def test_m7_is_not_starved_when_causal_candidate_exists(self) -> None:
         install_promotion_strategy_fairness_v828()
         engine = EvidenceGatedPromotionEngine()
-        nodes = tuple([_m1_row(1), _m6_row(50, support=8)] + [_m5_row(i) for i in range(1, 20)])
-        rows = engine.propose(nodes, (), budget=8)
+        contingency = _m1_row(1)
+        outcome = _m6_row(50, support=8)
+        nodes = tuple([contingency, outcome] + [_m5_row(i) for i in range(1, 20)])
+        rows = engine.propose(nodes, (_edge(outcome.uid, contingency.uid),), budget=8)
         self.assertLessEqual(len(rows), 8)
         self.assertTrue(
             any(int(row.level) == int(MemoryLevel.M7) for row in rows),
-            "reserved strategy capacity must keep M7 reachable",
+            "reserved strategy capacity must keep causally grounded M7 reachable",
         )
+
+    def test_m7_fairness_does_not_form_from_unrelated_same_bucket_m1(self) -> None:
+        install_promotion_strategy_fairness_v828()
+        engine = EvidenceGatedPromotionEngine()
+        causal = _m1_row(1)
+        unrelated = _m1_row(2)
+        outcome = _m6_row(50, support=8)
+        nodes = (causal, unrelated, outcome)
+        rows = engine.propose(nodes, (_edge(outcome.uid, causal.uid),), budget=8)
+        m7 = tuple(row for row in rows if int(row.level) == int(MemoryLevel.M7))
+        self.assertTrue(m7)
+        self.assertTrue(all(causal.uid in row.parents for row in m7))
+        self.assertTrue(all(unrelated.uid not in row.parents for row in m7))
 
 
 if __name__ == "__main__":
