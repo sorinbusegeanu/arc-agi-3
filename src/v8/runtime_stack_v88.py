@@ -155,9 +155,13 @@ def install_current_runtime_stack_v88() -> None:
     if _peer_run_once_v845 is not None:
         peers_v82.V82DevelopmentalPeerSupervisor.run_once = _peer_run_once_v845
 
+    # Keep later developmental stages from being starved by the shared candidate
+    # budget once M6 outcomes already exist.
+    _installer("promotion_strategy_fairness_v828")()
+
     # H13 validation wraps the final public peer entrypoint and runs on a shadow
-    # estimator after production M6/M7 formation. Diagnostics are installed last and
-    # are logging-only: they never alter evidence or memory decisions.
+    # estimator after production M6/M7 formation. Diagnostics are logging-only.
     _installer("outcome_holdout_v828")()
     _installer("outcome_holdout_diagnostics_v828")()
+    _installer("outcome_holdout_member_aggregation_fix_v828")()
     _INSTALLED = True
