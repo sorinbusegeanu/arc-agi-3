@@ -173,4 +173,8 @@ def install_current_runtime_stack_v88() -> None:
     # Preserve actor M7 statistics across periodic/final publication and emit H12
     # efficiency evidence only after empirical statistics are committed and visible.
     _installer("strategy_statistics_persistence_fix_v828")()
+
+    # Bootstrap only the missing empirical attempts for exact-context causal M7
+    # strategies, and make generic environments publish the same execution stats.
+    _installer("strategy_empirical_bootstrap_v881")()
     _INSTALLED = True
