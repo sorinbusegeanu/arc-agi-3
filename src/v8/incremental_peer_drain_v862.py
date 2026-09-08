@@ -103,8 +103,6 @@ def _saved_offset(supervisor, key) -> int:
 def _save_offset(supervisor, key, value: int) -> None:
     seen = getattr(supervisor, "_seen", None)
     if isinstance(seen, dict):
-        # Peer state restoration merges _seen values with max(), therefore the
-        # persisted cursor is an absolute monotonic offset rather than a row index.
         seen[key] = max(int(seen.get(key, 0)), max(0, int(value)))
 
 
@@ -135,9 +133,14 @@ def _coherent_checkpoint_due(supervisor, *, watermark: int, now: float) -> bool:
     last_time = getattr(supervisor, "_v862_last_coherent_checkpoint_time", None)
     last_watermark = getattr(supervisor, "_v862_last_coherent_checkpoint_watermark", None)
     if last_time is None or last_watermark is None:
+        # Do not anchor the first checkpoint to an already-advanced watermark. A
+        # bounded peer pass can itself take long enough for sampling to advance by
+        # tens of thousands of steps. Treat the run origin as the developmental
+        # baseline so the first large-graph checkpoint can run immediately once
+        # meaningful evidence exists.
         supervisor._v862_last_coherent_checkpoint_time = float(now)
-        supervisor._v862_last_coherent_checkpoint_watermark = int(watermark)
-        return False
+        supervisor._v862_last_coherent_checkpoint_watermark = 0
+        return int(watermark) >= _COHERENT_MIN_WATERMARK_PROGRESS
 
     progress = max(0, int(watermark) - int(last_watermark))
     elapsed = max(0.0, float(now) - float(last_time))
@@ -177,11 +180,23 @@ def _peer_run_once_v862(self):
 
     node_arenas = tuple(getattr(view, "_nodes", ()))
     edge_arenas = tuple(getattr(view, "_edges", ()))
-    # Several scientific unit fixtures intentionally expose already-materialized
-    # NodeRecord/EdgeRecord tuples here. They are small and must retain historical
-    # behavior; only production shared arenas need incremental slicing.
     if not _arena_backed(node_arenas) or (edge_arenas and not _arena_backed(edge_arenas)):
         return _BASE_PEER_RUN_ONCE(self)
+
+    before_cycles = int(getattr(self, "_cycles", 0))
+    before_cut = getattr(self, "_last_developmental_cut", None)
+    large_graph = _needs_coherent_checkpoint(node_arenas, edge_arenas)
+    watermark = _current_watermark(self)
+    now = time.monotonic()
+
+    # Developmental formation has priority over bounded maintenance. Previously the
+    # cadence was evaluated only after the bounded pass; if that pass was slow, the
+    # watermark could reach the end of sampling before the first full causal cut was
+    # even considered. Evaluate and execute a due coherent checkpoint first.
+    if large_graph and _coherent_checkpoint_due(self, watermark=watermark, now=now):
+        _coherent_checkpoint(self, before_cycles=before_cycles, before_cut=before_cut)
+        _mark_coherent_checkpoint(self, watermark=watermark, now=now)
+        return None
 
     node_rows, node_offset, node_wrapped = _bounded_arena_slice(
         node_arenas, _saved_offset(self, _NODE_OFFSET_KEY), _NODE_SLICE
@@ -194,8 +209,6 @@ def _peer_run_once_v862(self):
 
     original_nodes = view.node_records
     original_edges = view.edge_records
-    before_cycles = int(getattr(self, "_cycles", 0))
-    before_cut = getattr(self, "_last_developmental_cut", None)
     prior_edge_wrap = bool(getattr(self, "_v862_edge_wrapped_since_cycle", False))
     self._v862_edge_wrapped_since_cycle = prior_edge_wrap or bool(edge_wrapped)
 
@@ -220,24 +233,20 @@ def _peer_run_once_v862(self):
     if completed_sweep:
         self._v862_edge_wrapped_since_cycle = False
 
-    large_graph = _needs_coherent_checkpoint(node_arenas, edge_arenas)
-    watermark = _current_watermark(self)
-    now = time.monotonic()
-    cadence_due = bool(
+    # Re-evaluate after bounded maintenance because sampling may have advanced while
+    # that pass was running. This catches long maintenance passes without waiting for
+    # another supervisor interval.
+    watermark_after = _current_watermark(self)
+    now_after = time.monotonic()
+    cadence_due_after = bool(
         large_graph
-        and _coherent_checkpoint_due(self, watermark=watermark, now=now)
+        and _coherent_checkpoint_due(self, watermark=watermark_after, now=now_after)
     )
 
-    if large_graph and (completed_sweep or cadence_due):
-        # The coherent pass is independent of scan completion. This is the only
-        # higher-order formation pass counted for the interval; bounded slices remain
-        # maintenance-only and their absolute cursors continue unchanged.
+    if large_graph and (completed_sweep or cadence_due_after):
         _coherent_checkpoint(self, before_cycles=before_cycles, before_cut=before_cut)
-        _mark_coherent_checkpoint(self, watermark=watermark, now=now)
+        _mark_coherent_checkpoint(self, watermark=watermark_after, now=now_after)
     elif not completed_sweep:
-        # v8.41 marks an input token complete when the delegated cycle counter or
-        # developmental cut advances. Keep both unchanged until a coherent checkpoint
-        # or a small-graph historical pass completes.
         self._cycles = before_cycles
         if hasattr(self, "_last_developmental_cut"):
             self._last_developmental_cut = before_cut
