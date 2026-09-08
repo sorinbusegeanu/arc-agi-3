@@ -8,6 +8,12 @@ uninterruptible once the graph reaches millions of rows. v8.62 keeps the existin
 peer semantics and authority chain while feeding the historical pass bounded,
 coherent arena slices. Scan offsets are stored in the already-persisted ``_seen``
 map, so interrupted maintenance resumes on the next run without a full rescan.
+
+Higher-order formation is lineage-dependent. A bounded node/edge slice is not, in
+general, a connected causal subgraph, so one complete bounded sweep now ends with a
+single coherent full-cut checkpoint. This preserves bounded work between checkpoints
+while allowing M2-M7 formation to advance during sampling instead of only in the
+post-sampling fixed-point drain.
 """
 
 import time
@@ -105,6 +111,25 @@ def _arena_backed(values) -> bool:
     )
 
 
+def _needs_coherent_checkpoint(node_arenas, edge_arenas) -> bool:
+    node_total = sum(max(0, int(arena.count)) for arena in tuple(node_arenas))
+    edge_total = sum(max(0, int(arena.count)) for arena in tuple(edge_arenas))
+    return node_total > _NODE_SLICE or edge_total > _EDGE_SLICE
+
+
+def _coherent_checkpoint(supervisor, *, before_cycles: int, before_cut) -> None:
+    """Run one complete causal cut after a bounded sweep reaches its boundary."""
+    supervisor._cycles = before_cycles
+    if hasattr(supervisor, "_last_developmental_cut"):
+        supervisor._last_developmental_cut = before_cut
+    prior_stabilizing = bool(getattr(supervisor, "_v82_stabilizing", False))
+    supervisor._v82_stabilizing = True
+    try:
+        _BASE_PEER_RUN_ONCE(supervisor)
+    finally:
+        supervisor._v82_stabilizing = prior_stabilizing
+
+
 def _peer_run_once_v862(self):
     if bool(getattr(self, "_v82_stabilizing", False)):
         return _BASE_PEER_RUN_ONCE(self)
@@ -156,6 +181,11 @@ def _peer_run_once_v862(self):
     completed_sweep = bool(node_wrapped and self._v862_edge_wrapped_since_cycle)
     if completed_sweep:
         self._v862_edge_wrapped_since_cycle = False
+        if _needs_coherent_checkpoint(node_arenas, edge_arenas):
+            # The bounded pass may have touched all arena offsets, but its node and
+            # edge rows were not a connected causal graph. Count only the coherent
+            # checkpoint as the completed developmental interval.
+            _coherent_checkpoint(self, before_cycles=before_cycles, before_cut=before_cut)
     else:
         # v8.41 marks an input token complete when the delegated cycle counter or
         # developmental cut advances. Keep both unchanged until one bounded sweep
