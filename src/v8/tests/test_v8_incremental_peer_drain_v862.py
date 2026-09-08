@@ -87,6 +87,61 @@ class IncrementalPeerDrainV862Tests(unittest.TestCase):
         self.assertEqual(captured["edges"], v862._EDGE_SLICE)
         self.assertEqual(supervisor._cycles, 10)
 
+    def test_completed_large_sweep_runs_one_coherent_full_checkpoint(self):
+        class View:
+            def __init__(self):
+                self._nodes = (_Arena(_Row(i) for i in range(v862._NODE_SLICE + 1)),)
+                self._edges = (_Arena(_Row(i) for i in range(v862._EDGE_SLICE + 1)),)
+
+            def node_records(self, *, level=None):
+                rows = tuple(row for arena in self._nodes for row in arena._rows)
+                if level is None:
+                    return rows
+                return tuple(row for row in rows if int(row.level) == int(level))
+
+            def edge_records(self):
+                return tuple(row for arena in self._edges for row in arena._rows)
+
+        view = View()
+        supervisor = types.SimpleNamespace(
+            read_view=view,
+            _seen={
+                v862._NODE_OFFSET_KEY: 1,
+                v862._EDGE_OFFSET_KEY: 1,
+            },
+            _cycles=4,
+            _last_developmental_cut="before",
+            _v862_edge_wrapped_since_cycle=False,
+            _v82_stabilizing=False,
+        )
+        original_base = v862._BASE_PEER_RUN_ONCE
+        calls = []
+
+        def base(self):
+            calls.append((
+                bool(getattr(self, "_v82_stabilizing", False)),
+                len(self.read_view.node_records()),
+                len(self.read_view.edge_records()),
+            ))
+            self._cycles += 1
+            self._last_developmental_cut = "after"
+
+        try:
+            v862._BASE_PEER_RUN_ONCE = base
+            v862._peer_run_once_v862(supervisor)
+        finally:
+            v862._BASE_PEER_RUN_ONCE = original_base
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], (False, v862._NODE_SLICE, v862._EDGE_SLICE))
+        self.assertEqual(
+            calls[1],
+            (True, v862._NODE_SLICE + 1, v862._EDGE_SLICE + 1),
+        )
+        self.assertEqual(supervisor._cycles, 5)
+        self.assertEqual(supervisor._last_developmental_cut, "after")
+        self.assertFalse(supervisor._v82_stabilizing)
+
     def test_small_graph_keeps_historical_single_pass_semantics(self):
         class View:
             def __init__(self):
