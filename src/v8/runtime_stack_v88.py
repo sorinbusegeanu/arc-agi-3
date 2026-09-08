@@ -169,4 +169,8 @@ def install_current_runtime_stack_v88() -> None:
     # Give them a bounded, M7-specific lifecycle pass as well so global lifecycle
     # truncation cannot prevent accumulated evidence from promoting them.
     _installer("strategy_exploration_lifecycle_v880")()
+
+    # Preserve actor M7 statistics across periodic/final publication and emit H12
+    # efficiency evidence only after empirical statistics are committed and visible.
+    _installer("strategy_statistics_persistence_fix_v828")()
     _INSTALLED = True
