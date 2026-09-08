@@ -164,4 +164,9 @@ def install_current_runtime_stack_v88() -> None:
     _installer("outcome_holdout_v828")()
     _installer("outcome_holdout_diagnostics_v828")()
     _installer("outcome_holdout_member_aggregation_fix_v828")()
+
+    # Probationary M7 strategies are already eligible for bounded epsilon probes.
+    # Give them a bounded, M7-specific lifecycle pass as well so global lifecycle
+    # truncation cannot prevent accumulated evidence from promoting them.
+    _installer("strategy_exploration_lifecycle_v880")()
     _INSTALLED = True
