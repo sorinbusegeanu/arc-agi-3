@@ -10,10 +10,10 @@ coherent arena slices. Scan offsets are stored in the already-persisted ``_seen`
 map, so interrupted maintenance resumes on the next run without a full rescan.
 
 Higher-order formation is lineage-dependent. A bounded node/edge slice is not, in
-general, a connected causal subgraph, so one complete bounded sweep now ends with a
-single coherent full-cut checkpoint. This preserves bounded work between checkpoints
-while allowing M2-M7 formation to advance during sampling instead of only in the
-post-sampling fixed-point drain.
+general, a connected causal subgraph. Coherent full-cut checkpoints therefore run
+on an independent bounded watermark/time cadence during active sampling, rather
+than waiting for a complete incremental sweep. The slice-maintenance cursor remains
+independent and continues from its current offset after each checkpoint.
 """
 
 import time
@@ -28,6 +28,13 @@ _EDGE_SLICE = 4096
 _SLICE_READ_TIMEOUT = 0.25
 _NODE_OFFSET_KEY = ("__v862_node_offset", 0, 0)
 _EDGE_OFFSET_KEY = ("__v862_edge_offset", 0, 0)
+
+# Full causal cuts are intentionally much less frequent than bounded maintenance.
+# Watermark cadence is the primary production trigger; the time trigger prevents
+# slow environments from waiting indefinitely while still requiring real new data.
+_COHERENT_WATERMARK_INTERVAL = 10_000
+_COHERENT_TIME_INTERVAL_SECONDS = 15.0
+_COHERENT_MIN_WATERMARK_PROGRESS = 2_000
 
 
 def _stable_arena_rows(arena, start: int, count: int, *, timeout: float = _SLICE_READ_TIMEOUT):
@@ -117,8 +124,39 @@ def _needs_coherent_checkpoint(node_arenas, edge_arenas) -> bool:
     return node_total > _NODE_SLICE or edge_total > _EDGE_SLICE
 
 
+def _current_watermark(supervisor) -> int:
+    callback = getattr(supervisor, "current_watermark", None)
+    if callable(callback):
+        return max(0, int(callback()))
+    return max(0, int(getattr(supervisor, "watermark", 0)))
+
+
+def _coherent_checkpoint_due(supervisor, *, watermark: int, now: float) -> bool:
+    last_time = getattr(supervisor, "_v862_last_coherent_checkpoint_time", None)
+    last_watermark = getattr(supervisor, "_v862_last_coherent_checkpoint_watermark", None)
+    if last_time is None or last_watermark is None:
+        supervisor._v862_last_coherent_checkpoint_time = float(now)
+        supervisor._v862_last_coherent_checkpoint_watermark = int(watermark)
+        return False
+
+    progress = max(0, int(watermark) - int(last_watermark))
+    elapsed = max(0.0, float(now) - float(last_time))
+    return bool(
+        progress >= _COHERENT_WATERMARK_INTERVAL
+        or (
+            progress >= _COHERENT_MIN_WATERMARK_PROGRESS
+            and elapsed >= _COHERENT_TIME_INTERVAL_SECONDS
+        )
+    )
+
+
+def _mark_coherent_checkpoint(supervisor, *, watermark: int, now: float) -> None:
+    supervisor._v862_last_coherent_checkpoint_watermark = max(0, int(watermark))
+    supervisor._v862_last_coherent_checkpoint_time = float(now)
+
+
 def _coherent_checkpoint(supervisor, *, before_cycles: int, before_cut) -> None:
-    """Run one complete causal cut after a bounded sweep reaches its boundary."""
+    """Run one complete immutable causal cut without resetting slice progress."""
     supervisor._cycles = before_cycles
     if hasattr(supervisor, "_last_developmental_cut"):
         supervisor._last_developmental_cut = before_cut
@@ -181,15 +219,25 @@ def _peer_run_once_v862(self):
     completed_sweep = bool(node_wrapped and self._v862_edge_wrapped_since_cycle)
     if completed_sweep:
         self._v862_edge_wrapped_since_cycle = False
-        if _needs_coherent_checkpoint(node_arenas, edge_arenas):
-            # The bounded pass may have touched all arena offsets, but its node and
-            # edge rows were not a connected causal graph. Count only the coherent
-            # checkpoint as the completed developmental interval.
-            _coherent_checkpoint(self, before_cycles=before_cycles, before_cut=before_cut)
-    else:
+
+    large_graph = _needs_coherent_checkpoint(node_arenas, edge_arenas)
+    watermark = _current_watermark(self)
+    now = time.monotonic()
+    cadence_due = bool(
+        large_graph
+        and _coherent_checkpoint_due(self, watermark=watermark, now=now)
+    )
+
+    if large_graph and (completed_sweep or cadence_due):
+        # The coherent pass is independent of scan completion. This is the only
+        # higher-order formation pass counted for the interval; bounded slices remain
+        # maintenance-only and their absolute cursors continue unchanged.
+        _coherent_checkpoint(self, before_cycles=before_cycles, before_cut=before_cut)
+        _mark_coherent_checkpoint(self, watermark=watermark, now=now)
+    elif not completed_sweep:
         # v8.41 marks an input token complete when the delegated cycle counter or
-        # developmental cut advances. Keep both unchanged until one bounded sweep
-        # has completed so the next interval consumes the next slice.
+        # developmental cut advances. Keep both unchanged until a coherent checkpoint
+        # or a small-graph historical pass completes.
         self._cycles = before_cycles
         if hasattr(self, "_last_developmental_cut"):
             self._last_developmental_cut = before_cut
