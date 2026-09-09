@@ -25,6 +25,7 @@ class _Supervisor:
         self._cycles = 4
         self._cut = types.SimpleNamespace(nodes=())
         self.calls = 0
+        self.public_calls = 0
         self.submit_proposal = lambda proposal: None
 
     @property
@@ -41,46 +42,86 @@ class _Supervisor:
         return True
 
     def run_once(self):
-        self.calls += 1
-        if self.calls == 1:
-            return None
-        self._cycles += 1
-        self._cut = types.SimpleNamespace(nodes=())
+        self.public_calls += 1
+        raise AssertionError("final stabilization must bypass public run_once wrappers")
 
 
 class StabilizationNoopRetryV883Tests(unittest.TestCase):
-    def test_transient_noop_is_retried_instead_of_failing(self):
+    def test_final_stabilization_uses_direct_full_cut_authority(self):
         supervisor = _Supervisor()
         commits = []
-        result = v883._run_until_stable_v883(
-            supervisor,
-            max_cycles=2,
-            commit_proposals=lambda: commits.append(1),
-            timeout=1.0,
-        )
+        original = v883._BASE_FULL_CUT_RUN_ONCE
+
+        def direct(current):
+            current.calls += 1
+            current._cycles += 1
+            current._cut = types.SimpleNamespace(nodes=())
+
+        try:
+            v883._BASE_FULL_CUT_RUN_ONCE = direct
+            result = v883._run_until_stable_v883(
+                supervisor,
+                max_cycles=2,
+                commit_proposals=lambda: commits.append(1),
+                timeout=1.0,
+            )
+        finally:
+            v883._BASE_FULL_CUT_RUN_ONCE = original
+
         self.assertEqual(result, "stable")
-        self.assertEqual(supervisor.calls, 2)
+        self.assertEqual(supervisor.calls, 1)
+        self.assertEqual(supervisor.public_calls, 0)
         self.assertEqual(len(commits), 2)
         self.assertFalse(supervisor._pause.is_set())
 
-    def test_partial_cut_still_fails(self):
+    def test_true_direct_noop_is_retried(self):
         supervisor = _Supervisor()
+        original = v883._BASE_FULL_CUT_RUN_ONCE
 
-        def partial():
-            supervisor.calls += 1
-            supervisor._cycles += 1
+        def direct(current):
+            current.calls += 1
+            if current.calls == 1:
+                return
+            current._cycles += 1
+            current._cut = types.SimpleNamespace(nodes=())
 
-        supervisor.run_once = partial
-        with self.assertRaisesRegex(RuntimeError, "partial developmental cut"):
-            v883._run_until_stable_v883(
+        try:
+            v883._BASE_FULL_CUT_RUN_ONCE = direct
+            result = v883._run_until_stable_v883(
                 supervisor,
                 max_cycles=1,
                 commit_proposals=lambda: None,
                 timeout=1.0,
             )
+        finally:
+            v883._BASE_FULL_CUT_RUN_ONCE = original
+
+        self.assertEqual(result, "stable")
+        self.assertEqual(supervisor.calls, 2)
+
+    def test_partial_cut_still_fails(self):
+        supervisor = _Supervisor()
+        original = v883._BASE_FULL_CUT_RUN_ONCE
+
+        def partial(current):
+            current.calls += 1
+            current._cycles += 1
+
+        try:
+            v883._BASE_FULL_CUT_RUN_ONCE = partial
+            with self.assertRaisesRegex(RuntimeError, "partial developmental cut"):
+                v883._run_until_stable_v883(
+                    supervisor,
+                    max_cycles=1,
+                    commit_proposals=lambda: None,
+                    timeout=1.0,
+                )
+        finally:
+            v883._BASE_FULL_CUT_RUN_ONCE = original
 
     def test_runtime_stack_installs_v883_authority(self):
         self.assertIs(peers_v82.V82DevelopmentalPeerSupervisor.run_until_stable, v883._run_until_stable_v883)
+        self.assertTrue(callable(v883._BASE_FULL_CUT_RUN_ONCE))
 
 
 if __name__ == "__main__":
