@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-"""v8.83: make final developmental stabilization tolerate transient peer no-ops.
+"""v8.83: make final stabilization invoke the full-cut developmental authority.
 
-The public peer entrypoint is intentionally nonblocking. Even after pause/wait-idle,
-a concurrent maintenance wrapper can momentarily own the developmental run lock, so
-one ``run_once()`` call may legally return without producing a cut. Final
-stabilization previously treated that harmless no-op as a fatal runtime error.
+Final stabilization runs after peers are paused and idle. It must not re-enter the
+public active-runtime ``run_once`` wrapper chain because that chain contains bounded
+scheduling/input-token guards which may legally return without producing a cut.
 
-This layer retries only a proven no-op: both the developmental cut identity and the
-cycle counter must remain unchanged. A partial advance still fails immediately so
-we never risk replaying already-submitted developmental proposals.
+This layer therefore calls the underlying v8.2 full-cut authority directly while
+holding the v8.45 state lock. A proven no-op may still be retried until the existing
+stabilization timeout; partial advancement remains fatal to avoid duplicate writes.
 """
 
 import time
@@ -20,7 +19,20 @@ from v8.model import MemoryLevel, MemoryProposal, MemoryType, MemoryUid
 
 _INSTALLED = False
 _BASE_RUN_UNTIL_STABLE = None
+_BASE_FULL_CUT_RUN_ONCE = None
 _RETRY_POLL_SECONDS = 0.005
+
+
+def _run_full_cut_once(self) -> None:
+    runner = _BASE_FULL_CUT_RUN_ONCE
+    if not callable(runner):
+        raise RuntimeError("v8 full-cut developmental authority is unavailable")
+    state_lock = getattr(self, "_v845_state_lock", None)
+    if state_lock is None:
+        runner(self)
+        return
+    with state_lock:
+        runner(self)
 
 
 def _run_until_stable_v883(
@@ -71,7 +83,7 @@ def _run_until_stable_v883(
                 self._v841_last_input_token = None
                 self.submit_proposal = track
                 try:
-                    self.run_once()
+                    _run_full_cut_once(self)
                 finally:
                     self.submit_proposal = submit
 
@@ -124,13 +136,17 @@ def _run_until_stable_v883(
 
 
 def install_stabilization_noop_retry_v883() -> None:
-    global _INSTALLED, _BASE_RUN_UNTIL_STABLE
+    global _INSTALLED, _BASE_RUN_UNTIL_STABLE, _BASE_FULL_CUT_RUN_ONCE
     if _INSTALLED:
         return
 
     from v8 import peers_v82
+    from v8 import snapshot_state_consistency_v845 as v845
 
     cls = peers_v82.V82DevelopmentalPeerSupervisor
     _BASE_RUN_UNTIL_STABLE = cls.run_until_stable
+    _BASE_FULL_CUT_RUN_ONCE = v845._BASE_PEER_RUN_ONCE
+    if not callable(_BASE_FULL_CUT_RUN_ONCE):
+        raise RuntimeError("v8.45 did not expose the underlying full-cut peer authority")
     cls.run_until_stable = _run_until_stable_v883
     _INSTALLED = True
