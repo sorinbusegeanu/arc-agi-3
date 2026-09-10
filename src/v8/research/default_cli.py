@@ -6,7 +6,11 @@ import time
 from pathlib import Path
 from typing import Callable, Sequence
 
-from .experiment_artifacts import capture_experiment_start, write_experiment_evidence
+from .experiment_artifacts import (
+    capture_experiment_start,
+    write_experiment_evidence,
+    write_failed_experiment_evidence,
+)
 
 
 def _requested_root(values: Sequence[str]) -> Path:
@@ -50,7 +54,34 @@ def run_with_default_research(
             )
             return 2
 
-    result = int(main_func(values))
+    try:
+        result = int(main_func(values))
+    except BaseException as exc:
+        if not normal_run:
+            raise
+        print(
+            f'[{time.strftime("%H:%M")}] experiment runtime failed: '
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        try:
+            evidence = write_failed_experiment_evidence(
+                root,
+                exit_code=1,
+                error=exc,
+            )
+            print(
+                f'[{time.strftime("%H:%M")}] failed experiment evidence ready: '
+                f"{evidence}",
+                flush=True,
+            )
+        except BaseException as evidence_exc:
+            print(
+                f'[{time.strftime("%H:%M")}] failed experiment evidence failed: '
+                f"{type(evidence_exc).__name__}: {evidence_exc}",
+                flush=True,
+            )
+        return 1
     if not normal_run:
         return result
 

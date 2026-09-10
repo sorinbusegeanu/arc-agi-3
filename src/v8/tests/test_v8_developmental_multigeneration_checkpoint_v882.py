@@ -43,7 +43,7 @@ class _Runtime:
 
 
 class DevelopmentalMultigenerationCheckpointV882Tests(unittest.TestCase):
-    def test_checkpoint_runs_four_generations_with_three_scoped_fences(self):
+    def test_checkpoint_runs_six_generations_for_m2_through_m7(self):
         runtime = _Runtime()
         supervisor = types.SimpleNamespace(submit_proposal=runtime.submit_proposal)
         calls = []
@@ -66,9 +66,9 @@ class DevelopmentalMultigenerationCheckpointV882Tests(unittest.TestCase):
         finally:
             v882._BASE_COHERENT_CHECKPOINT = original
 
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 6)
         self.assertFalse(runtime.wait_quiescent_called)
-        self.assertGreaterEqual(runtime.worker_error_checks, 3)
+        self.assertGreaterEqual(runtime.worker_error_checks, 5)
 
     def test_later_unrelated_packets_do_not_block_checkpoint_fence(self):
         runtime = _Runtime()

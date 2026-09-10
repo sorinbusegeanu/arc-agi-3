@@ -35,6 +35,14 @@ from v8.transfer import TransferTrial, TransferValidator
 from v8.world_model import WorldModelEstimator
 
 
+def _transfer_freshness_kind(candidate) -> str:
+    """Scope freshness to a structural correspondence, not only its source node."""
+    correspondence = candidate.correspondence_uid
+    formation = ",".join(str(value) for value in candidate.formation_games)
+    targets = ",".join(str(value) for value in candidate.correspondence_games)
+    return f"transfer:{correspondence.hex()}:{formation}:{targets}"
+
+
 @dataclass(frozen=True, slots=True)
 class PeerMetrics:
     cycles: int
@@ -332,17 +340,6 @@ class DevelopmentalPeerSupervisor:
                         row,
                         min(1.0, row.support_count / 4.0),
                     )
-                if (
-                    int(row.memory_type) == int(MemoryType.CONTEXTUAL_ROLE)
-                    and row.support_count >= 2
-                    and self._fresh("context_gain", row.uid, row.updated_watermark)
-                ):
-                    self._append_evidence(
-                        "context_refinement_gain",
-                        row,
-                        max(row.significance, row.learning_value),
-                    )
-
             if cancelled():
                 return
             for replay in analyses["replay"]:
@@ -408,6 +405,19 @@ class DevelopmentalPeerSupervisor:
                     source,
                     refinement.contradiction_rate,
                 )
+                gain = refinement.matched_prediction_error_gain
+                if gain > 0.0 and self._fresh(
+                    "context_matched_gain",
+                    refinement.candidate_uid,
+                    source.updated_watermark,
+                ):
+                    self._append_evidence(
+                        "context_refinement_gain",
+                        source,
+                        gain,
+                        causal_intervention="matched_context_partition_prediction_error",
+                        effect_direction=1,
+                    )
 
             if cancelled():
                 return
@@ -629,7 +639,11 @@ class DevelopmentalPeerSupervisor:
                 reason = None
                 if row is None:
                     reason = "candidate_node_missing"
-                elif not self._fresh("transfer", row.uid, row.updated_watermark):
+                elif not self._fresh(
+                    _transfer_freshness_kind(candidate),
+                    row.uid,
+                    row.updated_watermark,
+                ):
                     reason = "stale_transfer_candidate"
                 if reason is not None:
                     transfer_rejections[reason] = transfer_rejections.get(reason, 0) + 1
@@ -830,21 +844,6 @@ class DevelopmentalPeerSupervisor:
                             row,
                             min(1.0, len(alternatives) / 3.0),
                         )
-                    if (
-                        row.attempt_weight > 0
-                        and self._fresh(
-                            "efficiency", row.uid, row.updated_watermark
-                        )
-                    ):
-                        efficiency = 1.0 / max(
-                            1e-9, strategy.mean_cost
-                        )
-                        self._append_evidence(
-                            "strategy_efficiency",
-                            row,
-                            min(1.0, efficiency),
-                        )
-
             if cancelled():
                 return
             lifecycle_rows = tuple(

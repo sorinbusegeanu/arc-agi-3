@@ -81,6 +81,13 @@ def _structural_alignment(
     """Production-role alignment without semantic labels or terminal outcomes."""
     if not isinstance(observed, dict) or not isinstance(expected, dict):
         return None
+    required = {
+        "m2_key",
+        "transformation_family_signature",
+        "future_bucket",
+    }
+    if not required.issubset(expected):
+        return None
     # M2 family identity and functional transformation carry most of the signal;
     # future-option sign is a smaller independent structural consequence.
     return (

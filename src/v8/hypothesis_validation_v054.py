@@ -364,27 +364,6 @@ def _filtered_replanning_results(results):
 def _record_actor_results_with_validation(self, results) -> None:
     filtered = _filtered_replanning_results(tuple(results))
     _BASE_RUNTIME_RECORD_RESULTS(self, filtered)
-    if self.peers is None:
-        return
-
-    # Primary-valence preference is already restricted to choices made without a
-    # preference-influenced plan.  Add a context-general probe so exact grid hashes
-    # do not prevent repeated evidence for the same reachable outcome pair.
-    for result in filtered:
-        seen_pairs: set[tuple[MemoryUid, MemoryUid]] = set()
-        for preference in getattr(result, "primary_valence_preferences", ()):
-            pair = (preference.preferred, preference.other)
-            if pair in seen_pairs or pair[0] == pair[1]:
-                continue
-            seen_pairs.add(pair)
-            self.peers.record_preference_probe(
-                outcome_a=preference.preferred,
-                outcome_b=preference.other,
-                context_bucket=0,
-                chosen_outcome=preference.preferred,
-                both_reachable=True,
-                preference_influenced=False,
-            )
 
 
 def install_hypothesis_validation_v054() -> None:

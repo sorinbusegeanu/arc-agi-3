@@ -205,7 +205,7 @@ class TrajectoryReplanningTests(unittest.TestCase):
 
 
 class PreferenceAggregationTests(unittest.TestCase):
-    def test_v054_helper_can_still_be_called_for_legacy_replay(self) -> None:
+    def test_primary_valence_is_not_converted_to_preference_evidence(self) -> None:
         import v8.hypothesis_validation_v054 as module
 
         preferred = MemoryUid(10, 10)
@@ -229,11 +229,7 @@ class PreferenceAggregationTests(unittest.TestCase):
         runtime = SimpleNamespace(peers=Peers())
         with patch.object(module, "_BASE_RUNTIME_RECORD_RESULTS", return_value=None):
             _record_actor_results_with_validation(runtime, (result,))
-        self.assertEqual(len(runtime.peers.calls), 1)
-        call = runtime.peers.calls[0]
-        self.assertEqual(call["context_bucket"], 0)
-        self.assertEqual(call["chosen_outcome"], preferred)
-        self.assertFalse(call["preference_influenced"])
+        self.assertEqual(runtime.peers.calls, [])
 
 
 if __name__ == "__main__":

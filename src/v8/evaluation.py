@@ -65,7 +65,16 @@ CONTRACTS: tuple[HypothesisContract, ...] = (
     ),
     HypothesisContract("H08", ("consequence_structure",), ("world_model_component",), 1),
     HypothesisContract("H09", ("future_option_estimate",), ("future_option_estimate",), 2),
-    HypothesisContract("H10", ("context_refinement",), ("context_refinement_gain",), 1),
+    HypothesisContract(
+        "H10",
+        ("context_refinement",),
+        ("context_refinement_gain",),
+        1,
+        causal_required=True,
+        positive_effect_required=True,
+        dependencies=("H02",),
+        dependency_min_status="PARTIALLY_VALID",
+    ),
     HypothesisContract(
         "H11",
         ("transfer_trial_pass",),
@@ -78,7 +87,14 @@ CONTRACTS: tuple[HypothesisContract, ...] = (
         min_distinct_targets=2,
         dependencies=("H06",),
     ),
-    HypothesisContract("H12", ("strategy_reuse",), ("strategy_efficiency",), 1),
+    HypothesisContract(
+        "H12",
+        ("strategy_reuse",),
+        ("strategy_efficiency",),
+        1,
+        dependencies=("H13",),
+        dependency_min_status="PARTIALLY_VALID",
+    ),
     HypothesisContract(
         "H13",
         ("outcome_equivalence", "outcome_merge"),

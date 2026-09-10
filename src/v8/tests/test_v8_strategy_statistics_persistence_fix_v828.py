@@ -56,7 +56,7 @@ class StrategyStatisticsPersistenceFixTests(unittest.TestCase):
         self.assertEqual(stat.successes, 2)
         self.assertEqual(stat.cost, 6.0)
 
-    def test_committed_efficiency_requires_two_empirical_active_same_cohort(self) -> None:
+    def test_committed_efficiency_requires_two_empirical_same_cohort(self) -> None:
         outcome = MemoryUid(10, 11)
         fast_uid = MemoryUid(12, 13)
         slow_uid = MemoryUid(14, 15)
@@ -107,6 +107,54 @@ class StrategyStatisticsPersistenceFixTests(unittest.TestCase):
         by_uid = {uid: value for _kind, uid, value in emitted}
         self.assertAlmostEqual(by_uid[fast_uid], 1.0)
         self.assertAlmostEqual(by_uid[slow_uid], 0.5)
+
+    def test_probationary_empirical_strategies_are_comparable(self) -> None:
+        outcome = MemoryUid(20, 21)
+        first_uid = MemoryUid(22, 23)
+        second_uid = MemoryUid(24, 25)
+        probation = int(CognitiveState.PROBATION)
+        nodes = {
+            first_uid: SimpleNamespace(
+                uid=first_uid,
+                cognitive_state=probation,
+                attempt_weight=1.0,
+                updated_watermark=30,
+            ),
+            second_uid: SimpleNamespace(
+                uid=second_uid,
+                cognitive_state=probation,
+                attempt_weight=1.0,
+                updated_watermark=31,
+            ),
+        }
+        rows = [
+            SimpleNamespace(strategy_uid=first_uid, outcome_uid=outcome, mean_cost=2.0),
+            SimpleNamespace(strategy_uid=second_uid, outcome_uid=outcome, mean_cost=3.0),
+        ]
+
+        class View:
+            _node_by_uid = nodes
+            _strategy_by_context = {101: rows}
+
+            def invalidate_strategy_cache(self):
+                return None
+
+            def _refresh_strategy_cache(self):
+                return None
+
+        emitted = []
+
+        class Supervisor:
+            read_view = View()
+
+            def _fresh(self, *_args):
+                return True
+
+            def _append_evidence(self, kind, row, value, **_kwargs):
+                emitted.append((kind, row.uid, value))
+
+        self.assertEqual(_emit_committed_strategy_efficiency(Supervisor()), 2)
+        self.assertEqual({kind for kind, _uid, _value in emitted}, {"strategy_efficiency"})
 
 
 if __name__ == "__main__":

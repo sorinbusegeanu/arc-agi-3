@@ -276,11 +276,9 @@ def _runtime_wait_quiescent_v862(
             or last_generation != generation
         ):
             peers.pause()
-            deadline = time.monotonic() + max(0.0, float(timeout))
-
             def commit_proposals() -> None:
                 _BASE_RUNTIME_WAIT(
-                    self, timeout=max(0.0, deadline - time.monotonic()),
+                    self, timeout=max(0.0, float(timeout)),
                     stable_checks=stable_checks, resume_peers=False, settle_peers=False,
                 )
 

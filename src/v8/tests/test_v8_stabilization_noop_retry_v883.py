@@ -51,14 +51,20 @@ class StabilizationNoopRetryV883Tests(unittest.TestCase):
         supervisor = _Supervisor()
         commits = []
         original = v883._BASE_FULL_CUT_RUN_ONCE
+        original_formation = v883._run_formation_cut_once
 
         def direct(current):
             current.calls += 1
             current._cycles += 1
             current._cut = types.SimpleNamespace(nodes=())
 
+        def formation(current):
+            current._cycles += 1
+            current._cut = types.SimpleNamespace(nodes=())
+
         try:
             v883._BASE_FULL_CUT_RUN_ONCE = direct
+            v883._run_formation_cut_once = formation
             result = v883._run_until_stable_v883(
                 supervisor,
                 max_cycles=2,
@@ -67,16 +73,18 @@ class StabilizationNoopRetryV883Tests(unittest.TestCase):
             )
         finally:
             v883._BASE_FULL_CUT_RUN_ONCE = original
+            v883._run_formation_cut_once = original_formation
 
         self.assertEqual(result, "stable")
         self.assertEqual(supervisor.calls, 1)
         self.assertEqual(supervisor.public_calls, 0)
-        self.assertEqual(len(commits), 2)
+        self.assertEqual(len(commits), 3)
         self.assertFalse(supervisor._pause.is_set())
 
     def test_true_direct_noop_is_retried(self):
         supervisor = _Supervisor()
         original = v883._BASE_FULL_CUT_RUN_ONCE
+        original_formation = v883._run_formation_cut_once
 
         def direct(current):
             current.calls += 1
@@ -85,16 +93,22 @@ class StabilizationNoopRetryV883Tests(unittest.TestCase):
             current._cycles += 1
             current._cut = types.SimpleNamespace(nodes=())
 
+        def formation(current):
+            current._cycles += 1
+            current._cut = types.SimpleNamespace(nodes=())
+
         try:
             v883._BASE_FULL_CUT_RUN_ONCE = direct
+            v883._run_formation_cut_once = formation
             result = v883._run_until_stable_v883(
                 supervisor,
-                max_cycles=1,
+                max_cycles=2,
                 commit_proposals=lambda: None,
                 timeout=1.0,
             )
         finally:
             v883._BASE_FULL_CUT_RUN_ONCE = original
+            v883._run_formation_cut_once = original_formation
 
         self.assertEqual(result, "stable")
         self.assertEqual(supervisor.calls, 2)
@@ -102,26 +116,36 @@ class StabilizationNoopRetryV883Tests(unittest.TestCase):
     def test_partial_cut_still_fails(self):
         supervisor = _Supervisor()
         original = v883._BASE_FULL_CUT_RUN_ONCE
+        original_formation = v883._run_formation_cut_once
 
         def partial(current):
             current.calls += 1
             current._cycles += 1
 
+        def formation(current):
+            current._cycles += 1
+            current._cut = types.SimpleNamespace(nodes=())
+
         try:
             v883._BASE_FULL_CUT_RUN_ONCE = partial
+            v883._run_formation_cut_once = formation
             with self.assertRaisesRegex(RuntimeError, "partial developmental cut"):
                 v883._run_until_stable_v883(
                     supervisor,
-                    max_cycles=1,
+                    max_cycles=2,
                     commit_proposals=lambda: None,
                     timeout=1.0,
                 )
         finally:
             v883._BASE_FULL_CUT_RUN_ONCE = original
+            v883._run_formation_cut_once = original_formation
 
     def test_runtime_stack_installs_v883_authority(self):
         self.assertIs(peers_v82.V82DevelopmentalPeerSupervisor.run_until_stable, v883._run_until_stable_v883)
-        self.assertTrue(callable(v883._BASE_FULL_CUT_RUN_ONCE))
+        self.assertIs(
+            v883._BASE_FULL_CUT_RUN_ONCE,
+            peers_v82.V82DevelopmentalPeerSupervisor.run_once,
+        )
 
 
 if __name__ == "__main__":

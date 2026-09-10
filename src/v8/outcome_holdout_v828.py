@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -46,7 +46,14 @@ def _derive_class(
     support = sum(max(0, int(row.support_count)) for row in members)
     variants = [int(row.key_parts[2]) if len(row.key_parts) >= 3 else 0 for row in members]
     stability = min(1.0, support / max(1.0, 2.0 * len(members)))
-    dominant_support = max((max(0, int(row.support_count)) for row in members), default=0)
+    # Holdout rows are split by provenance world, so the same fine outcome
+    # variant can appear in several pseudo rows.  Context consistency is a
+    # property of the variant distribution, not of the largest world slice.
+    support_by_variant: dict[int, int] = defaultdict(int)
+    for row in members:
+        variant = int(row.key_parts[2]) if len(row.key_parts) >= 3 else 0
+        support_by_variant[variant] += max(0, int(row.support_count))
+    dominant_support = max(support_by_variant.values(), default=0)
     context_consistency = dominant_support / max(1, support)
     if len(variants) <= 1:
         diameter = 0.0
@@ -137,16 +144,21 @@ def _select_occurrence_holdout_class(
     full_class: OutcomeClass,
     by_uid: dict[MemoryUid, object],
     occurrences: dict[MemoryUid, dict[int, int]],
+    rejection_counts: Counter | None = None,
 ) -> OutcomeHoldoutValidation | None:
+    rejected = rejection_counts if rejection_counts is not None else Counter()
     fine_uids = tuple(
         uid for uid in full_class.members if uid != full_class.uid and uid in by_uid
     )
     if len(fine_uids) < 2:
+        rejected["fewer_than_two_fine_members"] += 1
         return None
 
     candidate_games = sorted(
         {game for uid in fine_uids for game in occurrences.get(uid, {})}
     )
+    if not candidate_games:
+        rejected["no_lineage_world_occurrences"] += 1
     for target_game in candidate_games:
         training_rows = []
         holdout_rows = []
@@ -165,6 +177,7 @@ def _select_occurrence_holdout_class(
                     training_members.add(uid)
                     training_games.add(int(game))
         if not holdout_rows or len(training_members) < 2 or not training_games:
+            rejected["insufficient_disjoint_training_members"] += 1
             continue
 
         training_class = _derive_class(
@@ -175,6 +188,7 @@ def _select_occurrence_holdout_class(
             estimator=estimator,
         )
         if not training_class.persistent:
+            rejected["training_class_not_persistent"] += 1
             continue
         full_shadow = _derive_class(
             full_class.descriptor,
@@ -238,12 +252,26 @@ def _build_validations(supervisor: DevelopmentalPeerSupervisor):
     )
     occurrences = _lineage_occurrences_by_world(supervisor.read_view, roots)
     validations = []
+    rejection_counts: Counter = Counter()
     for outcome in classes:
         validation = _select_occurrence_holdout_class(
-            estimator, outcome, by_uid, occurrences
+            estimator, outcome, by_uid, occurrences, rejection_counts
         )
         if validation is not None:
             validations.append(validation)
+    try:
+        from v8 import information_flow_diagnostics as flow
+
+        flow.emit(
+            "outcomes",
+            "outcome_holdout_selection",
+            input_count=len(classes),
+            output_count=len(validations),
+            rejection_counts=rejection_counts,
+            examples=[],
+        )
+    except Exception:
+        pass
     return tuple(validations)
 
 

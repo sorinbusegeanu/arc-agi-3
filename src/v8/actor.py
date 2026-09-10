@@ -101,6 +101,31 @@ class PreferenceProbeResult:
     preference_influenced: bool
 
 
+def _select_replanning_ablation(view, primary, context: int, actions):
+    """Select a same-outcome replacement with the preferred strategy excluded."""
+    prior_plans = getattr(view, "_behavior_last_plans", None)
+    try:
+        alternatives = view.plan_candidates(
+            int(context),
+            actions,
+            outcome_uid=primary.outcome_uid,
+            excluded_strategies=frozenset({primary.strategy_uid}),
+            ignore_preference=True,
+        )
+    finally:
+        if prior_plans is not None:
+            view._behavior_last_plans = prior_plans
+    return next(
+        (
+            row
+            for row in alternatives
+            if row.outcome_uid == primary.outcome_uid
+            and row.strategy_uid != primary.strategy_uid
+        ),
+        None,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ReplanningTrialResult:
     primary_strategy_uid: MemoryUid
@@ -497,14 +522,25 @@ def actor_worker(
                     preference_probes.append(probe)
                     pending_preference_probes.append(probe)
 
-                same_outcome = [
-                    row
-                    for row in plans[1:]
-                    if row.outcome_uid == planned.outcome_uid
+                has_same_outcome = any(
+                    row.outcome_uid == planned.outcome_uid
                     and row.strategy_uid != planned.strategy_uid
-                ]
-                if same_outcome and rng.random() < float(job.replanning_probe_rate):
-                    alternative = same_outcome[0]
+                    for row in plans[1:]
+                )
+                alternative = (
+                    _select_replanning_ablation(
+                        view,
+                        planned,
+                        context,
+                        before_actions,
+                    )
+                    if has_same_outcome
+                    else None
+                )
+                if (
+                    alternative is not None
+                    and rng.random() < float(job.replanning_probe_rate)
+                ):
                     explicit_replan = (
                         planned.strategy_uid,
                         alternative.strategy_uid,

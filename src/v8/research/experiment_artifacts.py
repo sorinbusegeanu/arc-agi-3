@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -15,6 +16,16 @@ DECISION_NAME = "RESEARCH_DECISION.md"
 _BOUNDARY_NAME = ".experiment_start.json"
 _DECISION_BEGIN = "<!-- RESEARCH_DECISION_METADATA_BEGIN -->"
 _DECISION_END = "<!-- RESEARCH_DECISION_METADATA_END -->"
+
+_CHANGE_TYPES = {
+    "NONE",
+    "TELEMETRY",
+    "BUG_FIX",
+    "PARAMETER_INTERVENTION",
+    "MECHANISM_INTERVENTION",
+    "ARCHITECTURE_CHANGE",
+}
+_MEMORY_POLICIES = {"CLEAN", "REUSE"}
 
 
 def _git_revision() -> str:
@@ -68,6 +79,85 @@ def _extract_decision_metadata(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"parse_error": "invalid JSON between decision metadata markers"}
     return dict(value) if isinstance(value, Mapping) else {"parse_error": "decision metadata must be a JSON object"}
+
+
+def _argument_value(argv: Sequence[str], option: str) -> str | None:
+    values = tuple(str(value) for value in argv)
+    try:
+        index = values.index(option)
+    except ValueError:
+        return None
+    return values[index + 1] if index + 1 < len(values) else None
+
+
+def _validate_decision_metadata(metadata: Mapping[str, Any], *, argv: Sequence[str]) -> None:
+    """Fail closed unless a causal run has a complete, matching declaration."""
+    errors: list[str] = []
+    if metadata.get("parse_error"):
+        errors.append(str(metadata["parse_error"]))
+    scalar_fields = (
+        "change_id",
+        "target_hypothesis",
+        "target_causal_edge",
+        "primary_metric",
+        "predicted_change",
+        "minimum_meaningful_effect",
+        "falsifier",
+    )
+    for field in scalar_fields:
+        if not str(metadata.get(field, "")).strip():
+            errors.append(f"{field} is required")
+    change_type = str(metadata.get("change_type", "")).upper()
+    if change_type not in _CHANGE_TYPES:
+        errors.append(f"change_type must be one of {sorted(_CHANGE_TYPES)}")
+    memory_policy = str(metadata.get("memory_policy", "")).upper()
+    if memory_policy not in _MEMORY_POLICIES:
+        errors.append(f"memory_policy must be one of {sorted(_MEMORY_POLICIES)}")
+    for field in ("target_files", "target_functions", "must_not_change", "expected_unchanged_metrics"):
+        if not isinstance(metadata.get(field), list):
+            errors.append(f"{field} must be a list")
+    for field in ("change", "decision_rule"):
+        value = metadata.get(field)
+        if not isinstance(value, list) or not value:
+            errors.append(f"{field} must be a non-empty list")
+    declared_games = metadata.get("games")
+    actual_games = _argument_value(argv, "--games")
+    if not declared_games:
+        errors.append("games is required")
+    elif actual_games is None or str(declared_games) != str(actual_games):
+        errors.append(f"declared games {declared_games!r} do not match command {actual_games!r}")
+    try:
+        declared_steps = int(metadata.get("steps_per_game", 0))
+    except (TypeError, ValueError):
+        declared_steps = 0
+    actual_steps_raw = _argument_value(argv, "--steps-per-game")
+    try:
+        actual_steps = int(actual_steps_raw or 0)
+    except ValueError:
+        actual_steps = 0
+    if declared_steps <= 0:
+        errors.append("steps_per_game must be positive")
+    elif actual_steps != declared_steps:
+        errors.append(
+            f"declared steps_per_game {declared_steps} do not match command {actual_steps}"
+        )
+    if errors:
+        raise ValueError("invalid RESEARCH_DECISION declaration: " + "; ".join(errors))
+
+
+def _file_identity(path: Path) -> dict[str, Any]:
+    try:
+        payload = path.read_bytes()
+        stat = path.stat()
+    except OSError:
+        return {"available": False}
+    return {
+        "available": True,
+        "path": str(path),
+        "size": len(payload),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
 
 
 def _summary_state(summary: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -237,11 +327,28 @@ def capture_experiment_start(root: str | Path, *, argv: Sequence[str]) -> Path:
         previous_evidence = evidence_path.read_text(encoding="utf-8")
     except OSError:
         pass
-    decision_text = ""
+    decision_path = research_root / DECISION_NAME
     try:
-        decision_text = (research_root / DECISION_NAME).read_text(encoding="utf-8")
-    except OSError:
-        pass
+        decision_text = decision_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise FileNotFoundError(f"missing intervention declaration: {decision_path}") from exc
+    decision_metadata = _extract_decision_metadata(decision_text)
+    _validate_decision_metadata(decision_metadata, argv=argv)
+    summary_path = root / "v8_run_summary.json"
+    start_state_identity = _file_identity(summary_path)
+    start_state = _summary_state(_read_json(summary_path, None))
+    memory_policy = str(decision_metadata["memory_policy"]).upper()
+    if memory_policy == "REUSE" and not bool(start_state.get("available")):
+        raise ValueError(
+            "memory_policy=REUSE requires a valid durable v8_run_summary.json start snapshot"
+        )
+    if memory_policy == "CLEAN" and (
+        bool(start_state.get("available"))
+        and any(int(start_state.get(key, 0)) != 0 for key in ("watermark", "memories", "edges"))
+    ):
+        raise ValueError(
+            "memory_policy=CLEAN requires an empty run root; non-zero durable start state found"
+        )
     ledger = root / "evidence" / "v8_evidence.jsonl"
     try:
         ledger_offset = ledger.stat().st_size
@@ -256,10 +363,15 @@ def capture_experiment_start(root: str | Path, *, argv: Sequence[str]) -> Path:
         "command": _command(argv),
         "argv": [str(value) for value in argv],
         "started_ns": started_ns,
-        "start_state": _summary_state(_read_json(root / "v8_run_summary.json", None)),
-        "start_state_source": "previous durable v8_run_summary.json; memory is intentionally reused across runs",
+        "start_state": start_state,
+        "start_state_identity": start_state_identity,
+        "start_state_source": (
+            "previous durable v8_run_summary.json; memory is intentionally reused across runs"
+            if memory_policy == "REUSE"
+            else "empty run root declared by memory_policy=CLEAN"
+        ),
         "evidence_ledger_start_offset": int(ledger_offset),
-        "decision_metadata": _extract_decision_metadata(decision_text),
+        "decision_metadata": decision_metadata,
         "decision_text": decision_text,
     }
     path = research_root / _BOUNDARY_NAME
@@ -281,11 +393,13 @@ def build_experiment_evidence(
     cumulative_digest = _evidence_digest(ledger_path, start_offset=0)
     decision_metadata = dict(boundary.get("decision_metadata", {}) or {})
     decision_status = "DECLARED" if decision_metadata and "parse_error" not in decision_metadata else "UNDECLARED_OR_INVALID"
+    memory_policy = str(decision_metadata.get("memory_policy", "UNDECLARED")).upper()
     automatic_transfer = summary.get("automatic_transfer_experiments", {})
     metrics = summary.get("metrics", {}) if isinstance(summary.get("metrics", {}), Mapping) else {}
     formation = metrics.get("formation_telemetry", {}) if isinstance(metrics.get("formation_telemetry", {}), Mapping) else {}
     command = str(boundary.get("command", ""))
     finished_ns = time.time_ns()
+    runtime_error = boundary.get("runtime_error")
     return f"""# EXPERIMENT_EVIDENCE
 
 This file is factual experiment evidence. It must not prescribe the next architecture or mechanism change.
@@ -300,7 +414,7 @@ Persistent memory is intentional: causal interpretation must use experiment-loca
 - started_ns: `{boundary.get('started_ns')}`
 - finished_ns: `{finished_ns}`
 - exit_code: `{int(exit_code)}`
-- memory_policy: `REUSE`
+- memory_policy: `{memory_policy}`
 
 ## Applied intervention declaration
 
@@ -314,6 +428,12 @@ Persistent memory is intentional: causal interpretation must use experiment-loca
 ## Start state
 
 Source: {boundary.get('start_state_source', '')}
+
+Start snapshot identity:
+
+```json
+{json.dumps(boundary.get('start_state_identity', {}), indent=2, sort_keys=True, default=str)}
+```
 
 ```json
 {json.dumps(start_state, indent=2, sort_keys=True, default=str)}
@@ -364,7 +484,7 @@ These decisions are cumulative status at the end of the run. They are not automa
 ## Integrity and possible confounders
 
 ```json
-{json.dumps({'reporting_cut': _read_json(root / 'reports' / 'reporting_cut.json', {}), 'trajectory_optimizer': metrics.get('trajectory_optimizer', {}), 'adaptive_learning': metrics.get('adaptive_learning', {}), 'experiment_local_ledger_available': bool(local_digest.get('available')), 'decision_status': decision_status}, indent=2, sort_keys=True, default=str)}
+{json.dumps({'reporting_cut': _read_json(root / 'reports' / 'reporting_cut.json', {}), 'trajectory_optimizer': metrics.get('trajectory_optimizer', {}), 'adaptive_learning': metrics.get('adaptive_learning', {}), 'experiment_local_ledger_available': bool(local_digest.get('available')), 'decision_status': decision_status, 'runtime_error': runtime_error}, indent=2, sort_keys=True, default=str)}
 ```
 
 ## Cumulative state — context only
@@ -389,6 +509,43 @@ def write_experiment_evidence(root: str | Path, *, exit_code: int) -> Path:
     _atomic_text(target, build_experiment_evidence(summary, boundary=boundary, root=root, exit_code=exit_code))
     try:
         (root / "research" / _BOUNDARY_NAME).unlink()
+    except FileNotFoundError:
+        pass
+    return target
+
+
+def write_failed_experiment_evidence(
+    root: str | Path,
+    *,
+    exit_code: int,
+    error: BaseException,
+) -> Path:
+    """Finalize an analyzable boundary even when the runtime exits by exception."""
+    root = Path(root)
+    boundary_path = root / "research" / _BOUNDARY_NAME
+    boundary = _read_json(boundary_path, None)
+    if not isinstance(boundary, Mapping):
+        raise FileNotFoundError(f"missing experiment start boundary: {boundary_path}")
+    failed_boundary = dict(boundary)
+    failed_boundary["runtime_error"] = {
+        "type": type(error).__name__,
+        "message": str(error),
+    }
+    summary = _read_json(root / "v8_run_summary.json", {})
+    if not isinstance(summary, Mapping):
+        summary = {}
+    target = root / "research" / EVIDENCE_NAME
+    _atomic_text(
+        target,
+        build_experiment_evidence(
+            summary,
+            boundary=failed_boundary,
+            root=root,
+            exit_code=exit_code,
+        ),
+    )
+    try:
+        boundary_path.unlink()
     except FileNotFoundError:
         pass
     return target

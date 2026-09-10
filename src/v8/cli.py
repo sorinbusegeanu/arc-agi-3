@@ -98,6 +98,13 @@ def _actor_jobs(
     for game_index, game_id in enumerate(games):
         lane_count = max(1, base + int(game_index < extra))
         base_steps, extra_steps = divmod(int(steps_per_game), lane_count)
+        # ``--graph-check`` is a per-game progress interval.  Each lane only
+        # observes a fraction of that progress, so using the unscaled interval
+        # can leave every actor below its first refresh in highly parallel runs.
+        lane_graph_check_steps = max(
+            1,
+            (int(graph_check_steps) + lane_count - 1) // lane_count,
+        )
         for lane in range(lane_count):
             steps = base_steps + int(lane < extra_steps)
             if steps <= 0:
@@ -110,7 +117,7 @@ def _actor_jobs(
                     seed=int(seed) + actor_id * 1009,
                     env_root=env_root,
                     epsilon=float(epsilon),
-                    graph_check_steps=int(graph_check_steps),
+                    graph_check_steps=lane_graph_check_steps,
                 )
             )
             actor_id += 1

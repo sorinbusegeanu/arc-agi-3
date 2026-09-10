@@ -23,6 +23,9 @@ EXPERIMENT N+1
 ## Machine-readable decision metadata
 
 The JSON object between the markers below is authoritative. The runtime captures it before the next experiment starts.
+Normal causal runs fail closed until every required field is populated and the
+declared games, steps, and memory policy agree with the command and durable start
+state.
 
 <!-- RESEARCH_DECISION_METADATA_BEGIN -->
 {

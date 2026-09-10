@@ -102,6 +102,7 @@ class AdaptiveAllocationCliV819Tests(unittest.TestCase):
         self.assertEqual(observed["reported_len"], 30)
         self.assertEqual(len(observed["jobs"]), 30)
         self.assertEqual(observed["total"], 10000)
+        self.assertTrue(all(job.graph_check_steps == 34 for job in observed["jobs"]))
         self.assertIn("steps_per_game=10000", stdout.getvalue())
         self.assertIn("graph_check_interval=1000steps", stdout.getvalue())
 

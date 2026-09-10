@@ -55,15 +55,20 @@ def _select_occurrence_holdout_class(
     full_class,
     by_uid,
     occurrences,
+    rejection_counts=None,
 ):
+    rejected = rejection_counts if rejection_counts is not None else Counter()
     fine_uids = tuple(
         uid for uid in full_class.members if uid != full_class.uid and uid in by_uid
     )
     if len(fine_uids) < 2:
+        rejected["fewer_than_two_fine_members"] += 1
         return None
     candidate_games = sorted(
         {game for uid in fine_uids for game in occurrences.get(uid, {})}
     )
+    if not candidate_games:
+        rejected["no_lineage_world_occurrences"] += 1
     for target_game in candidate_games:
         (
             _fine_uids,
@@ -75,6 +80,7 @@ def _select_occurrence_holdout_class(
             training_games,
         ) = _aggregated_rows(full_class, by_uid, occurrences, int(target_game))
         if not holdout_rows or len(training_members) < 2 or not training_games:
+            rejected["insufficient_disjoint_training_members"] += 1
             continue
         training_class = holdout._derive_class(
             full_class.descriptor,
@@ -84,6 +90,7 @@ def _select_occurrence_holdout_class(
             estimator=estimator,
         )
         if not training_class.persistent:
+            rejected["training_class_not_persistent"] += 1
             continue
         full_shadow = holdout._derive_class(
             full_class.descriptor,

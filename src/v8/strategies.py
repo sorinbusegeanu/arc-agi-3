@@ -24,6 +24,8 @@ class StrategyEstimator:
     def evaluate(self, rows: tuple[NodeRecord, ...]) -> tuple[StrategyEvidence, ...]:
         result = []
         admissible = {
+            int(CognitiveState.CANDIDATE),
+            int(CognitiveState.PROBATION),
             int(CognitiveState.ACTIVE),
             int(CognitiveState.VALIDATED),
             int(CognitiveState.REACTIVATED),

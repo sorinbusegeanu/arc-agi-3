@@ -19,10 +19,42 @@ from v8.research.experiment_artifacts import (
     _evidence_digest,
     capture_experiment_start,
     write_experiment_evidence,
+    write_failed_experiment_evidence,
 )
 
 
 class DefaultRecursiveResearchTests(unittest.TestCase):
+    def _decision(self, *, games="research_1", steps=20000, memory_policy="REUSE"):
+        return {
+            "change_id": "R100-A1",
+            "change_type": "ARCHITECTURE_CHANGE",
+            "target_hypothesis": "H05",
+            "target_causal_edge": "M2_TO_M3",
+            "target_files": ["src/v8/example.py"],
+            "target_functions": ["example"],
+            "change": ["Run the declared intervention."],
+            "must_not_change": ["Scientific thresholds."],
+            "games": games,
+            "steps_per_game": steps,
+            "memory_policy": memory_policy,
+            "primary_metric": "first_m3_watermark",
+            "predicted_change": "Earlier M3 formation.",
+            "minimum_meaningful_effect": "At least one checkpoint earlier.",
+            "expected_unchanged_metrics": ["formation thresholds"],
+            "falsifier": "M3 formation is not earlier.",
+            "decision_rule": ["Reject the explanation if timing does not improve."],
+        }
+
+    def _write_decision(self, root: Path, **kwargs):
+        research = root / "research"
+        research.mkdir(parents=True, exist_ok=True)
+        metadata = self._decision(**kwargs)
+        (research / DECISION_NAME).write_text(
+            f"# RESEARCH_DECISION\n{_DECISION_BEGIN}\n{json.dumps(metadata)}\n{_DECISION_END}\n",
+            encoding="utf-8",
+        )
+        return metadata
+
     def _summary(self, *, watermark=300, memories=20, evidence_records=7):
         return {
             "games": ["ic01", "gp03", "ArcAgi/Sudoku-v0"],
@@ -68,18 +100,17 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "v8_run_summary.json").write_text(json.dumps(self._summary()), encoding="utf-8")
-            research = root / "research"
-            research.mkdir()
-            metadata = {"change_id": "R001-T1", "change_type": "TELEMETRY", "target_hypothesis": "H05"}
-            (research / DECISION_NAME).write_text(
-                f"# RESEARCH_DECISION\n{_DECISION_BEGIN}\n{json.dumps(metadata)}\n{_DECISION_END}\n",
-                encoding="utf-8",
+            metadata = self._write_decision(root)
+            boundary_path = capture_experiment_start(
+                root,
+                argv=["continuous-run", "--games", "research_1", "--steps-per-game", "20000"],
             )
-            boundary_path = capture_experiment_start(root, argv=["continuous-run", "--games", "research_1"])
             boundary = json.loads(boundary_path.read_text(encoding="utf-8"))
         self.assertEqual(boundary["start_state"]["watermark"], 300)
-        self.assertEqual(boundary["decision_metadata"]["change_id"], "R001-T1")
+        self.assertEqual(boundary["decision_metadata"]["change_id"], "R100-A1")
         self.assertIn("memory is intentionally reused", boundary["start_state_source"])
+        self.assertTrue(boundary["start_state_identity"]["available"])
+        self.assertEqual(len(boundary["start_state_identity"]["sha256"]), 64)
 
     def test_evidence_reports_start_end_delta_local_ledger_and_formation_funnel(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -88,7 +119,11 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
             (root / "evidence").mkdir()
             ledger = root / "evidence" / "v8_evidence.jsonl"
             ledger.write_text(json.dumps({"evidence_kind": "old"}) + "\n", encoding="utf-8")
-            capture_experiment_start(root, argv=["continuous-run", "--games", "research_1"])
+            self._write_decision(root)
+            capture_experiment_start(
+                root,
+                argv=["continuous-run", "--games", "research_1", "--steps-per-game", "20000"],
+            )
             with ledger.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps({"evidence_kind": "role_candidate", "hypothesis_id": "H05", "effect_direction": 1}) + "\n")
             (root / "v8_run_summary.json").write_text(json.dumps(self._summary(watermark=150, memories=14, evidence_records=3)), encoding="utf-8")
@@ -109,6 +144,10 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
     def test_normal_continuous_run_generates_evidence_not_legacy_packet(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            (root / "v8_run_summary.json").write_text(
+                json.dumps(self._summary(watermark=1)), encoding="utf-8"
+            )
+            self._write_decision(root)
 
             def fake_main(_argv):
                 (root / "v8_run_summary.json").write_text(json.dumps(self._summary()), encoding="utf-8")
@@ -136,6 +175,10 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
             information_path.write_text(
                 '{"stage":"OLD_INFORMATION"}\n', encoding="utf-8"
             )
+            (root / "v8_run_summary.json").write_text(
+                json.dumps(self._summary(watermark=1)), encoding="utf-8"
+            )
+            self._write_decision(root, steps=20000)
 
             def fake_main(_argv):
                 self.assertEqual(evidence_path.read_text(encoding="utf-8"), "")
@@ -164,6 +207,8 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
                     str(root),
                     "--games",
                     "research_1",
+                    "--steps-per-game",
+                    "20000",
                 ],
             )
 
@@ -181,6 +226,63 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
             root = Path(tmp)
             self.assertEqual(run_with_default_research(lambda _argv: 0, ["smoke", "--root", str(root)]), 0)
             self.assertFalse((root / "research").exists())
+
+    def test_normal_run_fails_closed_on_placeholder_decision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "v8_run_summary.json").write_text(
+                json.dumps(self._summary()), encoding="utf-8"
+            )
+            research = root / "research"
+            research.mkdir()
+            (research / DECISION_NAME).write_text(
+                f"# RESEARCH_DECISION\n{_DECISION_BEGIN}\n"
+                + json.dumps({"change_id": "R001-T1", "memory_policy": "REUSE"})
+                + f"\n{_DECISION_END}\n",
+                encoding="utf-8",
+            )
+            called = False
+
+            def fake_main(_argv):
+                nonlocal called
+                called = True
+                return 0
+
+            result = run_with_default_research(
+                fake_main,
+                ["continuous-run", "--root", str(root), "--games", "research_1", "--steps-per-game", "20000"],
+            )
+            self.assertEqual(result, 2)
+            self.assertFalse(called)
+            self.assertFalse((research / ".experiment_start.json").exists())
+
+    def test_reuse_requires_a_valid_durable_start_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_decision(root)
+            with self.assertRaisesRegex(ValueError, "requires a valid durable"):
+                capture_experiment_start(
+                    root,
+                    argv=["continuous-run", "--games", "research_1", "--steps-per-game", "20000"],
+                )
+
+    def test_runtime_exception_finalizes_failure_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_decision(root, memory_policy="CLEAN")
+
+            def fail(_argv):
+                raise TimeoutError("developmental cut timed out")
+
+            result = run_with_default_research(
+                fail,
+                ["continuous-run", "--root", str(root), "--games", "research_1", "--steps-per-game", "20000"],
+            )
+            evidence = (root / "research" / EVIDENCE_NAME).read_text(encoding="utf-8")
+
+        self.assertEqual(result, 1)
+        self.assertIn('"type": "TimeoutError"', evidence)
+        self.assertIn("developmental cut timed out", evidence)
 
 
 if __name__ == "__main__":

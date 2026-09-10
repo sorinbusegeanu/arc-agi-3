@@ -13,6 +13,15 @@ class ContextRefinement:
     candidate_uid: MemoryUid
     key_parts: tuple[int, ...]
     contradiction_rate: float
+    broad_prediction_error: float
+    refined_prediction_error: float
+
+    @property
+    def matched_prediction_error_gain(self) -> float:
+        return max(
+            0.0,
+            float(self.broad_prediction_error) - float(self.refined_prediction_error),
+        )
 
 
 class ContextRefiner:
@@ -71,6 +80,8 @@ class ContextRefiner:
                         MemoryUid.from_key(MemoryLevel.M3, MemoryType.CONTEXTUAL_ROLE, key),
                         key,
                         gain,
+                        broad_error,
+                        refined_error,
                     )
                 )
         return tuple(result)

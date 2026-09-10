@@ -559,13 +559,25 @@ def _decision_actor_worker(
                         preference_probes.append(probe)
                         pending_preference_probes.append(probe)
 
-                    same_outcome = [
-                        row for row in plans[1:]
-                        if row.outcome_uid == planned.outcome_uid
+                    has_same_outcome = any(
+                        row.outcome_uid == planned.outcome_uid
                         and row.strategy_uid != planned.strategy_uid
-                    ]
-                    if same_outcome and rng.random() < float(job.replanning_probe_rate):
-                        alternative = same_outcome[0]
+                        for row in plans[1:]
+                    )
+                    alternative = (
+                        actor_module._select_replanning_ablation(
+                            view,
+                            planned,
+                            context,
+                            before_actions,
+                        )
+                        if has_same_outcome
+                        else None
+                    )
+                    if (
+                        alternative is not None
+                        and rng.random() < float(job.replanning_probe_rate)
+                    ):
                         explicit_replan = (
                             planned.strategy_uid,
                             alternative.strategy_uid,

@@ -47,13 +47,16 @@ Therefore cumulative memory/evidence totals are context only. Causal interpretat
 - exact command
 - start/end timestamps
 - exit code
-- `memory_policy: REUSE`
+- declared `memory_policy` (`REUSE` or `CLEAN`)
 
 ### Applied intervention declaration
 
-The run captures the machine-readable metadata from the existing `RESEARCH_DECISION.md` before execution.
+The run validates and captures the machine-readable metadata from the existing
+`RESEARCH_DECISION.md` before execution. Declared games and steps must match the
+actual command.
 
-If the declaration is absent or invalid, the evidence file must state that causal interpretation is limited.
+If the declaration is absent, incomplete, invalid, or does not match the command,
+the causal run fails before sampling starts.
 
 ### Start state
 
@@ -67,6 +70,10 @@ Captured before the experiment starts from the previous durable run state:
 - formation telemetry
 - verified-success state
 - trajectory-optimizer state
+
+The boundary also records the start summary's path, size, modification time, and
+SHA-256 identity. `REUSE` requires this durable start state to exist; `CLEAN`
+requires an empty run root.
 
 ### Experiment-local activity
 

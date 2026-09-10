@@ -179,4 +179,12 @@ def install_current_runtime_stack_v88() -> None:
     # Bootstrap only the missing empirical attempts for exact-context causal M7
     # strategies, and make generic environments publish the same execution stats.
     _installer("strategy_empirical_bootstrap_v881")()
+
+    # v8.83 is installed before the late scientific peer wrappers so it can
+    # replace run_until_stable.  Its direct full-cut target must, however, be
+    # rebound after those wrappers exist; otherwise final stabilization silently
+    # bypasses H13 holdouts and committed H12 efficiency evaluation.
+    from v8 import stabilization_noop_retry_v883 as v883
+
+    v883._BASE_FULL_CUT_RUN_ONCE = peers_v82.V82DevelopmentalPeerSupervisor.run_once
     _INSTALLED = True

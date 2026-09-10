@@ -8,7 +8,8 @@ M3 -> M4 -> M5/M6 -> M7 can become visible while actors are still sampling.
 
 This layer keeps the existing v8.62 checkpoint cadence and all formation/evidence
 gates unchanged. It only expands one due coherent checkpoint into a bounded chain of
-up to four committed developmental generations.
+up to six committed developmental generations: enough for an M2 visible at the
+checkpoint boundary to propagate through M3, M4, M5, M6, and M7.
 """
 
 import time
@@ -16,7 +17,7 @@ import time
 
 _INSTALLED = False
 _BASE_COHERENT_CHECKPOINT = None
-_GENERATIONS = 4
+_GENERATIONS = 6
 _COMMIT_TIMEOUT_SECONDS = 5.0
 _COMMIT_POLL_SECONDS = 0.005
 

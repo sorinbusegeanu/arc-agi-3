@@ -157,7 +157,9 @@ def _emit_committed_strategy_efficiency(supervisor) -> int:
         refresh()
 
     by_uid = getattr(view, "_node_by_uid", {})
-    active_states = {
+    empirical_states = {
+        int(CognitiveState.CANDIDATE),
+        int(CognitiveState.PROBATION),
         int(CognitiveState.ACTIVE),
         int(CognitiveState.VALIDATED),
         int(CognitiveState.REACTIVATED),
@@ -173,7 +175,7 @@ def _emit_committed_strategy_efficiency(supervisor) -> int:
                 source = by_uid.get(item.strategy_uid)
                 if source is None:
                     continue
-                if int(source.cognitive_state) not in active_states:
+                if int(source.cognitive_state) not in empirical_states:
                     continue
                 if float(source.attempt_weight) <= 0.0:
                     continue

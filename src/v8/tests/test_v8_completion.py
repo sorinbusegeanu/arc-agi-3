@@ -10,13 +10,15 @@ from v8.evidence import EvidenceRecord
 from v8.future_options import FutureOptionEstimator
 from v8.lifecycle import LifecycleController
 from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid, ValidationState
-from v8.planning import Planner
+from v8.actor import _select_replanning_ablation
+from v8.planning import PlanSelection, Planner
+from v8.peers import _transfer_freshness_kind
 from v8.prediction import PredictionEstimator
 from v8.preference import PreferenceEstimator
 from v8.replanning import ReplanningController
 from v8.roles import FunctionalRoleEstimator
-from v8.strategies import StrategyEvidence
-from v8.transfer import TransferValidator
+from v8.strategies import StrategyEstimator, StrategyEvidence
+from v8.transfer import TransferCandidate, TransferValidator
 
 
 def node(
@@ -84,6 +86,14 @@ class PredictionAndContextTests(unittest.TestCase):
         )
         proposals = ContextRefiner(min_support=4, contradiction_threshold=0.2).propose(rows)
         self.assertGreaterEqual(len(proposals), 2)
+        self.assertTrue(
+            all(
+                proposal.broad_prediction_error > proposal.refined_prediction_error
+                and proposal.matched_prediction_error_gain
+                == proposal.contradiction_rate
+                for proposal in proposals
+            )
+        )
 
 
 class RoleAndFutureOptionTests(unittest.TestCase):
@@ -107,6 +117,42 @@ class RoleAndFutureOptionTests(unittest.TestCase):
 
 
 class TransferPlanningPreferenceTests(unittest.TestCase):
+    def test_probationary_grounded_strategies_are_visible_as_alternatives(self) -> None:
+        outcome = MemoryUid(40, 41)
+        row = node(
+            MemoryLevel.M7,
+            MemoryType.STRATEGY,
+            (1, outcome.hi, outcome.lo, 99),
+            support=3,
+            cognitive_state=int(CognitiveState.PROBATION),
+        )
+        evidence = StrategyEstimator().evaluate((row,))
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].outcome_uid, outcome)
+
+    def test_transfer_freshness_is_scoped_to_correspondence_target(self) -> None:
+        source = MemoryUid(1, 2)
+        first = TransferCandidate(
+            source,
+            2,
+            0.8,
+            (10,),
+            MemoryUid(3, 4),
+            (20,),
+        )
+        second = TransferCandidate(
+            source,
+            2,
+            0.8,
+            (10,),
+            MemoryUid(5, 6),
+            (30,),
+        )
+        self.assertNotEqual(
+            _transfer_freshness_kind(first),
+            _transfer_freshness_kind(second),
+        )
+
     def test_transfer_structural_candidate_is_not_empirical_validation(self) -> None:
         row = node(MemoryLevel.M4, MemoryType.CONCEPT, (7, 1), support=5, game_mask=3)
         validator = TransferValidator(effect_threshold=0.1)
@@ -152,6 +198,29 @@ class TransferPlanningPreferenceTests(unittest.TestCase):
             recovery_succeeded=True,
         )
         self.assertTrue(valid.valid_recovery)
+
+    def test_h14_ablation_excludes_primary_and_preserves_outcome(self) -> None:
+        outcome = MemoryUid(30, 31)
+        primary = PlanSelection(outcome, MemoryUid(32, 33), 1, 1.0)
+        alternative = PlanSelection(outcome, MemoryUid(34, 35), 2, 0.8)
+
+        class View:
+            def __init__(self):
+                self.kwargs = None
+
+            def plan_candidates(self, _context, _actions, **kwargs):
+                self.kwargs = kwargs
+                return (alternative,)
+
+        view = View()
+        selected = _select_replanning_ablation(view, primary, 7, (1, 2))
+        self.assertIs(selected, alternative)
+        self.assertEqual(view.kwargs["outcome_uid"], outcome)
+        self.assertEqual(
+            view.kwargs["excluded_strategies"],
+            frozenset({primary.strategy_uid}),
+        )
+        self.assertTrue(view.kwargs["ignore_preference"])
 
     def test_preference_ignores_preference_influenced_choices(self) -> None:
         a, b = MemoryUid(10, 10), MemoryUid(20, 20)
