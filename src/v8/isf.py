@@ -32,6 +32,7 @@ _STAGE_WEIGHTS: dict[int, tuple[float, float, float, float, float]] = {
     4: (0.25, 0.10, 0.15, 0.20, 0.30),
     5: (0.30, 0.05, 0.10, 0.20, 0.35),
     6: (0.30, 0.05, 0.10, 0.15, 0.40),
+    7: (0.30, 0.05, 0.10, 0.15, 0.40),
 }
 
 _ADMISSIBLE = {
@@ -48,7 +49,7 @@ _DEVELOPMENTAL_STAGE_REVISION = 0
 def publish_developmental_stage(stage: int) -> int:
     """Publish the Stage_t fixed for the current peer update interval."""
     global _CURRENT_DEVELOPMENTAL_STAGE, _DEVELOPMENTAL_STAGE_REVISION
-    value = max(0, min(6, int(stage)))
+    value = max(0, min(7, int(stage)))
     with _STAGE_LOCK:
         _CURRENT_DEVELOPMENTAL_STAGE = value
         _DEVELOPMENTAL_STAGE_REVISION += 1
@@ -73,11 +74,22 @@ def infer_developmental_stage(rows: Iterable[NodeRecord]) -> int:
     rows = tuple(rows)
     minimum_stage = 1 if any(float(row.prediction_error) > 0.0 for row in rows) else 0
     active = tuple(row for row in rows if int(row.cognitive_state) in _ADMISSIBLE)
+    empirical_by_outcome: dict[tuple[int, int, int], int] = defaultdict(int)
+    for row in active:
+        if (
+            int(row.level) == int(MemoryLevel.M7)
+            and int(row.memory_type) == int(MemoryType.STRATEGY)
+            and len(row.key_parts) >= 4
+            and row.attempt_weight > 0
+        ):
+            empirical_by_outcome[
+                (int(row.key_parts[1]), int(row.key_parts[2]), int(row.key_parts[3]))
+            ] += 1
+    if any(count >= 2 for count in empirical_by_outcome.values()):
+        return 7
     if any(
         int(row.level) == int(MemoryLevel.M7)
         and int(row.memory_type) == int(MemoryType.STRATEGY)
-        and row.attempt_weight > 0
-        and row.strategy_reliability > 0
         for row in active
     ):
         return 6
@@ -167,7 +179,7 @@ def score_memory(row: NodeRecord, *, developmental_stage: int | None = None) -> 
     stage = (
         _fallback_stage(row)
         if developmental_stage is None
-        else max(0, min(6, int(developmental_stage)))
+        else max(0, min(7, int(developmental_stage)))
     )
     return _score_from_components(raw_components(row), stage)
 
@@ -204,7 +216,7 @@ def score_memories(
     cancel_event=None,
 ) -> dict[MemoryUid, ISFScore] | None:
     """Deterministically normalize within (level,type,Stage_t) comparison classes."""
-    stage = max(0, min(6, int(developmental_stage)))
+    stage = max(0, min(7, int(developmental_stage)))
     grouped: dict[tuple[int, int, int], list[NodeRecord]] = defaultdict(list)
     for index, row in enumerate(rows):
         if (

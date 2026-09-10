@@ -56,6 +56,15 @@ def _plan_candidates_v826(self, context_signature, action_ids, **kwargs):
 
     from v8 import runtime_repair_v822 as v822
 
+    # v8.81 contributes empirical bootstrap candidates, but planner authority
+    # remains here so the complete composed control contract stays inspectable.
+    if not kwargs:
+        from v8 import strategy_empirical_bootstrap_v881 as v881
+
+        bootstrap = v881._bootstrap_plan(self, context_signature, action_ids)
+        if bootstrap:
+            return tuple(bootstrap)
+
     prior_probe = bool(getattr(v822._PROBE_STATE, "before_plan", False))
     if prior_probe:
         v822._PROBE_STATE.before_plan = False

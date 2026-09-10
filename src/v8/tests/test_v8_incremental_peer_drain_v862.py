@@ -136,19 +136,15 @@ class IncrementalPeerDrainV862Tests(unittest.TestCase):
             v862._BASE_PEER_RUN_ONCE = original_base
             v862.time.monotonic = original_time
 
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0], (False, v862._NODE_SLICE, v862._EDGE_SLICE))
+        self.assertEqual(len(calls), 1)
         self.assertEqual(
-            calls[1],
+            calls[0],
             (True, v862._NODE_SLICE * 4, v862._EDGE_SLICE * 4),
         )
         self.assertEqual(supervisor._cycles, 5)
         self.assertEqual(supervisor._last_developmental_cut, "after")
         self.assertEqual(supervisor._v862_last_coherent_checkpoint_watermark, 11000)
-        self.assertEqual(
-            v862._saved_offset(supervisor, v862._NODE_OFFSET_KEY),
-            v862._NODE_SLICE,
-        )
+        self.assertEqual(v862._saved_offset(supervisor, v862._NODE_OFFSET_KEY), 0)
 
     def test_time_cadence_requires_real_watermark_progress(self):
         supervisor = types.SimpleNamespace(
@@ -208,10 +204,9 @@ class IncrementalPeerDrainV862Tests(unittest.TestCase):
         finally:
             v862._BASE_PEER_RUN_ONCE = original_base
 
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0], (False, v862._NODE_SLICE, v862._EDGE_SLICE))
+        self.assertEqual(len(calls), 1)
         self.assertEqual(
-            calls[1],
+            calls[0],
             (True, v862._NODE_SLICE + 1, v862._EDGE_SLICE + 1),
         )
         self.assertEqual(supervisor._cycles, 5)

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import unittest
+import importlib.util
 
 import numpy as np
 
 from v7.environment.arc_adapter import _install_arcengine_render_compatibility
 
 
+@unittest.skipUnless(importlib.util.find_spec("arcengine"), "arcengine is optional")
 class ArcEngineRenderCompatibilityV880Tests(unittest.TestCase):
     def test_camera_accepts_list_backed_sprite_render(self):
         from arcengine.camera import Camera

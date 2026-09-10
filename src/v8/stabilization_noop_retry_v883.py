@@ -150,6 +150,16 @@ def _run_until_stable_v883(
 ) -> str:
     from v8 import information_flow_diagnostics as flow
 
+    # Preserve dependency-injected test/specialist supervisors. Production
+    # instances use the bounded immutable-cut implementation below.
+    if "run_once" in getattr(self, "__dict__", {}):
+        return _BASE_RUN_UNTIL_STABLE(
+            self,
+            max_cycles=max_cycles,
+            commit_proposals=commit_proposals,
+            timeout=timeout,
+        )
+
     limit = min(8, max(1, int(max_cycles)))
     operation_timeout = max(0.0, float(timeout))
     was_paused = self._pause.is_set()

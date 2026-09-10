@@ -627,6 +627,7 @@ class ContinuousMemoryRuntime:
                     preference_influenced=probe.preference_influenced,
                 )
             explicit_trials = tuple(getattr(result, "replanning_trials", ()))
+            recorded_trials = []
             for trial in explicit_trials:
                 recorded = self.peers.record_replanning_trial(
                     primary_strategy_uid=trial.primary_strategy_uid,
@@ -636,6 +637,7 @@ class ContinuousMemoryRuntime:
                     alternative_selected=True,
                     recovery_succeeded=trial.recovery_succeeded,
                 )
+                recorded_trials.append(recorded)
                 if not recorded.valid_recovery:
                     alternative = next(
                         (
@@ -654,15 +656,16 @@ class ContinuousMemoryRuntime:
                             causal_intervention="strategy_ablation_recovery",
                             effect_direction=-1,
                         )
-            if explicit_trials:
+            demonstrated = tuple(trial for trial in recorded_trials if trial.valid_recovery)
+            if demonstrated:
                 self.peers.ledger.append(
                     EvidenceRecord.for_uid(
                         f"replanning-observed:{result.actor_id}:{self.watermark}",
                         MemoryUid.zero(),
                         evidence_kind="replanning_observed",
                         watermark=self.watermark,
-                        raw_value=float(len(explicit_trials)),
-                        normalized_value=min(1.0, float(len(explicit_trials))),
+                        raw_value=float(len(demonstrated)),
+                        normalized_value=min(1.0, float(len(demonstrated))),
                         developmental_stage=int(MemoryLevel.M7),
                         validation_state=3,
                         source_game_hash=game_hash,

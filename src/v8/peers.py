@@ -100,6 +100,9 @@ class DevelopmentalPeerSupervisor:
         self._failures = 0
         self._last_error: str | None = None
         self._run_lock = threading.Lock()
+        self._live_transfer_candidates: dict[tuple[MemoryUid, MemoryUid], object] = {}
+        self._live_transfer_signal_revision = 0
+        self._live_transfer_consumed_revision = 0
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -356,17 +359,47 @@ class DevelopmentalPeerSupervisor:
             for evidence_index, evidence in enumerate(analyses["prediction"]):
                 if evidence_index % 256 == 0 and cancelled():
                     return
-                uid = MemoryUid(evidence.uid_hi, evidence.uid_lo)
+                uid = evidence.expectation_uid
                 row = by_uid.get(uid)
-                if row is None or not self._fresh(
-                    "prediction", uid, row.updated_watermark
-                ):
+                if row is None:
                     continue
-                self._append_evidence("supported_prediction", row, 1.0)
-                if evidence.error > 0.0:
-                    self._append_evidence(
-                        "prediction_violation", row, evidence.error
-                    )
+                if self._fresh("prediction", uid, row.updated_watermark):
+                    self._append_evidence("supported_prediction", row, 1.0)
+                if evidence.violated:
+                    observation = by_uid.get(evidence.observation_uid)
+                    if observation is not None and self._fresh(
+                        f"prediction_violation:{uid.hex()}",
+                        observation.uid,
+                        observation.updated_watermark,
+                    ):
+                        self._append_evidence(
+                            "prediction_violation",
+                            row,
+                            evidence.error,
+                            causal_intervention=(
+                                "contradictory_observation_for_supported_expectation:"
+                                f"{evidence.observation_uid.hex()}"
+                            ),
+                            effect_direction=1,
+                        )
+
+            from v8 import information_flow_diagnostics as flow
+            prediction_rows = tuple(analyses["prediction"])
+            violations = sum(int(row.violated) for row in prediction_rows)
+            flow.emit(
+                "prediction",
+                "supported_expectation_evaluation",
+                input_count=sum(
+                    1 for row in nodes
+                    if int(row.level) == int(MemoryLevel.M1) and len(row.key_parts) >= 3
+                ),
+                output_count=violations,
+                rejection_counts=getattr(self.prediction, "last_rejections", {}),
+                fields={
+                    "supported_expectations": len(prediction_rows),
+                    "prediction_violations": violations,
+                },
+            )
 
             if cancelled():
                 return
@@ -417,6 +450,14 @@ class DevelopmentalPeerSupervisor:
                         gain,
                         causal_intervention="matched_context_partition_prediction_error",
                         effect_direction=1,
+                    )
+                elif gain <= 0.0:
+                    flow.emit_bounded(
+                        "context_refinement",
+                        "matched_gain_rejected",
+                        input_count=refinement.matched_holdout_count,
+                        output_count=0,
+                        rejection_counts={"no_positive_matched_holdout_gain": 1},
                     )
 
             if cancelled():
@@ -639,12 +680,17 @@ class DevelopmentalPeerSupervisor:
                 reason = None
                 if row is None:
                     reason = "candidate_node_missing"
-                elif not self._fresh(
-                    _transfer_freshness_kind(candidate),
-                    row.uid,
-                    row.updated_watermark,
-                ):
-                    reason = "stale_transfer_candidate"
+                else:
+                    # Queue independently from evidence publication. In
+                    # particular this restores the scheduler signal after a
+                    # state restart without admitting a missing graph node.
+                    self._register_live_transfer_candidate(candidate)
+                    if not self._fresh(
+                        _transfer_freshness_kind(candidate),
+                        row.uid,
+                        candidate.evidence_watermark,
+                    ):
+                        reason = "already_scheduled_current_version"
                 if reason is not None:
                     transfer_rejections[reason] = transfer_rejections.get(reason, 0) + 1
                     if len(transfer_examples) < flow.MAX_EXAMPLES:
@@ -830,9 +876,17 @@ class DevelopmentalPeerSupervisor:
             if cancelled():
                 return
             for _outcome_uid, alternatives in by_outcome.items():
-                if len(alternatives) < 2:
+                grounded_alternatives = tuple(
+                    strategy
+                    for strategy in alternatives
+                    if (
+                        by_uid.get(strategy.uid) is not None
+                        and float(by_uid[strategy.uid].attempt_weight) > 0.0
+                    )
+                )
+                if len(grounded_alternatives) < 2:
                     continue
-                for strategy in alternatives:
+                for strategy in grounded_alternatives:
                     row = by_uid.get(strategy.uid)
                     if row is None:
                         continue
@@ -842,7 +896,7 @@ class DevelopmentalPeerSupervisor:
                         self._append_evidence(
                             "alternative_strategy",
                             row,
-                            min(1.0, len(alternatives) / 3.0),
+                            min(1.0, len(grounded_alternatives) / 3.0),
                         )
             if cancelled():
                 return
@@ -901,6 +955,35 @@ class DevelopmentalPeerSupervisor:
         finally:
             self._run_lock.release()
 
+    def consume_live_transfer_signal(self) -> bool:
+        """Notify the existing scheduler once for each newly published live version."""
+        if self._live_transfer_consumed_revision >= self._live_transfer_signal_revision:
+            return False
+        self._live_transfer_consumed_revision = self._live_transfer_signal_revision
+        return True
+
+    def _register_live_transfer_candidate(self, candidate) -> bool:
+        """Register an admissible correspondence version for live scheduling."""
+        key = (candidate.uid, candidate.correspondence_uid)
+        prior = self._live_transfer_candidates.get(key)
+        if (
+            prior is not None
+            and int(candidate.evidence_watermark)
+            <= int(getattr(prior, "evidence_watermark", -1))
+        ):
+            return False
+        self._live_transfer_candidates[key] = candidate
+        self._live_transfer_signal_revision += 1
+        return True
+
+    def live_transfer_candidates(self):
+        return tuple(
+            sorted(
+                self._live_transfer_candidates.values(),
+                key=lambda row: (-row.structural_score, row.uid, row.correspondence_uid),
+            )
+        )
+
     def record_strategy_statistics(
         self,
         uid: MemoryUid,
@@ -927,7 +1010,7 @@ class DevelopmentalPeerSupervisor:
             )
         )
         self._append_evidence(
-            "strategy_efficiency",
+            "strategy_reuse",
             row,
             min(1.0, float(attempts) / max(1.0, float(cost))),
             unique=True,
@@ -1001,6 +1084,21 @@ class DevelopmentalPeerSupervisor:
         both_reachable: bool,
         preference_influenced: bool,
     ) -> bool:
+        from v8 import information_flow_diagnostics as flow
+
+        rows = {
+            row.uid: row
+            for row in self.read_view.node_records(level=MemoryLevel.M6)
+        }
+        if outcome_a not in rows or outcome_b not in rows:
+            flow.emit_bounded(
+                "preference",
+                "comparative_choice_rejected",
+                input_count=1,
+                output_count=0,
+                rejection_counts={"missing_m6_comparison_outcome": 1},
+            )
+            return False
         accepted = self.preference.record_probe(
             outcome_a=outcome_a,
             outcome_b=outcome_b,
@@ -1010,20 +1108,17 @@ class DevelopmentalPeerSupervisor:
             preference_influenced=preference_influenced,
         )
         if not accepted:
-            return False
-        rows = {
-            row.uid: row
-            for row in self.read_view.node_records(level=MemoryLevel.M6)
-        }
-        chosen = rows.get(chosen_outcome)
-        if chosen is not None:
-            self._append_evidence(
-                "preference_probe",
-                chosen,
-                1.0,
-                unique=True,
-                causal_intervention="clean_choice_probe",
+            flow.emit_bounded(
+                "preference",
+                "comparative_choice_rejected",
+                input_count=1,
+                output_count=0,
+                rejection_counts={
+                    getattr(self.preference, "last_rejection", "scientific_gate_rejected"): 1
+                },
             )
+            return False
+        stable_count = 0
         for evidence in self.preference.evaluate():
             if evidence.state != "STABLE":
                 continue
@@ -1037,6 +1132,13 @@ class DevelopmentalPeerSupervisor:
             )
             if self.ledger.contains(stable_key):
                 continue
+            self._append_evidence(
+                "preference_probe",
+                preferred,
+                min(1.0, abs(evidence.strength)),
+                unique=True,
+                causal_intervention="repeated_comparative_choice_probe",
+            )
             self._submit(
                 self._existing_proposal(
                     preferred,
@@ -1067,6 +1169,16 @@ class DevelopmentalPeerSupervisor:
                     graph_generation=int(self.current_generation()),
                 )
             )
+            stable_count += 1
+        flow.emit_bounded(
+            "preference",
+            "repeated_comparative_choice",
+            input_count=1,
+            output_count=stable_count,
+            rejection_counts=(
+                {"insufficient_repeated_choice_support": 1} if stable_count == 0 else {}
+            ),
+        )
         return True
 
     def record_replanning_trial(
@@ -1119,6 +1231,17 @@ class DevelopmentalPeerSupervisor:
                 causal_intervention="strategy_ablation_recovery",
                 effect_direction=1,
             )
+        from v8 import information_flow_diagnostics as flow
+
+        flow.emit_bounded(
+            "replanning",
+            "preferred_strategy_ablation",
+            input_count=1,
+            output_count=int(trial.valid_recovery),
+            rejection_counts=(
+                {} if trial.valid_recovery else {"substitution_not_demonstrated": 1}
+            ),
+        )
         return trial
 
     def state_dict(self) -> dict[str, object]:

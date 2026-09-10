@@ -53,6 +53,24 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
             f"# RESEARCH_DECISION\n{_DECISION_BEGIN}\n{json.dumps(metadata)}\n{_DECISION_END}\n",
             encoding="utf-8",
         )
+        if (
+            metadata["memory_policy"] == "REUSE"
+            and (root / "v8_run_summary.json").is_file()
+        ):
+            summary = json.loads((root / "v8_run_summary.json").read_text(encoding="utf-8"))
+            snapshot = root / "snapshots" / "snapshot-00000000000000000001"
+            snapshot.mkdir(parents=True, exist_ok=True)
+            (snapshot / "COMPLETE").write_text("", encoding="utf-8")
+            (snapshot / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "snapshot_id": 1,
+                        "generation": 1,
+                        "watermark": summary.get("metrics", {}).get("watermark", 0),
+                    }
+                ),
+                encoding="utf-8",
+            )
         return metadata
 
     def _summary(self, *, watermark=300, memories=20, evidence_records=7):
@@ -111,6 +129,7 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
         self.assertIn("memory is intentionally reused", boundary["start_state_source"])
         self.assertTrue(boundary["start_state_identity"]["available"])
         self.assertEqual(len(boundary["start_state_identity"]["sha256"]), 64)
+        self.assertTrue(boundary["start_snapshot_identity"]["available"])
 
     def test_evidence_reports_start_end_delta_local_ledger_and_formation_funnel(self):
         with tempfile.TemporaryDirectory() as tmp:

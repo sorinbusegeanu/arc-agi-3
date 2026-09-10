@@ -33,6 +33,7 @@ class PreferenceEstimator:
         self.support_threshold = int(support_threshold)
         self.stable_margin = float(stable_margin)
         self._probes: list[PreferenceProbe] = []
+        self.last_rejection: str | None = None
 
     def record_probe(
         self,
@@ -44,11 +45,18 @@ class PreferenceEstimator:
         both_reachable: bool,
         preference_influenced: bool,
     ) -> bool:
+        self.last_rejection = None
         if outcome_a == outcome_b:
+            self.last_rejection = "identical_outcomes"
             return False
         if chosen_outcome not in {outcome_a, outcome_b}:
+            self.last_rejection = "choice_outside_comparison"
             return False
-        if not both_reachable or preference_influenced:
+        if not both_reachable:
+            self.last_rejection = "alternatives_not_both_reachable"
+            return False
+        if preference_influenced:
+            self.last_rejection = "choice_not_causally_clean"
             return False
         self._probes.append(
             PreferenceProbe(

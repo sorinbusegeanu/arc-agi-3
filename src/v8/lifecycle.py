@@ -44,7 +44,7 @@ class LifecycleController:
         self._low_windows: dict[MemoryUid, int] = {}
 
     def set_developmental_stage(self, stage: int) -> None:
-        self.developmental_stage = max(0, min(6, int(stage)))
+        self.developmental_stage = max(0, min(7, int(stage)))
         _stage, self._stage_revision = developmental_stage_snapshot()
         self._stage_explicit = True
 
@@ -189,7 +189,7 @@ class LifecycleController:
     def load_state(self, state: dict[str, object] | None) -> None:
         if not state:
             return
-        self.developmental_stage = max(0, min(6, int(state.get("developmental_stage", 0))))
+        self.developmental_stage = max(0, min(7, int(state.get("developmental_stage", 0))))
         _stage, current_revision = developmental_stage_snapshot()
         self._stage_revision = max(current_revision, int(state.get("stage_revision", 0)))
         self._stage_explicit = False

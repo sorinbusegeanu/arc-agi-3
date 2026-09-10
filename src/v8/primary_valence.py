@@ -328,6 +328,7 @@ def _install_isf_semantics() -> None:
         4: (0.25, 0.15, 0.05, 0.10, 0.15, 0.30),
         5: (0.30, 0.10, 0.05, 0.10, 0.10, 0.35),
         6: (0.35, 0.10, 0.05, 0.10, 0.10, 0.30),
+        7: (0.35, 0.10, 0.05, 0.10, 0.10, 0.30),
     }
 
     def valence_impact(row: NodeRecord) -> float:
@@ -345,11 +346,11 @@ def _install_isf_semantics() -> None:
             float(transfer), float(explanatory), float(future), float(total), int(stage), float(primary))
 
     def score_memory(row, *, developmental_stage=None):
-        stage = isf_module._fallback_stage(row) if developmental_stage is None else max(0, min(6, int(developmental_stage)))
+        stage = isf_module._fallback_stage(row) if developmental_stage is None else max(0, min(7, int(developmental_stage)))
         return build_score(row, isf_module.raw_components(row), stage)
 
     def score_memories(rows, *, developmental_stage, cancel_event=None):
-        stage = max(0, min(6, int(developmental_stage)))
+        stage = max(0, min(7, int(developmental_stage)))
         grouped = defaultdict(list)
         for index, row in enumerate(rows):
             if (

@@ -17,6 +17,7 @@ class TransferCandidate:
     formation_games: tuple[int, ...] = ()
     correspondence_uid: MemoryUid = MemoryUid(0, 0)
     correspondence_games: tuple[int, ...] = ()
+    evidence_watermark: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,6 +380,11 @@ class TransferValidator:
                     formation_games=own_games,
                     correspondence_uid=other_uid,
                     correspondence_games=other_games,
+                    evidence_watermark=max(
+                        int(edge.updated_watermark),
+                        int(eligible[edge.source_uid].updated_watermark),
+                        int(eligible[edge.target_uid].updated_watermark),
+                    ),
                 )
                 prior = best.get(uid)
                 if prior is None or (

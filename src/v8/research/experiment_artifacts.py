@@ -160,6 +160,35 @@ def _file_identity(path: Path) -> dict[str, Any]:
     }
 
 
+def _latest_snapshot_identity(root: Path) -> dict[str, Any]:
+    snapshots = root / "snapshots"
+    candidates = sorted(
+        (
+            path
+            for path in snapshots.glob("snapshot-*")
+            if path.is_dir() and (path / "COMPLETE").is_file()
+        ),
+        key=lambda path: path.name,
+    )
+    if not candidates:
+        return {"available": False}
+    path = candidates[-1]
+    manifest = _read_json(path / "manifest.json", None)
+    identity = _file_identity(path / "manifest.json")
+    if not isinstance(manifest, Mapping) or not identity.get("available"):
+        return {"available": False, "path": str(path), "reason": "invalid snapshot manifest"}
+    return {
+        "available": True,
+        "path": str(path),
+        "name": path.name,
+        "manifest_identity": identity,
+        "snapshot_id": manifest.get("snapshot_id"),
+        "generation": manifest.get("generation"),
+        "watermark": manifest.get("watermark"),
+        "digest": manifest.get("digest", manifest.get("snapshot_digest")),
+    }
+
+
 def _summary_state(summary: Mapping[str, Any] | None) -> dict[str, Any]:
     if not isinstance(summary, Mapping):
         return {
@@ -336,12 +365,34 @@ def capture_experiment_start(root: str | Path, *, argv: Sequence[str]) -> Path:
     _validate_decision_metadata(decision_metadata, argv=argv)
     summary_path = root / "v8_run_summary.json"
     start_state_identity = _file_identity(summary_path)
-    start_state = _summary_state(_read_json(summary_path, None))
+    raw_summary = _read_json(summary_path, None)
+    start_state = _summary_state(raw_summary)
+    start_snapshot_identity = _latest_snapshot_identity(root)
     memory_policy = str(decision_metadata["memory_policy"]).upper()
-    if memory_policy == "REUSE" and not bool(start_state.get("available")):
+    if memory_policy == "REUSE" and (
+        not bool(start_state.get("available"))
+        or not bool(start_snapshot_identity.get("available"))
+    ):
         raise ValueError(
-            "memory_policy=REUSE requires a valid durable v8_run_summary.json start snapshot"
+            "memory_policy=REUSE requires a valid durable run summary and complete graph start snapshot"
         )
+    if memory_policy == "REUSE":
+        final_snapshot = (
+            raw_summary.get("final_snapshot", {})
+            if isinstance(raw_summary, Mapping)
+            else {}
+        )
+        mismatches = []
+        for key in ("snapshot_id", "generation", "watermark"):
+            expected = final_snapshot.get(key) if isinstance(final_snapshot, Mapping) else None
+            actual = start_snapshot_identity.get(key)
+            if expected is not None and actual is not None and int(expected) != int(actual):
+                mismatches.append(key)
+        if mismatches:
+            raise ValueError(
+                "memory_policy=REUSE start snapshot does not match durable run summary: "
+                + ", ".join(mismatches)
+            )
     if memory_policy == "CLEAN" and (
         bool(start_state.get("available"))
         and any(int(start_state.get(key, 0)) != 0 for key in ("watermark", "memories", "edges"))
@@ -365,6 +416,7 @@ def capture_experiment_start(root: str | Path, *, argv: Sequence[str]) -> Path:
         "started_ns": started_ns,
         "start_state": start_state,
         "start_state_identity": start_state_identity,
+        "start_snapshot_identity": start_snapshot_identity,
         "start_state_source": (
             "previous durable v8_run_summary.json; memory is intentionally reused across runs"
             if memory_policy == "REUSE"
@@ -433,6 +485,12 @@ Start snapshot identity:
 
 ```json
 {json.dumps(boundary.get('start_state_identity', {}), indent=2, sort_keys=True, default=str)}
+```
+
+Graph snapshot identity captured before experiment actions:
+
+```json
+{json.dumps(boundary.get('start_snapshot_identity', {}), indent=2, sort_keys=True, default=str)}
 ```
 
 ```json

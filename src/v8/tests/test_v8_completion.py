@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import unittest
+import threading
+from dataclasses import replace
+from types import SimpleNamespace
 
 from v8.arena import NodeRecord
 from v8.context_refinement import ContextRefiner
@@ -12,13 +15,15 @@ from v8.lifecycle import LifecycleController
 from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid, ValidationState
 from v8.actor import _select_replanning_ablation
 from v8.planning import PlanSelection, Planner
-from v8.peers import _transfer_freshness_kind
+from v8.peers import DevelopmentalPeerSupervisor, _transfer_freshness_kind
 from v8.prediction import PredictionEstimator
 from v8.preference import PreferenceEstimator
 from v8.replanning import ReplanningController
+from v8.runtime import ContinuousMemoryRuntime
 from v8.roles import FunctionalRoleEstimator
 from v8.strategies import StrategyEstimator, StrategyEvidence
 from v8.transfer import TransferCandidate, TransferValidator
+from v8.isf import infer_developmental_stage
 
 
 def node(
@@ -33,6 +38,8 @@ def node(
     future: float = 0.0,
     cognitive_state: int = 0,
     validation_state: int = 0,
+    prediction_error: float = 0.0,
+    updated_watermark: int = 10,
 ) -> NodeRecord:
     uid = MemoryUid.from_key(level, memory_type, key)
     return NodeRecord(
@@ -43,13 +50,13 @@ def node(
         key_parts=key,
         support_count=support,
         significance_sum=significance,
-        prediction_error_sum=0.0,
+        prediction_error_sum=prediction_error,
         learning_value_sum=learning,
         transfer_prior_sum=0.0,
         explanatory_sum=0.0,
         future_option_sum=future,
         score_weight=1.0,
-        updated_watermark=10,
+        updated_watermark=updated_watermark,
         game_mask=game_mask,
         cognitive_state=cognitive_state,
         validation_state=validation_state,
@@ -73,11 +80,37 @@ class PredictionAndContextTests(unittest.TestCase):
         self.assertEqual(estimator.evaluate(sparse), ())
         rows = (
             node(MemoryLevel.M1, MemoryType.CONTINGENCY, (1, 2, 3, 4), support=8),
-            node(MemoryLevel.M1, MemoryType.CONTINGENCY, (1, 2, 9, 5), support=2),
+            node(
+                MemoryLevel.M1,
+                MemoryType.CONTINGENCY,
+                (1, 2, 9, 5),
+                support=2,
+                prediction_error=1.0,
+                updated_watermark=11,
+            ),
         )
         evidence = estimator.evaluate(rows)
-        self.assertEqual(len(evidence), 2)
-        self.assertTrue(all(item.error >= 0 for item in evidence))
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].expectation_uid, rows[0].uid)
+        self.assertEqual(evidence[0].observation_uid, rows[1].uid)
+        self.assertTrue(evidence[0].violated)
+
+    def test_prediction_violation_rejects_unsupported_expectation(self) -> None:
+        estimator = PredictionEstimator(min_support=3, stability_threshold=0.6)
+        rows = (
+            node(MemoryLevel.M1, MemoryType.CONTINGENCY, (1, 2, 3, 4), support=2),
+            node(
+                MemoryLevel.M1,
+                MemoryType.CONTINGENCY,
+                (1, 2, 9, 5),
+                support=1,
+                prediction_error=1.0,
+            ),
+        )
+        self.assertEqual(estimator.evaluate(rows), ())
+        self.assertIn(
+            "insufficient_dominant_expectation_support", estimator.last_rejections
+        )
 
     def test_contradiction_proposes_context_refinement(self) -> None:
         rows = (
@@ -89,11 +122,172 @@ class PredictionAndContextTests(unittest.TestCase):
         self.assertTrue(
             all(
                 proposal.broad_prediction_error > proposal.refined_prediction_error
-                and proposal.matched_prediction_error_gain
-                == proposal.contradiction_rate
+                and proposal.matched_holdout_count == 8
+                and proposal.matched_prediction_error_gain > 0
                 for proposal in proposals
             )
         )
+
+    def test_context_gain_requires_supported_separating_partitions(self) -> None:
+        rows = (
+            node(MemoryLevel.M1, MemoryType.CONTINGENCY, (1, 2, 3, 4), support=3),
+            node(MemoryLevel.M1, MemoryType.CONTINGENCY, (1, 2, 9, 5), support=1),
+        )
+        self.assertEqual(
+            ContextRefiner(min_support=4, contradiction_threshold=0.2).propose(rows),
+            (),
+        )
+
+
+class StageAndLiveTransferTests(unittest.TestCase):
+    def test_stage_seven_is_reachable_only_with_matched_empirical_strategies(self) -> None:
+        outcome = MemoryUid(70, 71)
+        first = replace(
+            node(
+                MemoryLevel.M7,
+                MemoryType.STRATEGY,
+                (1, outcome.hi, outcome.lo, 9),
+                cognitive_state=int(CognitiveState.ACTIVE),
+            ),
+            attempt_weight=2.0,
+            success_sum=1.0,
+            cost_sum=3.0,
+        )
+        second = replace(
+            node(
+                MemoryLevel.M7,
+                MemoryType.STRATEGY,
+                (2, outcome.hi, outcome.lo, 9),
+                cognitive_state=int(CognitiveState.ACTIVE),
+            ),
+            attempt_weight=2.0,
+            success_sum=2.0,
+            cost_sum=2.0,
+        )
+        self.assertEqual(infer_developmental_stage((first,)), 6)
+        self.assertEqual(infer_developmental_stage((first, second)), 7)
+
+    def test_published_correspondence_remains_schedulable_after_restart(self) -> None:
+        supervisor = object.__new__(DevelopmentalPeerSupervisor)
+        supervisor._live_transfer_candidates = {}
+        supervisor._live_transfer_signal_revision = 0
+        supervisor._live_transfer_consumed_revision = 0
+        candidate = TransferCandidate(
+            MemoryUid(1, 2),
+            2,
+            0.9,
+            (11,),
+            MemoryUid(3, 4),
+            (22,),
+            15,
+        )
+        self.assertTrue(supervisor._register_live_transfer_candidate(candidate))
+        self.assertTrue(supervisor.consume_live_transfer_signal())
+        self.assertFalse(supervisor._register_live_transfer_candidate(candidate))
+        self.assertFalse(supervisor.consume_live_transfer_signal())
+
+        # Persisted freshness state does not make a valid correspondence stale:
+        # a restarted supervisor has an empty live queue and schedules it again.
+        supervisor._live_transfer_candidates = {}
+        self.assertTrue(supervisor._register_live_transfer_candidate(candidate))
+        self.assertTrue(supervisor.consume_live_transfer_signal())
+
+
+class DemonstratedBehaviorEvidenceTests(unittest.TestCase):
+    def test_replanning_observed_requires_the_current_trial_to_substitute(self) -> None:
+        appended = []
+        outcome = MemoryUid(30, 31)
+        primary = MemoryUid(32, 33)
+        alternative = MemoryUid(34, 35)
+
+        class Peers:
+            ledger = SimpleNamespace(append=appended.append)
+
+            def record_replanning_trial(self, **kwargs):
+                return SimpleNamespace(
+                    valid_recovery=bool(kwargs["recovery_succeeded"])
+                )
+
+            def _append_evidence(self, *_args, **_kwargs):
+                return None
+
+        runtime = SimpleNamespace(
+            peers=Peers(),
+            read_view=SimpleNamespace(node_records=lambda **_kwargs: ()),
+            watermark=20,
+            generation=2,
+        )
+
+        def result(succeeded: bool):
+            trial = SimpleNamespace(
+                primary_strategy_uid=primary,
+                alternative_strategy_uid=alternative,
+                outcome_uid=outcome,
+                recovery_succeeded=succeeded,
+            )
+            return SimpleNamespace(
+                actor_id=1,
+                game_id="g",
+                strategy_stats=(),
+                preference_probes=(),
+                replanning_trials=(trial,),
+            )
+
+        ContinuousMemoryRuntime.record_actor_results(runtime, (result(False),))
+        self.assertEqual(appended, [])
+        ContinuousMemoryRuntime.record_actor_results(runtime, (result(True),))
+        self.assertEqual([row.evidence_kind for row in appended], ["replanning_observed"])
+
+    def test_preference_evidence_requires_repeated_clean_comparative_choices(self) -> None:
+        first = node(MemoryLevel.M6, MemoryType.OUTCOME, (1, 2, 3))
+        second = node(MemoryLevel.M6, MemoryType.OUTCOME, (4, 5, 6))
+        emitted = []
+        ledger_keys = set()
+
+        class Ledger:
+            def contains(self, key):
+                return key in ledger_keys
+
+            def append(self, row):
+                ledger_keys.add(row.evidence_id)
+
+        supervisor = SimpleNamespace(
+            preference=PreferenceEstimator(support_threshold=6, stable_margin=0.3),
+            read_view=SimpleNamespace(
+                node_records=lambda **_kwargs: (first, second),
+                source_games=lambda _row: frozenset((1,)),
+            ),
+            ledger=Ledger(),
+            _append_evidence=lambda kind, *_args, **_kwargs: emitted.append(kind),
+            _submit=lambda _proposal: None,
+            _existing_proposal=lambda row, **_kwargs: row,
+            current_watermark=lambda: 10,
+            current_generation=lambda: 1,
+            _v845_state_lock=threading.RLock(),
+        )
+        for _ in range(5):
+            self.assertTrue(
+                DevelopmentalPeerSupervisor.record_preference_probe(
+                    supervisor,
+                    outcome_a=first.uid,
+                    outcome_b=second.uid,
+                    context_bucket=7,
+                    chosen_outcome=first.uid,
+                    both_reachable=True,
+                    preference_influenced=False,
+                )
+            )
+        self.assertNotIn("preference_probe", emitted)
+        DevelopmentalPeerSupervisor.record_preference_probe(
+            supervisor,
+            outcome_a=first.uid,
+            outcome_b=second.uid,
+            context_bucket=7,
+            chosen_outcome=first.uid,
+            both_reachable=True,
+            preference_influenced=False,
+        )
+        self.assertEqual(emitted.count("preference_probe"), 1)
 
 
 class RoleAndFutureOptionTests(unittest.TestCase):

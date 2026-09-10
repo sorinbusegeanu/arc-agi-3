@@ -139,10 +139,21 @@ def _install_ephemeral_production_grounding() -> None:
 
     def capture_target_probe_state(*, game_id: str, env_root: str | None, seed: int):
         target_hash = int(world_id(game_id))
-        template = grounding._PENDING_TARGET_TEMPLATES.pop(target_hash, None)
-        references = grounding._PENDING_TARGET_STRUCTURES.pop(target_hash, ())
+        template = grounding._PENDING_TARGET_TEMPLATES.get(target_hash)
+        references = grounding._PENDING_TARGET_STRUCTURES.get(target_hash, ())
         if not isinstance(template, dict) or not references:
             return current_capture(game_id=game_id, env_root=env_root, seed=seed)
+        if not any(
+            int(getattr(reference.get("descriptor"), "level", -1))
+            == int(MemoryLevel.M3)
+            for reference in references
+            if isinstance(reference, dict)
+        ):
+            # The preceding structural-grounding layer owns M4 references.
+            # Do not consume its pending candidate before it can evaluate it.
+            return current_capture(game_id=game_id, env_root=env_root, seed=seed)
+        grounding._PENDING_TARGET_TEMPLATES.pop(target_hash, None)
+        grounding._PENDING_TARGET_STRUCTURES.pop(target_hash, None)
 
         captured = current_capture(game_id=game_id, env_root=env_root, seed=seed)
         env = copy.deepcopy(captured.environment)

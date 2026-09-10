@@ -236,6 +236,7 @@ def _install_target_local_transfer_grounding() -> None:
         env = copy.deepcopy(captured.environment)
         rng = Random(int(seed) ^ 0x54A2)
         matched = None
+        matched_environment = None
         grounding_steps = 0
         attempts: list[dict[str, object]] = []
         carriers_by_family: dict[int, set[int]] = defaultdict(set)
@@ -245,6 +246,7 @@ def _install_target_local_transfer_grounding() -> None:
             if not actions:
                 env.reset()
                 continue
+            pre_action_environment = copy.deepcopy(env)
             action = learning._memory_free_action(actions, rng)
             env.step(action)
             grounding_steps += 1
@@ -312,13 +314,16 @@ def _install_target_local_transfer_grounding() -> None:
                     None if carrier is None else int(carrier)
                 ),
                 "target_interaction_evidence_id": f"{evidence_hash:016x}",
+                "target_grounding_context_signature": int(grid_signature(before)),
+                "target_grounding_next_context_signature": int(grid_signature(after)),
                 "correspondence_conditioned_mapping": True,
                 "grounding_step_index": int(step_index),
                 "structural_match": dict(best),
             }
+            matched_environment = pre_action_environment
             break
 
-        if matched is None:
+        if matched is None or matched_environment is None:
             _CAPTURE_GROUNDINGS[captured.capture_id] = {
                 "evidence": None,
                 "grounding_prefix_steps": int(grounding_steps),
@@ -328,28 +333,30 @@ def _install_target_local_transfer_grounding() -> None:
             }
             return captured
 
-        state = env.observe()
-        actions = tuple(sorted(set(int(value) for value in env.available_actions())))
+        state = matched_environment.observe()
+        actions = tuple(
+            sorted(set(int(value) for value in matched_environment.available_actions()))
+        )
         signature = int(grid_signature(state))
         capture_hash = stable_u64(
             str(game_id),
             int(seed),
             signature,
             *actions,
-            grounding_steps,
+            max(0, grounding_steps - 1),
             person=b"v8-xfer-grounded-state",
         )
         capture_id = f"{capture_hash:016x}"
         _CAPTURE_GROUNDINGS[capture_id] = {
             "evidence": matched,
-            "grounding_prefix_steps": int(grounding_steps),
+            "grounding_prefix_steps": max(0, int(grounding_steps) - 1),
             "grounding_policy": "shared_memory_free_prefix",
             "grounding_attempts": attempts,
             "failure_reason": None,
         }
         return replace(
             captured,
-            environment=env,
+            environment=matched_environment,
             capture_id=capture_id,
             initial_state_signature=signature,
             initial_available_actions=actions,

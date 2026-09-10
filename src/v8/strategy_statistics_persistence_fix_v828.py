@@ -26,7 +26,9 @@ def _stats_map(rows) -> dict[MemoryUid, list[float]]:
     return result
 
 
-def _merge_strategy_stats(actor_module, strategy_stats) -> tuple[object, ...]:
+def _merge_strategy_stats(
+    actor_module, strategy_stats, *, prefer_tracker: bool = False
+) -> tuple[object, ...]:
     """Preserve normal actor stats; add tracker-only UIDs without double counting."""
     from v8.trajectory_efficiency_v054 import _TRACKER
 
@@ -36,9 +38,10 @@ def _merge_strategy_stats(actor_module, strategy_stats) -> tuple[object, ...]:
         if float(values[0]) > 0.0
     }
     for uid, values in _TRACKER.stats.items():
-        if uid in merged or float(values[0]) <= 0.0:
+        if float(values[0]) <= 0.0:
             continue
-        merged[uid] = [float(values[0]), float(values[1]), float(values[2])]
+        if prefer_tracker or uid not in merged:
+            merged[uid] = [float(values[0]), float(values[1]), float(values[2])]
     return tuple(
         actor_module.StrategyRunStat(uid, int(values[0]), int(values[1]), float(values[2]))
         for uid, values in sorted(merged.items())
@@ -47,22 +50,21 @@ def _merge_strategy_stats(actor_module, strategy_stats) -> tuple[object, ...]:
 
 
 def _learning_batch_v828(*, job, strategy_stats, preference_probes, replanning_trials):
-    del preference_probes
     from v8 import actor as actor_module
     from v8 import primary_valence as primary
     from v8.trajectory_efficiency_v054 import _TRACKER
 
     _TRACKER.flush_open_run()
-    stats = _merge_strategy_stats(actor_module, strategy_stats)
+    stats = _merge_strategy_stats(actor_module, strategy_stats, prefer_tracker=True)
     credits = primary._credit_tuple()
     preferences = tuple(primary._PENDING_VALENCE_PREFERENCES)
-    if not stats and not replanning_trials and not credits and not preferences:
+    if not stats and not preference_probes and not replanning_trials and not credits and not preferences:
         return None
     return primary.PrimaryValenceLearningBatch(
         int(job.actor_id),
         str(job.game_id),
         stats,
-        (),
+        tuple(preference_probes),
         tuple(replanning_trials),
         len(replanning_trials),
         credits,
@@ -165,6 +167,8 @@ def _emit_committed_strategy_efficiency(supervisor) -> int:
         int(CognitiveState.REACTIVATED),
     }
     emitted = 0
+    eligible = 0
+    unmatched = 0
     for context_bucket, rows in getattr(view, "_strategy_by_context", {}).items():
         grouped: dict[MemoryUid, list[object]] = defaultdict(list)
         for item in rows:
@@ -181,7 +185,9 @@ def _emit_committed_strategy_efficiency(supervisor) -> int:
                     continue
                 empirical.append((item, source))
             if len(empirical) < 2:
+                unmatched += len(empirical)
                 continue
+            eligible += len(empirical)
             best = min(max(1e-9, float(item.mean_cost)) for item, _source in empirical)
             for item, source in empirical:
                 if not supervisor._fresh(
@@ -193,6 +199,17 @@ def _emit_committed_strategy_efficiency(supervisor) -> int:
                 value = best / max(1e-9, float(item.mean_cost))
                 supervisor._append_evidence("strategy_efficiency", source, value)
                 emitted += 1
+    from v8 import information_flow_diagnostics as flow
+
+    flow.emit_bounded(
+        "strategy_efficiency",
+        "matched_m6_outcome_cost_comparison",
+        input_count=eligible + unmatched,
+        output_count=emitted,
+        rejection_counts=(
+            {"no_same_m6_outcome_comparator": unmatched} if unmatched else {}
+        ),
+    )
     return emitted
 
 

@@ -753,13 +753,15 @@ def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
     assert (result.attempted, result.completed, result.passed) == (1, 1, 1)
     assert _EffectProbeEnvironment.created == 1
     assert len(recorded) == 1
-    assert recorded[0].effect == 5.0
+    # A target-local mapping is consumed once at its grounded state; it is
+    # not replayed as a stationary policy across all four probe steps.
+    assert recorded[0].effect == 1.25
     assert recorded[0].passed is True
     assert "transfer_trial_fail" not in evidence
     assert scheduling["examples"][0]["scheduler_decision"] == "transfer_trial_pass"
 
     assert evaluation["exact_source_action_sequence"] == [9]
-    assert evaluation["exact_actions_executed_on_target"] == [2, 2, 2, 2]
+    assert evaluation["exact_actions_executed_on_target"] == [2, 1, 1, 1]
     assert evaluation["correspondence_mapping"]["mapped_action_sequence"] == [2]
     assert evaluation["correspondence_mapping"]["source_memory_ids"] == [
         ancestor.uid.hex(), source_grounded.uid.hex(),
@@ -778,7 +780,7 @@ def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
     assert evaluation["grounded_correspondence_memory_ids_actually_used"] == [
         mapped_grounded.uid.hex()
     ]
-    assert evaluation["intervention"]["score"] == 5.0
+    assert evaluation["intervention"]["score"] == 1.25
     assert evaluation["matched_memory_free_control"]["score"] == 0.0
     assert evaluation["matched_memory_free_control"]["actions"] == [1, 1, 1, 1]
     assert evaluation["intervention"]["initial_state_signature"] == evaluation[
@@ -793,7 +795,7 @@ def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
     ] == [1, 2]
     assert evaluation["matched_memory_free_control"]["target_memory_query_count"] == 0
     assert evaluation["matched_memory_free_control"]["target_memory_leakage"] is False
-    assert evaluation["computed_transfer_effect"] == 5.0
+    assert evaluation["computed_transfer_effect"] == 1.25
     assert evaluation["existing_pass_threshold"] == 0.0
     assert evaluation["exact_failure_reason"] is None
     assert evaluation["matched_control_checks"] == {
@@ -816,9 +818,9 @@ def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
     assert evaluation["transfer_informed_action"] == 2
     assert evaluation["transfer_memory_influenced_action_selection"] is True
     assert evaluation["selected_action_changed_due_to_transfer"] is True
-    assert evaluation["correspondence_conditioned_actions_executed"] == 4
+    assert evaluation["correspondence_conditioned_actions_executed"] == 1
     applied = evaluation["applied_transfer_mappings"]
-    assert len(applied) == 4
+    assert len(applied) == 1
     assert applied[0]["source_structural_memory_uid"] == ancestor.uid.hex()
     assert applied[0]["correspondence_uid"] == correspondence.uid.hex()
     assert applied[0]["target_grounded_memory_uid"] == mapped_grounded.uid.hex()
@@ -829,7 +831,7 @@ def test_correspondence_conditions_actions_and_positive_effect_passes() -> None:
         "explicit_structural_role_to_target_grounding"
     )
     assert evaluation["intervention_outcome"] == {
-        "wins": 4, "failures": 0, "level_gain": 0,
+        "wins": 1, "failures": 0, "level_gain": 0,
     }
     assert evaluation["control_outcome"] == {
         "wins": 0, "failures": 0, "level_gain": 0,

@@ -317,7 +317,8 @@ def install_strategy_empirical_bootstrap_v881() -> None:
 
     _BASE_PLAN_CANDIDATES = LiveReadView.plan_candidates
     _BASE_RUN_MIXED_ACTOR_JOBS = mixed.run_mixed_actor_jobs
-    LiveReadView.plan_candidates = _plan_candidates_v881
+    # Bootstrap is invoked by the final v8.26 planner authority. Keeping that
+    # function installed avoids a late monkey-patch hiding the control contract.
     mixed.run_generic_actor_job = _run_generic_actor_job_v881
     mixed.run_mixed_actor_jobs = _run_mixed_actor_jobs_v881
     _INSTALLED = True

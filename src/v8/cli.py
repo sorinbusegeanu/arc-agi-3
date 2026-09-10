@@ -207,6 +207,7 @@ def run_continuous(args) -> int:
     loaded_nodes = runtime.read_view.memory_count
     experiments = ExperimentSummary(0, 0, 0)
     reporter: DedicatedReporter | None = None
+    live_transfer_scheduler_active = False
 
     def accumulate_experiments(summary: ExperimentSummary) -> None:
         nonlocal experiments
@@ -217,8 +218,32 @@ def run_continuous(args) -> int:
         )
 
     def periodic_maintenance(_rows) -> None:
+        nonlocal live_transfer_scheduler_active
         if reporter is not None:
             reporter.raise_if_failed()
+        peers = getattr(runtime, "peers", None)
+        if (
+            live_transfer_scheduler_active
+            or args.no_automatic_experiments
+            or args.no_peers
+            or peers is None
+            or experiments.attempted >= int(args.max_transfer_experiments)
+            or peers.consume_live_transfer_signal() is not True
+        ):
+            return
+        live_transfer_scheduler_active = True
+        try:
+            tail = run_automatic_transfer_experiments(
+                runtime,
+                games=tuple(games),
+                env_root=args.env_root,
+                seed=args.seed + experiments.attempted * 7919,
+                steps_per_trial=args.transfer_experiment_steps,
+                max_trials=1,
+            )
+            accumulate_experiments(tail)
+        finally:
+            live_transfer_scheduler_active = False
 
     def stop_reporter() -> None:
         nonlocal reporter

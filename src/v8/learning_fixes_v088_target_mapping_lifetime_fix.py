@@ -24,8 +24,16 @@ def _install_target_mapping_lifetime() -> None:
             and isinstance(row.get("source_role_entity"), dict)
             and isinstance(row.get("target_role_entity"), dict)
             and row.get("mapping_kind")
-            and row.get("target_interaction_evidence_id")
-            and row.get("target_grounding_context_signature") is not None
+            and (
+                (
+                    row.get("target_interaction_evidence_id")
+                    and row.get("target_grounding_context_signature") is not None
+                )
+                # A persisted target-local grounded contingency is already a
+                # structural target observation; it need not masquerade as the
+                # ephemeral exact-state grounding form.
+                or row.get("target_grounded_memory_uid")
+            )
             and row.get("derived_target_action") is not None
         )
         position = max(0, int(cursor))

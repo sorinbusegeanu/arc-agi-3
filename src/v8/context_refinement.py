@@ -15,6 +15,7 @@ class ContextRefinement:
     contradiction_rate: float
     broad_prediction_error: float
     refined_prediction_error: float
+    matched_holdout_count: int = 0
 
     @property
     def matched_prediction_error_gain(self) -> float:
@@ -43,6 +44,29 @@ class ContextRefiner:
         dominant = max(by_outcome.values(), default=0)
         return 1.0 - dominant / total
 
+    @staticmethod
+    def _leave_one_out_error(rows: list[NodeRecord]) -> tuple[float, int]:
+        """Evaluate each occurrence against a predictor fit without that occurrence."""
+        counts: dict[int, int] = defaultdict(int)
+        for row in rows:
+            if len(row.key_parts) >= 3:
+                counts[int(row.key_parts[2])] += max(0, int(row.support_count))
+        total = sum(counts.values())
+        if total < 2:
+            return 0.0, 0
+        errors = evaluated = 0
+        for actual, occurrences in counts.items():
+            if occurrences <= 0:
+                continue
+            training = dict(counts)
+            training[actual] -= 1
+            if sum(training.values()) <= 0:
+                continue
+            predicted = min(training, key=lambda value: (-training[value], value))
+            errors += occurrences * int(predicted != actual)
+            evaluated += occurrences
+        return (errors / evaluated if evaluated else 0.0), evaluated
+
     def propose(self, rows: tuple[NodeRecord, ...]) -> tuple[ContextRefinement, ...]:
         grouped: dict[tuple[int, int], list[NodeRecord]] = defaultdict(list)
         for row in rows:
@@ -53,7 +77,7 @@ class ContextRefiner:
             total = sum(int(row.support_count) for row in variants)
             if total < self.min_support or len(variants) < 2:
                 continue
-            broad_error = self._error(variants)
+            broad_error, broad_holdouts = self._leave_one_out_error(variants)
             if broad_error < self.contradiction_threshold:
                 continue
 
@@ -61,10 +85,20 @@ class ContextRefiner:
             for row in variants:
                 next_context = int(row.key_parts[3]) if len(row.key_parts) >= 4 else 0
                 partitions[next_context].append(row)
-            refined_error = 0.0
+            if len(partitions) < 2 or any(
+                sum(max(0, int(row.support_count)) for row in part) < 2
+                for part in partitions.values()
+            ):
+                continue
+            refined_errors = 0.0
+            refined_holdouts = 0
             for partition_rows in partitions.values():
-                partition_support = sum(max(0, int(row.support_count)) for row in partition_rows)
-                refined_error += (partition_support / max(1, total)) * self._error(partition_rows)
+                error, holdouts = self._leave_one_out_error(partition_rows)
+                refined_errors += error * holdouts
+                refined_holdouts += holdouts
+            if broad_holdouts <= 0 or refined_holdouts != broad_holdouts:
+                continue
+            refined_error = refined_errors / refined_holdouts
             gain = max(0.0, broad_error - refined_error)
             if gain <= 1e-12:
                 continue
@@ -79,9 +113,10 @@ class ContextRefiner:
                         row.uid,
                         MemoryUid.from_key(MemoryLevel.M3, MemoryType.CONTEXTUAL_ROLE, key),
                         key,
-                        gain,
+                        broad_error,
                         broad_error,
                         refined_error,
+                        refined_holdouts,
                     )
                 )
         return tuple(result)

@@ -256,9 +256,11 @@ class PeerScalingTests(unittest.TestCase):
 
     def test_v845_wraps_v841_peer_authority(self):
         from v8 import snapshot_state_consistency_v845 as v845
+        from v8 import strategy_statistics_persistence_fix_v828 as v828
         from v8.peers_v82 import V82DevelopmentalPeerSupervisor
 
-        self.assertIs(V82DevelopmentalPeerSupervisor.run_once, v845._peer_run_once_v845)
+        self.assertIs(V82DevelopmentalPeerSupervisor.run_once, v828._peer_run_once_v828)
+        self.assertIsNotNone(v828._BASE_PEER_RUN_ONCE)
         self.assertIs(v845._BASE_PEER_RUN_ONCE, v841._peer_run_once_v841)
         self.assertIs(
             V82DevelopmentalPeerSupervisor._parallel_analyses,
