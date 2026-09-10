@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from collections import Counter
 from types import SimpleNamespace
 
 from v8.evaluation import ScientificHypothesisEvaluator
@@ -147,10 +148,12 @@ class OutcomeHoldoutV828Tests(unittest.TestCase):
         rows = (_row(1, support=2, variant=1), _row(2, support=2, variant=1))
         by_uid = {row.uid: row for row in rows}
         occurrences = {rows[0].uid: {10: 1}, rows[1].uid: {10: 1}}
+        rejected = Counter()
         validation = _select_occurrence_holdout_class(
-            self.estimator, self._class(rows), by_uid, occurrences
+            self.estimator, self._class(rows), by_uid, occurrences, rejected
         )
         self.assertIsNone(validation)
+        self.assertGreater(rejected["insufficient_disjoint_training_members"], 0)
 
     def test_h13_accepts_distinct_heldout_target(self) -> None:
         evidence = EvidenceRecord.for_uid(
