@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -144,6 +145,45 @@ class DeferredScalingTests(unittest.TestCase):
 
 
 class PeerScalingTests(unittest.TestCase):
+    def test_parallel_analysis_preserves_relational_role_estimator(self):
+        calls = []
+
+        class Roles:
+            @staticmethod
+            def propose(_nodes):
+                raise AssertionError("relational role analysis must receive graph edges")
+
+            @staticmethod
+            def propose_relational(nodes, edges):
+                calls.append((nodes, edges))
+                return ("relational-role",)
+
+        no_edges = SimpleNamespace(
+            evaluate=lambda *_args, **_kwargs: (),
+            propose=lambda *_args, **_kwargs: (),
+            candidates=lambda *_args, **_kwargs: (),
+        )
+        with ThreadPoolExecutor(max_workers=9) as executor:
+            peer = SimpleNamespace(
+                _v841_peer_executor=executor,
+                prediction=no_edges,
+                context=no_edges,
+                roles=Roles(),
+                future_options=no_edges,
+                compression=no_edges,
+                similarity=no_edges,
+                transfer=no_edges,
+                read_view=SimpleNamespace(source_games=lambda _uid: frozenset()),
+                world_model=no_edges,
+                replay=no_edges,
+                candidate_budget=8,
+                _v841_peer_cancel=threading.Event(),
+            )
+            result = v841._parallel_analyses_v841(peer, ("node",), ("edge",))
+
+        self.assertEqual(result["roles"], ("relational-role",))
+        self.assertEqual(calls, [(('node',), ('edge',))])
+
     def test_frozen_provenance_walk_honors_final_drain_cancellation(self):
         cancel = threading.Event()
         cut = DevelopmentalGenerationCut(0, 0, (), (), (), "")

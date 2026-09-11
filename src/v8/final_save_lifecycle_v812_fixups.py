@@ -121,6 +121,8 @@ def _indexed_relational_roles(self, rows, edges):
         neighbor = by_uid.get(neighbor_uid)
         if neighbor is None:
             return
+        if not self._is_role_defining_relation(direction, relation, neighbor):
+            return
         relation_counts[carrier_uid][
             (direction, relation, int(neighbor.level), int(neighbor.memory_type))
         ] += max(1, int(support))

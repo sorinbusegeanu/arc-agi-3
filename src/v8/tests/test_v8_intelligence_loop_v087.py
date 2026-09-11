@@ -64,6 +64,36 @@ class V087IntelligenceLoopTests(unittest.TestCase):
         self.assertNotIn(111, roles[0].key_parts)
         self.assertNotIn(222, roles[0].key_parts)
 
+    def test_relational_role_identity_ignores_roles_derived_from_same_carriers(self):
+        m1a = node(MemoryLevel.M1, MemoryType.CONTINGENCY, (11, 1, 2, 12))
+        m1b = node(MemoryLevel.M1, MemoryType.CONTINGENCY, (21, 1, 2, 22))
+        f1 = node(MemoryLevel.M2, MemoryType.FAMILY, (1001, 0))
+        f2 = node(MemoryLevel.M2, MemoryType.FAMILY, (2002, 0))
+        c1 = node(MemoryLevel.M3, MemoryType.CARRIER, (111, 501, 0))
+        c2 = node(MemoryLevel.M3, MemoryType.CARRIER, (222, 502, 0))
+        causal_edges = (
+            edge(c1, RelationType.EXPLAINS, f1),
+            edge(c1, RelationType.EXPLAINS, m1a),
+            edge(c2, RelationType.EXPLAINS, f2),
+            edge(c2, RelationType.EXPLAINS, m1b),
+        )
+        estimator = V087RelationalRoleEstimator()
+        initial = estimator.propose_relational(
+            (m1a, m1b, f1, f2, c1, c2), causal_edges
+        )
+        self.assertEqual(len(initial), 1)
+        derived = node(MemoryLevel.M3, MemoryType.ROLE, initial[0].key_parts)
+        repeated = estimator.propose_relational(
+            (m1a, m1b, f1, f2, c1, c2, derived),
+            causal_edges
+            + (
+                edge(derived, RelationType.EXPLAINS, c1),
+                edge(derived, RelationType.EXPLAINS, c2),
+            ),
+        )
+
+        self.assertEqual(tuple(item.uid for item in repeated), (initial[0].uid,))
+
     def test_structurally_ready_concept_can_form_probe_scaffold_but_failed_cannot(self):
         candidate = node(MemoryLevel.M4, MemoryType.CONCEPT, (7, 8), support=4, cognitive=CognitiveState.CANDIDATE, validation=ValidationState.STRUCTURAL)
         failed = node(MemoryLevel.M4, MemoryType.CONCEPT, (11, 12), support=4, cognitive=CognitiveState.QUARANTINED, validation=ValidationState.FAILED)

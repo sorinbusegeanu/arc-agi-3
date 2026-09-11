@@ -129,7 +129,7 @@ class HypothesisStartupDelayTests(unittest.TestCase):
         reporter = Mock()
         reporter.progress_queue = object()
         lifecycle: list[str] = []
-        reporter.close.side_effect = lambda: lifecycle.append("reporter stopped")
+        reporter.close.side_effect = lambda **_kwargs: lifecycle.append("reporter stopped")
         runtime.wait_quiescent.side_effect = lambda **_kwargs: lifecycle.append("runtime drained")
         runtime.metrics.side_effect = lambda: lifecycle.append("metrics") or {}
 
@@ -169,7 +169,7 @@ class HypothesisStartupDelayTests(unittest.TestCase):
         self.assertEqual(progress_baseline.games, 1)
         self.assertEqual(progress_baseline.level_rate, 100.0)
         reporter.start.assert_called_once_with()
-        reporter.close.assert_called_once_with()
+        reporter.close.assert_called_once_with(graceful=False)
         self.assertEqual(
             lifecycle,
             [

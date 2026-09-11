@@ -275,13 +275,19 @@ class DedicatedReporter:
                 f"v8 dedicated reporter exited unexpectedly: {self._process.exitcode}"
             )
 
-    def close(self, *, timeout: float = 3.0) -> None:
+    def close(self, *, timeout: float = 3.0, graceful: bool = False) -> None:
         if self._closed:
             return
         self._closed = True
-        self._stop.set()
         if self._started:
-            self._process.join(timeout=float(timeout))
+            if graceful:
+                # The actor runner has already queued SAMPLING_COMPLETE.  Give
+                # the reporter a chance to consume it and emit the durable
+                # completion line before using the stop event as a fallback.
+                self._process.join(timeout=float(timeout))
+            if self._process.is_alive():
+                self._stop.set()
+                self._process.join(timeout=float(timeout))
             if self._process.is_alive():
                 self._process.terminate()
                 self._process.join(timeout=2.0)

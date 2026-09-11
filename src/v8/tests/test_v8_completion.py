@@ -117,8 +117,13 @@ class PredictionAndContextTests(unittest.TestCase):
             node(MemoryLevel.M1, MemoryType.CONTINGENCY, (1, 2, 3, 4), support=5),
             node(MemoryLevel.M1, MemoryType.CONTINGENCY, (1, 2, 9, 5), support=3),
         )
-        proposals = ContextRefiner(min_support=4, contradiction_threshold=0.2).propose(rows)
+        refiner = ContextRefiner(min_support=4, contradiction_threshold=0.2)
+        proposals = refiner.propose(rows)
         self.assertGreaterEqual(len(proposals), 2)
+        self.assertEqual(refiner.last_input_count, 1)
+        self.assertEqual(refiner.last_row_count, 2)
+        self.assertEqual(refiner.last_output_count, 1)
+        self.assertEqual(refiner.last_rejections, {})
         self.assertTrue(
             all(
                 proposal.broad_prediction_error > proposal.refined_prediction_error
@@ -133,9 +138,14 @@ class PredictionAndContextTests(unittest.TestCase):
             node(MemoryLevel.M1, MemoryType.CONTINGENCY, (1, 2, 3, 4), support=3),
             node(MemoryLevel.M1, MemoryType.CONTINGENCY, (1, 2, 9, 5), support=1),
         )
+        refiner = ContextRefiner(min_support=4, contradiction_threshold=0.2)
+        self.assertEqual(refiner.propose(rows), ())
+        self.assertEqual(refiner.last_input_count, 1)
+        self.assertEqual(refiner.last_row_count, 2)
+        self.assertEqual(refiner.last_output_count, 0)
         self.assertEqual(
-            ContextRefiner(min_support=4, contradiction_threshold=0.2).propose(rows),
-            (),
+            refiner.last_rejections,
+            {"partition_insufficient_support": 1},
         )
 
 
@@ -513,6 +523,25 @@ class LifecycleAndReportingTests(unittest.TestCase):
         )
         statuses = evaluator.status_map(evaluator.evaluate((observed, self._h13_evidence())))
         self.assertEqual(statuses["H14"], "PARTIALLY_VALID")
+
+    def test_h12_dependency_uses_h13_status_independent_of_report_order(self) -> None:
+        strategy = EvidenceRecord.for_uid(
+            "h12-strategy",
+            MemoryUid(1, 3),
+            evidence_kind="strategy_reuse",
+            watermark=10,
+            raw_value=1.0,
+            normalized_value=1.0,
+            developmental_stage=7,
+            validation_state=int(ValidationState.STRUCTURAL),
+        )
+        decisions = ScientificHypothesisEvaluator().evaluate(
+            (strategy, self._h13_evidence())
+        )
+        h12 = next(row for row in decisions if row.hypothesis_id == "H12")
+
+        self.assertEqual(h12.dependency_gate, "PASS")
+        self.assertNotIn("blocked dependencies", h12.blocker)
 
     def test_h14_explicit_recovery_trial_can_validate(self) -> None:
         evaluator = ScientificHypothesisEvaluator()

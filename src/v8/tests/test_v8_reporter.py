@@ -400,6 +400,30 @@ class DedicatedReporterProcessTests(unittest.TestCase):
             output.close()
             output.join_thread()
 
+    def test_graceful_close_drains_queued_sampling_complete(self) -> None:
+        method = "forkserver" if "forkserver" in mp.get_all_start_methods() else "spawn"
+        ctx = mp.get_context(method)
+        output = ctx.Queue()
+        watermark = ctx.Value("Q", 0)
+        reporter = DedicatedReporter(
+            ctx,
+            watermark=watermark,
+            actors=((1, "tt01"),),
+            interval_seconds=60.0,
+            output_queue=output,
+            total_steps=100,
+        )
+        try:
+            reporter.start()
+            reporter.progress_queue.put(SAMPLING_COMPLETE)
+            reporter.close(graceful=True)
+            self.assertIn("sampling done", output.get(timeout=3.0))
+            self.assertEqual(reporter._process.exitcode, 0)
+        finally:
+            reporter.close()
+            output.close()
+            output.join_thread()
+
 
 if __name__ == "__main__":
     unittest.main()

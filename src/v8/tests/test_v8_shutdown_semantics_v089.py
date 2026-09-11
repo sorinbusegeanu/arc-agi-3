@@ -50,6 +50,17 @@ class ShutdownSemanticsV089Tests(unittest.TestCase):
         runtime.peers.resume.assert_not_called()
         self.assertGreaterEqual(runtime._is_quiescent.call_count, 2)
 
+    def test_post_sampling_drain_continues_one_maxed_stabilization_window(self) -> None:
+        runtime = self._runtime_stub(sampling_complete=True)
+        runtime.peers.run_until_stable.side_effect = ("max_cycles", "stable")
+
+        runtime.wait_quiescent(timeout=0.2, stable_checks=2)
+
+        self.assertEqual(runtime.peers.run_until_stable.call_count, 2)
+        for call in runtime.peers.run_until_stable.call_args_list:
+            self.assertEqual(call.kwargs["max_cycles"], 8)
+        self.assertTrue(runtime._v82_developmental_finalized)
+
     def test_midrun_semantic_settle_uses_graph_generation_not_proposal_counter(self) -> None:
         runtime = self._runtime_stub(sampling_complete=False)
         runtime.peers.metrics.side_effect = AssertionError(

@@ -89,6 +89,23 @@ class V087RelationalRoleEstimator(FunctionalRoleEstimator):
     def _future_bucket(value: float) -> int:
         return 1 if float(value) > 1e-9 else -1 if float(value) < -1e-9 else 0
 
+    @staticmethod
+    def _is_role_defining_relation(
+        direction: int,
+        relation: int,
+        neighbor: NodeRecord,
+    ) -> bool:
+        # A role explains its carrier after formation. Feeding that derived edge
+        # back into the carrier descriptor creates a fresh role identity on every
+        # subsequent full cut. Role identity must depend on the carrier's causal
+        # neighborhood, not on roles already induced from that same carrier.
+        return not (
+            int(direction) == -1
+            and int(relation) == int(RelationType.EXPLAINS)
+            and int(neighbor.level) == int(MemoryLevel.M3)
+            and int(neighbor.memory_type) == int(MemoryType.ROLE)
+        )
+
     @classmethod
     def _descriptor(cls, row: NodeRecord, *, edges: tuple[EdgeRecord, ...], by_uid: dict[MemoryUid, NodeRecord]) -> tuple[int, int, int, int]:
         relations: Counter[tuple[int, int, int, int]] = Counter()
@@ -105,6 +122,8 @@ class V087RelationalRoleEstimator(FunctionalRoleEstimator):
             elif edge.target_uid == row.uid:
                 direction, neighbor = -1, by_uid.get(edge.source_uid)
             if neighbor is None:
+                continue
+            if not cls._is_role_defining_relation(direction, relation, neighbor):
                 continue
             relations[(direction, relation, int(neighbor.level), int(neighbor.memory_type))] += max(1, int(edge.support_count))
             if relation in {int(RelationType.DEPENDS_ON), int(RelationType.ENABLES), int(RelationType.BLOCKS)}:

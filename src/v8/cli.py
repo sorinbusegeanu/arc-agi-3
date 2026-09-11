@@ -245,13 +245,13 @@ def run_continuous(args) -> int:
         finally:
             live_transfer_scheduler_active = False
 
-    def stop_reporter() -> None:
+    def stop_reporter(*, graceful: bool = False) -> None:
         nonlocal reporter
         if reporter is None:
             return
         if runtime.peers is not None:
             runtime.peers.ledger.set_append_listener(None)
-        reporter.close()
+        reporter.close(graceful=graceful)
         reporter = None
 
     try:
@@ -318,8 +318,11 @@ def run_continuous(args) -> int:
             else:
                 os.environ[LIFECYCLE_ENV] = previous_lifecycle
 
-        stop_reporter()
-        if getattr(runtime, "_v839_sampling_done_reported", False) is not True:
+        sampling_complete_queued = (
+            getattr(runtime, "_v839_sampling_done_reported", False) is True
+        )
+        stop_reporter(graceful=sampling_complete_queued)
+        if not sampling_complete_queued:
             _log("sampling done")
         runtime.wait_quiescent(timeout=args.drain_timeout)
 

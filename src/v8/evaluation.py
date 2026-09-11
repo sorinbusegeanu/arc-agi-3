@@ -165,11 +165,41 @@ class ScientificHypothesisEvaluator:
             return actual in {"PARTIALLY_VALID", "VALID"}
         return actual == "VALID"
 
+    def _intrinsic_status(
+        self,
+        contract: HypothesisContract,
+        kinds: dict[str, list[EvidenceRecord]],
+    ) -> str:
+        """Evaluate one contract without dependency ordering effects."""
+        required_raw = [
+            row for kind in contract.required_kinds for row in kinds.get(kind, ())
+        ]
+        partial_raw = [
+            row for kind in contract.partial_kinds for row in kinds.get(kind, ())
+        ]
+        negative_raw = [
+            row for kind in contract.negative_kinds for row in kinds.get(kind, ())
+        ]
+        required = [row for row in required_raw if self._admissible(row, contract)]
+        negative = [row for row in negative_raw if row.quality_valid()]
+        if negative and not self._enough(required, contract):
+            return "INVALID"
+        if self._enough(required_raw, contract) and self._enough(required, contract):
+            return "VALID"
+        if partial_raw or required_raw:
+            return "PARTIALLY_VALID"
+        return "INSUFFICIENT_EVIDENCE"
+
     def evaluate(self, evidence: Iterable[EvidenceRecord]) -> tuple[HypothesisDecision, ...]:
         rows = tuple(evidence)
         kinds: dict[str, list[EvidenceRecord]] = {}
         for row in rows:
             kinds.setdefault(row.evidence_kind, []).append(row)
+
+        intrinsic_statuses = {
+            contract.hypothesis_id: self._intrinsic_status(contract, kinds)
+            for contract in CONTRACTS
+        }
 
         decisions: list[HypothesisDecision] = []
         decided: dict[str, str] = {}
@@ -197,7 +227,10 @@ class ScientificHypothesisEvaluator:
             blocked_dependencies = [
                 dep
                 for dep in contract.dependencies
-                if not self._dependency_satisfied(decided.get(dep), contract.dependency_min_status)
+                if not self._dependency_satisfied(
+                    decided.get(dep, intrinsic_statuses.get(dep)),
+                    contract.dependency_min_status,
+                )
             ]
             dependency_gate = "PASS" if not blocked_dependencies else "BLOCKED"
 

@@ -35,6 +35,7 @@ _EDGE_OFFSET_KEY = ("__v862_edge_offset", 0, 0)
 _COHERENT_WATERMARK_INTERVAL = 10_000
 _COHERENT_TIME_INTERVAL_SECONDS = 15.0
 _COHERENT_MIN_WATERMARK_PROGRESS = 2_000
+_FINAL_STABILIZATION_WINDOWS = 2
 
 
 def _stable_arena_rows(arena, start: int, count: int, *, timeout: float = _SLICE_READ_TIMEOUT):
@@ -282,7 +283,20 @@ def _runtime_wait_quiescent_v862(
                     stable_checks=stable_checks, resume_peers=False, settle_peers=False,
                 )
 
-            stabilize(max_cycles=8, commit_proposals=commit_proposals, timeout=timeout)
+            reason = None
+            for _window in range(_FINAL_STABILIZATION_WINDOWS):
+                reason = stabilize(
+                    max_cycles=8,
+                    commit_proposals=commit_proposals,
+                    timeout=timeout,
+                )
+                if reason != "max_cycles":
+                    break
+            if reason == "max_cycles":
+                raise TimeoutError(
+                    "v8 developmental finalization did not stabilize after "
+                    f"{_FINAL_STABILIZATION_WINDOWS} bounded windows"
+                )
             self._v82_developmental_finalized = True
             self._v82_developmental_finalized_generation = int(
                 getattr(self, "generation", generation)

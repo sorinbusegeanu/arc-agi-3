@@ -326,10 +326,13 @@ def _peer_init_v841(self, *args, **kwargs):
 
 def _parallel_analyses_v841(self, nodes, edges):
     pool = self._v841_peer_executor
+    relational_roles = getattr(self.roles, "propose_relational", None)
+    role_fn = relational_roles if callable(relational_roles) else self.roles.propose
+    role_args = (nodes, edges) if callable(relational_roles) else (nodes,)
     futures = {
         "prediction": pool.submit(self.prediction.evaluate, nodes),
         "context": pool.submit(self.context.propose, nodes),
-        "roles": pool.submit(self.roles.propose, nodes),
+        "roles": pool.submit(role_fn, *role_args),
         "future": pool.submit(self.future_options.evaluate, nodes),
         "compression": pool.submit(self.compression.evaluate, nodes, edges),
         "similarity": pool.submit(self.similarity.evaluate, nodes, edges),

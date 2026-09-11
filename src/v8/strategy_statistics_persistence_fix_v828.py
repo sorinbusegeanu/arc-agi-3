@@ -167,8 +167,8 @@ def _emit_committed_strategy_efficiency(supervisor) -> int:
         int(CognitiveState.REACTIVATED),
     }
     emitted = 0
-    eligible = 0
-    unmatched = 0
+    considered = 0
+    rejection_counts: dict[str, int] = defaultdict(int)
     for context_bucket, rows in getattr(view, "_strategy_by_context", {}).items():
         grouped: dict[MemoryUid, list[object]] = defaultdict(list)
         for item in rows:
@@ -176,18 +176,22 @@ def _emit_committed_strategy_efficiency(supervisor) -> int:
         for _outcome_uid, cohort in grouped.items():
             empirical = []
             for item in cohort:
+                considered += 1
                 source = by_uid.get(item.strategy_uid)
                 if source is None:
+                    rejection_counts["strategy_source_unavailable"] += 1
                     continue
                 if int(source.cognitive_state) not in empirical_states:
+                    rejection_counts["strategy_not_empirically_admissible"] += 1
                     continue
                 if float(source.attempt_weight) <= 0.0:
+                    rejection_counts["strategy_without_empirical_attempt"] += 1
                     continue
                 empirical.append((item, source))
             if len(empirical) < 2:
-                unmatched += len(empirical)
+                if empirical:
+                    rejection_counts["no_same_m6_outcome_comparator"] += len(empirical)
                 continue
-            eligible += len(empirical)
             best = min(max(1e-9, float(item.mean_cost)) for item, _source in empirical)
             for item, source in empirical:
                 if not supervisor._fresh(
@@ -204,11 +208,9 @@ def _emit_committed_strategy_efficiency(supervisor) -> int:
     flow.emit_bounded(
         "strategy_efficiency",
         "matched_m6_outcome_cost_comparison",
-        input_count=eligible + unmatched,
+        input_count=considered,
         output_count=emitted,
-        rejection_counts=(
-            {"no_same_m6_outcome_comparator": unmatched} if unmatched else {}
-        ),
+        rejection_counts=dict(rejection_counts),
     )
     return emitted
 

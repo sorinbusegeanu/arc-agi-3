@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from collections import defaultdict
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from v8 import actor
 from v8.model import CognitiveState, MemoryUid
@@ -155,6 +156,46 @@ class StrategyStatisticsPersistenceFixTests(unittest.TestCase):
 
         self.assertEqual(_emit_committed_strategy_efficiency(Supervisor()), 2)
         self.assertEqual({kind for kind, _uid, _value in emitted}, {"strategy_efficiency"})
+
+    def test_zero_attempt_strategies_are_reported_as_rejected_inputs(self) -> None:
+        outcome = MemoryUid(30, 31)
+        strategy_uid = MemoryUid(32, 33)
+        source = SimpleNamespace(
+            uid=strategy_uid,
+            cognitive_state=int(CognitiveState.ACTIVE),
+            attempt_weight=0.0,
+            updated_watermark=40,
+        )
+
+        class View:
+            _node_by_uid = {strategy_uid: source}
+            _strategy_by_context = {
+                202: [
+                    SimpleNamespace(
+                        strategy_uid=strategy_uid,
+                        outcome_uid=outcome,
+                        mean_cost=1.0,
+                    )
+                ]
+            }
+
+            def invalidate_strategy_cache(self):
+                return None
+
+            def _refresh_strategy_cache(self):
+                return None
+
+        class Supervisor:
+            read_view = View()
+
+        with patch("v8.information_flow_diagnostics.emit_bounded") as emit:
+            self.assertEqual(_emit_committed_strategy_efficiency(Supervisor()), 0)
+
+        self.assertEqual(emit.call_args.kwargs["input_count"], 1)
+        self.assertEqual(
+            emit.call_args.kwargs["rejection_counts"],
+            {"strategy_without_empirical_attempt": 1},
+        )
 
 
 if __name__ == "__main__":

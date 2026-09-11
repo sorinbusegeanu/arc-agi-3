@@ -103,15 +103,18 @@ def test_normalized_generations_commit_between_immutable_cuts(
     assert role in kinds[2] and concept not in kinds[2]
     assert concept in kinds[3]
     assert correspondence_cuts == cuts
-    assert result == "stable"
+    # The bounded window may end immediately after the required full relational
+    # analysis introduces a distinct edge-aware role. Runtime finalization owns
+    # the continuation window that commits its downstream generations.
+    assert result == "max_cycles"
     assert not pending
     records = [json.loads(line) for line in (tmp_path / flow.LOG_NAME).read_text().splitlines()]
     records = [row for row in records if row["stage"] == "stabilization"]
     assert records[0]["new_m3_carrier_count"] == 2
     assert records[1]["new_m3_role_count"] >= 1
     assert records[2]["new_m4_count"] >= 1
-    assert records[-1]["stop_reason"] == "stable"
-    assert records[-1]["output_count"] == 0
+    assert records[-1]["stop_reason"] == "max_cycles"
+    assert records[-1]["new_m3_role_count"] >= 1
 
 
 def test_stabilization_hard_cap_and_cancellation_restore(developmental_graph, monkeypatch):

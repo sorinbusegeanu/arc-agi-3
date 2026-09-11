@@ -403,6 +403,17 @@ class DevelopmentalPeerSupervisor:
 
             if cancelled():
                 return
+            flow.emit(
+                "context_refinement",
+                "partition_proposal",
+                input_count=int(getattr(self.context, "last_input_count", 0)),
+                output_count=int(getattr(self.context, "last_output_count", 0)),
+                rejection_counts=getattr(self.context, "last_rejections", {}),
+                fields={
+                    "m1_row_count": int(getattr(self.context, "last_row_count", 0)),
+                    "proposal_count": len(analyses["context"]),
+                },
+            )
             for refinement in analyses["context"][: self.candidate_budget]:
                 source = by_uid.get(refinement.source_uid)
                 if source is None or not self._fresh(
