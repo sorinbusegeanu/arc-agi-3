@@ -99,6 +99,29 @@ class PreferenceProbeResult:
     context_bucket: int
     chosen_outcome: MemoryUid
     preference_influenced: bool
+    both_reachable: bool = False
+
+
+def _comparison_outcomes_reachable(view, primary, alternative, context: int, actions) -> bool:
+    """Require two exact-context, executable, causally grounded outcome plans."""
+    from v8.behavior_recovery import _strategy_can_probe
+
+    if primary.outcome_uid == alternative.outcome_uid:
+        return False
+    available = {int(value) for value in actions}
+    context_bucket = stable_u64(int(context), person=b"v8-context")
+    for plan in (primary, alternative):
+        if int(plan.action_id) not in available:
+            return False
+        source = getattr(view, "_node_by_uid", {}).get(plan.strategy_uid)
+        if (
+            source is None
+            or len(source.key_parts) < 4
+            or int(source.key_parts[3]) != int(context_bucket)
+            or not _strategy_can_probe(view, plan.strategy_uid, plan.outcome_uid)
+        ):
+            return False
+    return True
 
 
 def _select_replanning_ablation(view, primary, context: int, actions):
@@ -512,30 +535,25 @@ def actor_worker(
             if planned is not None:
                 alternatives = [row for row in plans[1:] if row.outcome_uid != planned.outcome_uid]
                 if alternatives and len(preference_probes) < int(job.max_probe_records):
+                    both_reachable = _comparison_outcomes_reachable(
+                        view, planned, alternatives[0], context, before_actions
+                    )
                     probe = PreferenceProbeResult(
                         planned.outcome_uid,
                         alternatives[0].outcome_uid,
                         stable_u64(context, person=b"v8-context"),
                         planned.outcome_uid,
                         bool(planned.preference_influenced),
+                        both_reachable,
                     )
                     preference_probes.append(probe)
                     pending_preference_probes.append(probe)
 
-                has_same_outcome = any(
-                    row.outcome_uid == planned.outcome_uid
-                    and row.strategy_uid != planned.strategy_uid
-                    for row in plans[1:]
-                )
-                alternative = (
-                    _select_replanning_ablation(
-                        view,
-                        planned,
-                        context,
-                        before_actions,
-                    )
-                    if has_same_outcome
-                    else None
+                alternative = _select_replanning_ablation(
+                    view,
+                    planned,
+                    context,
+                    before_actions,
                 )
                 if (
                     alternative is not None

@@ -115,6 +115,138 @@ class CompleteClickCoverageTests(unittest.TestCase):
                 all(row["x"] % 8 == 4 and row["y"] % 8 == 4 for row in decoded)
             )
 
+    def test_actor_lanes_choose_distinct_color_partitions(self):
+        frame = np.zeros((16, 16), dtype=np.int64)
+        frame[:, 8:] = 5
+        game = SimpleNamespace(
+            camera=SimpleNamespace(width=2, height=2, x=0, y=0),
+            current_level=SimpleNamespace(grid_size=(2, 2)),
+        )
+        colors = []
+        for actor_id in (1, 2):
+            env = SimpleNamespace(
+                env=SimpleNamespace(_game=game),
+                _v848_click_seed=0,
+                _v848_click_target_color=None,
+                _v848_replayable_clicks=set(),
+                last_levels_completed=0,
+            )
+            sampler = SimpleNamespace(game_id="g", base=SimpleNamespace())
+            v848.configure_actor_exploration_v848(
+                env, sampler, actor_id=actor_id
+            )
+            tokens = v848._canonical_click_tokens(env, frame)
+            payload = unpack_action_choice(tokens[0])[1]
+            colors.append(int(frame[payload["y"], payload["x"]]))
+        self.assertEqual(colors, [0, 5])
+
+    def test_replay_cohort_does_not_alias_onto_one_four_color_partition(self):
+        frame = np.zeros((16, 16), dtype=np.int64)
+        frame[0:8, 8:16] = 1
+        frame[8:16, 0:8] = 2
+        frame[8:16, 8:16] = 3
+        game = SimpleNamespace(
+            camera=SimpleNamespace(width=2, height=2, x=0, y=0),
+            current_level=SimpleNamespace(grid_size=(2, 2)),
+        )
+        colors = set()
+        with (
+            patch(
+                "v8.verified_success_metrics_v866.best_durable_complete_v866",
+                return_value=None,
+            ),
+            patch(
+                "v8.verified_success_metrics_v866.best_historical_partial_v866",
+                return_value=None,
+            ),
+        ):
+            for actor_id in (4, 8, 12, 16):
+                env = SimpleNamespace(
+                    env=SimpleNamespace(_game=game),
+                    _v848_click_seed=0,
+                    _v848_click_target_color=None,
+                    _v848_replayable_clicks=set(),
+                    last_levels_completed=0,
+                )
+                sampler = SimpleNamespace(game_id="gp02", base=SimpleNamespace())
+                v848.configure_actor_exploration_v848(
+                    env, sampler, actor_id=actor_id
+                )
+                token = v848._canonical_click_tokens(env, frame)[0]
+                payload = unpack_action_choice(token)[1]
+                colors.add(int(frame[payload["y"], payload["x"]]))
+        self.assertEqual(colors, {0, 1, 2, 3})
+
+    def test_actor_lanes_use_distinct_deterministic_coordinate_orders(self):
+        actions = tuple(pack_action_choice(6, x, 0) for x in range(20))
+
+        def first_for_lane(lane):
+            sampler = SimpleNamespace(
+                _v848_actor_lane=lane,
+                _v848_scan_available=actions,
+                _v848_scan_tried=set(),
+                base=SimpleNamespace(current=None),
+            )
+            with patch.object(v848, "_BASE_SAMPLER_FORCED_ACTION", return_value=None):
+                return v848._sampler_forced_action_v848(
+                    sampler,
+                    level=0,
+                    context=10,
+                    actions=actions,
+                    history=(),
+                )
+
+        selected = tuple(first_for_lane(lane) for lane in range(4))
+        self.assertEqual(len(set(selected)), 4)
+        self.assertEqual(selected, tuple(first_for_lane(lane) for lane in range(4)))
+
+    def test_level_boundary_reselects_color_partition(self):
+        grid = np.zeros((8, 8), dtype=np.int64)
+        env = SimpleNamespace(
+            _last_grid=grid,
+            _v848_click_seed=0,
+            _v848_click_page=0,
+            _v848_click_page_tried=set(),
+            _v848_replayable_clicks=set(),
+            _v848_click_target_color=7,
+            _v848_actor_lane=0,
+            last_levels_completed=0,
+            level_completed_event=False,
+            last_outcome_state="NOT_FINISHED",
+        )
+        action = pack_action_choice(6, 0, 0)
+
+        def advance(instance, _action):
+            instance.last_levels_completed = 1
+            instance.level_completed_event = True
+            return instance._last_grid
+
+        with (
+            patch.object(v848, "_exact_click_pages", return_value=((action,),)),
+            patch.object(v848, "_BASE_ENV_STEP", side_effect=advance),
+        ):
+            v848._env_step_v848(env, action)
+        self.assertIsNone(env._v848_click_target_color)
+        self.assertIsNone(env._v848_click_page)
+
+    def test_only_one_actor_cohort_replays_historical_partial(self):
+        action = pack_action_choice(6, 1, 1)
+        partial = {"levels_completed": 3, "actions": [action]}
+        replay_counts = []
+        with patch(
+            "v8.verified_success_metrics_v866.best_historical_partial_v866",
+            return_value=partial,
+        ):
+            for actor_id in (1, 2, 3, 4):
+                env = SimpleNamespace()
+                sampler = PortfolioSampler("gp02", seed=actor_id)
+                sampler.begin_lease(actor_id)
+                v848.configure_actor_exploration_v848(
+                    env, sampler, actor_id=actor_id
+                )
+                replay_counts.append(len(sampler.base.replay_actions))
+        self.assertEqual(replay_counts, [0, 0, 0, 1])
+
     def test_click_scan_keeps_long_observable_sweep_in_one_episode(self):
         # 60 distinct cells while the rendered display remains inside the exact
         # action codec's [0,63] coordinate contract.

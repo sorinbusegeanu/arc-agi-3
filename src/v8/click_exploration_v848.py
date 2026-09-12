@@ -23,6 +23,7 @@ rest of the run.
 import math
 import statistics
 from collections import defaultdict
+from collections import deque
 from typing import Iterable
 
 
@@ -122,6 +123,8 @@ def _ensure_env_click_state(env) -> None:
         env._v848_replayable_clicks = set()
     if not hasattr(env, "_v848_click_target_color"):
         env._v848_click_target_color = None
+    if not hasattr(env, "_v848_actor_lane"):
+        env._v848_actor_lane = None
 
 
 def _env_init_v848(self, *args, **kwargs) -> None:
@@ -132,6 +135,50 @@ def _env_init_v848(self, *args, **kwargs) -> None:
     self._v848_click_page_tried = set()
     self._v848_replayable_clicks = set()
     self._v848_click_target_color = None
+    self._v848_actor_lane = None
+
+
+def configure_actor_exploration_v848(env, sampler, *, actor_id: int) -> None:
+    """Give each actor an explicit exploration lane and some lanes partial replay."""
+    _ensure_env_click_state(env)
+    # Direct actor-id modulo partitioning aliases the replay cohort (4, 8, 12,
+    # ...) onto the same partition whenever a grid has two or four colors. Fold
+    # higher id bits down and include the lease seed so both parallel actors and
+    # later attempts cover different deterministic orders.
+    actor_lane = max(0, int(actor_id) - 1)
+    lane = actor_lane ^ (actor_lane >> 2) ^ max(
+        0, int(getattr(env, "_v848_click_seed", 0))
+    )
+    env._v848_actor_lane = lane
+    sampler._v848_actor_lane = lane
+
+    # One lane in four resumes the strongest verified prefix.  The remaining
+    # lanes continue independent discovery, so replay cannot collapse the whole
+    # pool onto one trajectory.
+    if int(actor_id) <= 0 or int(actor_id) % 4:
+        return
+    try:
+        from v8.verified_success_metrics_v866 import (
+            best_durable_complete_v866,
+            best_historical_partial_v866,
+        )
+
+        partial = best_durable_complete_v866(str(sampler.game_id))
+        if partial is None:
+            partial = best_historical_partial_v866(str(sampler.game_id))
+    except (OSError, TypeError, ValueError):
+        partial = None
+    if not isinstance(partial, dict):
+        return
+    actions = tuple(int(value) for value in partial.get("actions", ()))
+    if not actions or not all(_is_exact_click_token(value) for value in actions):
+        return
+    env._v848_replayable_clicks.update(actions)
+    sampler.base.replay_actions = deque(actions)
+    sampler.base.replay_target = None
+    sampler._v848_historical_replay_levels = max(
+        0, int(partial.get("levels_completed", 0) or 0)
+    )
 
 
 def _canonical_click_cells(env, grid) -> tuple[tuple[int, int, int], ...]:
@@ -184,7 +231,10 @@ def _canonical_click_tokens(env, grid) -> tuple[int, ...]:
     colors = tuple(sorted({int(color) for color, _x, _y in rows}))
     selected = getattr(env, "_v848_click_target_color", None)
     if selected not in colors:
-        selected = int(colors[int(env._v848_click_seed) % len(colors)])
+        level = max(0, int(getattr(env, "last_levels_completed", 0)))
+        lane_raw = getattr(env, "_v848_actor_lane", None)
+        lane = int(env._v848_click_seed) if lane_raw is None else max(0, int(lane_raw))
+        selected = int(colors[(lane + level) % len(colors)])
         env._v848_click_target_color = selected
     return tuple(
         pack_action_choice(6, int(x), int(y))
@@ -218,7 +268,10 @@ def _env_available_v848(self):
         return list(base)
     pages = len(exact_pages)
     if self._v848_click_page is None:
-        self._v848_click_page = int(self._v848_click_seed) % int(pages)
+        level = max(0, int(getattr(self, "last_levels_completed", 0)))
+        lane_raw = getattr(self, "_v848_actor_lane", None)
+        lane = int(self._v848_click_seed) if lane_raw is None else max(0, int(lane_raw))
+        self._v848_click_page = (lane + level) % int(pages)
     else:
         self._v848_click_page = int(self._v848_click_page) % int(pages)
 
@@ -242,7 +295,10 @@ def _env_step_v848(self, action):
     exact_pages = _exact_click_pages(self, before)
     pages = len(exact_pages)
     if pages > 0 and self._v848_click_page is None:
-        self._v848_click_page = int(self._v848_click_seed) % int(pages)
+        level = max(0, int(getattr(self, "last_levels_completed", 0)))
+        lane_raw = getattr(self, "_v848_actor_lane", None)
+        lane = int(self._v848_click_seed) if lane_raw is None else max(0, int(lane_raw))
+        self._v848_click_page = (lane + level) % int(pages)
     page_tokens = set(
         exact_pages[int(self._v848_click_page or 0) % pages]
         if pages > 0
@@ -270,6 +326,9 @@ def _env_step_v848(self, action):
     if level_progress:
         self._v848_click_page = None
         self._v848_click_page_tried.clear()
+        # A color is an observation-local exploration partition, not a durable
+        # semantic target.  Re-select for the next level using its actor lane.
+        self._v848_click_target_color = None
 
     # Advance only after every exact coordinate in the exposed page has actually
     # been tried. This prevents an ever-moving target set from leaving untested
@@ -369,7 +428,22 @@ def _sampler_forced_action_v848(
     )
     if not candidates:
         return None
-    action = min(candidates)
+    lane = getattr(self, "_v848_actor_lane", None)
+    if lane is None:
+        action = min(candidates)
+    else:
+        from v8.model import stable_u64
+
+        action = min(
+            candidates,
+            key=lambda value: stable_u64(
+                int(lane),
+                int(level),
+                int(context),
+                int(value),
+                person=b"v8-click-lane",
+            ),
+        )
     self._v848_scan_tried.add(action)
     self.base.current = sampling.Intervention(
         "CLICK_SCAN",

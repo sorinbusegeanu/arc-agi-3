@@ -356,36 +356,59 @@ class DevelopmentalPeerSupervisor:
 
             if cancelled():
                 return
+            prediction_publication_rejections: dict[str, int] = {}
+            supported_published = 0
+            violations_published = 0
+
+            def reject_prediction(reason: str) -> None:
+                prediction_publication_rejections[reason] = (
+                    prediction_publication_rejections.get(reason, 0) + 1
+                )
+
             for evidence_index, evidence in enumerate(analyses["prediction"]):
                 if evidence_index % 256 == 0 and cancelled():
                     return
                 uid = evidence.expectation_uid
                 row = by_uid.get(uid)
                 if row is None:
+                    reject_prediction("expectation_source_missing")
                     continue
                 if self._fresh("prediction", uid, row.updated_watermark):
                     self._append_evidence("supported_prediction", row, 1.0)
+                    supported_published += 1
+                else:
+                    reject_prediction("supported_prediction_already_published")
                 if evidence.violated:
                     observation = by_uid.get(evidence.observation_uid)
-                    if observation is not None and self._fresh(
-                        f"prediction_violation:{uid.hex()}",
-                        observation.uid,
+                    if observation is None:
+                        reject_prediction("contradictory_observation_missing")
+                        continue
+                    if not self._fresh(
+                        f"prediction_violation:{uid.hex()}", observation.uid,
                         observation.updated_watermark,
                     ):
-                        self._append_evidence(
-                            "prediction_violation",
-                            row,
-                            evidence.error,
-                            causal_intervention=(
-                                "contradictory_observation_for_supported_expectation:"
-                                f"{evidence.observation_uid.hex()}"
-                            ),
-                            effect_direction=1,
-                        )
+                        reject_prediction("prediction_violation_already_published")
+                        continue
+                    self._append_evidence(
+                        "prediction_violation",
+                        row,
+                        evidence.error,
+                        causal_intervention=(
+                            "contradictory_observation_for_supported_expectation:"
+                            f"{evidence.observation_uid.hex()}"
+                        ),
+                        effect_direction=1,
+                    )
+                    violations_published += 1
 
             from v8 import information_flow_diagnostics as flow
             prediction_rows = tuple(analyses["prediction"])
             violations = sum(int(row.violated) for row in prediction_rows)
+            prediction_rejections = dict(
+                getattr(self.prediction, "last_rejections", {})
+            )
+            for reason, count in prediction_publication_rejections.items():
+                prediction_rejections[reason] = prediction_rejections.get(reason, 0) + count
             flow.emit(
                 "prediction",
                 "supported_expectation_evaluation",
@@ -394,10 +417,12 @@ class DevelopmentalPeerSupervisor:
                     if int(row.level) == int(MemoryLevel.M1) and len(row.key_parts) >= 3
                 ),
                 output_count=violations,
-                rejection_counts=getattr(self.prediction, "last_rejections", {}),
+                rejection_counts=prediction_rejections,
                 fields={
                     "supported_expectations": len(prediction_rows),
                     "prediction_violations": violations,
+                    "supported_predictions_published": supported_published,
+                    "prediction_violations_published": violations_published,
                 },
             )
 
@@ -1004,6 +1029,12 @@ class DevelopmentalPeerSupervisor:
         cost: float,
         source_game_hash: int,
     ) -> bool:
+        invalidate = getattr(self.read_view, "invalidate_strategy_cache", None)
+        if callable(invalidate):
+            invalidate()
+        refresh = getattr(self.read_view, "_refresh_strategy_cache", None)
+        if callable(refresh):
+            refresh()
         row = getattr(self.read_view, "_node_by_uid", {}).get(uid)
         if (
             row is None

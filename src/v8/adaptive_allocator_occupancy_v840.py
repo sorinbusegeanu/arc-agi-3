@@ -11,6 +11,7 @@ from pathlib import Path
 
 _INSTALLED = False
 _ACTOR_POOL_ENV = "ARC_AGI3_V8_ACTOR_POOL_SIZE"
+_REPORTING_REFRESH_SECONDS = 5.0
 
 
 @dataclass(slots=True)
@@ -141,6 +142,17 @@ def _advance_periodic_deadline(deadline: float, interval_seconds: float) -> floa
     return next_deadline
 
 
+def _publish_reporting_rows(reporting_queue, rows) -> None:
+    """Publish one cumulative adaptive view without exposing lease-local counters."""
+    if reporting_queue is None:
+        return
+    for row in tuple(rows):
+        try:
+            reporting_queue.put_nowait(row)
+        except queue.Full:
+            break
+
+
 def _occupancy_bounded_lease_steps(
     recommended: int,
     *,
@@ -155,6 +167,43 @@ def _occupancy_bounded_lease_steps(
     slots = max(1, int(idle_slots))
     fair_share = (budget + slots - 1) // slots
     return min(budget, max(1, min(int(recommended), fair_share)))
+
+
+def _historical_completion_lease_steps_v840(
+    worker_id: int,
+    game_id: str,
+    normal_steps: int,
+    *,
+    available: int,
+    base_steps: int,
+) -> int:
+    """Reserve continuity for one replay lane without directing every actor."""
+    normal = max(0, min(int(normal_steps), int(available)))
+    if int(worker_id) <= 0 or int(worker_id) % 4:
+        return normal
+    from v8.verified_success_metrics_v866 import (
+        historical_completion_attempt_steps_v866,
+    )
+
+    required = historical_completion_attempt_steps_v866(str(game_id))
+    if required <= 0:
+        return normal
+    return min(
+        max(0, int(available)),
+        max(1, int(base_steps)),
+        max(normal, int(required)),
+    )
+
+
+def _historical_completion_attempt_limit_v840(
+    *,
+    base_steps: int,
+    attempt_steps: int,
+) -> int:
+    """Use at most half the game budget for repeats, while guaranteeing one."""
+    attempt = max(1, int(attempt_steps))
+    budget = max(1, int(base_steps))
+    return max(1, min(4, budget // (2 * attempt)))
 
 
 def _adaptive_run_actor_jobs_v840(
@@ -254,6 +303,9 @@ def _adaptive_run_actor_jobs_v840(
     started = time.monotonic()
     deadline = None if timeout is None else started + float(timeout)
     next_progress = started + float(progress_interval_seconds)
+    next_reporting = started + min(
+        float(progress_interval_seconds), _REPORTING_REFRESH_SECONDS
+    )
     next_log = started + float(v819._ALLOCATION_LOG_SECONDS)
     next_stdout = started + float(v819._ALLOCATION_STDOUT_SECONDS)
     budget = _BudgetLedger(int(total_budget))
@@ -264,6 +316,7 @@ def _adaptive_run_actor_jobs_v840(
     completed_by_game: dict[str, dict[str, int]] = {}
     provisional_wins: dict[str, float] = {}
     leases_by_game: dict[str, int] = {}
+    completion_leases_by_game: dict[str, int] = {}
     initial_games = list(games)
     no_progress_retries = 0
     final_peer_drain_requested = False
@@ -342,6 +395,26 @@ def _adaptive_run_actor_jobs_v840(
             # long straggler tail in which completed workers cannot be refilled.
             idle_slots=worker_count,
         )
+        if (
+            coordinator.game_state(game) == v819.GameLearningState.UNSOLVED
+            and int(worker_id) > 0
+            and int(worker_id) % 4 == 0
+        ):
+            continuity_steps = _historical_completion_lease_steps_v840(
+                int(worker_id),
+                game,
+                int(steps),
+                available=int(available),
+                base_steps=max(1, int(base_budget_by_game.get(game, 1))),
+            )
+            attempt_limit = _historical_completion_attempt_limit_v840(
+                base_steps=max(1, int(base_budget_by_game.get(game, 1))),
+                attempt_steps=max(1, int(continuity_steps)),
+            )
+            prior_attempts = int(completion_leases_by_game.get(game, 0))
+            if continuity_steps > steps and prior_attempts < attempt_limit:
+                steps = int(continuity_steps)
+                completion_leases_by_game[game] = prior_attempts + 1
         lease_id += 1
         excluded = (
             coordinator.alternative_exclusion(game)
@@ -482,6 +555,19 @@ def _adaptive_run_actor_jobs_v840(
                 raise RuntimeError(f"adaptive actor failed: {detail}")
 
             now = time.monotonic()
+            if now >= next_reporting:
+                rows = v819._adaptive_progress_rows(
+                    actor_module,
+                    jobs,
+                    completed_by_game,
+                    active_progress,
+                    active_leases,
+                )
+                _publish_reporting_rows(reporting_queue, rows)
+                next_reporting = _advance_periodic_deadline(
+                    next_reporting,
+                    min(float(progress_interval_seconds), _REPORTING_REFRESH_SECONDS),
+                )
             if now >= next_progress:
                 rows = v819._adaptive_progress_rows(
                     actor_module,
@@ -490,12 +576,6 @@ def _adaptive_run_actor_jobs_v840(
                     active_progress,
                     active_leases,
                 )
-                if reporting_queue is not None:
-                    for row in rows:
-                        try:
-                            reporting_queue.put_nowait(row)
-                        except queue.Full:
-                            break
                 if progress_callback is not None:
                     progress_callback(rows)
                 while next_progress <= now:
@@ -533,12 +613,7 @@ def _adaptive_run_actor_jobs_v840(
             {},
             {},
         )
-        if reporting_queue is not None:
-            for row in final_rows:
-                try:
-                    reporting_queue.put_nowait(row)
-                except queue.Full:
-                    break
+        _publish_reporting_rows(reporting_queue, final_rows)
         if progress_callback is not None:
             progress_callback(final_rows)
         perf._write_allocation_log_live(runtime, coordinator, completed_by_game, {}, {})

@@ -263,38 +263,36 @@ def _append_evidence_v054(self, kind, row, value, **kwargs):
             else MemoryUid.zero()
         )
         context_bucket = int(row.key_parts[3]) if len(row.key_parts) >= 4 else 0
-        by_uid = getattr(self.read_view, "_node_by_uid", {})
-        active_states = {
+        runtime = getattr(getattr(self, "submit_proposal", None), "__self__", None)
+        view = getattr(runtime, "read_view", None) or self.read_view
+        nodes = tuple(view.node_records())
+        empirical_states = {
+            int(CognitiveState.CANDIDATE),
+            int(CognitiveState.PROBATION),
             int(CognitiveState.ACTIVE),
             int(CognitiveState.VALIDATED),
             int(CognitiveState.REACTIVATED),
         }
         cohort = tuple(
-            item
-            for item in getattr(self.read_view, "_strategy_by_context", {}).get(
-                context_bucket, ()
-            )
-            if item.outcome_uid == outcome_uid
+            source for source in nodes
+            if int(source.level) == int(MemoryLevel.M7)
+            and int(source.memory_type) == int(MemoryType.STRATEGY)
+            and len(source.key_parts) >= 4
+            and int(source.key_parts[3]) == context_bucket
+            and MemoryUid(int(source.key_parts[1]), int(source.key_parts[2])) == outcome_uid
+            and float(source.attempt_weight) > 0.0
+            and int(source.cognitive_state) in empirical_states
         )
-        empirical = []
-        for item in cohort:
-            source = by_uid.get(item.strategy_uid)
-            if source is None:
-                continue
-            attempts = max(0, int(round(float(source.attempt_weight))))
-            if attempts <= 0 or int(source.cognitive_state) not in active_states:
-                continue
-            empirical.append(item)
-        if len(empirical) < 2:
+        if len(cohort) < 2:
             return None
-        best = min(item.mean_cost for item in empirical)
-        current = next(
-            (item for item in empirical if item.strategy_uid == row.uid),
-            None,
-        )
+        costs = {
+            source.uid: max(1e-9, float(source.cost_sum) / float(source.attempt_weight))
+            for source in cohort
+        }
+        current = costs.get(row.uid)
         if current is None:
             return None
-        value = best / max(1e-9, current.mean_cost)
+        value = min(costs.values()) / current
     return _BASE_APPEND_EVIDENCE(self, kind, row, value, **kwargs)
 
 

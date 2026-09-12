@@ -4,6 +4,9 @@ from v8.model import CognitiveState, MemoryLevel, MemoryType
 from v8.peers_v82 import V82DevelopmentalPeerSupervisor
 
 
+_STRATEGY_LIFECYCLE_RUN_ONCE_V880 = None
+
+
 _PROBATIONARY = {
     int(CognitiveState.CANDIDATE),
     int(CognitiveState.PROBATION),
@@ -52,15 +55,20 @@ def _advance_probationary_m7(supervisor: V82DevelopmentalPeerSupervisor) -> int:
 
 
 def install_strategy_exploration_lifecycle_v880() -> None:
+    global _STRATEGY_LIFECYCLE_RUN_ONCE_V880
     if getattr(V82DevelopmentalPeerSupervisor, "_v880_strategy_lifecycle_installed", False):
         return
 
     original_run_once = V82DevelopmentalPeerSupervisor.run_once
 
     def run_once(self: V82DevelopmentalPeerSupervisor):
+        before_cycles = int(getattr(self, "_cycles", 0))
         result = original_run_once(self)
+        if int(getattr(self, "_cycles", 0)) == before_cycles:
+            return result
         _advance_probationary_m7(self)
         return result
 
     V82DevelopmentalPeerSupervisor.run_once = run_once
+    _STRATEGY_LIFECYCLE_RUN_ONCE_V880 = run_once
     V82DevelopmentalPeerSupervisor._v880_strategy_lifecycle_installed = True

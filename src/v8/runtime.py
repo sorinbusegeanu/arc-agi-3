@@ -227,6 +227,10 @@ class ContinuousMemoryRuntime:
             if config.enable_peers
             else None
         )
+        if self.peers is not None:
+            # Incremental developmental cadence is current-run relative. A restored
+            # watermark is historical evidence, not progress made by this launch.
+            self.peers._v862_run_origin_watermark = int(self.watermark)
         if self.peers is not None and restored_aux is not None:
             peer_state = restored_aux.get("peers")
             if isinstance(peer_state, dict):
@@ -623,7 +627,7 @@ class ContinuousMemoryRuntime:
                     outcome_b=probe.outcome_b,
                     context_bucket=probe.context_bucket,
                     chosen_outcome=probe.chosen_outcome,
-                    both_reachable=True,
+                    both_reachable=bool(getattr(probe, "both_reachable", False)),
                     preference_influenced=probe.preference_influenced,
                 )
             explicit_trials = tuple(getattr(result, "replanning_trials", ()))

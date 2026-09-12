@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import types
 import unittest
+from unittest.mock import patch
 
 import v8
 from v8 import stabilization_noop_retry_v883 as v883
@@ -58,7 +59,7 @@ class StabilizationNoopRetryV883Tests(unittest.TestCase):
             current._cycles += 1
             current._cut = types.SimpleNamespace(nodes=())
 
-        def formation(current):
+        def formation(current, **_kwargs):
             current._cycles += 1
             current._cut = types.SimpleNamespace(nodes=())
 
@@ -93,7 +94,7 @@ class StabilizationNoopRetryV883Tests(unittest.TestCase):
             current._cycles += 1
             current._cut = types.SimpleNamespace(nodes=())
 
-        def formation(current):
+        def formation(current, **_kwargs):
             current._cycles += 1
             current._cut = types.SimpleNamespace(nodes=())
 
@@ -113,6 +114,34 @@ class StabilizationNoopRetryV883Tests(unittest.TestCase):
         self.assertEqual(result, "stable")
         self.assertEqual(supervisor.calls, 2)
 
+    def test_repeated_direct_noop_is_deferred_without_waiting_for_timeout(self):
+        supervisor = _Supervisor()
+        original = v883._BASE_FULL_CUT_RUN_ONCE
+        original_formation = v883._run_formation_cut_once
+
+        def direct(current):
+            current.calls += 1
+
+        def formation(current, **_kwargs):
+            current._cycles += 1
+            current._cut = types.SimpleNamespace(nodes=())
+
+        try:
+            v883._BASE_FULL_CUT_RUN_ONCE = direct
+            v883._run_formation_cut_once = formation
+            result = v883._run_until_stable_v883(
+                supervisor,
+                max_cycles=2,
+                commit_proposals=lambda: None,
+                timeout=300.0,
+            )
+        finally:
+            v883._BASE_FULL_CUT_RUN_ONCE = original
+            v883._run_formation_cut_once = original_formation
+
+        self.assertEqual(result, "incomplete_cut")
+        self.assertEqual(supervisor.calls, v883._NOOP_RETRY_LIMIT)
+
     def test_partial_cut_still_fails(self):
         supervisor = _Supervisor()
         original = v883._BASE_FULL_CUT_RUN_ONCE
@@ -122,7 +151,7 @@ class StabilizationNoopRetryV883Tests(unittest.TestCase):
             current.calls += 1
             current._cycles += 1
 
-        def formation(current):
+        def formation(current, **_kwargs):
             current._cycles += 1
             current._cut = types.SimpleNamespace(nodes=())
 
@@ -139,6 +168,55 @@ class StabilizationNoopRetryV883Tests(unittest.TestCase):
         finally:
             v883._BASE_FULL_CUT_RUN_ONCE = original
             v883._run_formation_cut_once = original_formation
+
+    def test_aborted_cut_skips_all_post_cut_evidence_wrappers(self):
+        from v8 import outcome_holdout_diagnostics_v828 as diagnostics
+        from v8 import outcome_holdout_v828 as holdout
+        from v8 import strategy_exploration_lifecycle_v880 as lifecycle
+
+        class EmptyView:
+            def node_records(self, *, level=None):
+                return ()
+
+            def edge_records(self):
+                return ()
+
+            def source_games(self, uid, *, max_depth=8):
+                return frozenset()
+
+        supervisor = peers_v82.V82DevelopmentalPeerSupervisor(
+            read_view=EmptyView(),
+            submit_proposal=lambda _proposal: None,
+            watermark=lambda: 0,
+            generation=lambda: 0,
+            interval_seconds=100.0,
+        )
+        supervisor._v841_peer_cancel.set()
+        try:
+            with (
+                patch.object(
+                    holdout,
+                    "_build_validations",
+                    side_effect=AssertionError("holdout ran after an aborted cut"),
+                ),
+                patch.object(
+                    diagnostics,
+                    "_emit_h13_diagnostics",
+                    side_effect=AssertionError("diagnostics ran after an aborted cut"),
+                ),
+                patch.object(
+                    lifecycle,
+                    "_advance_probationary_m7",
+                    side_effect=AssertionError("lifecycle ran after an aborted cut"),
+                ),
+            ):
+                holdout._HOLDOUT_RUN_ONCE_V828(supervisor)
+                diagnostics._DIAGNOSTIC_RUN_ONCE_V828(supervisor)
+                lifecycle._STRATEGY_LIFECYCLE_RUN_ONCE_V880(supervisor)
+        finally:
+            supervisor.close()
+
+        self.assertEqual(supervisor._cycles, 0)
 
     def test_runtime_stack_installs_v883_authority(self):
         self.assertIs(peers_v82.V82DevelopmentalPeerSupervisor.run_until_stable, v883._run_until_stable_v883)

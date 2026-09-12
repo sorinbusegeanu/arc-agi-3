@@ -119,7 +119,14 @@ def _game_token(game_id: str) -> str:
 def _state_path(sampler) -> Path | None:
     root = _state_root(sampler)
     actor_id = int(getattr(sampler, "_v847_actor_id", 0))
-    return None if root is None or actor_id <= 0 else root / f"{_game_token(sampler.game_id)}-{actor_id}.json"
+    if root is None or actor_id <= 0:
+        return None
+    # Actor ids are reused by every continuous-run process.  The old filename
+    # therefore replaced the preceding run's graph with the new actor-local
+    # graph, erasing exactly the deeper transitions a restart was meant to use.
+    # A process-scoped producer component makes every run additive while the
+    # existing game-token glob in _refresh_shared remains backward compatible.
+    return root / f"{_game_token(sampler.game_id)}-{os.getpid()}-{actor_id}.json"
 
 
 def _merge_edge(target: TransitionEdge, incoming: TransitionEdge) -> None:
@@ -296,6 +303,17 @@ def _forced_action_v861(self, *, level: int, context: int, actions: tuple[int, .
     _ensure_state(self)
     if (getattr(self, "_v860_pending_action", None) is not None or self.base.replay_actions or self.base.replay_target is not None or self.base.verification is not None or self.active_sequence or getattr(self, "_v832_persist_action", None) is not None):
         return _BASE_FORCED_ACTION(self, level=level, context=context, actions=tuple(actions), history=tuple(history))
+    # Three lanes in four are independent coverage lanes.  The transition graph
+    # used to preempt v8.48's pending lane scan here, collapsing every actor back
+    # onto the same learned action.  Returning None lets the outer v8.48 wrapper
+    # consume its own lane; the fourth lane remains graph/replay directed.
+    actor_id = max(0, int(getattr(self, "_v847_actor_id", 0)))
+    if (
+        actor_id > 0
+        and actor_id % 4
+        and bool(getattr(self, "_v848_scan_available", ()))
+    ):
+        return None
     self._v861_decisions += 1
     if self._v861_decisions == 1 or self._v861_decisions % _REFRESH_EVERY == 0:
         _save_local(self)

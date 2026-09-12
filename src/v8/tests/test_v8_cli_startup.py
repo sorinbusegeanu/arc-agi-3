@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from v8.__main__ import run as run_entrypoint
 from v8.cli import (
     _graph_load_line,
     _restored_solved_games,
@@ -14,6 +15,23 @@ from v8.cli import (
 
 
 class StartupGraphLineTests(unittest.TestCase):
+    def test_entrypoint_passes_continuous_run_directly_to_cli(self) -> None:
+        argv = [
+            "continuous-run",
+            "--root",
+            "runs/v8/continuous",
+            "--games",
+            "research_1",
+        ]
+        with (
+            patch("v8.__main__.main", return_value=0) as cli_main,
+            patch("v8.__main__.stdout_log_context") as log_context,
+        ):
+            self.assertEqual(run_entrypoint(argv), 0)
+
+        log_context.assert_called_once_with(argv)
+        cli_main.assert_called_once_with(argv)
+
     def test_snapshot_source_and_node_count_are_shown(self) -> None:
         line = _graph_load_line(
             snapshot_path=Path("runs/v8/continuous/snapshots/snapshot-00000000000000000042"),

@@ -79,8 +79,14 @@ def _select_occurrence_holdout_class(
             holdout_members,
             training_games,
         ) = _aggregated_rows(full_class, by_uid, occurrences, int(target_game))
-        if not holdout_rows or len(training_members) < 2 or not training_games:
-            rejected["insufficient_disjoint_training_members"] += 1
+        if not holdout_rows:
+            rejected["target_has_no_holdout_occurrences"] += 1
+            continue
+        if len(training_members) < 2:
+            rejected["fewer_than_two_training_members"] += 1
+            continue
+        if not training_games:
+            rejected["no_training_worlds"] += 1
             continue
         training_class = holdout._derive_class(
             full_class.descriptor,
@@ -90,8 +96,31 @@ def _select_occurrence_holdout_class(
             estimator=estimator,
         )
         if not training_class.persistent:
-            rejected["training_class_not_persistent"] += 1
+            rejected[holdout._persistence_rejection(
+                training_class, estimator, prefix="training"
+            )] += 1
             continue
+        holdout_class = holdout._derive_class(
+            full_class.descriptor,
+            holdout_rows,
+            uid=full_class.uid,
+            version=full_class.version,
+            estimator=estimator,
+        )
+        training_variants = {
+            int(row.key_parts[2]) for row in training_rows if len(row.key_parts) >= 3
+        }
+        holdout_variants = {
+            int(row.key_parts[2]) for row in holdout_rows if len(row.key_parts) >= 3
+        }
+        holdout_consistent = bool(
+            holdout_variants
+            and holdout_variants.issubset(training_variants)
+            and holdout_class.context_consistency >= estimator.context_consistency_threshold
+            and holdout_class.within_class_diameter <= estimator.max_diameter
+            and holdout_class.predictive_interchangeability
+            >= estimator.interchangeability_threshold
+        )
         full_shadow = holdout._derive_class(
             full_class.descriptor,
             full_rows,
@@ -108,8 +137,9 @@ def _select_occurrence_holdout_class(
             holdout_games=(int(target_game),),
             target_game_hash=int(target_game),
             training_persistent=True,
-            holdout_consistent=bool(full_shadow.persistent),
+            holdout_consistent=holdout_consistent,
             training_class=training_class,
+            holdout_class=holdout_class,
             full_class=full_shadow,
             training_occurrences=sum(int(row.support_count) for row in training_rows),
             holdout_occurrences=sum(int(row.support_count) for row in holdout_rows),

@@ -113,7 +113,7 @@ class PreferenceEstimator:
         for probe in self._probes:
             raw = asdict(probe)
             for key in ("outcome_a", "outcome_b", "chosen_outcome"):
-                uid = raw[key]
+                uid = getattr(probe, key)
                 raw[key] = [uid.hi, uid.lo]
             rows.append(raw)
         return {

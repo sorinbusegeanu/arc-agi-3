@@ -112,6 +112,23 @@ class PredictionAndContextTests(unittest.TestCase):
             "insufficient_dominant_expectation_support", estimator.last_rejections
         )
 
+    def test_prediction_rejects_unmatched_contradiction_with_exact_diagnostic(self) -> None:
+        estimator = PredictionEstimator(min_support=3, stability_threshold=0.6)
+        rows = (
+            node(MemoryLevel.M1, MemoryType.CONTINGENCY, (1, 2, 3, 4), support=8),
+            node(
+                MemoryLevel.M1, MemoryType.CONTINGENCY, (1, 2, 9, 5),
+                support=2, prediction_error=0.0,
+            ),
+        )
+        evidence = estimator.evaluate(rows)
+        self.assertEqual(len(evidence), 1)
+        self.assertFalse(evidence[0].violated)
+        self.assertEqual(
+            estimator.last_rejections,
+            {"contradiction_not_causally_matched": 1},
+        )
+
     def test_contradiction_proposes_context_refinement(self) -> None:
         rows = (
             node(MemoryLevel.M1, MemoryType.CONTINGENCY, (1, 2, 3, 4), support=5),
@@ -441,6 +458,20 @@ class TransferPlanningPreferenceTests(unittest.TestCase):
                 )
             )
         self.assertEqual(estimator.evaluate(), ())
+        self.assertEqual(estimator.last_rejection, "choice_not_causally_clean")
+
+    def test_preference_rejects_unreachable_comparison_with_exact_diagnostic(self) -> None:
+        a, b = MemoryUid(10, 10), MemoryUid(20, 20)
+        estimator = PreferenceEstimator(support_threshold=3, stable_margin=0.3)
+        self.assertFalse(estimator.record_probe(
+            outcome_a=a,
+            outcome_b=b,
+            context_bucket=77,
+            chosen_outcome=a,
+            both_reachable=False,
+            preference_influenced=False,
+        ))
+        self.assertEqual(estimator.last_rejection, "alternatives_not_both_reachable")
 
     def test_clean_preference_probes_can_become_stable(self) -> None:
         a, b = MemoryUid(10, 10), MemoryUid(20, 20)

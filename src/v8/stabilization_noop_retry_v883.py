@@ -32,6 +32,7 @@ _INSTALLED = False
 _BASE_RUN_UNTIL_STABLE = None
 _BASE_FULL_CUT_RUN_ONCE = None
 _RETRY_POLL_SECONDS = 0.005
+_NOOP_RETRY_LIMIT = 2
 
 
 def _process_role_formation(self, cut, frozen) -> None:
@@ -96,7 +97,7 @@ def _run_full_cut_once(self) -> None:
         runner(self)
 
 
-def _run_formation_cut_once(self) -> None:
+def _run_formation_cut_once(self, *, include_correspondence: bool = True) -> None:
     """Run one developmental cut without the expensive generic peer analyses."""
     from v8.developmental_cut import capture_developmental_cut
     from v8.peers_v82 import _FrozenCutReadView
@@ -125,7 +126,7 @@ def _run_formation_cut_once(self) -> None:
             self._process_formation(cut, frozen)
             if cancel is None or not cancel.is_set():
                 _process_role_formation(self, cut, frozen)
-            if cancel is None or not cancel.is_set():
+            if include_correspondence and (cancel is None or not cancel.is_set()):
                 self._process_correspondence(cut, frozen)
             if cancel is None or not cancel.is_set():
                 self._cycles += 1
@@ -162,6 +163,10 @@ def _run_until_stable_v883(
 
     limit = min(8, max(1, int(max_cycles)))
     operation_timeout = max(0.0, float(timeout))
+    operation_deadline = time.monotonic() + operation_timeout
+
+    def remaining_timeout() -> float:
+        return max(0.0, operation_deadline - time.monotonic())
     was_paused = self._pause.is_set()
     self.pause()
     cancel = getattr(self, "_v841_peer_cancel", None)
@@ -169,8 +174,16 @@ def _run_until_stable_v883(
     submit = self.submit_proposal
     prior_stabilizing = getattr(self, "_v82_stabilizing", False)
     try:
-        if not self.wait_idle(operation_timeout):
-            raise TimeoutError("v8 peers did not become idle before stabilization")
+        if not self.wait_idle(remaining_timeout()):
+            flow.emit(
+                "developmental",
+                "stabilization",
+                input_count=0,
+                output_count=0,
+                rejection_counts={"peer_cycle_not_idle": 1},
+                fields={"stop_reason": "timeout_waiting_for_idle"},
+            )
+            return "timeout_waiting_for_idle"
         if cancel is not None:
             cancel.clear()
         self._v82_stabilizing = True
@@ -178,7 +191,22 @@ def _run_until_stable_v883(
 
         formation_only = True
         for cycle in range(1, limit + 1):
-            cycle_deadline = time.monotonic() + operation_timeout
+            if remaining_timeout() <= 0.0:
+                flow.emit(
+                    "developmental",
+                    "stabilization",
+                    input_count=0,
+                    output_count=0,
+                    rejection_counts={"overall_timeout_before_next_cut": 1},
+                    fields={
+                        "stabilization_cycle": cycle,
+                        "stabilization_phase": (
+                            "formation" if formation_only else "full_analysis"
+                        ),
+                        "stop_reason": "timeout",
+                    },
+                )
+                return "timeout"
             submitted: dict[MemoryUid, str] = {}
 
             def track(proposal: MemoryProposal) -> None:
@@ -201,6 +229,7 @@ def _run_until_stable_v883(
                 elif level == int(MemoryLevel.M7):
                     submitted[proposal.uid] = "new_m7_count"
 
+            noop_attempts = 0
             while True:
                 before_cut = self.last_developmental_cut
                 before_cycles = self._cycles
@@ -224,10 +253,45 @@ def _run_until_stable_v883(
                     raise RuntimeError(
                         "v8 stabilization produced a partial developmental cut"
                     )
-                if time.monotonic() >= cycle_deadline:
-                    raise TimeoutError(
-                        "v8 stabilization timed out waiting for a developmental cut"
+                noop_attempts += 1
+                if remaining_timeout() <= 0.0:
+                    flow.emit(
+                        "developmental",
+                        "stabilization",
+                        input_count=0,
+                        output_count=0,
+                        rejection_counts={"developmental_cut_timeout": 1},
+                        fields={
+                            "stabilization_cycle": cycle,
+                            "stabilization_phase": (
+                                "formation" if formation_only else "full_analysis"
+                            ),
+                            "noop_attempts": noop_attempts,
+                            "stop_reason": "timeout",
+                        },
                     )
+                    return "timeout"
+                if noop_attempts >= _NOOP_RETRY_LIMIT:
+                    # A wrapper-level no-op is deterministic while peers are
+                    # paused and the graph is unchanged. Retrying it for the full
+                    # drain timeout previously reran post-cut H13 diagnostics for
+                    # minutes and then crashed the otherwise-complete run.
+                    flow.emit(
+                        "developmental",
+                        "stabilization",
+                        input_count=0,
+                        output_count=0,
+                        rejection_counts={"developmental_cut_not_started": 1},
+                        fields={
+                            "stabilization_cycle": cycle,
+                            "stabilization_phase": (
+                                "formation" if formation_only else "full_analysis"
+                            ),
+                            "noop_attempts": noop_attempts,
+                            "stop_reason": "incomplete_cut",
+                        },
+                    )
+                    return "incomplete_cut"
                 time.sleep(_RETRY_POLL_SECONDS)
 
             commit_proposals()

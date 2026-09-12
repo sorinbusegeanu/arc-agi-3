@@ -24,7 +24,7 @@ class ScientificConfig:
     arena_packet_sizes: tuple[tuple[str, int], ...] = ()
     arena_record_sizes: tuple[tuple[str, int], ...] = ()
     default_cli_contract: str = "PYTHONPATH=src python -m v8 continuous-run"
-    default_cli_entrypoint: str = "v8.__main__ -> v8.cli_v819.main + v8.research.default_cli"
+    default_cli_entrypoint: str = "v8.__main__ -> v8.cli_v819.main"
     symbol_codec_version: str = "v9-symbol-codec-1"
     environment_registry_version: int = 1
     multimodal_schema_version: int = 1

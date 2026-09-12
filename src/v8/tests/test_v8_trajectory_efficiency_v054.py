@@ -18,7 +18,7 @@ from v8.trajectory_efficiency_v054 import (
 
 
 class TrajectoryEfficiencyV054Tests(unittest.TestCase):
-    def test_efficiency_evidence_uses_existing_index_without_graph_scan(self):
+    def test_efficiency_evidence_revalidates_against_canonical_empirical_rows(self):
         outcome = MemoryUid(4, 5)
         strategy = MemoryUid(6, 7)
         row = SimpleNamespace(
@@ -43,20 +43,23 @@ class TrajectoryEfficiencyV054Tests(unittest.TestCase):
         )
 
         class ReadView:
-            _node_by_uid = {
-                strategy: SimpleNamespace(
-                    attempt_weight=1.0,
-                    cognitive_state=int(CognitiveState.ACTIVE),
-                ),
-                other: SimpleNamespace(
-                    attempt_weight=1.0,
-                    cognitive_state=int(CognitiveState.ACTIVE),
-                ),
-            }
-            _strategy_by_context = {9: cohort}
-
             def node_records(self, **_kwargs):
-                raise AssertionError("efficiency evidence must not rescan the graph")
+                return (
+                    SimpleNamespace(
+                        uid=strategy, level=int(MemoryLevel.M7),
+                        memory_type=int(MemoryType.STRATEGY),
+                        key_parts=(1, outcome.hi, outcome.lo, 9),
+                        attempt_weight=1.0, cost_sum=4.0,
+                        cognitive_state=int(CognitiveState.ACTIVE),
+                    ),
+                    SimpleNamespace(
+                        uid=other, level=int(MemoryLevel.M7),
+                        memory_type=int(MemoryType.STRATEGY),
+                        key_parts=(2, outcome.hi, outcome.lo, 9),
+                        attempt_weight=1.0, cost_sum=2.0,
+                        cognitive_state=int(CognitiveState.ACTIVE),
+                    ),
+                )
 
         supervisor = SimpleNamespace(read_view=ReadView())
 

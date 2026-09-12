@@ -25,11 +25,15 @@ def _row(uid_lo: int, *, support: int, variant: int):
 
 
 class _ReadView:
-    def __init__(self, edges):
+    def __init__(self, edges, nodes=()):
         self._edges = tuple(edges)
+        self._nodes = tuple(nodes)
 
     def edge_records(self):
         return self._edges
+
+    def node_records(self):
+        return self._nodes
 
 
 class OutcomeHoldoutV828Tests(unittest.TestCase):
@@ -73,6 +77,23 @@ class OutcomeHoldoutV828Tests(unittest.TestCase):
         )
         occurrences = _lineage_occurrences_by_world(_ReadView(edges), (root,))
         self.assertEqual(occurrences[root], {world: 2})
+
+    def test_m1_provenance_support_is_counted_without_higher_level_duplication(self) -> None:
+        root = SimpleNamespace(uid=MemoryUid(3, 1), level=int(MemoryLevel.M6))
+        m1 = SimpleNamespace(uid=MemoryUid(3, 2), level=int(MemoryLevel.M1))
+        world = 89
+        edges = (
+            SimpleNamespace(source_uid=root.uid, target_uid=m1.uid,
+                            relation_type=int(RelationType.EXPLAINS), support_count=1),
+            SimpleNamespace(source_uid=root.uid, target_uid=MemoryUid(0, world),
+                            relation_type=int(RelationType.GAME_PROVENANCE), support_count=7),
+            SimpleNamespace(source_uid=m1.uid, target_uid=MemoryUid(0, world),
+                            relation_type=int(RelationType.GAME_PROVENANCE), support_count=4),
+        )
+        occurrences = _lineage_occurrences_by_world(
+            _ReadView(edges, (root, m1)), (root.uid,)
+        )
+        self.assertEqual(occurrences[root.uid], {world: 4})
 
     def test_shadow_estimator_copies_criteria_without_sharing_state(self) -> None:
         live = OutcomeEquivalenceEstimator(
@@ -144,6 +165,27 @@ class OutcomeHoldoutV828Tests(unittest.TestCase):
             self.assertTrue(validation.training_persistent)
             self.assertFalse(validation.holdout_consistent)
 
+    def test_holdout_cannot_be_rescued_by_training_support(self) -> None:
+        rows = (
+            _row(1, support=6, variant=1),
+            _row(2, support=6, variant=1),
+            _row(3, support=6, variant=5),
+        )
+        by_uid = {row.uid: row for row in rows}
+        occurrences = {
+            rows[0].uid: {20: 6},
+            rows[1].uid: {30: 6},
+            rows[2].uid: {10: 6},
+        }
+        validation = _select_occurrence_holdout_class(
+            self.estimator, self._class(rows), by_uid, occurrences
+        )
+        self.assertIsNotNone(validation)
+        assert validation is not None
+        self.assertEqual(validation.target_game_hash, 10)
+        self.assertFalse(validation.holdout_consistent)
+        self.assertEqual(validation.training_class.context_consistency, 1.0)
+
     def test_insufficient_disjoint_training_support_emits_no_validation(self) -> None:
         rows = (_row(1, support=2, variant=1), _row(2, support=2, variant=1))
         by_uid = {row.uid: row for row in rows}
@@ -153,7 +195,7 @@ class OutcomeHoldoutV828Tests(unittest.TestCase):
             self.estimator, self._class(rows), by_uid, occurrences, rejected
         )
         self.assertIsNone(validation)
-        self.assertGreater(rejected["insufficient_disjoint_training_members"], 0)
+        self.assertGreater(rejected["fewer_than_two_training_members"], 0)
 
     def test_h13_accepts_distinct_heldout_target(self) -> None:
         evidence = EvidenceRecord.for_uid(

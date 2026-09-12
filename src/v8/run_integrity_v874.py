@@ -100,6 +100,7 @@ def _record_verified_success_v874(
     capture_step: int | None,
     trajectory_id: str | None = None,
     root: str | Path | None = None,
+    reset_relative_actions: bool = False,
 ) -> bool:
     persisted = bool(
         _BASE_RECORD_VERIFIED_SUCCESS(
@@ -111,6 +112,7 @@ def _record_verified_success_v874(
             capture_step=capture_step,
             trajectory_id=trajectory_id,
             root=root,
+            reset_relative_actions=bool(reset_relative_actions),
         )
     )
     if persisted and str(terminal_state).upper() == "WIN":

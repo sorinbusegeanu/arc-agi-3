@@ -6,16 +6,35 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from v8 import actor
-from v8.model import CognitiveState, MemoryUid
+from v8.model import CognitiveState, MemoryLevel, MemoryType, MemoryUid
 from v8.strategy_statistics_persistence_fix_v828 import (
     _emit_committed_strategy_efficiency,
     _final_residual_batches,
     _merge_strategy_stats,
+    _run_actor_jobs_v828,
 )
+from v8 import strategy_statistics_persistence_fix_v828 as persistence
 from v8.trajectory_efficiency_v054 import _TRACKER
 
 
 class StrategyStatisticsPersistenceFixTests(unittest.TestCase):
+    @staticmethod
+    def strategy_node(uid, outcome, context, *, attempts, cost, state):
+        return SimpleNamespace(
+            uid=uid,
+            level=int(MemoryLevel.M7),
+            memory_type=int(MemoryType.STRATEGY),
+            key_parts=(1, outcome.hi, outcome.lo, context),
+            cognitive_state=state,
+            attempt_weight=attempts,
+            cost_sum=cost,
+            updated_watermark=20,
+        )
+
+    @staticmethod
+    def outcome_node(uid):
+        return SimpleNamespace(uid=uid, level=int(MemoryLevel.M6))
+
     def test_merge_preserves_normal_stats_and_adds_tracker_only_uid(self) -> None:
         normal_uid = MemoryUid(1, 2)
         tracker_uid = MemoryUid(3, 4)
@@ -57,39 +76,30 @@ class StrategyStatisticsPersistenceFixTests(unittest.TestCase):
         self.assertEqual(stat.successes, 2)
         self.assertEqual(stat.cost, 6.0)
 
+    def test_actor_result_totals_are_not_reingested_as_tracker_residuals(self) -> None:
+        result = SimpleNamespace(strategy_stats=(actor.StrategyRunStat(
+            MemoryUid(9, 10), 5, 3, 10.0
+        ),))
+        runtime = SimpleNamespace(record_actor_results=lambda _rows: self.fail(
+            "cumulative ActorResult totals must not be ingested"
+        ))
+        with patch.object(persistence, "_BASE_RUN_ACTOR_JOBS", return_value=(result,)):
+            self.assertEqual(_run_actor_jobs_v828(runtime, ()), (result,))
+
     def test_committed_efficiency_requires_two_empirical_same_cohort(self) -> None:
         outcome = MemoryUid(10, 11)
         fast_uid = MemoryUid(12, 13)
         slow_uid = MemoryUid(14, 15)
         active = int(CognitiveState.ACTIVE)
-        nodes = {
-            fast_uid: SimpleNamespace(
-                uid=fast_uid,
-                cognitive_state=active,
-                attempt_weight=2.0,
-                updated_watermark=20,
-            ),
-            slow_uid: SimpleNamespace(
-                uid=slow_uid,
-                cognitive_state=active,
-                attempt_weight=3.0,
-                updated_watermark=21,
-            ),
-        }
-        rows = [
-            SimpleNamespace(strategy_uid=fast_uid, outcome_uid=outcome, mean_cost=2.0),
-            SimpleNamespace(strategy_uid=slow_uid, outcome_uid=outcome, mean_cost=4.0),
-        ]
+        node_rows = (
+            self.outcome_node(outcome),
+            self.strategy_node(fast_uid, outcome, 99, attempts=2.0, cost=4.0, state=active),
+            self.strategy_node(slow_uid, outcome, 99, attempts=3.0, cost=12.0, state=active),
+        )
 
         class View:
-            _node_by_uid = nodes
-            _strategy_by_context = {99: rows}
-
-            def invalidate_strategy_cache(self):
-                return None
-
-            def _refresh_strategy_cache(self):
-                return None
+            def node_records(self):
+                return node_rows
 
         emitted = []
 
@@ -114,34 +124,15 @@ class StrategyStatisticsPersistenceFixTests(unittest.TestCase):
         first_uid = MemoryUid(22, 23)
         second_uid = MemoryUid(24, 25)
         probation = int(CognitiveState.PROBATION)
-        nodes = {
-            first_uid: SimpleNamespace(
-                uid=first_uid,
-                cognitive_state=probation,
-                attempt_weight=1.0,
-                updated_watermark=30,
-            ),
-            second_uid: SimpleNamespace(
-                uid=second_uid,
-                cognitive_state=probation,
-                attempt_weight=1.0,
-                updated_watermark=31,
-            ),
-        }
-        rows = [
-            SimpleNamespace(strategy_uid=first_uid, outcome_uid=outcome, mean_cost=2.0),
-            SimpleNamespace(strategy_uid=second_uid, outcome_uid=outcome, mean_cost=3.0),
-        ]
+        node_rows = (
+            self.outcome_node(outcome),
+            self.strategy_node(first_uid, outcome, 101, attempts=1.0, cost=2.0, state=probation),
+            self.strategy_node(second_uid, outcome, 101, attempts=1.0, cost=3.0, state=probation),
+        )
 
         class View:
-            _node_by_uid = nodes
-            _strategy_by_context = {101: rows}
-
-            def invalidate_strategy_cache(self):
-                return None
-
-            def _refresh_strategy_cache(self):
-                return None
+            def node_records(self):
+                return node_rows
 
         emitted = []
 
@@ -160,30 +151,14 @@ class StrategyStatisticsPersistenceFixTests(unittest.TestCase):
     def test_zero_attempt_strategies_are_reported_as_rejected_inputs(self) -> None:
         outcome = MemoryUid(30, 31)
         strategy_uid = MemoryUid(32, 33)
-        source = SimpleNamespace(
-            uid=strategy_uid,
-            cognitive_state=int(CognitiveState.ACTIVE),
-            attempt_weight=0.0,
-            updated_watermark=40,
+        source = self.strategy_node(
+            strategy_uid, outcome, 202, attempts=0.0, cost=0.0,
+            state=int(CognitiveState.ACTIVE),
         )
 
         class View:
-            _node_by_uid = {strategy_uid: source}
-            _strategy_by_context = {
-                202: [
-                    SimpleNamespace(
-                        strategy_uid=strategy_uid,
-                        outcome_uid=outcome,
-                        mean_cost=1.0,
-                    )
-                ]
-            }
-
-            def invalidate_strategy_cache(self):
-                return None
-
-            def _refresh_strategy_cache(self):
-                return None
+            def node_records(self):
+                return (StrategyStatisticsPersistenceFixTests.outcome_node(outcome), source)
 
         class Supervisor:
             read_view = View()

@@ -32,7 +32,10 @@ class V9BootstrapTests(unittest.TestCase):
         self.assertGreaterEqual(len(config.arena_record_sizes), 3)
         self.assertTrue(all(size > 0 for _name, size in config.arena_packet_sizes))
         self.assertTrue(all(size > 0 for _name, size in config.arena_record_sizes))
-        self.assertIn("v8.cli_v819.main", config.default_cli_entrypoint)
+        self.assertEqual(
+            config.default_cli_entrypoint,
+            "v8.__main__ -> v8.cli_v819.main",
+        )
 
     def test_manifest_rejects_different_config_in_same_run_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

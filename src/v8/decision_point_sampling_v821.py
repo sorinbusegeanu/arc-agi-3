@@ -415,7 +415,38 @@ def _fallback_action(view, context, before_actions, local_overlay, rng, epsilon:
     return int(min(combined, key=lambda row: (-row[2], -row[1], row[0]))[0])
 
 
-def _decision_actor_worker(
+def _bootstrap_before_forced_action(view, sampler, *, level, context, actions, history):
+    from v8 import strategy_empirical_bootstrap_v881 as empirical
+
+    bootstrap_plan = empirical._bootstrap_plan(view, context, actions)
+    if bootstrap_plan is None:
+        return (
+            sampler.forced_action(
+                level=level,
+                context=context,
+                actions=actions,
+                history=history,
+            ),
+            None,
+            (),
+        )
+    base_plans = tuple(
+        empirical._BASE_ACTOR_PLAN_CANDIDATES(view, context, actions)
+    )
+    plans = (bootstrap_plan,) + tuple(
+        row
+        for row in base_plans
+        if row.strategy_uid != bootstrap_plan.strategy_uid
+    )
+    return None, bootstrap_plan, plans
+
+
+def _actor_experience_event(actor_module, **kwargs):
+    """Construct through the installed actor factory so evidence hooks compose."""
+    return actor_module.ExperienceEvent(**kwargs)
+
+
+def _decision_actor_worker_impl(
     *,
     job,
     experience_ring_args,
@@ -441,7 +472,7 @@ def _decision_actor_worker(
     )
     from v8 import actor as actor_module
     from v8 import trajectory_optimizer_v814 as optimizer
-    from v8.model import EventId, ExperienceEvent, PipelineEvent, encode_pipeline, stable_u64
+    from v8.model import EventId, PipelineEvent, encode_pipeline, stable_u64
     from v8.persistent_identity import arc_world_id, trajectory_identity
     from v8.ring import SharedRingBuffer
 
@@ -455,6 +486,13 @@ def _decision_actor_worker(
     )
     rng = Random(job.seed)
     env = ArcGridEnvironment(game_id=job.game_id, seed=job.seed, env_root=job.env_root)
+    from v8 import click_exploration_v848 as click_exploration
+
+    click_exploration.configure_actor_exploration_v848(
+        env,
+        sampler,
+        actor_id=int(job.actor_id),
+    )
     terminal_wait_seconds = max(0.0, float(env.game_wait_seconds))
     env.game_wait_seconds = 0.0
     sequence = 0
@@ -534,45 +572,45 @@ def _decision_actor_worker(
             before_level = int(env.last_levels_completed)
             history_before = tuple(int(value) for value in optimizer._ACTOR_ACTION_HISTORY)
 
-            action = sampler.forced_action(
+            # A scientifically eligible M7 bootstrap probe must precede forced
+            # discovery. Otherwise the coverage sampler can consume the complete
+            # lease without ever consulting the planner, leaving every canonical
+            # strategy structurally formed but empirically unattempted.
+            action, planned, plans = _bootstrap_before_forced_action(
+                view,
+                sampler,
                 level=before_level,
                 context=context,
                 actions=before_actions,
                 history=history_before,
             )
-            planned = None
             explicit_replan = None
-            plans = ()
             if action is None:
-                plans = view.plan_candidates(context, before_actions)
-                planned = plans[0] if plans else None
+                if planned is None:
+                    plans = view.plan_candidates(context, before_actions)
+                    planned = plans[0] if plans else None
                 if planned is not None:
                     alternatives = [row for row in plans[1:] if row.outcome_uid != planned.outcome_uid]
                     if alternatives and len(preference_probes) < int(job.max_probe_records):
+                        both_reachable = actor_module._comparison_outcomes_reachable(
+                            view, planned, alternatives[0], context, before_actions
+                        )
                         probe = actor_module.PreferenceProbeResult(
                             planned.outcome_uid,
                             alternatives[0].outcome_uid,
                             stable_u64(context, person=b"v8-context"),
                             planned.outcome_uid,
                             bool(planned.preference_influenced),
+                            both_reachable,
                         )
                         preference_probes.append(probe)
                         pending_preference_probes.append(probe)
 
-                    has_same_outcome = any(
-                        row.outcome_uid == planned.outcome_uid
-                        and row.strategy_uid != planned.strategy_uid
-                        for row in plans[1:]
-                    )
-                    alternative = (
-                        actor_module._select_replanning_ablation(
-                            view,
-                            planned,
-                            context,
-                            before_actions,
-                        )
-                        if has_same_outcome
-                        else None
+                    alternative = actor_module._select_replanning_ablation(
+                        view,
+                        planned,
+                        context,
+                        before_actions,
                     )
                     if (
                         alternative is not None
@@ -614,6 +652,17 @@ def _decision_actor_worker(
                             float(job.epsilon),
                         )
 
+            if planned is not None:
+                # The primary-valence event factory reads the actor view at event
+                # construction time. Preserve the executed plan first, followed
+                # by genuine comparison plans, even when an ablation query
+                # temporarily changed the planner's last-result cache.
+                view._behavior_last_plans = (planned,) + tuple(
+                    row
+                    for row in plans
+                    if row.strategy_uid != planned.strategy_uid
+                )
+
             prediction_distribution = view.outcome_distribution(context, int(action))
 
             if actor_throttle is not None:
@@ -643,7 +692,8 @@ def _decision_actor_worker(
             next_sequence = sequence + 1
             producer_sequence = sequence_base + next_sequence
             def packet_for_watermark(current_watermark: int) -> bytes:
-                event = ExperienceEvent(
+                event = _actor_experience_event(
+                    actor_module,
                     event_id=EventId.from_producer(job.actor_id, producer_sequence),
                     watermark=current_watermark,
                     producer_id=job.actor_id,
@@ -843,6 +893,41 @@ def _decision_actor_worker(
         view.close()
         ring.close()
         optimizer._reset_capture(None)
+
+
+def _decision_actor_worker(*, job, **kwargs) -> None:
+    """Run the decision controller inside the installed actor evidence scopes."""
+    from v8 import behavior_recovery as behavior
+    from v8 import primary_valence as primary
+
+    prior_behavior = os.environ.get(behavior._ACTOR_MODE_ENV)
+    prior_epsilon = os.environ.get(behavior._ACTOR_EPSILON_ENV)
+    prior_seed = os.environ.get(behavior._ACTOR_SEED_ENV)
+    prior_capture = bool(primary._CAPTURE_ACTIVE)
+    os.environ[behavior._ACTOR_MODE_ENV] = "1"
+    os.environ[behavior._ACTOR_EPSILON_ENV] = str(
+        max(0.0, min(1.0, float(job.epsilon)))
+    )
+    os.environ[behavior._ACTOR_SEED_ENV] = str(int(job.seed))
+    owns_capture = not prior_capture
+    if owns_capture:
+        primary._reset_actor_capture()
+        primary._CAPTURE_ACTIVE = True
+    try:
+        return _decision_actor_worker_impl(job=job, **kwargs)
+    finally:
+        if owns_capture:
+            primary._CAPTURE_ACTIVE = False
+            primary._reset_actor_capture()
+        for name, prior in (
+            (behavior._ACTOR_MODE_ENV, prior_behavior),
+            (behavior._ACTOR_EPSILON_ENV, prior_epsilon),
+            (behavior._ACTOR_SEED_ENV, prior_seed),
+        ):
+            if prior is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = prior
 
 
 def _actor_worker_v821(*, job, **kwargs):

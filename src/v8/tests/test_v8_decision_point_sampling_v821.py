@@ -7,8 +7,12 @@ from unittest.mock import patch
 
 import v8
 from v8 import actor as actor_module
+from v8 import behavior_recovery as behavior
 from v8 import decision_point_sampling_v821 as sampling
+from v8 import primary_valence
 from v8 import runtime_repair_v822 as repair
+from v8 import strategy_empirical_bootstrap_v881 as empirical
+from v8.model import MemoryUid
 
 
 class _Env:
@@ -21,6 +25,34 @@ class _Env:
 
 
 class DecisionPointSamplingV821Tests(unittest.TestCase):
+    def test_eligible_bootstrap_precedes_forced_discovery(self) -> None:
+        chosen = SimpleNamespace(strategy_uid=MemoryUid(7, 1))
+        alternative = SimpleNamespace(strategy_uid=MemoryUid(7, 2))
+        sampler = SimpleNamespace(
+            forced_action=lambda **kwargs: self.fail(
+                "forced discovery must not hide an eligible M7 bootstrap"
+            )
+        )
+        with (
+            patch.object(empirical, "_bootstrap_plan", return_value=chosen),
+            patch.object(
+                empirical,
+                "_BASE_ACTOR_PLAN_CANDIDATES",
+                return_value=(alternative,),
+            ),
+        ):
+            action, planned, plans = sampling._bootstrap_before_forced_action(
+                object(),
+                sampler,
+                level=0,
+                context=10,
+                actions=(1, 2),
+                history=(),
+            )
+        self.assertIsNone(action)
+        self.assertIs(planned, chosen)
+        self.assertEqual(plans, (chosen, alternative))
+
     def test_installed_actor_uses_v822_wrapper_over_v821_discovery_controller(self) -> None:
         self.assertIs(actor_module.actor_worker, repair._actor_worker_v822)
         self.assertIs(repair._BASE_ACTOR_WORKER, sampling._actor_worker_v821)
@@ -31,7 +63,7 @@ class DecisionPointSamplingV821Tests(unittest.TestCase):
 
         descriptors = (object(),)
         cuts = {}
-        job = SimpleNamespace(game_id="ez01")
+        job = SimpleNamespace(game_id="ez01", epsilon=0.2, seed=17)
         with (
             patch.object(sampling, "_sampler_for", return_value=object()),
             patch("v8.trajectory_optimizer_v814._reset_capture"),
@@ -57,6 +89,36 @@ class DecisionPointSamplingV821Tests(unittest.TestCase):
             refresh_interval_seconds=None,
             record_cuts=cuts,
         )
+
+    def test_decision_worker_enters_behavior_and_primary_valence_scopes(self) -> None:
+        job = SimpleNamespace(game_id="ez01", epsilon=0.25, seed=19)
+        observed = {}
+
+        def implementation(*, job, **kwargs):
+            observed["behavior"] = os.environ.get(behavior._ACTOR_MODE_ENV)
+            observed["epsilon"] = os.environ.get(behavior._ACTOR_EPSILON_ENV)
+            observed["seed"] = os.environ.get(behavior._ACTOR_SEED_ENV)
+            observed["capture"] = primary_valence._CAPTURE_ACTIVE
+
+        prior_behavior = os.environ.get(behavior._ACTOR_MODE_ENV)
+        with patch.object(sampling, "_decision_actor_worker_impl", implementation):
+            actor_module.actor_worker(job=job)
+
+        self.assertEqual(observed, {
+            "behavior": "1",
+            "epsilon": "0.25",
+            "seed": "19",
+            "capture": True,
+        })
+        self.assertEqual(os.environ.get(behavior._ACTOR_MODE_ENV), prior_behavior)
+        self.assertFalse(primary_valence._CAPTURE_ACTIVE)
+
+    def test_decision_worker_uses_installed_experience_factory(self) -> None:
+        sentinel = object()
+        with patch.object(actor_module, "ExperienceEvent", return_value=sentinel) as factory:
+            result = sampling._actor_experience_event(actor_module, marker=7)
+        self.assertIs(result, sentinel)
+        factory.assert_called_once_with(marker=7)
 
     def test_new_decision_point_suppresses_planner_until_probe_is_selected(self) -> None:
         sampler = sampling.DecisionPointSampler("ez01", seed=9)

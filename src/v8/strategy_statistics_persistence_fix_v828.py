@@ -124,41 +124,30 @@ def _final_residual_batches(actor_module, results, published) -> tuple[object, .
 
 
 def _run_actor_jobs_v828(runtime, jobs, **kwargs):
-    from v8 import actor as actor_module
+    """Keep result reporting separate from canonical incremental learning.
 
-    prior_active = bool(getattr(runtime, "_v828_strategy_final_accounting_active", False))
-    prior_published = getattr(runtime, "_v828_strategy_published", None)
-    runtime._v828_strategy_final_accounting_active = True
-    runtime._v828_strategy_published = defaultdict(lambda: [0.0, 0.0, 0.0])
-    try:
-        results = tuple(_BASE_RUN_ACTOR_JOBS(runtime, jobs, **kwargs))
-        published = runtime._v828_strategy_published
-        residual = _final_residual_batches(actor_module, results, published)
-        if residual:
-            runtime.record_actor_results(residual)
-        return results
-    finally:
-        runtime._v828_strategy_final_accounting_active = prior_active
-        if prior_published is None:
-            try:
-                delattr(runtime, "_v828_strategy_published")
-            except AttributeError:
-                pass
-        else:
-            runtime._v828_strategy_published = prior_published
+    The base runner records every queued learning batch and records an actor's
+    ``pending_learning`` exactly once when the final queue write fails.  The
+    cumulative counters on ``ActorResult`` use per-step units, while the
+    trajectory tracker batches use completed-run units, so subtracting one from
+    the other creates spurious residual attempts.
+    """
+    return _BASE_RUN_ACTOR_JOBS(runtime, jobs, **kwargs)
 
 
 def _emit_committed_strategy_efficiency(supervisor) -> int:
     """Emit H12 evidence only from committed empirical same-outcome/context cohorts."""
-    view = supervisor.read_view
-    invalidate = getattr(view, "invalidate_strategy_cache", None)
-    if callable(invalidate):
-        invalidate()
-    refresh = getattr(view, "_refresh_strategy_cache", None)
-    if callable(refresh):
-        refresh()
-
-    by_uid = getattr(view, "_node_by_uid", {})
+    # During immutable-cut processing ``supervisor.read_view`` is deliberately
+    # replaced by a frozen formation cut. Actor statistics commit independently
+    # to the canonical live view and may be newer than that cut.
+    runtime = getattr(getattr(supervisor, "submit_proposal", None), "__self__", None)
+    view = (
+        getattr(runtime, "read_view", None)
+        or getattr(supervisor, "_v813_live_read_view", None)
+        or supervisor.read_view
+    )
+    nodes = tuple(view.node_records())
+    by_uid = {row.uid: row for row in nodes}
     empirical_states = {
         int(CognitiveState.CANDIDATE),
         int(CognitiveState.PROBATION),
@@ -169,40 +158,54 @@ def _emit_committed_strategy_efficiency(supervisor) -> int:
     emitted = 0
     considered = 0
     rejection_counts: dict[str, int] = defaultdict(int)
-    for context_bucket, rows in getattr(view, "_strategy_by_context", {}).items():
-        grouped: dict[MemoryUid, list[object]] = defaultdict(list)
-        for item in rows:
-            grouped[item.outcome_uid].append(item)
-        for _outcome_uid, cohort in grouped.items():
-            empirical = []
-            for item in cohort:
-                considered += 1
-                source = by_uid.get(item.strategy_uid)
-                if source is None:
-                    rejection_counts["strategy_source_unavailable"] += 1
-                    continue
-                if int(source.cognitive_state) not in empirical_states:
-                    rejection_counts["strategy_not_empirically_admissible"] += 1
-                    continue
-                if float(source.attempt_weight) <= 0.0:
-                    rejection_counts["strategy_without_empirical_attempt"] += 1
-                    continue
-                empirical.append((item, source))
-            if len(empirical) < 2:
-                if empirical:
-                    rejection_counts["no_same_m6_outcome_comparator"] += len(empirical)
+    grouped: dict[tuple[int, MemoryUid], list[object]] = defaultdict(list)
+    for source in nodes:
+        if (
+            int(source.level) == int(MemoryLevel.M7)
+            and int(source.memory_type) == int(MemoryType.STRATEGY)
+            and len(source.key_parts) >= 4
+        ):
+            outcome_uid = MemoryUid(
+                int(source.key_parts[1]), int(source.key_parts[2])
+            )
+            grouped[(int(source.key_parts[3]), outcome_uid)].append(source)
+
+    for (context_bucket, outcome_uid), cohort in grouped.items():
+        empirical = []
+        outcome = by_uid.get(outcome_uid)
+        if outcome is None or int(outcome.level) != int(MemoryLevel.M6):
+            rejection_counts["same_cohort_m6_outcome_unavailable"] += len(cohort)
+            continue
+        for source in cohort:
+            considered += 1
+            if int(source.cognitive_state) not in empirical_states:
+                rejection_counts["strategy_not_empirically_admissible"] += 1
                 continue
-            best = min(max(1e-9, float(item.mean_cost)) for item, _source in empirical)
-            for item, source in empirical:
-                if not supervisor._fresh(
-                    f"efficiency_committed:{int(context_bucket)}",
-                    source.uid,
-                    source.updated_watermark,
-                ):
-                    continue
-                value = best / max(1e-9, float(item.mean_cost))
-                supervisor._append_evidence("strategy_efficiency", source, value)
-                emitted += 1
+            if float(source.attempt_weight) <= 0.0:
+                rejection_counts["strategy_without_empirical_attempt"] += 1
+                continue
+            empirical.append(source)
+        if len(empirical) < 2:
+            if empirical:
+                rejection_counts["no_same_m6_outcome_comparator"] += len(empirical)
+            continue
+        mean_costs = {
+            source.uid: max(
+                1e-9, float(source.cost_sum) / float(source.attempt_weight)
+            )
+            for source in empirical
+        }
+        best = min(mean_costs.values())
+        for source in empirical:
+            if not supervisor._fresh(
+                f"efficiency_committed:{int(context_bucket)}",
+                source.uid,
+                source.updated_watermark,
+            ):
+                continue
+            value = best / mean_costs[source.uid]
+            supervisor._append_evidence("strategy_efficiency", source, value)
+            emitted += 1
     from v8 import information_flow_diagnostics as flow
 
     flow.emit_bounded(
@@ -216,11 +219,15 @@ def _emit_committed_strategy_efficiency(supervisor) -> int:
 
 
 def _peer_run_once_v828(self) -> None:
-    _BASE_PEER_RUN_ONCE(self)
     cancelled = getattr(self, "_v841_peer_cancel", None)
     if cancelled is not None and cancelled.is_set():
         return
+    # Evaluate the canonical actor-statistics cut before the base peer pass can
+    # publish lifecycle proposals for the same M7 rows.  Those proposals are
+    # intentionally zero-delta, but later generation reconciliation may make a
+    # stale pre-stat row visible until its next commit barrier.
     _emit_committed_strategy_efficiency(self)
+    _BASE_PEER_RUN_ONCE(self)
 
 
 def install_strategy_statistics_persistence_fix_v828() -> None:

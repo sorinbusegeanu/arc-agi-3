@@ -42,11 +42,18 @@ def _restore_repeatable_preference_evidence() -> None:
         both_reachable: bool,
         preference_influenced: bool,
     ) -> bool:
+        self.last_rejection = None
         if outcome_a == outcome_b:
+            self.last_rejection = "identical_outcomes"
             return False
         if chosen_outcome not in {outcome_a, outcome_b}:
+            self.last_rejection = "choice_outside_comparison"
             return False
-        if not both_reachable or preference_influenced:
+        if not both_reachable:
+            self.last_rejection = "alternatives_not_both_reachable"
+            return False
+        if preference_influenced:
+            self.last_rejection = "choice_not_causally_clean"
             return False
         self._probes.append(
             Probe(
@@ -69,15 +76,13 @@ def _restore_repeatable_preference_evidence() -> None:
             a = raw.get("outcome_a", [0, 0])
             b = raw.get("outcome_b", [0, 0])
             chosen = raw.get("chosen_outcome", [0, 0])
-            self._probes.append(
-                Probe(
-                    MemoryUid(int(a[0]), int(a[1])),
-                    MemoryUid(int(b[0]), int(b[1])),
-                    int(raw.get("context_bucket", 0)),
-                    MemoryUid(int(chosen[0]), int(chosen[1])),
-                    bool(raw.get("both_reachable", True)),
-                    bool(raw.get("preference_influenced", False)),
-                )
+            self.record_probe(
+                outcome_a=MemoryUid(int(a[0]), int(a[1])),
+                outcome_b=MemoryUid(int(b[0]), int(b[1])),
+                context_bucket=int(raw.get("context_bucket", 0)),
+                chosen_outcome=MemoryUid(int(chosen[0]), int(chosen[1])),
+                both_reachable=bool(raw.get("both_reachable", True)),
+                preference_influenced=bool(raw.get("preference_influenced", False)),
             )
 
     preference_module.PreferenceEstimator.record_probe = record_probe

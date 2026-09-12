@@ -9,11 +9,11 @@ coordinates instead of characterizing the causal state machine of a coordinate t
 has already produced evidence.
 
 This layer composes beneath the established v8.32/v8.47/v8.48 authorities. A
-productive CLICK_SCAN/CLICK_CHARACTERIZE transition immediately becomes a bounded
-local characterization sequence. The same executable coordinate is re-clicked while
-it continues to produce novel observable state transitions. Characterization stops
-on no observable change, terminal/level progress, a repeated transition (cycle), or
-the bounded repeat cap. Broad coverage then resumes from the existing frontier.
+productive CLICK_SCAN/CLICK_CHARACTERIZE transition can become a bounded local
+characterization sequence when explicitly enabled. Re-clicking an unknown coordinate
+is unsafe by default: in toggle games the second click reverses the productive first
+transition before the solver can use it. Set ``ARC_AGI3_V8_CLICK_CHARACTERIZE_CAP``
+above one for environments where destructive repeat probes are acceptable.
 """
 
 import os
@@ -26,7 +26,7 @@ _BASE_PREPARE_STEP = None
 _BASE_FORCED_ACTION = None
 _BASE_OBSERVE_TRANSITION = None
 
-_DEFAULT_REPEAT_CAP = 4
+_DEFAULT_REPEAT_CAP = 1
 _REPEAT_CAP_ENV = "ARC_AGI3_V8_CLICK_CHARACTERIZE_CAP"
 
 

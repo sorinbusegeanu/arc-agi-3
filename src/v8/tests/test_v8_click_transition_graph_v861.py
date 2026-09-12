@@ -107,6 +107,32 @@ class ClickTransitionGraphV861Tests(unittest.TestCase):
             self.assertEqual(self.sampler._v861_shared_edges[edge.key()].attempts, 3)
             self.assertGreaterEqual(self.sampler._v861_peer_refreshes, 1)
 
+    def test_new_run_does_not_replace_prior_actor_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sampling_frontier_v847"
+            root.mkdir(parents=True)
+            self.sampler._v847_state_root = root
+            old = graph.TransitionEdge(
+                3, 70, self.action, 71, attempts=2, changed_cells=1, progress=True
+            )
+            self.sampler._v861_local_edges = {old.key(): old}
+            self.sampler._v861_dirty_observations = 1
+            with patch.object(graph.os, "getpid", return_value=1001):
+                graph._save_local(self.sampler)
+
+            self.sampler._v861_local_edges = {}
+            new = graph.TransitionEdge(0, 10, self.action, 11, attempts=1, changed_cells=1)
+            self.sampler._v861_local_edges[new.key()] = new
+            self.sampler._v861_dirty_observations = 1
+            with patch.object(graph.os, "getpid", return_value=2002):
+                graph._save_local(self.sampler)
+
+            files = tuple((root.parent / "click_transition_graph_v861").glob("*.json"))
+            self.assertEqual(len(files), 2)
+            graph._refresh_shared(self.sampler)
+            self.assertIn(old.key(), self.sampler._v861_shared_edges)
+            self.assertIn(new.key(), self.sampler._v861_shared_edges)
+
     def test_terminal_failure_edge_is_not_guided(self) -> None:
         edge = graph.TransitionEdge(
             0, 10, self.action, 11,
@@ -117,6 +143,23 @@ class ClickTransitionGraphV861Tests(unittest.TestCase):
         )
         self.sampler._v861_shared_edges = {edge.key(): edge}
         self.assertIsNone(graph._graph_action(self.sampler, level=0, context=10, actions=(self.action,)))
+
+    def test_independent_actor_lane_is_not_preempted_by_shared_graph(self) -> None:
+        edge = graph.TransitionEdge(
+            0, 10, self.action, 11, attempts=2, changed_cells=1, progress=True
+        )
+        self.sampler._v847_actor_id = 1
+        self.sampler._v848_scan_available = (self.action,)
+        self.sampler._v861_shared_edges = {edge.key(): edge}
+        selected = graph._forced_action_v861(
+            self.sampler,
+            level=0,
+            context=10,
+            actions=(self.action,),
+            history=(),
+        )
+        self.assertIsNone(selected)
+        self.assertEqual(self.sampler._v861_graph_actions, 0)
 
     def test_v860_begin_lease_clears_episode_scoped_characterization(self) -> None:
         self.sampler._v860_pending_action = self.action

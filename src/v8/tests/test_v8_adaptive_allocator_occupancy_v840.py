@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import unittest
 from unittest.mock import patch
 
@@ -13,6 +14,14 @@ from v8 import sampling_control_repair_v823 as v823
 
 
 class AdaptiveAllocatorOccupancyV840Tests(unittest.TestCase):
+    def test_reporting_rows_are_published_as_one_cumulative_snapshot(self) -> None:
+        target = queue.Queue(maxsize=3)
+        rows = (object(), object(), object())
+
+        v840._publish_reporting_rows(target, rows)
+
+        self.assertEqual(tuple(target.get_nowait() for _ in rows), rows)
+
     def test_failed_process_check_polls_all_sentinels_once(self) -> None:
         read_fd, write_fd = os.pipe()
 
@@ -128,6 +137,64 @@ class AdaptiveAllocatorOccupancyV840Tests(unittest.TestCase):
         self.assertEqual(v840._refill_idle_workers(idle, assign), (1,))
         self.assertIn(1, ledger.reservations)
         self.assertLess(ledger.available, available_before_refill)
+
+    def test_one_replay_lane_gets_uninterrupted_historical_completion_budget(self) -> None:
+        with patch(
+            "v8.verified_success_metrics_v866.historical_completion_attempt_steps_v866",
+            return_value=300,
+        ):
+            self.assertEqual(
+                v840._historical_completion_lease_steps_v840(
+                    4,
+                    "gp02",
+                    180,
+                    available=8_000,
+                    base_steps=5_000,
+                ),
+                300,
+            )
+            self.assertEqual(
+                v840._historical_completion_lease_steps_v840(
+                    5,
+                    "gp02",
+                    180,
+                    available=8_000,
+                    base_steps=5_000,
+                ),
+                180,
+            )
+
+    def test_historical_completion_budget_never_exceeds_available_or_game_budget(self) -> None:
+        with patch(
+            "v8.verified_success_metrics_v866.historical_completion_attempt_steps_v866",
+            return_value=9_000,
+        ):
+            self.assertEqual(
+                v840._historical_completion_lease_steps_v840(
+                    8,
+                    "gp02",
+                    100,
+                    available=4_000,
+                    base_steps=3_000,
+                ),
+                3_000,
+            )
+
+    def test_completion_attempts_preserve_half_budget_for_independent_lanes(self) -> None:
+        self.assertEqual(
+            v840._historical_completion_attempt_limit_v840(
+                base_steps=5_000,
+                attempt_steps=300,
+            ),
+            4,
+        )
+        self.assertEqual(
+            v840._historical_completion_attempt_limit_v840(
+                base_steps=5_000,
+                attempt_steps=2_000,
+            ),
+            1,
+        )
 
     def test_actor_option_is_a_cap_and_all_job_descriptors_survive(self) -> None:
         self.assertIs(cli_v819._requested_actor_pool, v840._requested_actor_pool_v840)

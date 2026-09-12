@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
-from v8 import information_flow_diagnostics as flow
 from v8.research.contracts import ChainStatus
 from v8.research.default_analysis import derive_chain_evidence
-from v8.research.default_cli import run_with_default_research
 from v8.research.experiment_artifacts import (
     DECISION_NAME,
     EVIDENCE_NAME,
@@ -19,8 +16,8 @@ from v8.research.experiment_artifacts import (
     _evidence_digest,
     capture_experiment_start,
     write_experiment_evidence,
-    write_failed_experiment_evidence,
 )
+from v8.mixed_environment_v859 import RESEARCH_1_GAME_IDS
 
 
 class DefaultRecursiveResearchTests(unittest.TestCase):
@@ -61,21 +58,30 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
             snapshot = root / "snapshots" / "snapshot-00000000000000000001"
             snapshot.mkdir(parents=True, exist_ok=True)
             (snapshot / "COMPLETE").write_text("", encoding="utf-8")
-            (snapshot / "manifest.json").write_text(
-                json.dumps(
-                    {
-                        "snapshot_id": 1,
-                        "generation": 1,
-                        "watermark": summary.get("metrics", {}).get("watermark", 0),
-                    }
-                ),
-                encoding="utf-8",
+            manifest_path = snapshot / "manifest.json"
+            manifest_path.write_text(json.dumps({
+                "snapshot_id": 1,
+                "generation": 1,
+                "watermark": summary.get("metrics", {}).get("watermark", 0),
+                "final": True,
+            }), encoding="utf-8")
+            digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            summary["final_snapshot"] = {
+                "snapshot_id": 1,
+                "generation": 1,
+                "watermark": summary.get("metrics", {}).get("watermark", 0),
+                "path": str(snapshot),
+                "digest": digest,
+                "final": True,
+            }
+            (root / "v8_run_summary.json").write_text(
+                json.dumps(summary), encoding="utf-8"
             )
         return metadata
 
     def _summary(self, *, watermark=300, memories=20, evidence_records=7):
         return {
-            "games": ["ic01", "gp03", "ArcAgi/Sudoku-v0"],
+            "games": list(RESEARCH_1_GAME_IDS),
             "actors": [
                 {"game_id": "ic01", "steps": 100, "wins": 1, "failures": 0, "levels_completed": 1, "resets": 1},
                 {"game_id": "gp03", "steps": 100, "wins": 0, "failures": 1, "levels_completed": 0, "resets": 2},
@@ -160,121 +166,6 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
         self.assertIn('"formation_telemetry"', text)
         self.assertIn("Cumulative state — context only", text)
 
-    def test_normal_continuous_run_generates_evidence_not_legacy_packet(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "v8_run_summary.json").write_text(
-                json.dumps(self._summary(watermark=1)), encoding="utf-8"
-            )
-            self._write_decision(root)
-
-            def fake_main(_argv):
-                (root / "v8_run_summary.json").write_text(json.dumps(self._summary()), encoding="utf-8")
-                return 0
-
-            result = run_with_default_research(fake_main, [
-                "continuous-run", "--root", str(root), "--games", "research_1",
-                "--steps-per-game", "20000", "--actors", "30", "--shards", "4", "--stage-workers", "2",
-            ])
-            self.assertEqual(result, 0)
-            self.assertTrue((root / "research" / EVIDENCE_NAME).is_file())
-            self.assertFalse((root / "research" / "LLM_RESEARCH_PACKET.md").exists())
-
-    def test_normal_run_replaces_prior_evidence_and_information_log(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            research = root / "research"
-            research.mkdir(parents=True)
-            evidence_path = research / EVIDENCE_NAME
-            evidence_path.write_text(
-                "# prior evidence\n- experiment_id: `prior-experiment`\nOLD_EVIDENCE\n",
-                encoding="utf-8",
-            )
-            information_path = root / flow.LOG_NAME
-            information_path.write_text(
-                '{"stage":"OLD_INFORMATION"}\n', encoding="utf-8"
-            )
-            (root / "v8_run_summary.json").write_text(
-                json.dumps(self._summary(watermark=1)), encoding="utf-8"
-            )
-            self._write_decision(root, steps=20000)
-
-            def fake_main(_argv):
-                self.assertEqual(evidence_path.read_text(encoding="utf-8"), "")
-                self.assertEqual(information_path.read_text(encoding="utf-8"), "")
-                with patch.dict(
-                    os.environ,
-                    {"ARC_AGI3_V8_ROOT": str(root)},
-                    clear=False,
-                ):
-                    flow.emit(
-                        "transfer",
-                        "CURRENT_INFORMATION",
-                        input_count=1,
-                        output_count=1,
-                    )
-                (root / "v8_run_summary.json").write_text(
-                    json.dumps(self._summary()), encoding="utf-8"
-                )
-                return 0
-
-            result = run_with_default_research(
-                fake_main,
-                [
-                    "continuous-run",
-                    "--root",
-                    str(root),
-                    "--games",
-                    "research_1",
-                    "--steps-per-game",
-                    "20000",
-                ],
-            )
-
-            evidence = evidence_path.read_text(encoding="utf-8")
-            information = information_path.read_text(encoding="utf-8")
-
-        self.assertEqual(result, 0)
-        self.assertNotIn("OLD_EVIDENCE", evidence)
-        self.assertIn("parent_experiment_id: `prior-experiment`", evidence)
-        self.assertNotIn("OLD_INFORMATION", information)
-        self.assertIn("CURRENT_INFORMATION", information)
-
-    def test_non_continuous_command_does_not_create_research_artifacts(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self.assertEqual(run_with_default_research(lambda _argv: 0, ["smoke", "--root", str(root)]), 0)
-            self.assertFalse((root / "research").exists())
-
-    def test_normal_run_fails_closed_on_placeholder_decision(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "v8_run_summary.json").write_text(
-                json.dumps(self._summary()), encoding="utf-8"
-            )
-            research = root / "research"
-            research.mkdir()
-            (research / DECISION_NAME).write_text(
-                f"# RESEARCH_DECISION\n{_DECISION_BEGIN}\n"
-                + json.dumps({"change_id": "R001-T1", "memory_policy": "REUSE"})
-                + f"\n{_DECISION_END}\n",
-                encoding="utf-8",
-            )
-            called = False
-
-            def fake_main(_argv):
-                nonlocal called
-                called = True
-                return 0
-
-            result = run_with_default_research(
-                fake_main,
-                ["continuous-run", "--root", str(root), "--games", "research_1", "--steps-per-game", "20000"],
-            )
-            self.assertEqual(result, 2)
-            self.assertFalse(called)
-            self.assertFalse((research / ".experiment_start.json").exists())
-
     def test_reuse_requires_a_valid_durable_start_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -285,24 +176,22 @@ class DefaultRecursiveResearchTests(unittest.TestCase):
                     argv=["continuous-run", "--games", "research_1", "--steps-per-game", "20000"],
                 )
 
-    def test_runtime_exception_finalizes_failure_evidence(self):
+    def test_reuse_rejects_incomplete_summary_even_with_complete_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self._write_decision(root, memory_policy="CLEAN")
-
-            def fail(_argv):
-                raise TimeoutError("developmental cut timed out")
-
-            result = run_with_default_research(
-                fail,
-                ["continuous-run", "--root", str(root), "--games", "research_1", "--steps-per-game", "20000"],
+            (root / "v8_run_summary.json").write_text(
+                json.dumps(self._summary()), encoding="utf-8"
             )
-            evidence = (root / "research" / EVIDENCE_NAME).read_text(encoding="utf-8")
-
-        self.assertEqual(result, 1)
-        self.assertIn('"type": "TimeoutError"', evidence)
-        self.assertIn("developmental cut timed out", evidence)
-
+            self._write_decision(root)
+            summary = json.loads((root / "v8_run_summary.json").read_text())
+            summary.pop("final_snapshot")
+            (root / "v8_run_summary.json").write_text(json.dumps(summary))
+            with self.assertRaisesRegex(ValueError, "summary.final_snapshot"):
+                capture_experiment_start(
+                    root,
+                    argv=["continuous-run", "--games", "research_1",
+                          "--steps-per-game", "20000"],
+                )
 
 if __name__ == "__main__":
     unittest.main()

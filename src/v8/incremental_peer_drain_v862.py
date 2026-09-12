@@ -35,7 +35,7 @@ _EDGE_OFFSET_KEY = ("__v862_edge_offset", 0, 0)
 _COHERENT_WATERMARK_INTERVAL = 10_000
 _COHERENT_TIME_INTERVAL_SECONDS = 15.0
 _COHERENT_MIN_WATERMARK_PROGRESS = 2_000
-_FINAL_STABILIZATION_WINDOWS = 2
+_FINAL_STABILIZATION_WINDOWS = 3
 
 
 def _stable_arena_rows(arena, start: int, count: int, *, timeout: float = _SLICE_READ_TIMEOUT):
@@ -134,14 +134,18 @@ def _coherent_checkpoint_due(supervisor, *, watermark: int, now: float) -> bool:
     last_time = getattr(supervisor, "_v862_last_coherent_checkpoint_time", None)
     last_watermark = getattr(supervisor, "_v862_last_coherent_checkpoint_watermark", None)
     if last_time is None or last_watermark is None:
-        # Do not anchor the first checkpoint to an already-advanced watermark. A
-        # bounded peer pass can itself take long enough for sampling to advance by
-        # tens of thousands of steps. Treat the run origin as the developmental
-        # baseline so the first large-graph checkpoint can run immediately once
-        # meaningful evidence exists.
+        # The runtime watermark is restored with a reused snapshot.  Anchor the
+        # cadence to the explicit run origin, otherwise every REUSE launch treats
+        # historical observations as current-run progress and immediately enters
+        # an expensive coherent checkpoint. Dependency-injected legacy supervisors
+        # have a fresh zero origin.
+        origin = max(
+            0,
+            int(getattr(supervisor, "_v862_run_origin_watermark", 0)),
+        )
         supervisor._v862_last_coherent_checkpoint_time = float(now)
-        supervisor._v862_last_coherent_checkpoint_watermark = 0
-        return int(watermark) >= _COHERENT_MIN_WATERMARK_PROGRESS
+        supervisor._v862_last_coherent_checkpoint_watermark = origin
+        return max(0, int(watermark) - origin) >= _COHERENT_MIN_WATERMARK_PROGRESS
 
     progress = max(0, int(watermark) - int(last_watermark))
     elapsed = max(0.0, float(now) - float(last_time))
@@ -173,15 +177,50 @@ def _coherent_checkpoint(supervisor, *, before_cycles: int, before_cut) -> None:
 
 
 def _peer_run_once_v862(self):
+    from v8 import information_flow_diagnostics as flow
+
     if bool(getattr(self, "_v82_stabilizing", False)):
+        flow.emit_bounded(
+            "developmental",
+            "incremental_peer_dispatch",
+            input_count=1,
+            output_count=0,
+            rejection_counts={"stabilization_bypass": 1},
+            fields={"dispatch_branch": "stabilization_bypass"},
+        )
         return _BASE_PEER_RUN_ONCE(self)
-    view = getattr(self, "_v813_live_read_view", None) or getattr(self, "read_view", None)
+    # ``read_view`` is the authority used by the downstream peer pass.  A restored
+    # runtime can retain an older v8.13 bookkeeping view; slicing that object while
+    # the peer reads the replacement silently turns bounded maintenance into a full
+    # graph scan.
+    view = getattr(self, "read_view", None) or getattr(self, "_v813_live_read_view", None)
     if view is None:
+        flow.emit_bounded(
+            "developmental",
+            "incremental_peer_dispatch",
+            input_count=1,
+            output_count=0,
+            rejection_counts={"read_view_unavailable": 1},
+            fields={"dispatch_branch": "full_fallback"},
+        )
         return _BASE_PEER_RUN_ONCE(self)
 
     node_arenas = tuple(getattr(view, "_nodes", ()))
     edge_arenas = tuple(getattr(view, "_edges", ()))
     if not _arena_backed(node_arenas) or (edge_arenas and not _arena_backed(edge_arenas)):
+        flow.emit_bounded(
+            "developmental",
+            "incremental_peer_dispatch",
+            input_count=1,
+            output_count=0,
+            rejection_counts={"active_read_view_not_arena_backed": 1},
+            fields={
+                "dispatch_branch": "full_fallback",
+                "node_arena_count": len(node_arenas),
+                "edge_arena_count": len(edge_arenas),
+                "active_matches_v813_view": view is getattr(self, "_v813_live_read_view", None),
+            },
+        )
         return _BASE_PEER_RUN_ONCE(self)
 
     before_cycles = int(getattr(self, "_cycles", 0))
@@ -195,6 +234,13 @@ def _peer_run_once_v862(self):
     # watermark could reach the end of sampling before the first full causal cut was
     # even considered. Evaluate and execute a due coherent checkpoint first.
     if large_graph and _coherent_checkpoint_due(self, watermark=watermark, now=now):
+        flow.emit_bounded(
+            "developmental",
+            "incremental_peer_dispatch",
+            input_count=sum(max(0, int(arena.count)) for arena in node_arenas),
+            output_count=1,
+            fields={"dispatch_branch": "coherent_checkpoint", "watermark": watermark},
+        )
         _coherent_checkpoint(self, before_cycles=before_cycles, before_cut=before_cut)
         _mark_coherent_checkpoint(self, watermark=watermark, now=now)
         return None
@@ -208,27 +254,45 @@ def _peer_run_once_v862(self):
     _save_offset(self, _NODE_OFFSET_KEY, node_offset)
     _save_offset(self, _EDGE_OFFSET_KEY, edge_offset)
 
-    original_nodes = view.node_records
-    original_edges = view.edge_records
     prior_edge_wrap = bool(getattr(self, "_v862_edge_wrapped_since_cycle", False))
     self._v862_edge_wrapped_since_cycle = prior_edge_wrap or bool(edge_wrapped)
 
-    def sliced_nodes(*, level=None):
-        if level is None:
-            return tuple(node_rows)
-        wanted = int(level)
-        return tuple(row for row in node_rows if int(row.level) == wanted)
+    class _SlicedReadView:
+        # Deliberately do not expose ``_nodes``/``_edges``. Developmental cut
+        # capture otherwise bypasses these accessors and rematerializes every live
+        # arena row, defeating the bounded-maintenance contract.
+        def node_records(self, *, level=None):
+            if level is None:
+                return tuple(node_rows)
+            wanted = int(level)
+            return tuple(row for row in node_rows if int(row.level) == wanted)
 
-    def sliced_edges():
-        return tuple(edge_rows)
+        def edge_records(self):
+            return tuple(edge_rows)
 
-    view.node_records = sliced_nodes
-    view.edge_records = sliced_edges
+        def source_games(self, uid, *, max_depth=8):
+            return view.source_games(uid, max_depth=max_depth)
+
+    original_view = self.read_view
+    self.read_view = _SlicedReadView()
     try:
         result = _BASE_PEER_RUN_ONCE(self)
     finally:
-        view.node_records = original_nodes
-        view.edge_records = original_edges
+        self.read_view = original_view
+
+    flow.emit_bounded(
+        "developmental",
+        "incremental_peer_dispatch",
+        input_count=len(node_rows),
+        output_count=1,
+        fields={
+            "dispatch_branch": "bounded_slice",
+            "node_slice_count": len(node_rows),
+            "edge_slice_count": len(edge_rows),
+            "large_graph": large_graph,
+            "watermark": watermark,
+        },
+    )
 
     completed_sweep = bool(node_wrapped and self._v862_edge_wrapped_since_cycle)
     if completed_sweep:
@@ -266,18 +330,32 @@ def _runtime_wait_quiescent_v862(
         getattr(self, "_accepting", True)
     )
     if final_drain:
+        finalization_deadline = time.monotonic() + max(0.0, float(timeout))
+
+        def remaining_timeout() -> float:
+            return max(0.0, finalization_deadline - time.monotonic())
+
         settle_peers = False
         resume_peers = False
         peers = getattr(self, "peers", None)
         stabilize = getattr(peers, "run_until_stable", None)
         generation = int(getattr(self, "generation", -1))
         last_generation = getattr(self, "_v82_developmental_finalized_generation", None)
+        attempted_generation = getattr(
+            self, "_v82_developmental_finalization_attempted_generation", None
+        )
         if callable(stabilize) and (
             not getattr(self, "_v82_developmental_finalized", False)
             or last_generation != generation
+        ) and attempted_generation != generation and not bool(
+            getattr(self, "_v82_developmental_finalization_deferred", False)
         ):
             peers.pause()
             def commit_proposals() -> None:
+                # Canonical durability is not optional and has its own drain
+                # allowance. The semantic deadline only limits additional peer
+                # cuts; it must never prevent already-produced proposals from
+                # reaching their shards.
                 _BASE_RUNTIME_WAIT(
                     self, timeout=max(0.0, float(timeout)),
                     stable_checks=stable_checks, resume_peers=False, settle_peers=False,
@@ -285,26 +363,55 @@ def _runtime_wait_quiescent_v862(
 
             reason = None
             for _window in range(_FINAL_STABILIZATION_WINDOWS):
+                remaining = remaining_timeout()
+                if remaining <= 0.0:
+                    reason = "timeout"
+                    break
                 reason = stabilize(
                     max_cycles=8,
                     commit_proposals=commit_proposals,
-                    timeout=timeout,
+                    timeout=remaining,
                 )
                 if reason != "max_cycles":
                     break
-            if reason == "max_cycles":
-                raise TimeoutError(
-                    "v8 developmental finalization did not stabilize after "
-                    f"{_FINAL_STABILIZATION_WINDOWS} bounded windows"
+            self._v82_developmental_finalization_attempted_generation = generation
+            self._v82_developmental_finalization_status = reason
+            if reason == "stable":
+                self._v82_developmental_finalized = True
+                self._v82_developmental_finalized_generation = int(
+                    getattr(self, "generation", generation)
                 )
-            self._v82_developmental_finalized = True
-            self._v82_developmental_finalized_generation = int(
-                getattr(self, "generation", generation)
+                return
+
+            # Semantic fixed-point work is best-effort at a process boundary.
+            # Canonical actor/stage/shard data is already durable and must still
+            # reach the normal drain/snapshot path when a large research graph
+            # needs more generations than this invocation can finish.
+            from v8 import information_flow_diagnostics as flow
+
+            flow.emit_bounded(
+                "developmental",
+                "finalization_deferred",
+                input_count=1,
+                output_count=0,
+                rejection_counts={f"stabilization_{reason or 'unknown'}": 1},
+                fields={
+                    "stabilization_status": reason or "unknown",
+                    "attempted_generation": generation,
+                    "finalized": False,
+                },
             )
-            return
+            # Metrics, transfer, snapshot, and close paths can each call
+            # wait_quiescent. Once this invocation has exhausted its semantic
+            # allowance, do not restart finalization merely because draining its
+            # own proposals advanced the canonical generation. The next process
+            # restores those proposals and gets a fresh bounded attempt.
+            self._v82_developmental_finalization_deferred = True
     return _BASE_RUNTIME_WAIT(
         self,
-        timeout=timeout,
+        # A semantic stabilization budget must not consume the independent
+        # canonical drain budget needed to preserve and snapshot actor results.
+        timeout=max(0.0, float(timeout)),
         stable_checks=stable_checks,
         resume_peers=resume_peers,
         settle_peers=settle_peers,

@@ -12,6 +12,9 @@ from v8.outcome_holdout_v828 import (
 from v8.peers_v82 import V82DevelopmentalPeerSupervisor
 
 
+_DIAGNOSTIC_RUN_ONCE_V828 = None
+
+
 def _diagnose_h13_holdout(supervisor: V82DevelopmentalPeerSupervisor) -> dict[str, object]:
     """Describe why H13 holdout candidates are accepted or rejected.
 
@@ -200,15 +203,20 @@ def _emit_h13_diagnostics(supervisor: V82DevelopmentalPeerSupervisor) -> None:
 
 
 def install_outcome_holdout_diagnostics_v828() -> None:
+    global _DIAGNOSTIC_RUN_ONCE_V828
     if getattr(V82DevelopmentalPeerSupervisor, "_v828_holdout_diagnostics_installed", False):
         return
 
     original_run_once = V82DevelopmentalPeerSupervisor.run_once
 
     def run_once(self: V82DevelopmentalPeerSupervisor):
+        before_cycles = int(getattr(self, "_cycles", 0))
         result = original_run_once(self)
+        if int(getattr(self, "_cycles", 0)) == before_cycles:
+            return result
         _emit_h13_diagnostics(self)
         return result
 
     V82DevelopmentalPeerSupervisor.run_once = run_once
+    _DIAGNOSTIC_RUN_ONCE_V828 = run_once
     V82DevelopmentalPeerSupervisor._v828_holdout_diagnostics_installed = True

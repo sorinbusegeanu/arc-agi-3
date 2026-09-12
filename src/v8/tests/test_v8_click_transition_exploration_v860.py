@@ -42,27 +42,39 @@ class ClickTransitionExplorationV860Tests(unittest.TestCase):
         with patch.object(v860, "_BASE_OBSERVE_TRANSITION", return_value=None):
             v860._observe_transition_v860(self.sampler, **kwargs)
 
-    def test_productive_scan_immediately_queues_same_coordinate(self) -> None:
+    def test_productive_scan_does_not_repeat_unknown_coordinate_by_default(self) -> None:
         self._observe(10, 11)
-        self.assertEqual(self.sampler._v860_pending_action, self.action)
+        self.assertIsNone(self.sampler._v860_pending_action)
         self.assertEqual(
             self.sampler._v860_seen_transitions,
             {(self.action, 10, 11)},
         )
 
-        with patch.object(v860, "_BASE_FORCED_ACTION", return_value=None):
-            selected = v860._forced_action_v860(
-                self.sampler,
-                level=0,
-                context=11,
-                actions=(self.action,),
-                history=(self.action,),
-            )
-        self.assertEqual(selected, self.action)
-        self.assertEqual(self.sampler.base.current.kind, "CLICK_CHARACTERIZE")
+    def test_explicit_characterization_cap_queues_same_coordinate(self) -> None:
+        prior = os.environ.get(v860._REPEAT_CAP_ENV)
+        os.environ[v860._REPEAT_CAP_ENV] = "4"
+        try:
+            self._observe(10, 11)
+            self.assertEqual(self.sampler._v860_pending_action, self.action)
+
+            with patch.object(v860, "_BASE_FORCED_ACTION", return_value=None):
+                selected = v860._forced_action_v860(
+                    self.sampler,
+                    level=0,
+                    context=11,
+                    actions=(self.action,),
+                    history=(self.action,),
+                )
+            self.assertEqual(selected, self.action)
+            self.assertEqual(self.sampler.base.current.kind, "CLICK_CHARACTERIZE")
+        finally:
+            if prior is None:
+                os.environ.pop(v860._REPEAT_CAP_ENV, None)
+            else:
+                os.environ[v860._REPEAT_CAP_ENV] = prior
 
     def test_pending_characterization_prevents_frontier_reset(self) -> None:
-        self._observe(20, 21)
+        self.sampler._v860_pending_action = self.action
         self.sampler.pending_sequence = ((1,), (0, 20), (self.action,))
         self.sampler.base.pending_reset = ((1,), (0, 20))
         with patch.object(v860, "_BASE_PREPARE_STEP", return_value=True) as delegated:
@@ -78,17 +90,25 @@ class ClickTransitionExplorationV860Tests(unittest.TestCase):
         self.assertEqual(len(self.sampler._v860_seen_transitions), 0)
 
     def test_state_transition_cycle_stops_without_spending_another_click(self) -> None:
-        self._observe(40, 41)
-        self.assertEqual(self.sampler._v860_pending_action, self.action)
-        self.sampler._v860_pending_action = None
+        prior = os.environ.get(v860._REPEAT_CAP_ENV)
+        os.environ[v860._REPEAT_CAP_ENV] = "4"
+        try:
+            self._observe(40, 41)
+            self.assertEqual(self.sampler._v860_pending_action, self.action)
+            self.sampler._v860_pending_action = None
 
-        self._observe(41, 40, kind="CLICK_CHARACTERIZE")
-        self.assertEqual(self.sampler._v860_pending_action, self.action)
-        self.sampler._v860_pending_action = None
+            self._observe(41, 40, kind="CLICK_CHARACTERIZE")
+            self.assertEqual(self.sampler._v860_pending_action, self.action)
+            self.sampler._v860_pending_action = None
 
-        self._observe(40, 41, kind="CLICK_CHARACTERIZE")
-        self.assertIsNone(self.sampler._v860_pending_action)
-        self.assertEqual(len(self.sampler._v860_seen_transitions), 2)
+            self._observe(40, 41, kind="CLICK_CHARACTERIZE")
+            self.assertIsNone(self.sampler._v860_pending_action)
+            self.assertEqual(len(self.sampler._v860_seen_transitions), 2)
+        finally:
+            if prior is None:
+                os.environ.pop(v860._REPEAT_CAP_ENV, None)
+            else:
+                os.environ[v860._REPEAT_CAP_ENV] = prior
 
     def test_characterization_repeat_cap_is_bounded_and_configurable(self) -> None:
         prior = os.environ.get(v860._REPEAT_CAP_ENV)

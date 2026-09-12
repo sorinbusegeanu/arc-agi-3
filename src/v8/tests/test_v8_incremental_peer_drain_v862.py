@@ -6,6 +6,8 @@ import unittest
 import v8
 from v8 import incremental_peer_drain_v862 as v862
 from v8 import runtime_scaling_v841 as v841
+from v8.developmental_cut import capture_developmental_cut
+from v8.model import MemoryUid
 from v8.runtime import ContinuousMemoryRuntime
 
 
@@ -26,6 +28,13 @@ class _Row:
     def __init__(self, value, level=1):
         self.value = value
         self.level = level
+        self.uid = MemoryUid(1, int(value) + 1)
+        self.updated_watermark = max(0, int(value))
+        self.cognitive_state = 0
+        self.validation_state = 0
+        self.source_uid = self.uid
+        self.target_uid = MemoryUid.zero()
+        self.relation_type = 1
 
 
 class IncrementalPeerDrainV862Tests(unittest.TestCase):
@@ -88,6 +97,90 @@ class IncrementalPeerDrainV862Tests(unittest.TestCase):
         self.assertEqual(captured["edges"], v862._EDGE_SLICE)
         self.assertEqual(supervisor._cycles, 10)
 
+    def test_slice_targets_the_read_view_used_by_downstream_peer(self):
+        class View:
+            def __init__(self, count):
+                self._nodes = (_Arena(_Row(i) for i in range(count)),)
+                self._edges = (_Arena(_Row(i) for i in range(v862._EDGE_SLICE + 5)),)
+
+            def node_records(self, *, level=None):
+                raise AssertionError("active view must be sliced")
+
+            def edge_records(self):
+                raise AssertionError("active view must be sliced")
+
+        active = View(v862._NODE_SLICE + 5)
+        stale = View(v862._NODE_SLICE + 50)
+        supervisor = types.SimpleNamespace(
+            read_view=active,
+            _v813_live_read_view=stale,
+            _seen={},
+            _cycles=1,
+            _last_developmental_cut=None,
+            _v862_edge_wrapped_since_cycle=False,
+            current_watermark=lambda: 100,
+        )
+        original_base = v862._BASE_PEER_RUN_ONCE
+        captured = {}
+        try:
+            def base(self):
+                captured["nodes"] = len(self.read_view.node_records())
+
+            v862._BASE_PEER_RUN_ONCE = base
+            v862._peer_run_once_v862(supervisor)
+        finally:
+            v862._BASE_PEER_RUN_ONCE = original_base
+
+        self.assertEqual(captured["nodes"], v862._NODE_SLICE)
+
+    def test_arena_backed_cut_cannot_bypass_slice_accessors(self):
+        class View:
+            def __init__(self):
+                self._nodes = (_Arena(_Row(i) for i in range(v862._NODE_SLICE + 7)),)
+                self._edges = (_Arena(_Row(i) for i in range(v862._EDGE_SLICE + 7)),)
+
+            def _stable_records_with_version(self, arena):
+                return arena._rows, arena.sequence
+
+            def node_records(self, *, level=None):
+                raise AssertionError("full accessor must be replaced")
+
+            def edge_records(self):
+                raise AssertionError("full accessor must be replaced")
+
+            def source_games(self, uid, *, max_depth=8):
+                return frozenset()
+
+        supervisor = types.SimpleNamespace(
+            read_view=View(),
+            _seen={},
+            _cycles=1,
+            _last_developmental_cut=None,
+            _v862_edge_wrapped_since_cycle=False,
+            current_watermark=lambda: 100,
+        )
+        original_base = v862._BASE_PEER_RUN_ONCE
+        captured = {}
+        try:
+            def base(self):
+                cut = capture_developmental_cut(
+                    self.read_view,
+                    generation=1,
+                    watermark=100,
+                )
+                captured["nodes"] = len(cut.nodes)
+                captured["edges"] = len(cut.edges)
+
+            v862._BASE_PEER_RUN_ONCE = base
+            v862._peer_run_once_v862(supervisor)
+        finally:
+            v862._BASE_PEER_RUN_ONCE = original_base
+
+        self.assertEqual(captured["nodes"], v862._NODE_SLICE)
+        # Only edges whose synthetic source is inside the bounded node slice remain.
+        # An arena fast-path capture would have returned more than this slice.
+        self.assertEqual(captured["edges"], v862._NODE_SLICE)
+
     def test_watermark_cadence_runs_full_checkpoint_before_sweep_wrap(self):
         class View:
             def __init__(self):
@@ -139,7 +232,7 @@ class IncrementalPeerDrainV862Tests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(
             calls[0],
-            (True, v862._NODE_SLICE * 4, v862._EDGE_SLICE * 4),
+            (True, 2048, 2048),
         )
         self.assertEqual(supervisor._cycles, 5)
         self.assertEqual(supervisor._last_developmental_cut, "after")
@@ -207,7 +300,7 @@ class IncrementalPeerDrainV862Tests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(
             calls[0],
-            (True, v862._NODE_SLICE + 1, v862._EDGE_SLICE + 1),
+            (True, v862._NODE_SLICE + 1, v862._NODE_SLICE + 1),
         )
         self.assertEqual(supervisor._cycles, 5)
         self.assertEqual(supervisor._last_developmental_cut, "after")
@@ -259,6 +352,122 @@ class IncrementalPeerDrainV862Tests(unittest.TestCase):
             v862._BASE_RUNTIME_WAIT = original_base
         self.assertFalse(captured["settle_peers"])
         self.assertEqual(captured["timeout"], 9.0)
+
+    def test_finalization_allows_third_bounded_window_for_full_noop_proof(self):
+        original_base = v862._BASE_RUNTIME_WAIT
+
+        class Peers:
+            def __init__(self):
+                self.reasons = iter(("max_cycles", "max_cycles", "stable"))
+                self.calls = 0
+
+            def pause(self):
+                return None
+
+            def run_until_stable(self, **kwargs):
+                self.calls += 1
+                kwargs["commit_proposals"]()
+                return next(self.reasons)
+
+        peers = Peers()
+        runtime = types.SimpleNamespace(
+            _sampling_complete=True,
+            _accepting=False,
+            peers=peers,
+            generation=12,
+        )
+        try:
+            v862._BASE_RUNTIME_WAIT = lambda self, **kwargs: None
+            v862._runtime_wait_quiescent_v862(runtime, timeout=1.0)
+        finally:
+            v862._BASE_RUNTIME_WAIT = original_base
+        self.assertEqual(peers.calls, 3)
+        self.assertTrue(runtime._v82_developmental_finalized)
+        self.assertEqual(runtime._v82_developmental_finalized_generation, 12)
+
+    def test_finalization_timeout_defers_semantic_work_and_still_drains(self):
+        original_base = v862._BASE_RUNTIME_WAIT
+        original_time = v862.time.monotonic
+        drains = []
+
+        class Peers:
+            def __init__(self):
+                self.timeouts = []
+
+            def pause(self):
+                return None
+
+            def run_until_stable(self, **kwargs):
+                self.timeouts.append(kwargs["timeout"])
+                return "max_cycles"
+
+        peers = Peers()
+        runtime = types.SimpleNamespace(
+            _sampling_complete=True,
+            _accepting=False,
+            peers=peers,
+            generation=12,
+        )
+        ticks = iter((10.0, 10.1, 10.6, 11.0))
+        try:
+            v862._BASE_RUNTIME_WAIT = lambda self, **kwargs: drains.append(kwargs)
+            v862.time.monotonic = lambda: next(ticks)
+            v862._runtime_wait_quiescent_v862(runtime, timeout=1.0)
+        finally:
+            v862._BASE_RUNTIME_WAIT = original_base
+            v862.time.monotonic = original_time
+
+        self.assertEqual(len(peers.timeouts), 2)
+        self.assertAlmostEqual(peers.timeouts[0], 0.9)
+        self.assertAlmostEqual(peers.timeouts[1], 0.4)
+        self.assertEqual(runtime._v82_developmental_finalization_status, "timeout")
+        self.assertFalse(getattr(runtime, "_v82_developmental_finalized", False))
+        self.assertEqual(len(drains), 1)
+        self.assertEqual(drains[0]["timeout"], 1.0)
+
+    def test_incomplete_cut_does_not_abort_canonical_shutdown_drain(self):
+        original_base = v862._BASE_RUNTIME_WAIT
+        drains = []
+        stabilization_calls = []
+
+        def stabilize(**_kwargs):
+            stabilization_calls.append(1)
+            return "incomplete_cut"
+
+        peers = types.SimpleNamespace(
+            pause=lambda: None,
+            run_until_stable=stabilize,
+        )
+        runtime = types.SimpleNamespace(
+            _sampling_complete=True,
+            _accepting=False,
+            peers=peers,
+            generation=17,
+        )
+        try:
+            v862._BASE_RUNTIME_WAIT = lambda self, **kwargs: drains.append(kwargs)
+            v862._runtime_wait_quiescent_v862(runtime, timeout=9.0)
+        finally:
+            v862._BASE_RUNTIME_WAIT = original_base
+
+        self.assertEqual(runtime._v82_developmental_finalization_status, "incomplete_cut")
+        self.assertFalse(getattr(runtime, "_v82_developmental_finalized", False))
+        self.assertTrue(runtime._v82_developmental_finalization_deferred)
+        self.assertEqual(runtime._v82_developmental_finalization_attempted_generation, 17)
+        self.assertEqual(len(drains), 1)
+        self.assertEqual(drains[0]["timeout"], 9.0)
+
+        # Metrics, snapshot, and close paths may all request quiescence. Do not
+        # repeat the known-incomplete semantic pass in this process, even when
+        # draining its own proposals advances the graph generation.
+        runtime.generation = 18
+        try:
+            v862._BASE_RUNTIME_WAIT = lambda self, **kwargs: drains.append(kwargs)
+            v862._runtime_wait_quiescent_v862(runtime, timeout=9.0)
+        finally:
+            v862._BASE_RUNTIME_WAIT = original_base
+        self.assertEqual(stabilization_calls, [1])
+        self.assertEqual(len(drains), 2)
 
     def test_normal_active_wait_can_still_settle_peers(self):
         original_base = v862._BASE_RUNTIME_WAIT

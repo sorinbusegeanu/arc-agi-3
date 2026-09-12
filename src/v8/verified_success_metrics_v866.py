@@ -39,6 +39,8 @@ _BASE_EFFECTIVENESS_LOG = None
 
 _ARC_CAPTURE = threading.local()
 _WRITE_LOCK = threading.Lock()
+_HISTORICAL_PARTIAL_CACHE: dict[tuple[str, str], dict[str, object] | None] = {}
+_TRAJECTORY_ROOT_ENV = "ARC_AGI3_V8_TRAJECTORY_ROOT"
 
 
 def _root_path(value) -> Path | None:
@@ -97,6 +99,7 @@ def record_verified_success_v866(
     capture_step: int | None,
     trajectory_id: str | None = None,
     root: str | Path | None = None,
+    reset_relative_actions: bool = False,
 ) -> bool:
     """Persist one current-run successful trajectory atomically.
 
@@ -130,6 +133,7 @@ def record_verified_success_v866(
         "actions": list(action_values),
         "action_count": len(action_values),
         "capture_step": None if capture_step is None else max(0, int(capture_step)),
+        "reset_relative_actions": bool(reset_relative_actions),
         "recorded_ns": time.time_ns(),
     }
     target = (
@@ -171,8 +175,154 @@ def _read_events(root: Path | None) -> tuple[dict[str, object], ...]:
     return tuple(rows)
 
 
+def best_historical_partial_v866(
+    game_id: str,
+    *,
+    current_root: str | Path | None = None,
+) -> dict[str, object] | None:
+    """Return the deepest verified prior-run trajectory without crediting it.
+
+    Restored scientific metrics intentionally credit only completed competence.
+    Sampling still needs the deepest verified prefix, however, or every restart
+    throws away partial progress and asks all actors to rediscover level one.
+    """
+    active = _root_path(current_root) or _configured_success_root()
+    if active is None:
+        return None
+    cache_key = (str(active), str(game_id))
+    if cache_key in _HISTORICAL_PARTIAL_CACHE:
+        cached = _HISTORICAL_PARTIAL_CACHE[cache_key]
+        return None if cached is None else dict(cached)
+    verified_root = active.parent
+    if not verified_root.is_dir():
+        return None
+    selected: dict[str, object] | None = None
+    selected_key: tuple[int, int, int] | None = None
+    for run_root in sorted(verified_root.glob("run-*")):
+        if not run_root.is_dir() or run_root == active:
+            continue
+        for row in _read_events(run_root):
+            if str(row.get("game_id", "")) != str(game_id):
+                continue
+            state = str(row.get("terminal_state", "")).upper()
+            if state not in {"LEVEL", "WIN"}:
+                continue
+            # Events written before this marker contained only a successful
+            # level segment in some capture paths.  Such a segment is valid
+            # outcome evidence but is not safe to replay from reset.
+            if not bool(row.get("reset_relative_actions", False)):
+                continue
+            actions = row.get("actions")
+            if not isinstance(actions, list) or not actions:
+                continue
+            try:
+                levels = max(0, int(row.get("levels_completed", 0) or 0))
+                action_count = len(actions)
+                recorded_ns = max(0, int(row.get("recorded_ns", 0) or 0))
+                action_values = [int(value) for value in actions]
+            except (TypeError, ValueError):
+                continue
+            if levels <= 0:
+                continue
+            # Deeper prefixes dominate; among equal depths prefer the shortest,
+            # then the newest observation.
+            key = (-levels, action_count, -recorded_ns)
+            if selected_key is None or key < selected_key:
+                selected_key = key
+                selected = dict(row)
+                selected["actions"] = action_values
+    _HISTORICAL_PARTIAL_CACHE[cache_key] = (
+        None if selected is None else dict(selected)
+    )
+    return None if selected is None else dict(selected)
+
+
+def best_durable_complete_v866(game_id: str) -> dict[str, object] | None:
+    """Load a complete ARC trajectory as reset-relative sampling guidance."""
+    root_raw = os.environ.get(_TRAJECTORY_ROOT_ENV)
+    if root_raw is None or not str(root_raw).strip():
+        return None
+    try:
+        raw = json.loads(
+            (Path(root_raw) / "best_successful.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, TypeError):
+        return None
+    environments = raw.get("environments")
+    if not isinstance(environments, dict):
+        return None
+    record = environments.get(str(game_id))
+    if not isinstance(record, dict):
+        return None
+    levels = record.get("levels")
+    if not isinstance(levels, list) or len(levels) < _target_levels(str(game_id)):
+        return None
+    actions: list[int] = []
+    try:
+        ordered = sorted(
+            (row for row in levels if isinstance(row, dict)),
+            key=lambda row: int(row.get("level", 0)),
+        )
+        for row in ordered:
+            segment = row.get("actions")
+            if not isinstance(segment, list) or not segment:
+                return None
+            actions.extend(int(value) for value in segment)
+    except (TypeError, ValueError):
+        return None
+    if not actions:
+        return None
+    return {
+        "game_id": str(game_id),
+        "trajectory_id": str(record.get("trajectory_id", "")),
+        "levels_completed": _target_levels(str(game_id)),
+        "terminal_state": "WIN",
+        "actions": actions,
+        "reset_relative_actions": True,
+        "source": "arc_best_successful",
+    }
+
+
 def _target_levels(game_id: str) -> int:
     return 1 if str(game_id) in _GENERIC_GAMES else 5
+
+
+def historical_completion_attempt_steps_v866(
+    game_id: str,
+    *,
+    current_root: str | Path | None = None,
+) -> int:
+    """Estimate one uninterrupted completion attempt from a verified prefix.
+
+    This is scheduling guidance, not success evidence.  It extrapolates the
+    observed mean actions per completed level only far enough to give one actor
+    room to replay the reset-relative prefix and attempt every remaining level.
+    """
+    # A complete durable route is replayed directly and normally terminates
+    # early, so it does not need an enlarged unsolved lease.
+    if best_durable_complete_v866(str(game_id)) is not None:
+        return 0
+    row = best_historical_partial_v866(
+        str(game_id),
+        current_root=current_root,
+    )
+    if not isinstance(row, dict):
+        return 0
+    if str(row.get("terminal_state", "")).upper() == "WIN":
+        return 0
+    actions = row.get("actions")
+    if not isinstance(actions, list) or not actions:
+        return 0
+    try:
+        levels = max(0, int(row.get("levels_completed", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+    target = _target_levels(str(game_id))
+    if levels <= 0 or levels >= target:
+        return 0
+    observed_actions = len(actions)
+    actions_per_level = max(1, (observed_actions + levels - 1) // levels)
+    return observed_actions + actions_per_level * (target - levels)
 
 
 def verified_success_snapshot_v866(
@@ -381,6 +531,7 @@ class _VerifiedAdapterProxy:
                 levels_completed=1,
                 actions=tuple(self._actions),
                 capture_step=self._steps,
+                reset_relative_actions=True,
             )
         return result
 
@@ -448,9 +599,12 @@ def _write_successful_trajectory_v866(row) -> None:
             seed=int(row.anchor.seed),
             terminal_state=str(row.target.terminal_state),
             levels_completed=int(row.target.levels_completed),
-            actions=tuple(row.actions),
+            # A level row can contain only its final segment.  Replay evidence
+            # must start at reset, so persist the anchor prefix as well.
+            actions=tuple(row.full_actions),
             capture_step=max(0, int(getattr(_ARC_CAPTURE, "step", 0))) or None,
             trajectory_id=str(row.trajectory_id),
+            reset_relative_actions=True,
         )
     except (AttributeError, TypeError, ValueError):
         # Optimizer capture remains operational; malformed/noncanonical rows earn no

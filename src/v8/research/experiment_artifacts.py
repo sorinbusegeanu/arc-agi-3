@@ -185,8 +185,27 @@ def _latest_snapshot_identity(root: Path) -> dict[str, Any]:
         "snapshot_id": manifest.get("snapshot_id"),
         "generation": manifest.get("generation"),
         "watermark": manifest.get("watermark"),
+        "final": manifest.get("final"),
         "digest": manifest.get("digest", manifest.get("snapshot_digest")),
     }
+
+
+def _resolved_command_games(argv: Sequence[str]) -> tuple[str, ...]:
+    selector = _argument_value(argv, "--games")
+    if selector is None:
+        return ()
+    from v8.mixed_environment_v859 import resolve_mixed_game_selector
+
+    mixed = resolve_mixed_game_selector(selector)
+    if mixed is not None:
+        return tuple(str(value) for value in mixed)
+    from v7.game_sets import resolve_game_selector
+
+    return tuple(
+        str(value) for value in resolve_game_selector(
+            selector, _argument_value(argv, "--env-root")
+        )
+    )
 
 
 def _summary_state(summary: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -383,22 +402,57 @@ def capture_experiment_start(root: str | Path, *, argv: Sequence[str]) -> Path:
             else {}
         )
         mismatches = []
+        if not isinstance(raw_summary.get("metrics"), Mapping):
+            mismatches.append("summary.metrics")
+        if not isinstance(raw_summary.get("games"), list) or not raw_summary.get("games"):
+            mismatches.append("summary.games")
+        if not isinstance(final_snapshot, Mapping):
+            mismatches.append("summary.final_snapshot")
+            final_snapshot = {}
+        required_snapshot_fields = (
+            "snapshot_id", "generation", "watermark", "path", "digest", "final"
+        )
+        for key in required_snapshot_fields:
+            if final_snapshot.get(key) in (None, ""):
+                mismatches.append(f"summary.final_snapshot.{key}")
         for key in ("snapshot_id", "generation", "watermark"):
-            expected = final_snapshot.get(key) if isinstance(final_snapshot, Mapping) else None
+            expected = final_snapshot.get(key)
             actual = start_snapshot_identity.get(key)
-            if expected is not None and actual is not None and int(expected) != int(actual):
+            if expected is None or actual is None or int(expected) != int(actual):
                 mismatches.append(key)
+        summary_watermark = int(start_state.get("watermark", 0))
+        if summary_watermark <= 0 or summary_watermark != int(
+            start_snapshot_identity.get("watermark", -1) or -1
+        ):
+            mismatches.append("metrics.watermark")
+        if final_snapshot.get("final") is not True:
+            mismatches.append("summary.final_snapshot.final")
+        if start_snapshot_identity.get("final") is not True:
+            mismatches.append("manifest.final")
+        snapshot_path = str(final_snapshot.get("path", ""))
+        if Path(snapshot_path).name != str(start_snapshot_identity.get("name", "")):
+            mismatches.append("summary.final_snapshot.path")
+        if str(final_snapshot.get("digest", "")) != str(
+            start_snapshot_identity.get("manifest_identity", {}).get("sha256", "")
+        ):
+            mismatches.append("summary.final_snapshot.digest")
+        try:
+            command_games = _resolved_command_games(argv)
+        except ValueError as exc:
+            raise ValueError(f"invalid command game selector for REUSE: {exc}") from exc
+        if tuple(str(value) for value in raw_summary.get("games", ())) != command_games:
+            mismatches.append("summary.games")
         if mismatches:
             raise ValueError(
                 "memory_policy=REUSE start snapshot does not match durable run summary: "
-                + ", ".join(mismatches)
+                + ", ".join(dict.fromkeys(mismatches))
             )
     if memory_policy == "CLEAN" and (
         bool(start_state.get("available"))
-        and any(int(start_state.get(key, 0)) != 0 for key in ("watermark", "memories", "edges"))
+        or bool(start_snapshot_identity.get("available"))
     ):
         raise ValueError(
-            "memory_policy=CLEAN requires an empty run root; non-zero durable start state found"
+            "memory_policy=CLEAN requires an empty run root; durable start state found"
         )
     ledger = root / "evidence" / "v8_evidence.jsonl"
     try:

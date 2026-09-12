@@ -10,6 +10,7 @@ from v8.publication import LiveReadView
 
 _INSTALLED = False
 _BASE_PLAN_CANDIDATES = None
+_BASE_ACTOR_PLAN_CANDIDATES = None
 _BASE_RUN_MIXED_ACTOR_JOBS = None
 _BOOTSTRAP_ATTEMPTS = 3
 
@@ -85,6 +86,19 @@ def _plan_candidates_v881(self: LiveReadView, context_signature: int, action_ids
     return _BASE_PLAN_CANDIDATES(self, context_signature, action_ids, **kwargs)
 
 
+def _actor_plan_candidates_v881(self, context_signature: int, action_ids, **kwargs):
+    # ``memory_efficiency_v851`` installs a compact ActorReadView with its own
+    # planner implementation. Preserve that class-specific delegate rather than
+    # invoking the publication-view method on a different representation.
+    if not kwargs:
+        bootstrap = _bootstrap_plan(self, context_signature, action_ids)
+        if bootstrap is not None:
+            return (bootstrap,)
+    return _BASE_ACTOR_PLAN_CANDIDATES(
+        self, context_signature, action_ids, **kwargs
+    )
+
+
 def _selected_generic_plan(view, action: int, planned: bool):
     if not planned:
         return None
@@ -138,7 +152,17 @@ def _run_generic_actor_job_v881(runtime, job, *, reporting_queue=None) -> ActorR
     graph_check_steps = max(1, int(job.graph_check_steps))
     try:
         for requested_step in range(1, int(job.steps) + 1):
-            if getattr(runtime, "_stop", None) is not None and runtime._stop.is_set():
+            stop = getattr(runtime, "_stop", None)
+            if stop is not None and stop.is_set():
+                break
+            freeze = getattr(runtime, "_snapshot_freeze", None)
+            while (
+                freeze is not None
+                and freeze.is_set()
+                and (stop is None or not stop.is_set())
+            ):
+                time.sleep(0.002)
+            if stop is not None and stop.is_set():
                 break
             if requested_step > 1 and (requested_step - 1) % graph_check_steps == 0:
                 invalidate = getattr(view, "invalidate_strategy_cache", None)
@@ -310,15 +334,22 @@ def _run_mixed_actor_jobs_v881(runtime, jobs, **kwargs):
 
 
 def install_strategy_empirical_bootstrap_v881() -> None:
-    global _INSTALLED, _BASE_PLAN_CANDIDATES, _BASE_RUN_MIXED_ACTOR_JOBS
+    global _INSTALLED, _BASE_PLAN_CANDIDATES, _BASE_ACTOR_PLAN_CANDIDATES
+    global _BASE_RUN_MIXED_ACTOR_JOBS
     if _INSTALLED:
         return
     from v8 import mixed_environment_v859 as mixed
+    from v8 import actor as actor_module
 
     _BASE_PLAN_CANDIDATES = LiveReadView.plan_candidates
+    actor_view_cls = actor_module.LiveReadView
+    _BASE_ACTOR_PLAN_CANDIDATES = actor_view_cls.plan_candidates
     _BASE_RUN_MIXED_ACTOR_JOBS = mixed.run_mixed_actor_jobs
-    # Bootstrap is invoked by the final v8.26 planner authority. Keeping that
-    # function installed avoids a late monkey-patch hiding the control contract.
+    # The publication view remains owned by the v8.26 planner authority. Actor
+    # workers use the compact replacement installed by v8.51; that is the class
+    # which needs the empirical bootstrap wrapper.
+    if actor_view_cls is not LiveReadView:
+        actor_view_cls.plan_candidates = _actor_plan_candidates_v881
     mixed.run_generic_actor_job = _run_generic_actor_job_v881
     mixed.run_mixed_actor_jobs = _run_mixed_actor_jobs_v881
     _INSTALLED = True

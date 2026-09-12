@@ -65,6 +65,7 @@ class VerifiedSuccessMetricsV866Tests(unittest.TestCase):
     def setUp(self):
         self.previous_root = os.environ.get(SUCCESS_ROOT_ENV)
         os.environ.pop(SUCCESS_ROOT_ENV, None)
+        verified._HISTORICAL_PARTIAL_CACHE.clear()
 
     def tearDown(self):
         if self.previous_root is None:
@@ -182,6 +183,118 @@ class VerifiedSuccessMetricsV866Tests(unittest.TestCase):
             self.assertEqual(won["game_solve_rate_pct"], 100.0)
             self.assertEqual(won["mean_first_win_step"], 37.0)
 
+    def test_deepest_historical_partial_is_available_without_metric_credit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            verified_root = Path(tmp) / "verified_success"
+            old = verified_root / "run-old"
+            current = verified_root / "run-current"
+            current.mkdir(parents=True)
+            record_verified_success_v866(
+                game_id="gp02", seed=1, terminal_state="LEVEL",
+                levels_completed=2, actions=(1, 2, 3), capture_step=3, root=old,
+                reset_relative_actions=True,
+            )
+            record_verified_success_v866(
+                game_id="gp02", seed=2, terminal_state="LEVEL",
+                levels_completed=4, actions=(4, 5), capture_step=2, root=old,
+                reset_relative_actions=True,
+            )
+            selected = verified.best_historical_partial_v866(
+                "gp02", current_root=current
+            )
+            self.assertIsNotNone(selected)
+            self.assertEqual(selected["levels_completed"], 4)
+            self.assertEqual(selected["actions"], [4, 5])
+            # Historical replay support never enters current-run outcome credit.
+            snapshot = verified_success_snapshot_v866(current, ("gp02",))
+            self.assertEqual(snapshot["current_run_levels_solved"], 0)
+
+    def test_legacy_level_segment_is_never_replayed_from_reset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            verified_root = Path(tmp) / "verified_success"
+            old = verified_root / "run-old"
+            current = verified_root / "run-current"
+            current.mkdir(parents=True)
+            record_verified_success_v866(
+                game_id="gp02", seed=1, terminal_state="LEVEL",
+                levels_completed=4, actions=(9, 10), capture_step=200, root=old,
+            )
+            self.assertIsNone(
+                verified.best_historical_partial_v866(
+                    "gp02", current_root=current
+                )
+            )
+
+    def test_historical_prefix_sizes_one_attempt_through_remaining_levels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            verified_root = Path(tmp) / "verified_success"
+            old = verified_root / "run-old"
+            current = verified_root / "run-current"
+            current.mkdir(parents=True)
+            record_verified_success_v866(
+                game_id="gp02",
+                seed=1,
+                terminal_state="LEVEL",
+                levels_completed=3,
+                actions=tuple(range(180)),
+                capture_step=180,
+                root=old,
+                reset_relative_actions=True,
+            )
+            with patch.dict(os.environ, {verified._TRAJECTORY_ROOT_ENV: ""}):
+                self.assertEqual(
+                    verified.historical_completion_attempt_steps_v866(
+                        "gp02", current_root=current
+                    ),
+                    300,
+                )
+
+    def test_complete_arc_trajectory_is_loaded_as_reset_relative_replay(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = {
+                "environments": {
+                    "gp01": {
+                        "trajectory_id": "winner",
+                        "levels": [
+                            {"level": level, "actions": [level + 10]}
+                            for level in range(5)
+                        ],
+                    }
+                }
+            }
+            (root / "best_successful.json").write_text(json.dumps(payload))
+            with patch.dict(
+                os.environ,
+                {verified._TRAJECTORY_ROOT_ENV: str(root)},
+            ):
+                selected = verified.best_durable_complete_v866("gp01")
+            self.assertEqual(selected["actions"], [10, 11, 12, 13, 14])
+            self.assertEqual(selected["terminal_state"], "WIN")
+            self.assertTrue(selected["reset_relative_actions"])
+
+    def test_arc_level_event_persists_reset_relative_full_actions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "verified"
+            os.environ[SUCCESS_ROOT_ENV] = str(root)
+            row = SuccessfulTrajectory(
+                "partial",
+                ReplayAnchor("gp02", 0, (10, 11), None),
+                TrajectoryTarget(3, "LEVEL"),
+                (12, 13),
+            )
+            _ARC_CAPTURE.step = 4
+            with patch.object(verified, "_BASE_TRAJECTORY_WRITE", return_value=None):
+                verified._write_successful_trajectory_v866(row)
+            event = next((root / "events").glob("*.json"))
+            import json
+
+            payload = json.loads(event.read_text(encoding="utf-8"))
+            self.assertEqual(payload["actions"], [10, 11, 12, 13])
+            self.assertTrue(payload["reset_relative_actions"])
+
     def test_mixed_denominator_is_thirteen_units_and_five_games(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "verified"
@@ -234,6 +347,24 @@ class VerifiedSuccessMetricsV866Tests(unittest.TestCase):
             self.assertEqual(payload["successful_trajectories"], 1)
             self.assertEqual(payload["current_run_games_won"], 1)
             self.assertEqual(payload["mean_first_win_step"], 41.0)
+
+    def test_late_integrity_wrapper_preserves_reset_relative_marker(self):
+        from v8 import run_integrity_v874 as integrity
+
+        captured = {}
+        with patch.object(
+            integrity,
+            "_BASE_RECORD_VERIFIED_SUCCESS",
+            side_effect=lambda **kwargs: captured.update(kwargs) or True,
+        ):
+            self.assertTrue(
+                integrity._record_verified_success_v874(
+                    game_id="gp02", seed=1, terminal_state="LEVEL",
+                    levels_completed=2, actions=(1,), capture_step=1,
+                    reset_relative_actions=True,
+                )
+            )
+        self.assertTrue(captured["reset_relative_actions"])
 
     def test_periodic_actor_wins_are_zero_without_verified_trajectory(self):
         with tempfile.TemporaryDirectory() as tmp:

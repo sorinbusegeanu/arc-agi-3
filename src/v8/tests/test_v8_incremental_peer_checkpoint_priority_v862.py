@@ -4,12 +4,16 @@ import types
 import unittest
 
 from v8 import incremental_peer_drain_v862 as v862
+from v8.model import MemoryUid
 
 
 class _Row:
     def __init__(self, value, level=1):
         self.value = value
         self.level = level
+        self.uid = MemoryUid(1, int(value) + 1)
+        self.source_uid = self.uid
+        self.target_uid = MemoryUid.zero()
 
 
 class _Arena:
@@ -41,16 +45,30 @@ class _View:
 
 
 class IncrementalPeerCheckpointPriorityV862Tests(unittest.TestCase):
-    def test_first_large_graph_checkpoint_is_due_from_run_origin(self):
-        supervisor = types.SimpleNamespace()
-        self.assertTrue(
+    def test_first_large_graph_checkpoint_anchors_to_restored_watermark(self):
+        supervisor = types.SimpleNamespace(_v862_run_origin_watermark=60_000)
+        self.assertFalse(
             v862._coherent_checkpoint_due(
                 supervisor,
-                watermark=v862._COHERENT_MIN_WATERMARK_PROGRESS,
+                watermark=60_000,
                 now=10.0,
             )
         )
-        self.assertEqual(supervisor._v862_last_coherent_checkpoint_watermark, 0)
+        self.assertEqual(supervisor._v862_last_coherent_checkpoint_watermark, 60_000)
+        self.assertFalse(
+            v862._coherent_checkpoint_due(
+                supervisor,
+                watermark=61_999,
+                now=40.0,
+            )
+        )
+        self.assertTrue(
+            v862._coherent_checkpoint_due(
+                supervisor,
+                watermark=62_000,
+                now=40.0,
+            )
+        )
 
     def test_due_checkpoint_runs_before_bounded_slice(self):
         view = _View()
@@ -62,6 +80,8 @@ class IncrementalPeerCheckpointPriorityV862Tests(unittest.TestCase):
             _v862_edge_wrapped_since_cycle=False,
             _v82_stabilizing=False,
             current_watermark=lambda: v862._COHERENT_MIN_WATERMARK_PROGRESS,
+            _v862_last_coherent_checkpoint_time=0.0,
+            _v862_last_coherent_checkpoint_watermark=0,
         )
         original_base = v862._BASE_PEER_RUN_ONCE
         original_time = v862.time.monotonic
@@ -80,7 +100,7 @@ class IncrementalPeerCheckpointPriorityV862Tests(unittest.TestCase):
 
         try:
             v862._BASE_PEER_RUN_ONCE = base
-            v862.time.monotonic = lambda: 10.0
+            v862.time.monotonic = lambda: 20.0
             v862._peer_run_once_v862(supervisor)
         finally:
             v862._BASE_PEER_RUN_ONCE = original_base
@@ -89,7 +109,7 @@ class IncrementalPeerCheckpointPriorityV862Tests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(
             calls[0],
-            (True, v862._NODE_SLICE * 2, v862._EDGE_SLICE * 2),
+            (True, v862._NODE_SLICE * 2, v862._NODE_SLICE * 2),
         )
         self.assertEqual(
             v862._saved_offset(supervisor, v862._NODE_OFFSET_KEY),

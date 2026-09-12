@@ -9,6 +9,9 @@ from v8.outcomes import OutcomeClass, OutcomeEquivalenceEstimator
 from v8.peers import DevelopmentalPeerSupervisor
 
 
+_HOLDOUT_RUN_ONCE_V828 = None
+
+
 _LINEAGE_RELATIONS = {
     int(RelationType.PROVENANCE),
     int(RelationType.EXPLAINS),
@@ -30,6 +33,7 @@ class OutcomeHoldoutValidation:
     training_persistent: bool
     holdout_consistent: bool
     training_class: OutcomeClass
+    holdout_class: OutcomeClass
     full_class: OutcomeClass
     training_occurrences: int
     holdout_occurrences: int
@@ -83,6 +87,22 @@ def _derive_class(
     )
 
 
+def _persistence_rejection(
+    outcome: OutcomeClass, estimator: OutcomeEquivalenceEstimator, *, prefix: str
+) -> str:
+    if outcome.support < estimator.min_support:
+        return f"{prefix}_support_below_minimum"
+    if outcome.stability < estimator.stability_threshold:
+        return f"{prefix}_stability_below_threshold"
+    if outcome.context_consistency < estimator.context_consistency_threshold:
+        return f"{prefix}_context_consistency_below_threshold"
+    if outcome.within_class_diameter > estimator.max_diameter:
+        return f"{prefix}_diameter_above_threshold"
+    if outcome.predictive_interchangeability < estimator.interchangeability_threshold:
+        return f"{prefix}_interchangeability_below_threshold"
+    return f"{prefix}_not_persistent"
+
+
 def _lineage_occurrences_by_world(
     read_view,
     roots: tuple[MemoryUid, ...],
@@ -91,11 +111,28 @@ def _lineage_occurrences_by_world(
 ):
     """Count direct game-provenance-bearing lineage occurrences for each fine M6 root."""
     parents: dict[MemoryUid, set[MemoryUid]] = defaultdict(set)
-    direct_games: dict[MemoryUid, set[int]] = defaultdict(set)
+    try:
+        node_levels = {
+            row.uid: int(row.level) for row in read_view.node_records()
+        }
+    except (AttributeError, TypeError):
+        node_levels = {}
+    direct_games: dict[MemoryUid, dict[int, int]] = defaultdict(
+        lambda: defaultdict(int)
+    )
     for edge in read_view.edge_records():
         relation = int(edge.relation_type)
         if relation == int(RelationType.GAME_PROVENANCE) and int(edge.target_uid.hi) == 0:
-            direct_games[edge.source_uid].add(int(edge.target_uid.lo))
+            # A single M1 contingency is the canonical occurrence unit.  Higher
+            # levels repeat the same lineage fact and must not multiply it.
+            if (
+                edge.source_uid in node_levels
+                and node_levels[edge.source_uid] != int(MemoryLevel.M1)
+            ):
+                continue
+            direct_games[edge.source_uid][int(edge.target_uid.lo)] += max(
+                1, int(getattr(edge, "support_count", 1))
+            )
         elif relation in _LINEAGE_RELATIONS:
             parents[edge.source_uid].add(edge.target_uid)
 
@@ -103,12 +140,12 @@ def _lineage_occurrences_by_world(
     for root in roots:
         frontier = {root}
         visited = {root}
-        occurrences_by_game: dict[int, set[MemoryUid]] = defaultdict(set)
+        occurrences_by_game: dict[int, int] = defaultdict(int)
         for _depth in range(max(0, int(max_depth)) + 1):
             following: set[MemoryUid] = set()
             for uid in frontier:
-                for game in direct_games.get(uid, ()):
-                    occurrences_by_game[int(game)].add(uid)
+                for game, support in direct_games.get(uid, {}).items():
+                    occurrences_by_game[int(game)] += int(support)
                 for parent in parents.get(uid, ()):
                     if parent not in visited:
                         visited.add(parent)
@@ -117,9 +154,9 @@ def _lineage_occurrences_by_world(
                 break
             frontier = following
         result[root] = {
-            int(game): len(occurrences)
-            for game, occurrences in occurrences_by_game.items()
-            if occurrences
+            int(game): int(count)
+            for game, count in occurrences_by_game.items()
+            if count > 0
         }
     return result
 
@@ -176,8 +213,14 @@ def _select_occurrence_holdout_class(
                     training_rows.append(row)
                     training_members.add(uid)
                     training_games.add(int(game))
-        if not holdout_rows or len(training_members) < 2 or not training_games:
-            rejected["insufficient_disjoint_training_members"] += 1
+        if not holdout_rows:
+            rejected["target_has_no_holdout_occurrences"] += 1
+            continue
+        if len(training_members) < 2:
+            rejected["fewer_than_two_training_members"] += 1
+            continue
+        if not training_games:
+            rejected["no_training_worlds"] += 1
             continue
 
         training_class = _derive_class(
@@ -188,8 +231,31 @@ def _select_occurrence_holdout_class(
             estimator=estimator,
         )
         if not training_class.persistent:
-            rejected["training_class_not_persistent"] += 1
+            rejected[_persistence_rejection(
+                training_class, estimator, prefix="training"
+            )] += 1
             continue
+        holdout_class = _derive_class(
+            full_class.descriptor,
+            tuple(holdout_rows),
+            uid=full_class.uid,
+            version=full_class.version,
+            estimator=estimator,
+        )
+        training_variants = {
+            int(row.key_parts[2]) for row in training_rows if len(row.key_parts) >= 3
+        }
+        holdout_variants = {
+            int(row.key_parts[2]) for row in holdout_rows if len(row.key_parts) >= 3
+        }
+        holdout_consistent = bool(
+            holdout_variants
+            and holdout_variants.issubset(training_variants)
+            and holdout_class.context_consistency >= estimator.context_consistency_threshold
+            and holdout_class.within_class_diameter <= estimator.max_diameter
+            and holdout_class.predictive_interchangeability
+            >= estimator.interchangeability_threshold
+        )
         full_shadow = _derive_class(
             full_class.descriptor,
             tuple(training_rows + holdout_rows),
@@ -206,8 +272,9 @@ def _select_occurrence_holdout_class(
             holdout_games=(int(target_game),),
             target_game_hash=int(target_game),
             training_persistent=True,
-            holdout_consistent=bool(full_shadow.persistent),
+            holdout_consistent=holdout_consistent,
             training_class=training_class,
+            holdout_class=holdout_class,
             full_class=full_shadow,
             training_occurrences=sum(int(row.support_count) for row in training_rows),
             holdout_occurrences=sum(int(row.support_count) for row in holdout_rows),
@@ -313,7 +380,7 @@ def _emit_holdout_evidence(
             level=MemoryLevel.M6,
             validation_state=int(ValidationState.STRUCTURAL),
         )
-        score = _consistency_score(validation.full_class)
+        score = _consistency_score(validation.holdout_class)
         value = score if validation.holdout_consistent else max(1e-9, 1.0 - score)
         supervisor._append_evidence(
             kind,
@@ -346,29 +413,36 @@ def _emit_holdout_evidence(
                         "training_persistent": validation.training_persistent,
                         "holdout_consistent": validation.holdout_consistent,
                         "training_support": validation.training_class.support,
+                        "holdout_support": validation.holdout_class.support,
                         "full_support": validation.full_class.support,
                         "training_diameter": validation.training_class.within_class_diameter,
                         "full_diameter": validation.full_class.within_class_diameter,
                         "training_interchangeability": validation.training_class.predictive_interchangeability,
+                        "holdout_interchangeability": validation.holdout_class.predictive_interchangeability,
                         "full_interchangeability": validation.full_class.predictive_interchangeability,
                         "criterion": "existing_m6_persistence_diameter_interchangeability",
-                        "validation_unit": "direct_game_provenance_bearing_lineage_node",
+                        "validation_unit": "m1_game_provenance_edge_support",
                     }
                 ],
             )
 
 
 def install_outcome_holdout_v828() -> None:
+    global _HOLDOUT_RUN_ONCE_V828
     if getattr(OutcomeEquivalenceEstimator, "_v828_holdout_installed", False):
         return
 
     original_base_run_once = DevelopmentalPeerSupervisor.run_once
 
     def base_run_once(self: DevelopmentalPeerSupervisor):
+        before_cycles = int(getattr(self, "_cycles", 0))
         result = original_base_run_once(self)
+        if int(getattr(self, "_cycles", 0)) == before_cycles:
+            return result
         validations = _build_validations(self)
         _emit_holdout_evidence(self, validations)
         return result
 
     DevelopmentalPeerSupervisor.run_once = base_run_once
+    _HOLDOUT_RUN_ONCE_V828 = base_run_once
     OutcomeEquivalenceEstimator._v828_holdout_installed = True

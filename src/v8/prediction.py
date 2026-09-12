@@ -47,6 +47,9 @@ class PredictionEstimator:
         self.min_support = int(min_support)
         self.stability_threshold = float(stability_threshold)
         self.last_rejections: dict[str, int] = {}
+        self.last_group_count = 0
+        self.last_supported_count = 0
+        self.last_violation_count = 0
 
     def evaluate(self, rows: tuple[NodeRecord, ...]) -> tuple[PredictionEvidence, ...]:
         grouped: dict[tuple[int, int], list[NodeRecord]] = defaultdict(list)
@@ -57,6 +60,7 @@ class PredictionEstimator:
 
         result: list[PredictionEvidence] = []
         rejected: dict[str, int] = {}
+        self.last_group_count = len(grouped)
         for (context, action), variants in grouped.items():
             total = sum(max(0, int(row.support_count)) for row in variants)
             if not variants or total < self.min_support:
@@ -81,12 +85,23 @@ class PredictionEstimator:
                 ) + 1
                 continue
             outcome = int(expectation.key_parts[2])
-            contradictory = [
+            contradictory_observations = [
                 row
                 for row in variants
                 if int(row.key_parts[2]) != outcome
-                and float(row.prediction_error) > 0.0
             ]
+            contradictory = [
+                row for row in contradictory_observations
+                if float(row.prediction_error) > 0.0
+            ]
+            if not contradictory_observations:
+                rejected["no_contradictory_observation"] = rejected.get(
+                    "no_contradictory_observation", 0
+                ) + 1
+            elif not contradictory:
+                rejected["contradiction_not_causally_matched"] = rejected.get(
+                    "contradiction_not_causally_matched", 0
+                ) + 1
             observation = (
                 min(
                     contradictory,
@@ -108,4 +123,6 @@ class PredictionEstimator:
                 )
             )
         self.last_rejections = rejected
+        self.last_supported_count = len(result)
+        self.last_violation_count = sum(int(row.violated) for row in result)
         return tuple(result)
