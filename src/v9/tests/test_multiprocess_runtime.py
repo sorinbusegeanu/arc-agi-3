@@ -77,3 +77,29 @@ def test_restored_parallel_run_appends_unique_m0(tmp_path) -> None:
     second_m0 = second["metrics"]["memory_levels"]["M0"]
 
     assert second_m0 > first_m0
+
+
+def test_epochs_repeat_sampling_and_training(tmp_path) -> None:
+    root = tmp_path / "epochs"
+    args = build_parser().parse_args([
+        "continuous-run",
+        "--root", str(root),
+        "--games", "step1",
+        "--steps-per-game", "1",
+        "--epochs", "2",
+        "--actors", "2",
+        "--shards", "2",
+        "--stage-workers", "1",
+        "--ingest-workers", "2",
+        "--derivation-workers", "2",
+        "--no-peers",
+        "--no-dashboard",
+    ])
+    assert run_continuous(args) == 0
+
+    summary = json.loads((root / "v9_run_summary.json").read_text(encoding="utf-8"))
+    assert len(summary["epochs"]) == 2
+    assert len(summary["actors"]) == 24
+    assert summary["metrics"]["memory_levels"]["M0"] >= 24
+    assert summary["epochs"][0]["training"]["status"].startswith(("SKIPPED_", "PROMOTED", "REJECTED"))
+    assert summary["epochs"][1]["training"]["status"].startswith(("SKIPPED_", "PROMOTED", "REJECTED"))
