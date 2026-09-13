@@ -75,7 +75,7 @@ def _condition_config(condition: str | None) -> tuple[bool, bool, bool]:
     return True, True, False
 
 
-def make_adapter(spec: EnvironmentSpec | str, *, seed: int, env_root: str | None):
+def make_adapter(spec: EnvironmentSpec | str, *, seed: int, env_root: str | None, alfred_backend_factory: str | None = None):
     if isinstance(spec, str):
         spec = EnvironmentSpec("auto", spec)
     game_id = spec.game_id
@@ -133,7 +133,15 @@ def make_adapter(spec: EnvironmentSpec | str, *, seed: int, env_root: str | None
             )
         )
     if adapter == "alfred":
-        raise RuntimeError("ALFRED curriculum execution requires an injected ALFRED backend")
+        if not alfred_backend_factory:
+            raise RuntimeError("ALFRED curriculum execution requires --alfred-backend-factory module:function")
+        module_name, separator, attribute = alfred_backend_factory.partition(":")
+        if not separator:
+            raise ValueError("--alfred-backend-factory must use module:function")
+        factory = getattr(importlib.import_module(module_name), attribute)
+        from v9.environments import AlfredAdapter
+        backend = factory(game_id=game_id, seed=seed, **kwargs)
+        return AlfredAdapter(backend)
     if adapter == "arc":
         return ARCAdapter(game_id, seed=seed, env_root=env_root)
     raise ValueError(f"unsupported curriculum adapter: {spec.adapter}")
