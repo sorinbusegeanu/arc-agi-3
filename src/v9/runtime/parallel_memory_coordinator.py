@@ -72,12 +72,17 @@ def run_parallel_memory_jobs(
     canonical_apply_seconds = 0.0
     canonical_apply_events = 0
 
-    def launch() -> None:
-        while pending and free_slots:
-            actor_id, spec, steps, seed = pending.pop(0)
-            slot = free_slots.pop(0)
-            topology.start_actor(index=slot, spec=spec, actor_id=actor_id, steps=steps, seed=seed, env_root=env_root, adapter_factory_path="v9.cli:make_adapter", alfred_backend_factory=alfred_backend_factory, run_nonce=run_nonce, initial_policy=runtime.actor_policy_snapshot(), epsilon=float(epsilon), policy_refresh_steps=int(actor_view_refresh_steps), policy_refresh_ms=float(actor_view_refresh_ms))
-            active[actor_id] = (slot, topology.actor_processes[-1])
+    def launch_one() -> bool:
+        if not pending or not free_slots:
+            return False
+        actor_id, spec, steps, seed = pending.pop(0)
+        slot = free_slots.pop(0)
+        launch_started = time.perf_counter()
+        topology.start_actor(index=slot, spec=spec, actor_id=actor_id, steps=steps, seed=seed, env_root=env_root, adapter_factory_path="v9.cli:make_adapter", alfred_backend_factory=alfred_backend_factory, run_nonce=run_nonce, initial_policy=runtime.actor_policy_snapshot(), epsilon=float(epsilon), policy_refresh_steps=int(actor_view_refresh_steps), policy_refresh_ms=float(actor_view_refresh_ms))
+        active[actor_id] = (slot, topology.actor_processes[-1])
+        runtime.set_telemetry_gauge("actor_launch_latency_ms", 1000.0 * (time.perf_counter() - launch_started))
+        runtime.set_telemetry_gauge("actors_launched", len(topology.actor_processes))
+        return True
 
     def dispatch_transition(transition: Any) -> None:
         nonlocal sampled, ingest_sequence, watermark_cursor
@@ -198,10 +203,10 @@ def run_parallel_memory_jobs(
                 break
         return progressed
 
-    launch()
     try:
-        while active:
-            progressed = drain_publication_queue()
+        while active or pending:
+            progressed = launch_one()
+            progressed = drain_publication_queue() or progressed
             progressed = drain_results() or progressed
             for _ in range(coordinator_batch_size):
                 try:
@@ -216,7 +221,6 @@ def run_parallel_memory_jobs(
                 free_slots.append(slot)
                 free_slots.sort()
                 results.append(ProcessActorResult(done.actor_id, done.game_id, done.steps, done.positive_boundaries, done.negative_boundaries, done.episode_boundaries, done.resets, done.policy_refreshes))
-                launch()
                 progressed = True
             for actor_id, (_, process) in tuple(active.items()):
                 if not process.is_alive() and process.exitcode not in (0, None):
