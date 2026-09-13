@@ -68,9 +68,6 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
         actor_results.extend(process_results)
         runtime.wait_quiescent(args.drain_timeout)
         runtime.flush_deferred_memory_updates()
-        lifecycle_result = run_lifecycle_maintenance(runtime)
-        for key, value in lifecycle_result.items():
-            runtime.set_telemetry_gauge(f"lifecycle_{key}", value)
         scenario_success, behavioral_success = _scenario_success(process_results)
         if baseline_success is None:
             baseline_success = behavioral_success
@@ -78,6 +75,9 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
         runtime.set_telemetry_gauge("behavioral_success_rate", behavioral_success)
         runtime.set_telemetry_gauge("behavioral_success_gain", behavioral_gain)
         runtime.set_telemetry_gauge("successful_scenarios", sum(rate > 0.0 for rate in scenario_success.values()))
+        lifecycle_result = run_lifecycle_maintenance(runtime)
+        for key, value in lifecycle_result.items():
+            runtime.set_telemetry_gauge(f"lifecycle_{key}", value)
         requested_training_steps = int(args.hgt_training_epochs)
         effective_training_steps = requested_training_steps if requested_training_steps > 1 else int(runtime.config.scientific.hgt_gradient_accumulation)
         training = train_hgt_epoch(runtime, epoch=epoch, training_epochs=effective_training_steps, learning_rate=args.hgt_learning_rate, root=args.root)
