@@ -99,7 +99,7 @@ def run_parallel_memory_jobs(
                 adapter_factory_path="v9.cli:make_adapter",
                 alfred_backend_factory=alfred_backend_factory,
                 run_nonce=run_nonce,
-                initial_policy=runtime.actor_policy_snapshot(),
+                initial_policy=initial_policy,
                 epsilon=float(epsilon),
                 policy_refresh_steps=int(actor_view_refresh_steps),
                 policy_refresh_ms=float(actor_view_refresh_ms),
@@ -254,7 +254,18 @@ def run_parallel_memory_jobs(
                 results.append(ProcessActorResult(done.actor_id, done.game_id, done.steps, done.positive_boundaries, done.negative_boundaries, done.episode_boundaries, done.resets, done.policy_refreshes))
                 launch()
                 progressed = True
-            if time.monotonic() >= next_progress:
+            now = time.monotonic()
+            if now >= next_policy_publish:
+                snapshot = runtime.actor_policy_snapshot()
+                if int(snapshot.generation) > int(published_policy_generation):
+                    topology.publish_policy_snapshot(
+                        tuple(slot for slot, _ in active.values()),
+                        snapshot,
+                    )
+                    published_policy_generation = int(snapshot.generation)
+                    runtime.set_telemetry_gauge("policy_snapshot_generation", published_policy_generation)
+                next_policy_publish = now + max(0.01, float(actor_view_refresh_ms) / 1000.0)
+            if now >= next_progress:
                 progress()
                 next_progress = time.monotonic() + max(1.0, float(progress_interval_seconds))
             if not progressed:
@@ -300,6 +311,9 @@ def run_parallel_memory_jobs(
             "ingest_worker_processes": int(ingest_workers),
             "derivation_worker_processes": int(derivation_workers),
             "multiprocess_transitions_published": int(ingested),
+            "coordinator_action_requests": 0,
+            "policy_snapshot_generation": int(published_policy_generation),
+            "policy_snapshot_refreshes": sum(int(row.policy_refreshes) for row in results),
         }.items():
             runtime.set_telemetry_gauge(key, value)
         progress()
