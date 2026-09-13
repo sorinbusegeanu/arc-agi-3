@@ -83,7 +83,9 @@ def run_parallel_memory_jobs(
     derive_results = {}
     inflight = set()
     last_support = {}
-    coordinator_batch_size = 256
+    coordinator_batch_size = 32
+    canonical_apply_seconds = 0.0
+    canonical_apply_events = 0
 
     def launch() -> None:
         while pending and free_slots:
@@ -154,7 +156,8 @@ def run_parallel_memory_jobs(
             schedule(int(signature))
 
     def apply_ready() -> bool:
-        nonlocal ingest_apply, derive_apply, derived
+        nonlocal ingest_apply, derive_apply, derived, canonical_apply_seconds, canonical_apply_events
+        apply_started = time.perf_counter()
         ingest_applied = 0
         while ingest_apply in ingest_results and ingest_applied < coordinator_batch_size:
             apply_ingest(ingest_results.pop(ingest_apply))
@@ -171,7 +174,11 @@ def run_parallel_memory_jobs(
             derive_apply += 1
             schedule(signature)
             derive_applied += 1
-        return ingest_applied > 0 or derive_applied > 0
+        applied = ingest_applied + derive_applied
+        if applied:
+            canonical_apply_seconds += time.perf_counter() - apply_started
+            canonical_apply_events += applied
+        return applied > 0
 
     def drain_results(*, block: bool = False, timeout: float = 0.0) -> bool:
         progressed = apply_ready()
@@ -210,6 +217,9 @@ def run_parallel_memory_jobs(
             "sampling_rate": sampled / elapsed,
             "ingestion_rate": ingested / elapsed,
             "derivation_rate": derived / elapsed,
+            "canonical_apply_rate": canonical_apply_events / max(1e-9, canonical_apply_seconds),
+            "canonical_apply_latency_ms": 1000.0 * canonical_apply_seconds / max(1, canonical_apply_events),
+            "canonical_batch_size": coordinator_batch_size,
         }
         for key, value in gauges.items():
             runtime.set_telemetry_gauge(key, value)
