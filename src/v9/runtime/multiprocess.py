@@ -23,7 +23,7 @@ class EncodedTransition:
     producer_sequence: int
     global_step: int
     environment_identity: tuple[str, str, str, str]
-    episode_ordinal: int
+    episode_id: int
     observation_schema_id: int
     before_signature: int
     action_id: int
@@ -70,6 +70,7 @@ def actor_process_main(
     result_queue: Any,
     adapter_factory_path: str,
     alfred_backend_factory: str | None,
+    run_nonce: int,
 ) -> None:
     factory = _load_factory(adapter_factory_path)
     adapter = factory(spec, seed=seed, env_root=env_root, alfred_backend_factory=alfred_backend_factory)
@@ -102,7 +103,7 @@ def actor_process_main(
                     producer_sequence=index + 1,
                     global_step=index,
                     environment_identity=(identity.family, identity.environment_type, identity.config, identity.instance),
-                    episode_ordinal=episode_ordinal,
+                    episode_id=int(stable_u64(environment_instance_id, run_nonce, actor_id, episode_ordinal, person=b"v9-mp-episode")),
                     observation_schema_id=observation_schema_id,
                     before_signature=int(adapter.encode_observation(before)),
                     action_id=int(adapter.encode_action(action)),
@@ -179,7 +180,7 @@ class ProcessTopology:
             process.start()
             self.stage_processes.append(process)
 
-    def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None) -> None:
+    def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int) -> None:
         process = self.ctx.Process(
             target=actor_process_main,
             kwargs={
@@ -194,6 +195,7 @@ class ProcessTopology:
                 "result_queue": self.result_queue,
                 "adapter_factory_path": adapter_factory_path,
                 "alfred_backend_factory": alfred_backend_factory,
+                "run_nonce": int(run_nonce),
             },
             name=f"v9-actor-{actor_id}",
         )
