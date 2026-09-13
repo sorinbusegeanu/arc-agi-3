@@ -15,6 +15,7 @@ from v9.cognition.roles import form_roles
 from v9.cognition.similarity import ProgressiveSimilarity, ScaleStatistics, StructuralCandidateIndex, StructuralIndexKey
 from v9.cognition.transfer import TransferTrustRegistry, ValidationMode
 from v9.environments.registry import EnvironmentRegistry
+from v9.environments.schemas import EnvironmentIdentity
 from v9.memory.identity import ContextScopeId, EpisodeId, EventUid, LineageUid, MemoryUid, ModalityId, stable_u64
 from v9.memory.m0_episode import M0Episode
 from v9.memory.m1_grounded import GroundedRelation, M1GroundedContingency
