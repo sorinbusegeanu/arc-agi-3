@@ -191,6 +191,7 @@ class ContinuousMemoryRuntime:
                 generation=self.graph.generation,
                 normalized_action_supports=action_supports,
                 hgt_action_scores=self._hgt_action_scores,
+                hgt_action_scores_by_type=self._hgt_scores_by_environment_type(),
                 model_version=self.unified_telemetry.model_version,
             )
 
