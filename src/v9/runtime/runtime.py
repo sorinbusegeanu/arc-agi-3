@@ -112,6 +112,7 @@ class ContinuousMemoryRuntime:
         self._prediction_error_sum = 0.0
         self._prediction_error_count = 0
         self.unified_telemetry = UnifiedTelemetry(model_version=scientific.hgt_model_version)
+        self._hgt_action_scores: dict[int, dict[int, float]] = {}
         self.telemetry: dict[str, int] = {
             "events": 0, "proposals": 0, "accepted": 0, "stale": 0,
             "rejected": 0, "cross_partition_transactions": 0,
@@ -137,6 +138,18 @@ class ContinuousMemoryRuntime:
     @property
     def read_view(self) -> ReadView:
         return self.graph.read_view()
+
+    def set_hgt_action_scores(self, scores: dict[int, dict[int, float]]) -> None:
+        with self._lock:
+            self._hgt_action_scores = {
+                int(environment): {int(action): float(score) for action, score in actions.items()}
+                for environment, actions in scores.items()
+            }
+
+    def hgt_action_scores(self, environment_id: int, actions: tuple[int, ...]) -> dict[int, float]:
+        with self._lock:
+            source = self._hgt_action_scores.get(int(environment_id), {})
+            return {int(action): float(source.get(int(action), 0.0)) for action in actions}
 
     def start(self) -> None:
         if self._closed:
@@ -734,6 +747,7 @@ class ContinuousMemoryRuntime:
             "prediction_error_sum": self._prediction_error_sum,
             "prediction_error_count": self._prediction_error_count,
             "unified_telemetry": self.unified_telemetry.state_dict(),
+            "hgt_action_scores": {str(env): {str(action): score for action, score in actions.items()} for env, actions in self._hgt_action_scores.items()},
             "in_flight_proposals": [],
             "m1n_occurrences": {str(key): len(value) for key, value in self._m1n_occurrences.items()},
             "m1n_supports": {str(key): value for key, value in self._m1n_supports.items()},
@@ -795,6 +809,7 @@ class ContinuousMemoryRuntime:
         self._prediction_error_sum = float(state.get("prediction_error_sum", 0.0))
         self._prediction_error_count = int(state.get("prediction_error_count", 0))
         self.unified_telemetry = UnifiedTelemetry.from_state_dict(dict(state.get("unified_telemetry", UnifiedTelemetry(model_version=scientific.hgt_model_version).state_dict())))
+        self._hgt_action_scores = {int(env): {int(action): float(score) for action, score in dict(actions).items()} for env, actions in dict(state.get("hgt_action_scores", {})).items()}
         if state.get("in_flight_proposals"):
             raise RuntimeError("native v9 snapshot contains unsupported in-flight proposals")
         for signature, count in dict(state.get("m1n_occurrences", {})).items():
