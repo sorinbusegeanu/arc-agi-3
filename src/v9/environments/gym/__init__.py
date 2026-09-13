@@ -1,4 +1,3 @@
-from .adapter import GymDiscreteAdapter
+from .adapter import GymDiscreteAdapter, GymStructuredAdapter
 
-__all__ = ["GymDiscreteAdapter"]
-
+__all__ = ["GymDiscreteAdapter", "GymStructuredAdapter"]
