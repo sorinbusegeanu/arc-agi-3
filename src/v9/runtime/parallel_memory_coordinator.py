@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import queue
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from random import Random
 from typing import Any
 
@@ -102,6 +102,12 @@ def run_parallel_memory_jobs(
     def dispatch_transition(transition: Any) -> None:
         nonlocal sampled, ingest_sequence, watermark_cursor
         sampled += 1
+        canonical_sequence = runtime.reserve_producer_sequence(
+            int(transition.actor_id),
+            int(transition.producer_sequence),
+        )
+        if canonical_sequence != int(transition.producer_sequence):
+            transition = replace(transition, producer_sequence=canonical_sequence)
         sequence = ingest_sequence
         ingest_sequence += 1
         watermark_cursor += 1
