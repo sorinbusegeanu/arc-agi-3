@@ -263,16 +263,23 @@ def run_continuous(args: argparse.Namespace) -> int:
         dashboard.start()
         print(f"v9 dashboard: http://{args.dashboard_host}:{args.dashboard_port}/", flush=True)
     jobs: list[tuple[int, EnvironmentSpec, int, int]] = []
-    lanes, actor_id = max(len(specs), args.actors), 1
-    base_lanes, extra_lanes = divmod(lanes, len(specs))
-    for game_index, spec in enumerate(specs):
-        lane_count = base_lanes + int(game_index < extra_lanes)
+    actor_count = max(len(specs), int(args.actors))
+    assigned_specs = [specs[index % len(specs)] for index in range(actor_count)]
+    lanes_per_spec = {
+        spec_index: sum(1 for index in range(actor_count) if index % len(specs) == spec_index)
+        for spec_index in range(len(specs))
+    }
+    lane_seen = {spec_index: 0 for spec_index in range(len(specs))}
+    for actor_index, spec in enumerate(assigned_specs):
+        spec_index = actor_index % len(specs)
+        lane_count = lanes_per_spec[spec_index]
+        lane = lane_seen[spec_index]
+        lane_seen[spec_index] += 1
         base_steps, extra_steps = divmod(args.steps_per_game, lane_count)
-        for lane in range(lane_count):
-            steps = base_steps + int(lane < extra_steps)
-            if steps:
-                jobs.append((actor_id, spec, steps, args.seed + actor_id * 1009))
-                actor_id += 1
+        steps = base_steps + int(lane < extra_steps)
+        if steps:
+            actor_id = actor_index + 1
+            jobs.append((actor_id, spec, steps, args.seed + actor_id * 1009))
     print(f"v9 continuous: games={len(games)} actors={min(args.actors, len(jobs))} shards={args.shards} stage_workers={args.stage_workers} ingest_workers={args.ingest_workers} derivation_workers={args.derivation_workers} peers={'off' if args.no_peers else 'on'} lifecycle={args.lifecycle} snapshots={'off' if args.no_snapshots else 'native'} game_ids={','.join(games)}", flush=True)
     try:
         process_results = run_parallel_memory_jobs(
