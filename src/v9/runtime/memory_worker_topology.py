@@ -25,6 +25,18 @@ def _close_queue(queue_obj: Any, *, drain: bool) -> None:
             pass
 
 
+def _close_process(process: Any) -> None:
+    try:
+        if process.is_alive():
+            return
+    except (AttributeError, ValueError):
+        return
+    try:
+        process.close()
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
 class MemoryWorkerTopology:
     def __init__(self, ctx: Any, *, ingest_workers: int, derivation_workers: int, ingest_queue_capacity: int, derivation_queue_capacity: int, result_queue_capacity: int) -> None:
         self.ctx = ctx
@@ -75,6 +87,8 @@ class MemoryWorkerTopology:
         self._closed = True
         for queue_obj in (self.ingest_queue, self.derivation_queue, self.result_queue):
             _close_queue(queue_obj, drain=drain)
+        for process in self.ingest_processes + self.derivation_processes:
+            _close_process(process)
 
     @staticmethod
     def _safe_qsize(queue_obj: Any) -> int:
