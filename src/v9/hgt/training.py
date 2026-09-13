@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -277,6 +278,7 @@ def train_hgt_epoch(
     promote = parent_version is None or validation_loss <= previous_val * 1.02
     status = "PROMOTED" if promote else "REJECTED"
     if promote:
+        temporary_checkpoint = checkpoint_path.with_suffix(".pt.tmp")
         torch.save(
             {
                 "model_state": model.state_dict(),
@@ -288,8 +290,9 @@ def train_hgt_epoch(
                 "validation_loss": validation_loss,
                 "training_loss": training_loss,
             },
-            checkpoint_path,
+            temporary_checkpoint,
         )
+        os.replace(temporary_checkpoint, checkpoint_path)
         manifest = {
             "version_index": version_index,
             "current_model_version": candidate_version,
@@ -300,7 +303,9 @@ def train_hgt_epoch(
             "graph_generation": int(read_view.generation),
             "examples": sum(int(v.numel()) for v in y_dict.values()),
         }
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary_manifest = manifest_path.with_suffix(".json.tmp")
+        temporary_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary_manifest, manifest_path)
         model_version = candidate_version
     else:
         model_version = str(parent_version)
