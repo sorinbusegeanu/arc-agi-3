@@ -25,8 +25,8 @@ def assert_native_root(root: Path) -> None:
     manifest = root / "scientific_config.json"
     if manifest.exists():
         raw = json.loads(manifest.read_text(encoding="utf-8"))
-        if str(raw.get("design_version")) != "9.5":
-            raise RuntimeError("predecessor run root is not a native v9.5 root; use a fresh v9 root")
+        if str(raw.get("design_version")) != "9.7.6":
+            raise RuntimeError("predecessor run root is not a native v9.7.6 root; use a fresh v9 root")
     predecessor_markers = (root / "v8_run_summary.json", root / "v9_auxiliary_state.json")
     if any(path.exists() for path in predecessor_markers):
         raise RuntimeError("predecessor run roots are not migrated; use a fresh v9 root")

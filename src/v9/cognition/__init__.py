@@ -1,3 +1,5 @@
+from .deliberation import CandidateEvaluation, DeliberationBudget, DeliberationCycle, DeliberationResult, DeliberationSignals, DeliberationStopReason, RecursiveDeliberator, adaptive_budget
+from .reasoning_workspace import ReasoningOperator, ReasoningWorkspace
 from .compression import form_families
 from .concepts import validate_concept
 from .correspondence import StructuralCorrespondence, propose_correspondence

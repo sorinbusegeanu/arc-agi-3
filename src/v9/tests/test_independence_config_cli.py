@@ -44,8 +44,8 @@ def test_scientific_config_id_is_deterministic_and_complete() -> None:
     right = ScientificConfig()
     assert left.config_id == right.config_id
     assert left.as_dict()["scientific_config_id"] == left.config_id.value
-    assert left.research_contract_version == "0.6.3.1"
-    assert left.design_version == "9.5"
+    assert left.research_contract_version == "0.7.0"
+    assert left.design_version == "9.7.6"
 
 
 def test_scientific_config_changes_change_identity() -> None:
@@ -77,3 +77,10 @@ def test_mixed_selectors_are_native() -> None:
     assert resolve_games("a,b") == ("a", "b")
     with pytest.raises(ValueError):
         resolve_games(" , ")
+
+
+def test_hgt_and_deliberation_config_are_part_of_scientific_identity() -> None:
+    base = ScientificConfig()
+    assert base.config_id != ScientificConfig(deliberation_max_cycles=base.deliberation_max_cycles + 1).config_id
+    assert base.config_id != ScientificConfig(hgt_hidden_dim=400, hgt_heads=5).config_id
+    assert base.hgt_hidden_dim % base.hgt_heads == 0

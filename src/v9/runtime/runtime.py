@@ -38,6 +38,16 @@ from v9.mutation.read_sets import ReadDependency, ReadSet
 from v9.research.evidence import EvidenceLedger
 from v9.research.hypotheses import untested_assessment
 from v9.research.reports import write_report
+from v9.telemetry import (
+    ConsolidationSample,
+    HGTInferenceSample,
+    HGTTrainingSample,
+    ModelEvolutionSample,
+    OptimizationSample,
+    TelemetryProvenance,
+    UnifiedTelemetry,
+    build_primary_dashboard,
+)
 
 from .config import RuntimeConfig, write_scientific_config_manifest
 from .lifecycle import LifecycleRegistry
@@ -98,6 +108,9 @@ class ContinuousMemoryRuntime:
         self._replans_demonstrated = 0
         self._efficient_replans = 0
         self._symbol_prediction_delta_sum = 0.0
+        self._prediction_error_sum = 0.0
+        self._prediction_error_count = 0
+        self.unified_telemetry = UnifiedTelemetry(model_version=scientific.hgt_model_version)
         self.telemetry: dict[str, int] = {
             "events": 0, "proposals": 0, "accepted": 0, "stale": 0,
             "rejected": 0, "cross_partition_transactions": 0,
@@ -206,6 +219,8 @@ class ContinuousMemoryRuntime:
                     next_stage=stage_snapshot.next_stage,
                     graph_generation=self.graph.generation,
                 )
+                self._prediction_error_sum += abs(float(experience.prediction_error))
+                self._prediction_error_count += 1
                 self.evidence.append("ISF_DECISION", self._watermark, {"stage": int(decision.developmental_stage), "next_stage": int(decision.next_developmental_stage), "score": decision.score, "raw": asdict(decision.raw_components), "normalized": asdict(decision.normalized_components), "graph_generation": decision.graph_generation})
 
     def _stage_evidence(self) -> StageEvidence:
@@ -450,6 +465,9 @@ class ContinuousMemoryRuntime:
             "similarity_entropy_by_radius": {str(key): list(value) for key, value in self._similarity_entropy_by_radius.items()},
             "replans_demonstrated": self._replans_demonstrated, "efficient_replans": self._efficient_replans,
             "symbol_prediction_delta_sum": self._symbol_prediction_delta_sum,
+            "prediction_error_sum": self._prediction_error_sum,
+            "prediction_error_count": self._prediction_error_count,
+            "unified_telemetry": self.unified_telemetry.state_dict(),
             "in_flight_proposals": [],
             "m1n_occurrences": {str(key): len(value) for key, value in self._m1n_occurrences.items()},
             "m1n_supports": {str(key): value for key, value in self._m1n_supports.items()},
@@ -508,6 +526,9 @@ class ContinuousMemoryRuntime:
         self._replans_demonstrated = int(state.get("replans_demonstrated", 0))
         self._efficient_replans = int(state.get("efficient_replans", 0))
         self._symbol_prediction_delta_sum = float(state.get("symbol_prediction_delta_sum", 0.0))
+        self._prediction_error_sum = float(state.get("prediction_error_sum", 0.0))
+        self._prediction_error_count = int(state.get("prediction_error_count", 0))
+        self.unified_telemetry = UnifiedTelemetry.from_state_dict(dict(state.get("unified_telemetry", UnifiedTelemetry(model_version=scientific.hgt_model_version).state_dict())))
         if state.get("in_flight_proposals"):
             raise RuntimeError("native v9 snapshot contains unsupported in-flight proposals")
         for signature, count in dict(state.get("m1n_occurrences", {})).items():
@@ -544,6 +565,52 @@ class ContinuousMemoryRuntime:
         for raw_uid, rows in dict(state.get("transfer_trials", {})).items():
             self._transfer_trials[MemoryUid(int(raw_uid[:16], 16), int(raw_uid[16:], 16))] = list(rows)
 
+    def telemetry_provenance(
+        self,
+        *,
+        decision_uid: str | None = None,
+        model_version: str | None = None,
+        curriculum_step: str | None = None,
+        environment_family: str | None = None,
+        game_scenario: str | None = None,
+        context_uid: str | None = None,
+        lineage_uid: str | None = None,
+        memory_level: str | None = None,
+    ) -> TelemetryProvenance:
+        return TelemetryProvenance(
+            decision_uid=decision_uid,
+            graph_generation=self.graph.generation,
+            model_version=model_version or self.unified_telemetry.model_version,
+            scientific_config_id=self.config.scientific.config_id.value,
+            curriculum_step=curriculum_step,
+            environment_family=environment_family,
+            game_scenario=game_scenario,
+            context_uid=context_uid,
+            lineage_uid=lineage_uid,
+            memory_level=memory_level,
+        )
+
+    def record_deliberation_metrics(self, *, reasoning_cycles: int, initial_score: float, final_score: float, best_score: float, changed: bool, behavior_improved: bool | None, reasoning_cost: float, stop_reason: str, candidate_changes: int = 0, prediction_improvement: float = 0.0, strategy_changes: int = 0, provenance: TelemetryProvenance | None = None) -> None:
+        self.unified_telemetry.record_deliberation(reasoning_cycles=reasoning_cycles, initial_score=initial_score, final_score=final_score, best_score=best_score, changed=changed, behavior_improved=behavior_improved, reasoning_cost=reasoning_cost, stop_reason=stop_reason, candidate_changes=candidate_changes, prediction_improvement=prediction_improvement, strategy_changes=strategy_changes, provenance=provenance)
+
+    def record_hgt_inference(self, sample: HGTInferenceSample, *, provenance: TelemetryProvenance | None = None) -> None:
+        self.unified_telemetry.record_hgt_inference(sample, provenance=provenance)
+
+    def record_hgt_ablation(self, *, enabled_outcome: float, hydra_baseline_outcome: float, provenance: TelemetryProvenance | None = None) -> None:
+        self.unified_telemetry.record_hgt_ablation(enabled_outcome=enabled_outcome, hydra_baseline_outcome=hydra_baseline_outcome, provenance=provenance)
+
+    def record_hgt_training(self, sample: HGTTrainingSample, *, provenance: TelemetryProvenance | None = None) -> None:
+        self.unified_telemetry.record_hgt_training(sample, provenance=provenance)
+
+    def record_model_evolution(self, sample: ModelEvolutionSample, *, provenance: TelemetryProvenance | None = None) -> None:
+        self.unified_telemetry.record_model_evolution(sample, provenance=provenance)
+
+    def record_hgt_consolidation(self, sample: ConsolidationSample, *, provenance: TelemetryProvenance | None = None) -> None:
+        self.unified_telemetry.record_consolidation(sample, provenance=provenance)
+
+    def record_optimization(self, sample: OptimizationSample, *, provenance: TelemetryProvenance | None = None) -> None:
+        self.unified_telemetry.record_optimization(sample, provenance=provenance)
+
     def metrics(self) -> dict[str, Any]:
         view = self.read_view
         counts = {f"M{level}": view.memory_count(MemoryLevel(level)) for level in range(8)}
@@ -552,14 +619,93 @@ class ContinuousMemoryRuntime:
         persistent_bytes = max(1, len(json.dumps(self.graph.state_dict(), sort_keys=True, separators=(",", ":"))))
         validated_transfers = sum(row.successes for row in self.transfer_trust.records.values())
         prediction_observations = self.telemetry["symbol_conditioned_prediction_observations"]
-        return {"watermark": self._watermark, "graph_generation": view.generation, "memories": len(view.nodes), "edges": len(view.edges), "memory_levels": counts, "scientific_config_id": self.config.scientific.config_id.value, "timeline_events_seen": self.timeline.events_seen, "timeline_events_dropped": self.timeline.events_dropped, "events_by_modality": {str(key): value for key, value in sorted(self._modality_events.items())}, "actions_committed": self.timeline.actions_committed, "normalization_states": normalization, "normalization_estimator_generation": self.scale_statistics.estimator_generation, "structural_index_generation": self.structural_index.generation, "structural_index_buckets": len(self.structural_index.buckets), "candidate_entropy_by_radius": {str(key): list(value) for key, value in sorted(self._similarity_entropy_by_radius.items())}, "equivalence_sets": len(self.similarity.equivalence_sets), "transfer_validation_mode": self.config.scientific.transfer_validation_mode, "transfer_trials": sum(len(rows) for rows in self._transfer_trials.values()), "transfer_trust_scopes": len(self.transfer_trust.records), "grounding_relations": len(self.grounding.states), "grounding_counts": grounding_counts, "lineage_overlays": len(self.lineages.overlays), "lineage_dependencies": len(self.lineages.dependencies), "context_scopes": len(self.contexts.records), "probation_records": sum(row.state.name == "PROBATION" for row in self.lifecycle.records.values()), "probation_transitions": self.lifecycle.transitions, "developmental_stage": int(self.stage_tracker.stage), "developmental_intervals": self.stage_tracker.interval_id, "isf_decisions_hot": len(self.isf.decisions), "replay": self.replay.state_dict(), "symbol_conditioned_prediction_delta": self._symbol_prediction_delta_sum / max(1, prediction_observations), "persistent_consolidated_bytes": persistent_bytes, "persistent_memory_growth_ratio": len(view.nodes) / max(1, self.telemetry["events"]), "explanatory_reach_per_persistent_byte": sum(int(payload.get("explanatory_reach", 0)) for payload in view.payloads.values()) / persistent_bytes, "transfer_quality_per_persistent_byte": validated_transfers / persistent_bytes, "prediction_quality_per_persistent_byte": max(0.0, self._symbol_prediction_delta_sum) / persistent_bytes, "hot_payload_bytes": self.payloads.hot_bytes, **self.telemetry}
+        strategy_payloads = [payload for uid, payload in view.payloads.items() if view.nodes[uid].level is MemoryLevel.M7]
+        strategy_trials = sum(int(row.get("reliability_trials", 0)) for row in strategy_payloads)
+        strategy_successes = sum(int(row.get("reliability_successes", 0)) for row in strategy_payloads)
+        realized_cost_total = sum(float(row.get("realized_cost_sum", 0.0)) for row in strategy_payloads)
+        failed_transfer_scopes = sum(getattr(row.state, "name", str(row.state)) == "FAILED" for row in self.transfer_trust.records.values())
+        validated_m4 = sum(bool(row.validated) for row in self._m4.values())
+        diagnostic = self.unified_telemetry.diagnostic_metrics()
+        retired = int(diagnostic.get("hydra_nodes_retired", 0))
+        replaced = int(diagnostic.get("hydra_nodes_replaced_by_abstractions", 0))
+        compression_ratio = (retired + replaced) / max(1, len(view.nodes) + retired)
+        base = {
+            "watermark": self._watermark,
+            "graph_generation": view.generation,
+            "memories": len(view.nodes),
+            "edges": len(view.edges),
+            "memory_levels": counts,
+            "scientific_config_id": self.config.scientific.config_id.value,
+            "timeline_events_seen": self.timeline.events_seen,
+            "timeline_events_dropped": self.timeline.events_dropped,
+            "events_by_modality": {str(key): value for key, value in sorted(self._modality_events.items())},
+            "actions_committed": self.timeline.actions_committed,
+            "normalization_states": normalization,
+            "normalization_estimator_generation": self.scale_statistics.estimator_generation,
+            "structural_index_generation": self.structural_index.generation,
+            "structural_index_buckets": len(self.structural_index.buckets),
+            "candidate_entropy_by_radius": {str(key): list(value) for key, value in sorted(self._similarity_entropy_by_radius.items())},
+            "equivalence_sets": len(self.similarity.equivalence_sets),
+            "transfer_validation_mode": self.config.scientific.transfer_validation_mode,
+            "transfer_trials": sum(len(rows) for rows in self._transfer_trials.values()),
+            "transfer_trust_scopes": len(self.transfer_trust.records),
+            "failed_transfer_scopes": failed_transfer_scopes,
+            "cross_family_transfer": validated_transfers / max(1, len(self.transfer_trust.records)),
+            "grounding_relations": len(self.grounding.states),
+            "grounding_counts": grounding_counts,
+            "lineage_overlays": len(self.lineages.overlays),
+            "lineage_dependencies": len(self.lineages.dependencies),
+            "context_scopes": len(self.contexts.records),
+            "probation_records": sum(row.state.name == "PROBATION" for row in self.lifecycle.records.values()),
+            "probation_transitions": self.lifecycle.transitions,
+            "developmental_stage": int(self.stage_tracker.stage),
+            "developmental_intervals": self.stage_tracker.interval_id,
+            "isf_decisions_hot": len(self.isf.decisions),
+            "replay": self.replay.state_dict(),
+            "symbol_conditioned_prediction_delta": self._symbol_prediction_delta_sum / max(1, prediction_observations),
+            "prediction_error": self._prediction_error_sum / max(1, self._prediction_error_count),
+            "persistent_consolidated_bytes": persistent_bytes,
+            "persistent_memory_growth_ratio": len(view.nodes) / max(1, self.telemetry["events"]),
+            "compression_ratio": compression_ratio,
+            "m4_validated": validated_m4,
+            "success_rate": strategy_successes / max(1, strategy_trials),
+            "trajectory_efficiency": strategy_successes / max(1.0, realized_cost_total),
+            "explanatory_reach_per_persistent_byte": sum(int(payload.get("explanatory_reach", 0)) for payload in view.payloads.values()) / persistent_bytes,
+            "transfer_quality_per_persistent_byte": validated_transfers / persistent_bytes,
+            "prediction_quality_per_persistent_byte": max(0.0, self._symbol_prediction_delta_sum) / persistent_bytes,
+            "hot_payload_bytes": self.payloads.hot_bytes,
+            **self.telemetry,
+        }
+        base["telemetry_diagnostics"] = diagnostic
+        base["primary_dashboard"] = build_primary_dashboard(base, diagnostic)
+        return base
+
+
 
     def scientific_statuses(self) -> dict[str, str]:
-        return {"H16": "UNTESTED", "H17": "UNTESTED", "H18": "UNTESTED"}
+        return {"H16": "UNTESTED", "H17": "UNTESTED", "H18": "UNTESTED", "H19": "UNTESTED"}
 
     def write_scientific_report(self) -> Path:
-        assessments = {name: asdict(untested_assessment(name, scientific_config_id=self.config.scientific.config_id.value, blocker="required matched causal evaluation has not run")) for name in self.scientific_statuses()}
-        return write_report(self.root, "reporting_cut.json", {"metrics": self.metrics(), "hypotheses": self.scientific_statuses(), "hypothesis_assessments": assessments, "scientific_config": self.config.scientific.as_dict()})
+        assessments = {
+            name: asdict(
+                untested_assessment(
+                    name,
+                    scientific_config_id=self.config.scientific.config_id.value,
+                    blocker="required matched causal evaluation has not run",
+                )
+            )
+            for name in self.scientific_statuses()
+        }
+        return write_report(
+            self.root,
+            "reporting_cut.json",
+            {
+                "metrics": self.metrics(),
+                "hypotheses": self.scientific_statuses(),
+                "hypothesis_assessments": assessments,
+                "scientific_config": self.config.scientific.as_dict(),
+            },
+        )
 
     def close(self, *, normal: bool = True, timeout: float = 300.0) -> SnapshotResult | None:
         del timeout
