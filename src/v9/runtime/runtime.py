@@ -533,6 +533,58 @@ class ContinuousMemoryRuntime:
 
     def flush_deferred_memory_updates(self) -> None:
         with self._lock:
+            pending = tuple(self._deferred_base_nodes.values())
+            self._deferred_base_nodes.clear()
+            batch_size = 4096
+            for offset in range(0, len(pending), batch_size):
+                chunk = pending[offset : offset + batch_size]
+                writes: list[MutationWrite] = []
+                target_partitions: set[int] = set()
+                evidence_refs: set[MemoryUid] = set()
+                for node, raw_payload, evidence in chunk:
+                    payload = dict(raw_payload)
+                    writes.append(MutationWrite(node=node, payload=payload))
+                    target_partitions.add(self.partitions.owner(node.uid))
+                    evidence_refs.update(evidence)
+                    for raw_parent in payload.get("parents", []):
+                        if not isinstance(raw_parent, (list, tuple)) or len(raw_parent) != 2:
+                            continue
+                        parent = MemoryUid(int(raw_parent[0]), int(raw_parent[1]))
+                        edge = RelationEdge(node.uid, RelationType.PROVENANCE, parent, evidence)
+                        writes.append(MutationWrite(edge=edge))
+                        target_partitions.add(self.partitions.owner(parent))
+                if writes:
+                    proposal = MutationProposal.build(
+                        MutationKind.UPSERT_NODE,
+                        target_partitions=tuple(sorted(target_partitions)),
+                        read_set=ReadSet.build(
+                            (),
+                            maximum_size=self.config.scientific.maximum_read_set_size,
+                        ),
+                        evidence_refs=tuple(sorted(evidence_refs)),
+                        causal_watermark=self._watermark,
+                        writes=tuple(writes),
+                        proposal_class=ProposalClass.ADDITIVE,
+                    )
+                    self.telemetry["proposals"] += 1
+                    self.telemetry["cross_partition_transactions"] += int(len(target_partitions) > 1)
+                    result = self.graph.publish(proposal)
+                    if result.outcome.value == "ACCEPTED":
+                        self.telemetry["accepted"] += 1
+                        if self.config.enable_lifecycle:
+                            for node, _, _ in chunk:
+                                self.lifecycle.observe(
+                                    node.uid,
+                                    support_delta=1,
+                                    relevant_opportunity=True,
+                                    watermark=self._watermark,
+                                )
+                    elif result.outcome.value == "STALE_READ_SET":
+                        self.telemetry["stale"] += 1
+                        self.telemetry["read_set_conflicts"] += 1
+                    else:
+                        self.telemetry["rejected"] += 1
+
             dirty = tuple(self._m1n_dirty)
             self._m1n_dirty.clear()
             for signature in dirty:
@@ -664,7 +716,7 @@ class ContinuousMemoryRuntime:
                 "grounded_next_context_signature": m1g.grounded_next_context_signature,
                 "parents": [[m0.uid.hi, m0.uid.lo]],
             }
-            self._publish_group(
+            self._defer_base_group(
                 (
                     (m0_node, m0_payload, (m0.uid,)),
                     (m1g_node, m1g_payload, (m0.uid,)),
@@ -672,7 +724,7 @@ class ContinuousMemoryRuntime:
             )
             key = (m1g.environment_instance_id, m1g.episode_id)
             self._latest_interaction_grounding[key] = m1g
-            signature = self._record_normalized(m1n)
+            signature = self._record_normalized(m1n, defer_publication=True)
             self.evidence.append(
                 "INGESTION",
                 self._watermark,
@@ -1152,6 +1204,12 @@ class ContinuousMemoryRuntime:
     def _metrics_locked(self) -> dict[str, Any]:
         view = self.read_view
         counts = {f"M{level}": self.graph.memory_count(MemoryLevel(level)) for level in range(8)}
+        deferred_levels = {0: 0, 1: 0}
+        for node, _, _ in self._deferred_base_nodes.values():
+            if int(node.level) in deferred_levels and node.uid not in self.graph.nodes:
+                deferred_levels[int(node.level)] += 1
+        counts["M0"] += deferred_levels[0]
+        counts["M1"] += deferred_levels[1]
         normalization = {str(radius): self.scale_statistics.state(radius).value for radius in self.config.scientific.structural_radii}
         grounding_counts = {f"G{level}": sum(int(row.maturity) == level for row in self.grounding.states.values()) for level in range(6)}
         persistent_bytes = max(
