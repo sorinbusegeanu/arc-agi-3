@@ -164,13 +164,12 @@ def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-peers", action="store_true")
 
 
-def _runtime_config(args: argparse.Namespace, *, validation_mode_override: str | None = None) -> RuntimeConfig:
+def _runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     scientific = ScientificConfig()
     overrides = {name: value for name, value in vars(args).items() if name.startswith("allocation_") and value is not None}
     overrides["random_seeds"] = (int(getattr(args, "seed", 0)),)
     if hasattr(args, "validation_mode"):
-        selected_validation = validation_mode_override or args.validation_mode
-        overrides["transfer_validation_mode"] = "learning_only" if args.no_automatic_experiments else selected_validation
+        overrides["transfer_validation_mode"] = "learning_only" if args.no_automatic_experiments else args.validation_mode
         overrides["transfer_validation_trials_per_interval"] = args.max_transfer_experiments
         overrides["transfer_validation_time_budget_seconds"] = args.transfer_experiment_time_budget_seconds
     if overrides:
@@ -249,9 +248,9 @@ def run_continuous(args: argparse.Namespace) -> int:
         raise ValueError("actors, steps-per-game, graph-check and progress interval must be positive; wait and epsilon must be valid")
     specs = resolve_game_specs(args.games, curriculum_config=args.curriculum_config)
     games = tuple(spec.display_name for spec in specs)
-    modes = {spec.validation_mode for spec in specs if spec.validation_mode}
-    curriculum_validation = next(iter(modes)) if len(modes) == 1 else None
-    runtime = ContinuousMemoryRuntime(_runtime_config(args, validation_mode_override=curriculum_validation))
+    runtime = ContinuousMemoryRuntime(_runtime_config(args))
+    curriculum_modes = sorted({spec.validation_mode for spec in specs if spec.validation_mode})
+    runtime.unified_telemetry.set_gauge("curriculum_validation_mode", ",".join(curriculum_modes))
     runtime.start()
     jobs: list[tuple[int, EnvironmentSpec, int, int]] = []
     lanes, actor_id = max(len(specs), args.actors), 1
