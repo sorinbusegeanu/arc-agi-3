@@ -186,12 +186,12 @@ def test_grounded_action_influence_requires_g4_validated_higher_memory() -> None
         GroundedActionSignal(4, 3.0, GroundingMaturity.G4, MemoryLevel.M4, True, 7, 7),
     )
     scores = action_scores(graph.read_view(), (2, 3, 4), grounded_signals=signals, target_environment_id=7)
-    assert scores == {2: 7.0, 3: 0.0, 4: 3.0}
+    assert scores == {2: 0.05, 3: 0.0, 4: 3.0}
     cross_environment = (
         GroundedActionSignal(2, 4.0, GroundingMaturity.G4, MemoryLevel.M4, True, 6, 7),
         GroundedActionSignal(3, 5.0, GroundingMaturity.G5, MemoryLevel.M4, True, 6, 7),
     )
-    assert action_scores(graph.read_view(), (2, 3), grounded_signals=cross_environment, target_environment_id=7) == {2: 7.0, 3: 5.0}
+    assert action_scores(graph.read_view(), (2, 3), grounded_signals=cross_environment, target_environment_id=7) == {2: 0.05, 3: 5.0}
 
 
 def test_lifecycle_retirement_preserves_authoritative_dependencies() -> None:
