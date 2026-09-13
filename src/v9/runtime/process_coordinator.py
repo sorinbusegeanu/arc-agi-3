@@ -34,6 +34,7 @@ def run_process_jobs(
     env_root: str | None,
     alfred_backend_factory: str | None,
     start_method: str | None = None,
+    progress_interval_seconds: float = 60.0,
 ) -> list[ProcessActorResult]:
     topology = ProcessTopology(
         actors=min(int(actor_limit), len(jobs)),
@@ -50,6 +51,31 @@ def run_process_jobs(
     results: list[ProcessActorResult] = []
     run_nonce = int(runtime.watermark)
     published = 0
+    total_steps = sum(int(row[2]) for row in jobs)
+    next_progress = time.monotonic() + max(1.0, float(progress_interval_seconds))
+
+    def _print_progress() -> None:
+        metrics = runtime.metrics()
+        levels = dict(metrics.get("memory_levels", {}))
+        percent = (100.0 * published / total_steps) if total_steps else 100.0
+        print(
+            "v9 progress "
+            f"{percent:5.1f}% "
+            f"steps={published}/{total_steps} "
+            f"memories={metrics.get('memories', 0)} "
+            f"M0={levels.get('M0', 0)} "
+            f"M1={levels.get('M1', 0)} "
+            f"M2={levels.get('M2', 0)} "
+            f"M3={levels.get('M3', 0)} "
+            f"M4={levels.get('M4', 0)} "
+            f"M5={levels.get('M5', 0)} "
+            f"M6={levels.get('M6', 0)} "
+            f"M7={levels.get('M7', 0)} "
+            f"pred_err={float(metrics.get('prediction_error', 0.0)):.4f} "
+            f"success={100.0 * float(metrics.get('success_rate', 0.0)):.1f}% "
+            f"compression={float(metrics.get('compression_ratio', 0.0)):.3f}",
+            flush=True,
+        )
 
     def launch_available() -> None:
         while pending and free_slots:
@@ -130,6 +156,11 @@ def run_process_jobs(
                 if not process.is_alive() and process.exitcode not in (0, None):
                     raise RuntimeError(f"actor process {actor_id} exited with code {process.exitcode}")
 
+            now = time.monotonic()
+            if now >= next_progress:
+                _print_progress()
+                next_progress = now + max(1.0, float(progress_interval_seconds))
+
             if not progressed:
                 time.sleep(0.001)
 
@@ -159,6 +190,7 @@ def run_process_jobs(
         runtime.unified_telemetry.set_gauge("stage_worker_processes", int(stage_workers))
         runtime.unified_telemetry.set_gauge("shard_worker_processes", int(shards))
         runtime.unified_telemetry.set_gauge("multiprocess_transitions_published", int(published))
+        _print_progress()
         return sorted(results, key=lambda row: row.actor_id)
     except BaseException:
         topology.terminate()
