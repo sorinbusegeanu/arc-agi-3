@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 
+import pytest
+
 from v9.cli import build_parser, run_continuous
 
 
@@ -169,3 +171,52 @@ def test_parallel_sampling_defers_raw_graph_publication(tmp_path) -> None:
 
     runtime.flush_deferred_memory_updates()
     assert runtime.graph.memory_count() >= 3
+
+
+def test_actor_terminal_record_is_published_only_after_transition_queue_flush() -> None:
+    from v9.runtime.multiprocess import ActorDone, _publish_actor_terminal
+
+    events: list[tuple[str, str]] = []
+
+    class ProbeQueue:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def put(self, item) -> None:
+            events.append((self.name, f"put:{type(item).__name__}"))
+
+        def close(self) -> None:
+            events.append((self.name, "close"))
+
+        def join_thread(self) -> None:
+            events.append((self.name, "join_thread"))
+
+    _publish_actor_terminal(
+        ProbeQueue("stage"),
+        ProbeQueue("result"),
+        ActorDone(1, "g", 10, 1, 0, 1, 0),
+    )
+
+    assert events == [
+        ("stage", "close"),
+        ("stage", "join_thread"),
+        ("result", "put:ActorDone"),
+        ("result", "close"),
+        ("result", "join_thread"),
+    ]
+
+
+def test_clean_actor_exit_without_done_becomes_bounded_protocol_error() -> None:
+    from v9.runtime.parallel_memory_coordinator import _reconcile_actor_liveness
+
+    class CleanExitProcess:
+        exitcode = 0
+        name = "v9-actor-7"
+
+    active = {7: (0, CleanExitProcess())}
+    first_seen: dict[int, float] = {}
+
+    assert _reconcile_actor_liveness(active, first_seen, now=10.0, grace_seconds=1.0) == 1
+    assert first_seen == {7: 10.0}
+    with pytest.raises(RuntimeError, match="no ActorDone was received"):
+        _reconcile_actor_liveness(active, first_seen, now=11.01, grace_seconds=1.0)
