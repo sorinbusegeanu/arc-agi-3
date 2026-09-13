@@ -347,13 +347,40 @@ class ContinuousMemoryRuntime:
     def _publish(self, node: CanonicalNode, payload: dict[str, Any], evidence: tuple[MemoryUid, ...], *, proposal_class: ProposalClass = ProposalClass.ADDITIVE, mutation_kind: MutationKind = MutationKind.UPSERT_NODE) -> None:
         payload = dict(payload)
         payload.setdefault("evidence_refs", [[uid.hi, uid.lo] for uid in sorted(set(evidence))])
-        owner = self.partitions.owner(node.uid)
-        ref = node_ref(node.uid)
-        read_set = ReadSet.build((ReadDependency(ref, self.graph.versions.get(ref)),), maximum_size=self.config.scientific.maximum_read_set_size)
-        proposal = MutationProposal.build(mutation_kind, target_partitions=(owner,), read_set=read_set, evidence_refs=evidence, causal_watermark=self._watermark, writes=(MutationWrite(node=node, payload=payload),), proposal_class=proposal_class)
+
+        writes: list[MutationWrite] = [MutationWrite(node=node, payload=payload)]
+        target_partitions = {self.partitions.owner(node.uid)}
+        dependencies = [ReadDependency(node_ref(node.uid), self.graph.versions.get(node_ref(node.uid)))]
+
+        for raw_parent in payload.get("parents", []):
+            if not isinstance(raw_parent, (list, tuple)) or len(raw_parent) != 2:
+                continue
+            parent = MemoryUid(int(raw_parent[0]), int(raw_parent[1]))
+            edge = RelationEdge(node.uid, RelationType.PROVENANCE, parent, evidence)
+            writes.append(MutationWrite(edge=edge))
+            target_partitions.add(self.partitions.owner(parent))
+            edge_reference = edge_ref(edge)
+            dependencies.append(ReadDependency(edge_reference, self.graph.versions.get(edge_reference)))
+
+        read_set = ReadSet.build(
+            tuple(dependencies),
+            maximum_size=self.config.scientific.maximum_read_set_size,
+        )
+        proposal = MutationProposal.build(
+            mutation_kind,
+            target_partitions=tuple(sorted(target_partitions)),
+            read_set=read_set,
+            evidence_refs=evidence,
+            causal_watermark=self._watermark,
+            writes=tuple(writes),
+            proposal_class=proposal_class,
+        )
+
         self.telemetry["proposals"] += 1
+        self.telemetry["cross_partition_transactions"] += int(len(target_partitions) > 1)
         previous_generation = self.graph.generation
         result = self.graph.publish(proposal)
+
         if result.outcome.value == "ACCEPTED":
             self.telemetry["accepted"] += 1
             if result.graph_generation == previous_generation:
@@ -361,30 +388,17 @@ class ContinuousMemoryRuntime:
             else:
                 self.structural_index.add(node)
             if self.config.enable_lifecycle and result.graph_generation != previous_generation:
-                self.lifecycle.observe(node.uid, support_delta=1, relevant_opportunity=True, watermark=self._watermark)
+                self.lifecycle.observe(
+                    node.uid,
+                    support_delta=1,
+                    relevant_opportunity=True,
+                    watermark=self._watermark,
+                )
         elif result.outcome.value == "STALE_READ_SET":
             self.telemetry["stale"] += 1
             self.telemetry["read_set_conflicts"] += 1
         else:
             self.telemetry["rejected"] += 1
-        for raw_parent in payload.get("parents", []):
-            if not isinstance(raw_parent, (list, tuple)) or len(raw_parent) != 2:
-                continue
-            parent = MemoryUid(int(raw_parent[0]), int(raw_parent[1]))
-            edge = RelationEdge(node.uid, RelationType.PROVENANCE, parent, evidence)
-            partitions = tuple(sorted({self.partitions.owner(node.uid), self.partitions.owner(parent)}))
-            edge_read = ReadSet.build((ReadDependency(edge_ref(edge), self.graph.versions.get(edge_ref(edge))),), maximum_size=self.config.scientific.maximum_read_set_size)
-            edge_proposal = MutationProposal.build(MutationKind.UPSERT_EDGE, target_partitions=partitions, read_set=edge_read, evidence_refs=evidence, causal_watermark=self._watermark, writes=(MutationWrite(edge=edge),))
-            self.telemetry["proposals"] += 1
-            self.telemetry["cross_partition_transactions"] += int(len(partitions) > 1)
-            edge_result = self.graph.publish(edge_proposal)
-            if edge_result.outcome.value == "ACCEPTED":
-                self.telemetry["accepted"] += 1
-            elif edge_result.outcome.value == "STALE_READ_SET":
-                self.telemetry["stale"] += 1
-                self.telemetry["read_set_conflicts"] += 1
-            else:
-                self.telemetry["rejected"] += 1
 
     def _record_normalized(self, relation: M1NormalizedRelation) -> int:
         occurrences = self._m1n_occurrences.setdefault(relation.structural_signature, [])
