@@ -216,7 +216,7 @@ def test_normalized_m1_remains_active_reusable_substrate() -> None:
     assert lifecycle.records[normalized.uid].state is CognitiveState.ACTIVE
 
 
-def test_higher_memory_can_go_dormant_but_is_not_physically_retired() -> None:
+def test_higher_memory_is_not_hidden_by_age_alone() -> None:
     graph = CanonicalGraph(1)
     concept = CanonicalNode.build(MemoryLevel.M4, MemoryType.CONCEPT, (40,), 1)
     _publish_node(graph, concept)
@@ -224,16 +224,27 @@ def test_higher_memory_can_go_dormant_but_is_not_physically_retired() -> None:
     lifecycle.observe(concept.uid, support_delta=1, relevant_opportunity=True, watermark=1)
     runtime = _Runtime(graph, lifecycle)
 
-    runtime.watermark = 5000
-    run_lifecycle_maintenance(runtime, dormancy_grace_cycles=1, retirement_grace_cycles=1)
-    assert lifecycle.records[concept.uid].state is CognitiveState.DORMANT
+    for watermark in (5000, 9000, 13000):
+        runtime.watermark = watermark
+        result = run_lifecycle_maintenance(runtime, dormancy_grace_cycles=1, retirement_grace_cycles=1)
+        assert result["retired"] == 0
+    assert lifecycle.records[concept.uid].state is CognitiveState.ACTIVE
     assert concept.uid in graph.nodes
-    assert concept.uid not in graph.read_view().nodes
+    assert concept.uid in graph.read_view().nodes
 
-    runtime.watermark = 9000
-    result = run_lifecycle_maintenance(runtime, dormancy_grace_cycles=1, retirement_grace_cycles=1)
-    assert result["retired"] == 0
-    assert concept.uid in graph.nodes
+
+def test_lifecycle_scan_budget_is_bounded() -> None:
+    graph = CanonicalGraph(1)
+    lifecycle = LifecycleRegistry()
+    runtime = _Runtime(graph, lifecycle)
+    for index in range(50):
+        node = CanonicalNode.build(MemoryLevel.M4, MemoryType.CONCEPT, (1000 + index,), index + 1)
+        _publish_node(graph, node)
+        lifecycle.observe(node.uid, support_delta=1, relevant_opportunity=True, watermark=index + 1)
+    runtime.watermark = 100_000
+    result = run_lifecycle_maintenance(runtime, scan_limit=7)
+    assert result["scanned"] == 7
+    assert len(lifecycle.records) == 50
 
 
 def test_positive_new_support_reactivates_dormant_memory() -> None:
