@@ -24,20 +24,23 @@ class GroundedActionSignal:
         return self.validated and self.grounding_maturity >= required and self.source_level >= MemoryLevel.M4
 
 
-def action_scores(view: ReadView, actions: tuple[int, ...], *, grounded_signals: tuple[GroundedActionSignal, ...] = (), target_environment_id: int | None = None) -> dict[int, float]:
+def action_scores(view: ReadView, actions: tuple[int, ...], *, grounded_signals: tuple[GroundedActionSignal, ...] = (), learned_scores: dict[int, float] | None = None, target_environment_id: int | None = None) -> dict[int, float]:
     scores = {int(action): float(view.normalized_action_supports.get(int(action), 0.0)) for action in actions}
+    if learned_scores:
+        for action in actions:
+            scores[int(action)] += float(learned_scores.get(int(action), 0.0))
     for signal in grounded_signals:
         if signal.authoritative and target_environment_id is not None and signal.target_environment_id == int(target_environment_id) and signal.native_action in scores:
             scores[signal.native_action] += float(signal.score)
     return scores
 
 
-def choose_action(view: ReadView, actions: tuple[int, ...], *, rng: Random, epsilon: float, grounded_signals: tuple[GroundedActionSignal, ...] = (), target_environment_id: int | None = None) -> int:
+def choose_action(view: ReadView, actions: tuple[int, ...], *, rng: Random, epsilon: float, grounded_signals: tuple[GroundedActionSignal, ...] = (), learned_scores: dict[int, float] | None = None, target_environment_id: int | None = None) -> int:
     if not actions:
         raise ValueError("cannot choose from an empty action set")
     if not 0.0 <= float(epsilon) <= 1.0:
         raise ValueError("epsilon must be in [0, 1]")
-    scores = action_scores(view, actions, grounded_signals=grounded_signals, target_environment_id=target_environment_id)
+    scores = action_scores(view, actions, grounded_signals=grounded_signals, learned_scores=learned_scores, target_environment_id=target_environment_id)
     unseen = tuple(action for action in actions if scores[action] == 0)
     if rng.random() < epsilon or unseen:
         candidates = unseen or actions
