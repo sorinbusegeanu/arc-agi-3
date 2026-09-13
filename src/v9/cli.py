@@ -175,9 +175,6 @@ def _actor(runtime: ContinuousMemoryRuntime, spec: EnvironmentSpec, *, actor_id:
     identity = runtime.environments.register(adapter.identity())
     episode = runtime.environments.next_episode(identity)
     codec = DeterministicSymbolCodec(f"{adapter.identity().family}-raw-symbols")
-    runtime.unified_telemetry.set_gauge("curriculum_step", spec.curriculum_step or "")
-    runtime.unified_telemetry.set_gauge("environment_family", adapter.identity().family)
-    runtime.unified_telemetry.set_gauge("game_scenario", spec.game_id)
     rng = Random(seed)
     positives = negatives = resets = completed = 0
     next_progress = time.monotonic() + progress_interval
@@ -195,6 +192,7 @@ def _actor(runtime: ContinuousMemoryRuntime, spec: EnvironmentSpec, *, actor_id:
             action = choose_action(runtime.read_view, actions, rng=rng, epsilon=epsilon, target_environment_id=identity.value)
             after = adapter.step(action)
             runtime.record_interaction(adapter, producer_id=actor_id, producer_sequence=index + 1, global_step=index, native_action=action, before_observation=before, after_observation=after, episode_id=episode, symbol_codec=codec)
+            runtime.unified_telemetry.record_curriculum_event(step=spec.curriculum_step, environment_family=adapter.identity().family, game_scenario=spec.game_id)
             completed += 1
             boundary = adapter.boundary_event()
             positives += int(boundary.primary_valence > 0)
