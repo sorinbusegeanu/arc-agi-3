@@ -43,6 +43,7 @@ class ActorDone:
     steps: int
     positive_boundaries: int
     negative_boundaries: int
+    episode_boundaries: int
     resets: int
 
 
@@ -77,7 +78,7 @@ def actor_process_main(
     adapter = factory(spec, seed=seed, env_root=env_root, alfred_backend_factory=alfred_backend_factory)
     identity = adapter.identity()
     environment_instance_id = int(identity.instance_id.value)
-    positives = negatives = resets = completed = 0
+    positives = negatives = episode_boundaries = resets = completed = 0
     episode_ordinal = 1
     try:
         for index in range(int(steps)):
@@ -120,11 +121,12 @@ def actor_process_main(
             completed += 1
             positives += int(boundary.primary_valence > 0)
             negatives += int(boundary.primary_valence < 0)
+            episode_boundaries += int(not boundary.continuation)
             if not boundary.continuation:
                 adapter.reset()
                 episode_ordinal += 1
                 resets += 1
-        result_queue.put(ActorDone(actor_id, str(getattr(spec, "display_name", identity.environment_type)), completed, positives, negatives, resets))
+        result_queue.put(ActorDone(actor_id, str(getattr(spec, "display_name", identity.environment_type)), completed, positives, negatives, episode_boundaries, resets))
     finally:
         close = getattr(adapter, "close", None)
         if callable(close):
