@@ -264,7 +264,11 @@ def run_continuous(args: argparse.Namespace) -> int:
         dashboard = MetricsHTTPServer(runtime.metrics, host=args.dashboard_host, port=args.dashboard_port)
         dashboard.start()
         print(f"{time.strftime('[%H:%M]')} dashboard: http://{args.dashboard_host}:{args.dashboard_port}/", flush=True)
-    print(f"{time.strftime('[%H:%M]')} continuous: games={len(games)} actors={args.actors} epochs={args.epochs} shards={args.shards} stage_workers={args.stage_workers} ingest_workers={args.ingest_workers} derivation_workers={args.derivation_workers} peers={'off' if args.no_peers else 'on'} lifecycle={args.lifecycle} snapshots={'off' if args.no_snapshots else 'native'} game_ids={','.join(games)}", flush=True)
+    print(
+        f"{time.strftime('[%H:%M]')} continuous games={len(games)} actors={args.actors} "
+        f"epochs={args.epochs} steps/game={args.steps_per_game}",
+        flush=True,
+    )
     try:
         process_results, epoch_results = run_epochs(runtime, specs, args)
         results = [
