@@ -98,6 +98,34 @@ def _game_spec(
     )
 
 
+def _environment_specs(
+    environments: Any,
+    *,
+    step: str | None,
+    validation_mode: str,
+    inherited_options: dict[str, Any] | None = None,
+) -> tuple[EnvironmentSpec, ...]:
+    specs: list[EnvironmentSpec] = []
+    inherited = dict(inherited_options or {})
+    for environment in environments or ():
+        row = dict(environment)
+        adapter = str(row["adapter"])
+        condition = row.get("condition")
+        options = {**inherited, **dict(row.get("environment_options", {}))}
+        for game in row.get("games", ()):
+            specs.append(
+                _game_spec(
+                    adapter=adapter,
+                    raw_game=game,
+                    condition=condition,
+                    options=options,
+                    step=step,
+                    validation_mode=validation_mode,
+                )
+            )
+    return tuple(specs)
+
+
 def _step_specs(config: dict[str, Any], step_name: str) -> tuple[EnvironmentSpec, ...]:
     steps = dict(config["steps"])
     if step_name not in steps:
@@ -106,23 +134,14 @@ def _step_specs(config: dict[str, Any], step_name: str) -> tuple[EnvironmentSpec
     default_validation = str(config.get("defaults", {}).get("validation_mode", "learning_only"))
     validation_mode = str(step.get("validation_mode", default_validation))
     step_options = dict(step.get("environment_options", {}))
-    specs: list[EnvironmentSpec] = []
-    for environment in step.get("environments", ()):
-        row = dict(environment)
-        adapter = str(row["adapter"])
-        condition = row.get("condition")
-        options = {**step_options, **dict(row.get("environment_options", {}))}
-        for game in row.get("games", ()):
-            specs.append(
-                _game_spec(
-                    adapter=adapter,
-                    raw_game=game,
-                    condition=condition,
-                    options=options,
-                    step=step_name,
-                    validation_mode=validation_mode,
-                )
-            )
+    specs = list(
+        _environment_specs(
+            step.get("environments", ()),
+            step=step_name,
+            validation_mode=validation_mode,
+            inherited_options=step_options,
+        )
+    )
     if not specs:
         raise ValueError(f"curriculum step {step_name} resolves to no environments")
     return tuple(specs)
@@ -143,6 +162,16 @@ def resolve_curriculum_selector(selector: str, *, path: str | Path | None = None
     preset = dict(presets[normalized])
     allowed_adapters = set(str(value) for value in preset.get("adapters", ()))
     specs: list[EnvironmentSpec] = []
+    default_validation = str(config.get("defaults", {}).get("validation_mode", "learning_only"))
+    preset_validation = str(preset.get("validation_mode", default_validation))
+    specs.extend(
+        _environment_specs(
+            preset.get("environments", ()),
+            step=normalized,
+            validation_mode=preset_validation,
+            inherited_options=dict(preset.get("environment_options", {})),
+        )
+    )
     for step_name in preset.get("include_steps", ()):
         for spec in _step_specs(config, str(step_name)):
             if allowed_adapters and spec.adapter not in allowed_adapters:
