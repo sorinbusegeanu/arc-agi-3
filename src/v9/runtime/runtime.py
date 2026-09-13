@@ -57,7 +57,7 @@ from .partitions import PartitionMap
 from .publication import CanonicalGraph, edge_ref, node_ref
 from .read_view import ReadView
 from .rings import MultimodalTimeline
-from .snapshot import SnapshotResult, assert_native_root, latest_snapshot, load_snapshot, write_snapshot
+from .snapshot_backend import SnapshotResult, assert_native_root, latest_snapshot, load_snapshot, write_snapshot
 
 
 class ContinuousMemoryRuntime:
