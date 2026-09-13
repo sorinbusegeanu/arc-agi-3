@@ -50,6 +50,7 @@ from v9.telemetry import (
     build_primary_dashboard,
 )
 
+from .actor_policy import ActorPolicySnapshot
 from .config import RuntimeConfig, write_scientific_config_manifest
 from .lifecycle import LifecycleRegistry
 from .partitions import PartitionMap
