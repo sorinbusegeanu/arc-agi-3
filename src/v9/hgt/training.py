@@ -65,10 +65,12 @@ def _node_feature(node: Any, payload: dict[str, Any], dim: int, torch: Any):
     return torch.tensor(values[:dim], dtype=torch.float32)
 
 
-def build_hgt_graph(read_view: Any, *, input_dim: int = 64):
+def build_hgt_graph(read_view: Any, *, input_dim: int = 64, max_nodes: int = 800):
     torch, _, _ = _require_torch()
     nodes_by_type: dict[str, list[Any]] = {}
-    for uid, node in read_view.nodes.items():
+    ordered_nodes = sorted(read_view.nodes.items(), key=lambda row: (row[1].created_watermark, row[0]), reverse=True)
+    selected = ordered_nodes[: max(1, int(max_nodes))]
+    for uid, node in selected:
         node_type = f"M{int(node.level)}"
         nodes_by_type.setdefault(node_type, []).append(uid)
     for rows in nodes_by_type.values():
@@ -189,7 +191,7 @@ def train_hgt_epoch(
     if len(read_view.nodes) < 8:
         return HGTTrainingResult(epoch, "SKIPPED_INSUFFICIENT_DATA", runtime.unified_telemetry.model_version, None, 0.0, 0.0, len(read_view.nodes), 0, None)
 
-    x_dict, edge_index_dict, y_dict = build_hgt_graph(read_view)
+    x_dict, edge_index_dict, y_dict = build_hgt_graph(read_view, max_nodes=int(config.hgt_max_subgraph_nodes))
     metadata = (sorted(x_dict), sorted(edge_index_dict))
     if not metadata[1]:
         return HGTTrainingResult(epoch, "SKIPPED_NO_RELATIONS", runtime.unified_telemetry.model_version, None, 0.0, 0.0, len(read_view.nodes), 0, None)
