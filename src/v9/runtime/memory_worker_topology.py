@@ -6,6 +6,25 @@ from .memory_pipeline import derivation_worker_main, ingest_worker_main
 from .multiprocess import WorkerStop
 
 
+def _close_queue(queue_obj: Any, *, drain: bool) -> None:
+    if queue_obj is None:
+        return
+    if not drain:
+        try:
+            queue_obj.cancel_join_thread()
+        except (AttributeError, OSError, ValueError):
+            pass
+    try:
+        queue_obj.close()
+    except (AttributeError, OSError, ValueError):
+        pass
+    if drain:
+        try:
+            queue_obj.join_thread()
+        except (AttributeError, AssertionError, OSError, ValueError):
+            pass
+
+
 class MemoryWorkerTopology:
     def __init__(self, ctx: Any, *, ingest_workers: int, derivation_workers: int, ingest_queue_capacity: int, derivation_queue_capacity: int, result_queue_capacity: int) -> None:
         self.ctx = ctx
@@ -16,6 +35,7 @@ class MemoryWorkerTopology:
         self.result_queue = ctx.Queue(maxsize=int(result_queue_capacity))
         self.ingest_processes = []
         self.derivation_processes = []
+        self._closed = False
 
     def start(self) -> None:
         for index in range(self.ingest_workers):
@@ -49,11 +69,18 @@ class MemoryWorkerTopology:
                 process.terminate()
             process.join(timeout=5)
 
+    def close(self, *, drain: bool = True) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for queue_obj in (self.ingest_queue, self.derivation_queue, self.result_queue):
+            _close_queue(queue_obj, drain=drain)
+
     @staticmethod
     def _safe_qsize(queue_obj: Any) -> int:
         try:
             return int(queue_obj.qsize())
-        except (NotImplementedError, AttributeError):
+        except (NotImplementedError, AttributeError, OSError, ValueError):
             return -1
 
     def queue_depths(self) -> dict[str, int]:
