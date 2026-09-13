@@ -99,6 +99,7 @@ class ContinuousMemoryRuntime:
         self._m1n_occurrences: dict[int, list[M1NormalizedRelation]] = {}
         self._m1n_supports: dict[int, int] = {}
         self._m1n_dirty: set[int] = set()
+        self._actor_action_supports: dict[int, float] = {}
         self._replay_pool: dict[MemoryUid, float] = {}
         self._formation_environments: set[int] = set()
         self._latest_interaction_grounding: dict[tuple[int, int], M1GroundedContingency] = {}
@@ -176,24 +177,9 @@ class ContinuousMemoryRuntime:
 
     def actor_policy_snapshot(self) -> ActorPolicySnapshot:
         with self._lock:
-            action_supports: dict[int, float] = {}
-            for signature, support in self._m1n_supports.items():
-                rows = self._m1n_occurrences.get(int(signature), ())
-                if not rows:
-                    continue
-                observable = str(rows[0].observable_relation)
-                prefix, separator, remainder = observable.partition(":")
-                action_text, action_separator, _ = remainder.partition(":")
-                if prefix != "ACTION" or not separator or not action_separator:
-                    continue
-                try:
-                    action = int(action_text)
-                except ValueError:
-                    continue
-                action_supports[action] = action_supports.get(action, 0.0) + float(support)
             return ActorPolicySnapshot.build(
                 generation=self.graph.generation,
-                normalized_action_supports=action_supports,
+                normalized_action_supports=self._actor_action_supports,
                 hgt_action_scores=self._hgt_action_scores,
                 hgt_action_scores_by_type=self._hgt_scores_by_environment_type(),
                 model_version=self.unified_telemetry.model_version,
@@ -471,6 +457,16 @@ class ContinuousMemoryRuntime:
         occurrences = self._m1n_occurrences.setdefault(relation.structural_signature, [])
         support = self._m1n_supports.get(relation.structural_signature, 0) + 1
         self._m1n_supports[relation.structural_signature] = support
+        observable = str(relation.observable_relation)
+        prefix, separator, remainder = observable.partition(":")
+        action_text, action_separator, _ = remainder.partition(":")
+        if prefix == "ACTION" and separator and action_separator:
+            try:
+                action = int(action_text)
+            except ValueError:
+                action = None
+            if action is not None:
+                self._actor_action_supports[action] = self._actor_action_supports.get(action, 0.0) + 1.0
         if len(occurrences) < max(2, self.config.scientific.m1n_facts_per_channel):
             occurrences.append(relation)
         self._replay_pool[relation.uid] = float(support)
@@ -1024,6 +1020,21 @@ class ContinuousMemoryRuntime:
             dummy = M1NormalizedRelation(node, str(payload["observable_relation"]), NormalizedChannel(str(payload["channel"])), int(signature), DerivationProvenance((dummy_parent_uid,), evidence_refs))
             self._m1n_occurrences[int(signature)] = [dummy] if int(count) > 0 else []
         self._m1n_supports = {int(key): int(value) for key, value in dict(state.get("m1n_supports", state.get("m1n_occurrences", {}))).items()}
+        self._actor_action_supports = {}
+        for signature, support in self._m1n_supports.items():
+            rows = self._m1n_occurrences.get(int(signature), ())
+            if not rows:
+                continue
+            observable = str(rows[0].observable_relation)
+            prefix, separator, remainder = observable.partition(":")
+            action_text, action_separator, _ = remainder.partition(":")
+            if prefix != "ACTION" or not separator or not action_separator:
+                continue
+            try:
+                action = int(action_text)
+            except ValueError:
+                continue
+            self._actor_action_supports[action] = self._actor_action_supports.get(action, 0.0) + float(support)
         self._replay_pool = {MemoryUid(int(key[:16], 16), int(key[16:], 16)): float(value) for key, value in dict(state.get("replay_pool", {})).items()}
         self._formation_environments = {int(value) for value in state.get("formation_environments", [])}
         self._latest_interaction_grounding = {}
