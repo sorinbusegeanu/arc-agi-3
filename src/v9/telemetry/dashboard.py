@@ -5,6 +5,8 @@ from typing import Any
 
 PRIMARY_KEYS = (
     "success_rate",
+    "behavioral_success_rate",
+    "behavioral_success_gain",
     "trajectory_efficiency",
     "M0_count",
     "M1_count",
@@ -60,6 +62,8 @@ def build_primary_dashboard(runtime_metrics: dict[str, Any], diagnostic: dict[st
     best_sum = float(diagnostic.get("best_candidate_score", 0.0))
     dashboard = {
         "success_rate": float(runtime_metrics.get("success_rate", 0.0)),
+        "behavioral_success_rate": float(diagnostic.get("behavioral_success_rate", 0.0)),
+        "behavioral_success_gain": float(diagnostic.get("behavioral_success_gain", 0.0)),
         "trajectory_efficiency": float(runtime_metrics.get("trajectory_efficiency", 0.0)),
         "M0_count": int(levels.get("M0", 0)),
         "M1_count": int(levels.get("M1", 0)),
