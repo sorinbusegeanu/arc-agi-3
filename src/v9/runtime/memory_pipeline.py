@@ -1,0 +1,190 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import Any
+
+from v9.cognition.compression import form_families
+from v9.cognition.roles import form_roles
+from v9.environments.schemas import EnvironmentIdentity
+from v9.memory.identity import EpisodeId, EventUid, stable_u64
+from v9.memory.m0_episode import M0Episode
+from v9.memory.m1_grounded import GroundedRelation, M1GroundedContingency
+from v9.memory.m1_normalized import M1NormalizedRelation, NormalizedChannel
+from v9.memory.m2_family import M2TransformationFamily
+from v9.memory.m3_role import M3FunctionalRole
+from v9.memory.m4_concept import M4Concept
+from v9.memory.provenance import DerivationProvenance
+from v9.memory.model import ExperienceEvent
+from v9.modalities.contract import InteractionEvent, TimelineIdentity, WORLD_MODALITY
+
+from .multiprocess import EncodedTransition, WorkerStop
+
+
+@dataclass(frozen=True, slots=True)
+class IngestionTask:
+    sequence: int
+    causal_watermark: int
+    transition: EncodedTransition
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedIngestion:
+    sequence: int
+    transition: EncodedTransition
+    identity: EnvironmentIdentity
+    event: InteractionEvent | None
+    m0: M0Episode | None
+    m1g: M1GroundedContingency | None
+    m1n: M1NormalizedRelation | None
+
+
+@dataclass(frozen=True, slots=True)
+class DerivationTask:
+    task_id: int
+    structural_signature: int
+    rows: tuple[M1NormalizedRelation, ...]
+    support: int
+    formation_scope: tuple[int, ...]
+    causal_watermark: int
+
+
+@dataclass(frozen=True, slots=True)
+class DerivationResult:
+    task_id: int
+    structural_signature: int
+    support: int
+    family: M2TransformationFamily
+    roles: tuple[M3FunctionalRole, ...]
+    concepts: tuple[M4Concept, ...]
+    causal_watermark: int
+
+
+def prepare_ingestion(task: IngestionTask) -> PreparedIngestion:
+    transition = task.transition
+    identity = EnvironmentIdentity(*transition.environment_identity)
+    if transition.symbols_only:
+        return PreparedIngestion(task.sequence, transition, identity, None, None, None, None)
+
+    environment = int(identity.instance_id.value)
+    episode_id = EpisodeId(int(transition.episode_id))
+    producer_id = int(transition.actor_id)
+    producer_sequence = int(transition.producer_sequence)
+    event_uid = EventUid.from_producer(producer_id, producer_sequence)
+    experience = ExperienceEvent(
+        event_uid,
+        int(task.causal_watermark),
+        producer_id,
+        producer_sequence,
+        environment,
+        int(transition.global_step),
+        int(transition.before_signature),
+        int(transition.action_id),
+        int(transition.after_signature),
+        stable_u64(
+            int(transition.observation_schema_id),
+            int(transition.before_signature != transition.after_signature),
+            person=b"v9-family",
+        ),
+        stable_u64(
+            int(transition.observation_schema_id),
+            int(transition.before_signature),
+            person=b"v9-carrier",
+        ),
+        float(transition.available_actions_after),
+        int(transition.before_signature != transition.after_signature),
+        int(transition.primary_valence),
+        stable_u64(environment, int(transition.episode_id), person=b"v9-trajectory"),
+        int(transition.after_signature),
+        0.0,
+    )
+    event = InteractionEvent(
+        TimelineIdentity(
+            event_uid,
+            int(task.causal_watermark),
+            producer_id,
+            producer_sequence,
+            environment,
+            episode_id,
+            WORLD_MODALITY,
+        ),
+        experience,
+    )
+    payload_digest = stable_u64(
+        experience.context_signature,
+        experience.action_id,
+        experience.outcome_signature,
+        person=b"v9-interaction-payload",
+    )
+    m0 = M0Episode.from_event(
+        event,
+        context_signature=experience.context_signature,
+        payload_digest=payload_digest,
+    )
+    m1g = M1GroundedContingency.build(GroundedRelation.ACTION_CONDITIONED, (m0,))
+    observable = (
+        f"ACTION:{experience.action_id}:"
+        f"FAMILY:{experience.family_signature}:"
+        f"OUTCOME:{experience.outcome_signature}"
+    )
+    m1n = M1NormalizedRelation.build(observable, NormalizedChannel.WORLD, (m1g,))
+    return PreparedIngestion(task.sequence, transition, identity, event, m0, m1g, m1n)
+
+
+def ingest_worker_main(task_queue: Any, result_queue: Any) -> None:
+    while True:
+        item = task_queue.get()
+        if isinstance(item, WorkerStop):
+            return
+        if not isinstance(item, IngestionTask):
+            continue
+        try:
+            result_queue.put(("ingest", item.sequence, prepare_ingestion(item)))
+        except BaseException as exc:
+            result_queue.put(("worker_error", "ingest", item.sequence, repr(exc)))
+
+
+def derive_memory(task: DerivationTask) -> DerivationResult:
+    if len(task.rows) < 2 or task.support < 2:
+        raise ValueError("derivation requires recurrent M1 support")
+    family = form_families(task.rows)[0]
+    family = replace(
+        family,
+        recurrence=int(task.support),
+        compression_benefit=float(task.support - 1),
+    )
+    roles = form_roles(
+        (family,),
+        consequence_by_family={family.uid.lo: family.structural_signature},
+    )
+    concepts = tuple(
+        M4Concept.candidate(
+            (role,),
+            compression_benefit=family.compression_benefit,
+            explanatory_reach=max(1, len(role.provenance.evidence)),
+            transfer_prior=0.5,
+            formation_scope=task.formation_scope,
+        )
+        for role in roles
+    )
+    return DerivationResult(
+        task.task_id,
+        task.structural_signature,
+        task.support,
+        family,
+        roles,
+        concepts,
+        task.causal_watermark,
+    )
+
+
+def derivation_worker_main(task_queue: Any, result_queue: Any) -> None:
+    while True:
+        item = task_queue.get()
+        if isinstance(item, WorkerStop):
+            return
+        if not isinstance(item, DerivationTask):
+            continue
+        try:
+            result_queue.put(("derivation", item.task_id, derive_memory(item)))
+        except BaseException as exc:
+            result_queue.put(("worker_error", "derivation", item.task_id, repr(exc)))
