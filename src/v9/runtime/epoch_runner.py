@@ -120,7 +120,6 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
         runtime.set_telemetry_gauge("behavioral_success_gain", behavioral_gain)
         runtime.set_telemetry_gauge("successful_scenarios", sum(rate > 0.0 for rate in scenario_success.values()))
 
-        print(f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} training start", flush=True)
         training = train_hgt_epoch(
             runtime,
             epoch=epoch,
