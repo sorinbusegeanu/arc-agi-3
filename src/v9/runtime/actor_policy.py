@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Mapping
 
 
 @dataclass(frozen=True, slots=True)
 class ActorPolicySnapshot:
     generation: int
-    normalized_action_supports: Mapping[int, float]
-    hgt_action_scores: Mapping[int, Mapping[int, float]]
+    normalized_action_supports: dict[int, float]
+    hgt_action_scores: dict[int, dict[int, float]]
     model_version: str
 
     @classmethod
@@ -22,19 +21,19 @@ class ActorPolicySnapshot:
         model_version: str,
     ) -> "ActorPolicySnapshot":
         learned = {
-            int(environment): MappingProxyType({
+            int(environment): {
                 int(action): float(score)
                 for action, score in actions.items()
-            })
+            }
             for environment, actions in hgt_action_scores.items()
         }
         return cls(
             int(generation),
-            MappingProxyType({
+            {
                 int(action): float(score)
                 for action, score in normalized_action_supports.items()
-            }),
-            MappingProxyType(learned),
+            },
+            learned,
             str(model_version),
         )
 
