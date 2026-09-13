@@ -14,7 +14,6 @@ from random import Random
 
 from v9.cognition.action_selection import choose_action
 from v9.runtime.actor_policy import ActorPolicySnapshot
-
 from v9.memory.identity import stable_u64
 
 
@@ -69,24 +68,7 @@ def _load_factory(path: str):
     return getattr(importlib.import_module(module_name), attr)
 
 
-def actor_process_main(
-    *,
-    spec: Any,
-    actor_id: int,
-    steps: int,
-    seed: int,
-    env_root: str | None,
-    initial_policy: ActorPolicySnapshot,
-    policy_updates: Any,
-    epsilon: float,
-    policy_refresh_steps: int,
-    policy_refresh_ms: float,
-    stage_queue: Any,
-    result_queue: Any,
-    adapter_factory_path: str,
-    alfred_backend_factory: str | None,
-    run_nonce: int,
-) -> None:
+def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, initial_policy: ActorPolicySnapshot, policy_updates: Any, epsilon: float, policy_refresh_steps: int, policy_refresh_ms: float, stage_queue: Any, result_queue: Any, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int) -> None:
     game_id = str(getattr(spec, "display_name", getattr(spec, "game_id", "unknown")))
     adapter = None
     devnull = open(os.devnull, "w", encoding="utf-8")
@@ -128,20 +110,11 @@ def actor_process_main(
                         policy = newest
                         policy_refreshes += 1
                     next_refresh_time = now + refresh_seconds
-                learned_scores = policy.learned_scores(
-                    environment_instance_id,
-                    actions,
-                    environment_type=identity.environment_type,
-                )
-                action = choose_action(
-                    policy,
-                    actions,
-                    rng=rng,
-                    epsilon=float(epsilon),
-                    learned_scores=learned_scores,
-                    target_environment_id=environment_instance_id,
-                )
+
                 before = adapter.observe()
+                before_signature = int(adapter.encode_observation(before))
+                learned_scores = policy.learned_scores(environment_instance_id, actions, environment_type=identity.environment_type, context_signature=before_signature)
+                action = choose_action(policy, actions, rng=rng, epsilon=float(epsilon), learned_scores=learned_scores, target_environment_id=environment_instance_id)
                 after = adapter.step(int(action))
                 boundary = adapter.boundary_event()
                 observation_schema_id = int(adapter.observation_schema().schema_id)
@@ -153,7 +126,7 @@ def actor_process_main(
                         environment_identity=(identity.family, identity.environment_type, identity.config, identity.instance),
                         episode_id=int(stable_u64(environment_instance_id, run_nonce, actor_id, episode_ordinal, person=b"v9-mp-episode")),
                         observation_schema_id=observation_schema_id,
-                        before_signature=int(adapter.encode_observation(before)),
+                        before_signature=before_signature,
                         action_id=int(adapter.encode_action(action)),
                         after_signature=int(adapter.encode_observation(after)),
                         available_actions_after=len(tuple(adapter.available_actions())),
@@ -195,7 +168,7 @@ def stage_worker_main(stage_queue: Any, shard_queues: tuple[Any, ...]) -> None:
             return
         if not isinstance(item, EncodedTransition):
             continue
-        shard = int(stable_u64(item.environment_instance_id if hasattr(item, "environment_instance_id") else item.environment_identity[1], item.actor_id, item.producer_sequence, person=b"v9-stage-route") % len(shard_queues))
+        shard = int(stable_u64(item.environment_identity[1], item.actor_id, item.producer_sequence, person=b"v9-stage-route") % len(shard_queues))
         shard_queues[shard].put(item)
 
 
@@ -239,27 +212,7 @@ class ProcessTopology:
             self.stage_processes.append(process)
 
     def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, initial_policy: ActorPolicySnapshot, epsilon: float, policy_refresh_steps: int, policy_refresh_ms: float) -> None:
-        process = self.ctx.Process(
-            target=actor_process_main,
-            kwargs={
-                "spec": spec,
-                "actor_id": actor_id,
-                "steps": steps,
-                "seed": seed,
-                "env_root": env_root,
-                "initial_policy": initial_policy,
-                "policy_updates": self.policy_updates[index],
-                "epsilon": float(epsilon),
-                "policy_refresh_steps": int(policy_refresh_steps),
-                "policy_refresh_ms": float(policy_refresh_ms),
-                "stage_queue": self.stage_queue,
-                "result_queue": self.result_queue,
-                "adapter_factory_path": adapter_factory_path,
-                "alfred_backend_factory": alfred_backend_factory,
-                "run_nonce": int(run_nonce),
-            },
-            name=f"v9-actor-{actor_id}",
-        )
+        process = self.ctx.Process(target=actor_process_main, kwargs={"spec": spec, "actor_id": actor_id, "steps": steps, "seed": seed, "env_root": env_root, "initial_policy": initial_policy, "policy_updates": self.policy_updates[index], "epsilon": float(epsilon), "policy_refresh_steps": int(policy_refresh_steps), "policy_refresh_ms": float(policy_refresh_ms), "stage_queue": self.stage_queue, "result_queue": self.result_queue, "adapter_factory_path": adapter_factory_path, "alfred_backend_factory": alfred_backend_factory, "run_nonce": int(run_nonce)}, name=f"v9-actor-{actor_id}")
         process.start()
         self.actor_processes.append(process)
 
