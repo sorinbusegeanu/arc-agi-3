@@ -20,6 +20,8 @@ class LifecycleRecord:
     relevant_opportunities: int = 0
     last_transition_watermark: int = 0
     last_observed_watermark: int = 0
+    last_transition_cycle: int = 0
+    last_observed_cycle: int = 0
     retention_score: float = 1.0
     replacement_uid: MemoryUid | None = None
     baseline_hgt_retention: float | None = None
@@ -29,12 +31,26 @@ class LifecycleRecord:
 
 
 class LifecycleRegistry:
+    SCHEMA_VERSION = 2
+
     def __init__(self) -> None:
         self.records: dict[MemoryUid, LifecycleRecord] = {}
         self.transitions = 0
+        self.maintenance_cycle = 0
+
+    def begin_maintenance(self) -> int:
+        self.maintenance_cycle += 1
+        return self.maintenance_cycle
+
+    def _new_record(self, uid: MemoryUid) -> LifecycleRecord:
+        return LifecycleRecord(
+            uid=uid,
+            last_transition_cycle=self.maintenance_cycle,
+            last_observed_cycle=self.maintenance_cycle,
+        )
 
     def observe(self, uid: MemoryUid, *, support_delta: int, relevant_opportunity: bool, watermark: int) -> LifecycleRecord:
-        current = self.records.get(uid, LifecycleRecord(uid))
+        current = self.records.get(uid, self._new_record(uid))
         support = current.support + int(support_delta)
         opportunities = current.relevant_opportunities + int(relevant_opportunity)
         state = current.state
@@ -52,6 +68,8 @@ class LifecycleRegistry:
             relevant_opportunities=opportunities,
             last_transition_watermark=int(watermark) if transitioned else current.last_transition_watermark,
             last_observed_watermark=int(watermark),
+            last_transition_cycle=self.maintenance_cycle if transitioned else current.last_transition_cycle,
+            last_observed_cycle=self.maintenance_cycle,
             replacement_uid=None if state in {CognitiveState.ACTIVE, CognitiveState.REACTIVATED} else current.replacement_uid,
             baseline_hgt_retention=None if reactivated else current.baseline_hgt_retention,
             baseline_behavioral_success=None if reactivated else current.baseline_behavioral_success,
@@ -71,7 +89,7 @@ class LifecycleRegistry:
         replacement_uid: MemoryUid | None = None,
         validation_baseline: tuple[float | None, float | None, float | None, float | None] | None = None,
     ) -> LifecycleRecord:
-        current = self.records.get(uid, LifecycleRecord(uid))
+        current = self.records.get(uid, self._new_record(uid))
         transitioned = state is not current.state
         self.transitions += int(transitioned)
         baseline = validation_baseline or (
@@ -84,6 +102,7 @@ class LifecycleRegistry:
             current,
             state=state,
             last_transition_watermark=int(watermark) if transitioned else current.last_transition_watermark,
+            last_transition_cycle=self.maintenance_cycle if transitioned else current.last_transition_cycle,
             retention_score=current.retention_score if retention_score is None else float(retention_score),
             replacement_uid=replacement_uid,
             baseline_hgt_retention=baseline[0],
@@ -112,6 +131,8 @@ class LifecycleRegistry:
             support=current.support + int(support_delta),
             last_transition_watermark=int(watermark),
             last_observed_watermark=int(watermark),
+            last_transition_cycle=self.maintenance_cycle,
+            last_observed_cycle=self.maintenance_cycle,
             replacement_uid=None,
             baseline_hgt_retention=None,
             baseline_behavioral_success=None,
@@ -123,7 +144,9 @@ class LifecycleRegistry:
 
     def state_dict(self) -> dict[str, object]:
         return {
+            "schema_version": self.SCHEMA_VERSION,
             "transitions": self.transitions,
+            "maintenance_cycle": self.maintenance_cycle,
             "records": [
                 {
                     "uid": [uid.hi, uid.lo],
@@ -132,6 +155,8 @@ class LifecycleRegistry:
                     "relevant_opportunities": row.relevant_opportunities,
                     "last_transition_watermark": row.last_transition_watermark,
                     "last_observed_watermark": row.last_observed_watermark,
+                    "last_transition_cycle": row.last_transition_cycle,
+                    "last_observed_cycle": row.last_observed_cycle,
                     "retention_score": row.retention_score,
                     "replacement_uid": None if row.replacement_uid is None else [row.replacement_uid.hi, row.replacement_uid.lo],
                     "baseline_hgt_retention": row.baseline_hgt_retention,
@@ -146,25 +171,34 @@ class LifecycleRegistry:
     @classmethod
     def from_state_dict(cls, state: dict[str, object]) -> "LifecycleRegistry":
         result = cls()
+        schema_version = int(state.get("schema_version", 1))
+        legacy_watermark_aging = schema_version < cls.SCHEMA_VERSION or "maintenance_cycle" not in state
         result.transitions = int(state.get("transitions", 0))
+        result.maintenance_cycle = int(state.get("maintenance_cycle", 0))
         for raw in state.get("records", []):
             uid = MemoryUid(int(raw["uid"][0]), int(raw["uid"][1]))
             transition_watermark = int(raw.get("last_transition_watermark", 0))
             raw_replacement = raw.get("replacement_uid")
             replacement_uid = None if raw_replacement is None else MemoryUid(int(raw_replacement[0]), int(raw_replacement[1]))
+            restored_state = CognitiveState[str(raw["state"])]
+            if legacy_watermark_aging and restored_state in {CognitiveState.DORMANT, CognitiveState.RETIRE_PENDING}:
+                restored_state = CognitiveState.ACTIVE
+                replacement_uid = None
             result.records[uid] = LifecycleRecord(
                 uid=uid,
-                state=CognitiveState[str(raw["state"])],
+                state=restored_state,
                 support=int(raw.get("support", 0)),
                 relevant_opportunities=int(raw.get("relevant_opportunities", 0)),
                 last_transition_watermark=transition_watermark,
                 last_observed_watermark=int(raw.get("last_observed_watermark", transition_watermark)),
+                last_transition_cycle=int(raw.get("last_transition_cycle", result.maintenance_cycle)),
+                last_observed_cycle=int(raw.get("last_observed_cycle", result.maintenance_cycle)),
                 retention_score=float(raw.get("retention_score", 1.0)),
                 replacement_uid=replacement_uid,
-                baseline_hgt_retention=None if raw.get("baseline_hgt_retention") is None else float(raw["baseline_hgt_retention"]),
-                baseline_behavioral_success=None if raw.get("baseline_behavioral_success") is None else float(raw["baseline_behavioral_success"]),
-                baseline_transfer_quality=None if raw.get("baseline_transfer_quality") is None else float(raw["baseline_transfer_quality"]),
-                baseline_prediction_quality=None if raw.get("baseline_prediction_quality") is None else float(raw["baseline_prediction_quality"]),
+                baseline_hgt_retention=None if legacy_watermark_aging or raw.get("baseline_hgt_retention") is None else float(raw["baseline_hgt_retention"]),
+                baseline_behavioral_success=None if legacy_watermark_aging or raw.get("baseline_behavioral_success") is None else float(raw["baseline_behavioral_success"]),
+                baseline_transfer_quality=None if legacy_watermark_aging or raw.get("baseline_transfer_quality") is None else float(raw["baseline_transfer_quality"]),
+                baseline_prediction_quality=None if legacy_watermark_aging or raw.get("baseline_prediction_quality") is None else float(raw["baseline_prediction_quality"]),
             )
         return result
 
@@ -233,12 +267,14 @@ def _sync_cognitive_visibility(graph: Any, updates: dict[MemoryUid, CognitiveSta
             payload = graph.payloads.get(uid)
             if payload is None:
                 continue
-            before = payload.get("cognitive_state")
+            before = (payload.get("cognitive_state"), payload.get("cognitive_state_version"))
             if state in {CognitiveState.ACTIVE, CognitiveState.REACTIVATED, CognitiveState.VALIDATED}:
                 payload.pop("cognitive_state", None)
+                payload.pop("cognitive_state_version", None)
             else:
                 payload["cognitive_state"] = state.name
-            after = payload.get("cognitive_state")
+                payload["cognitive_state_version"] = 2
+            after = (payload.get("cognitive_state"), payload.get("cognitive_state_version"))
             if before != after:
                 changed.append(uid)
         if changed:
@@ -255,15 +291,18 @@ def run_lifecycle_maintenance(
     retirement_limit: int = 2048,
     dormant_threshold: float = 0.22,
     reactivation_threshold: float = 0.40,
-    dormancy_grace_watermarks: int = 2048,
-    retirement_grace_watermarks: int = 2048,
+    dormancy_grace_cycles: int = 3,
+    retirement_grace_cycles: int = 3,
     validation_tolerance: float = 0.05,
 ) -> dict[str, int | float]:
     if not runtime.config.enable_lifecycle:
-        return {"scanned": 0, "dormant": 0, "pending": 0, "retired": 0, "reactivated": 0, "blocked": 0, "pressure": 0.0}
+        return {"cycle": 0, "scanned": 0, "dormant": 0, "pending": 0, "retired": 0, "reactivated": 0, "blocked": 0, "pressure": 0.0}
+    if min(int(dormancy_grace_cycles), int(retirement_grace_cycles)) <= 0:
+        raise ValueError("lifecycle grace cycles must be positive")
 
     graph = runtime.graph
     registry: LifecycleRegistry = runtime.lifecycle
+    cycle = registry.begin_maintenance()
     watermark = int(runtime.watermark)
     pressure = float(graph.pressure_ratio())
     pressure_multiplier = min(4, 1 + max(0, int((pressure - 0.70) * 10)))
@@ -282,7 +321,7 @@ def run_lifecycle_maintenance(
         replacement_uid = replacements.get(uid)
         if node is None or replacement_uid is None or node.level > MemoryLevel.M1:
             continue
-        if watermark - int(row.last_transition_watermark) < int(retirement_grace_watermarks):
+        if cycle - int(row.last_transition_cycle) < int(retirement_grace_cycles):
             continue
         if uid in runtime._replay_pool or not _validation_preserved(row, runtime, tolerance=validation_tolerance):
             blocked += 1
@@ -294,7 +333,7 @@ def run_lifecycle_maintenance(
     retired_uids = graph.retire_nodes_batch(tuple(pending_plans))
     retired_set = set(retired_uids)
     for uid in retired_uids:
-        row = registry.records.get(uid, LifecycleRecord(uid))
+        row = registry.records.get(uid, registry._new_record(uid))
         registry.transition(uid, CognitiveState.RETIRED, watermark=watermark, retention_score=row.retention_score, replacement_uid=row.replacement_uid or replacements.get(uid))
         runtime._replay_pool.pop(uid, None)
         runtime._deferred_base_nodes.pop(uid, None)
@@ -312,7 +351,7 @@ def run_lifecycle_maintenance(
     candidates = heapq.nsmallest(
         effective_scan_limit,
         eligible,
-        key=lambda row: (0 if row.state is CognitiveState.DORMANT else 1, int(row.last_observed_watermark), row.uid),
+        key=lambda row: (0 if row.state is CognitiveState.DORMANT else 1, int(row.last_observed_cycle), int(row.last_observed_watermark), row.uid),
     )
 
     dormant = 0
@@ -326,7 +365,7 @@ def run_lifecycle_maintenance(
             continue
         payload = graph.payloads.get(row.uid, {})
         score = retention_score(row, payload, watermark=watermark)
-        age = watermark - int(row.last_observed_watermark)
+        idle_cycles = cycle - int(row.last_observed_cycle)
         replacement_uid = replacements.get(row.uid)
         covered = replacement_uid is not None
         if row.state is CognitiveState.DORMANT:
@@ -334,7 +373,7 @@ def run_lifecycle_maintenance(
                 state = CognitiveState.REACTIVATED
                 registry.transition(row.uid, state, watermark=watermark, retention_score=score)
                 reactivated += 1
-            elif node.level <= MemoryLevel.M1 and covered and watermark - int(row.last_transition_watermark) >= int(dormancy_grace_watermarks):
+            elif node.level <= MemoryLevel.M1 and covered and cycle - int(row.last_transition_cycle) >= int(dormancy_grace_cycles):
                 if row.uid in runtime._replay_pool or not _validation_preserved(row, runtime, tolerance=validation_tolerance):
                     state = CognitiveState.DORMANT
                     registry.transition(row.uid, state, watermark=watermark, retention_score=score, replacement_uid=replacement_uid)
@@ -349,7 +388,7 @@ def run_lifecycle_maintenance(
             visibility_updates[row.uid] = state
             continue
         can_dormant = covered if node.level <= MemoryLevel.M1 else True
-        if can_dormant and age >= int(dormancy_grace_watermarks) and score < dormant_threshold:
+        if can_dormant and idle_cycles >= int(dormancy_grace_cycles) and score < dormant_threshold:
             state = CognitiveState.DORMANT
             registry.transition(
                 row.uid,
@@ -387,6 +426,7 @@ def run_lifecycle_maintenance(
         )
 
     return {
+        "cycle": cycle,
         "scanned": len(candidates),
         "dormant": dormant,
         "pending": pending,
