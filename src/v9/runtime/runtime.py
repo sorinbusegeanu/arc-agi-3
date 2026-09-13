@@ -1207,7 +1207,6 @@ class ContinuousMemoryRuntime:
             return self._metrics_locked()
 
     def _metrics_locked(self) -> dict[str, Any]:
-        view = self.read_view
         counts = {f"M{level}": self.graph.memory_count(MemoryLevel(level)) for level in range(8)}
         deferred_levels = {0: 0, 1: 0}
         for node, _, _ in self._deferred_base_nodes.values():
@@ -1223,7 +1222,11 @@ class ContinuousMemoryRuntime:
         )
         validated_transfers = sum(row.successes for row in self.transfer_trust.records.values())
         prediction_observations = self.telemetry["symbol_conditioned_prediction_observations"]
-        strategy_payloads = [payload for uid, payload in view.payloads.items() if view.nodes[uid].level is MemoryLevel.M7]
+        strategy_payloads = [
+            payload
+            for uid, payload in self.graph.payloads.items()
+            if self.graph.nodes[uid].level is MemoryLevel.M7
+        ]
         strategy_trials = sum(int(row.get("reliability_trials", 0)) for row in strategy_payloads)
         strategy_successes = sum(int(row.get("reliability_successes", 0)) for row in strategy_payloads)
         realized_cost_total = sum(float(row.get("realized_cost_sum", 0.0)) for row in strategy_payloads)
@@ -1232,12 +1235,13 @@ class ContinuousMemoryRuntime:
         diagnostic = self.unified_telemetry.diagnostic_metrics()
         retired = int(diagnostic.get("hydra_nodes_retired", 0))
         replaced = int(diagnostic.get("hydra_nodes_replaced_by_abstractions", 0))
-        compression_ratio = (retired + replaced) / max(1, len(view.nodes) + retired)
+        total_memories = sum(counts.values())
+        compression_ratio = (retired + replaced) / max(1, total_memories + retired)
         base = {
             "watermark": self._watermark,
-            "graph_generation": view.generation,
-            "memories": len(view.nodes),
-            "edges": len(view.edges),
+            "graph_generation": self.graph.generation,
+            "memories": total_memories,
+            "edges": len(self.graph.edges),
             "memory_levels": counts,
             "scientific_config_id": self.config.scientific.config_id.value,
             "timeline_events_seen": self.timeline.events_seen,
@@ -1269,12 +1273,12 @@ class ContinuousMemoryRuntime:
             "symbol_conditioned_prediction_delta": self._symbol_prediction_delta_sum / max(1, prediction_observations),
             "prediction_error": self._prediction_error_sum / max(1, self._prediction_error_count),
             "persistent_consolidated_bytes": persistent_bytes,
-            "persistent_memory_growth_ratio": len(view.nodes) / max(1, self.telemetry["events"]),
+            "persistent_memory_growth_ratio": total_memories / max(1, self.telemetry["events"]),
             "compression_ratio": compression_ratio,
             "m4_validated": validated_m4,
             "success_rate": strategy_successes / max(1, strategy_trials),
             "trajectory_efficiency": strategy_successes / max(1.0, realized_cost_total),
-            "explanatory_reach_per_persistent_byte": sum(int(payload.get("explanatory_reach", 0)) for payload in view.payloads.values()) / persistent_bytes,
+            "explanatory_reach_per_persistent_byte": sum(int(payload.get("explanatory_reach", 0)) for payload in self.graph.payloads.values()) / persistent_bytes,
             "transfer_quality_per_persistent_byte": validated_transfers / persistent_bytes,
             "prediction_quality_per_persistent_byte": max(0.0, self._symbol_prediction_delta_sum) / persistent_bytes,
             "hot_payload_bytes": self.payloads.hot_bytes,
