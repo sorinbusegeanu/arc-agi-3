@@ -71,6 +71,7 @@ def run_parallel_memory_jobs(
     coordinator_batch_size = 256
     canonical_apply_seconds = 0.0
     canonical_apply_events = 0
+    clean_shutdown = False
 
     def launch_one() -> bool:
         if not pending or not free_slots:
@@ -281,8 +282,12 @@ def run_parallel_memory_jobs(
         for key, value in {"actor_processes": min(int(actor_limit), len(jobs)), "stage_worker_processes": int(stage_workers), "shard_worker_processes": int(shards), "ingest_worker_processes": int(ingest_workers), "derivation_worker_processes": int(derivation_workers), "multiprocess_transitions_published": int(ingested), "coordinator_action_requests": 0, "policy_snapshot_generation": int(published_policy_generation), "policy_snapshot_refreshes": sum(int(row.policy_refreshes) for row in results)}.items():
             runtime.set_telemetry_gauge(key, value)
         progress()
+        clean_shutdown = True
         return sorted(results, key=lambda row: row.actor_id)
     except BaseException:
         memory.terminate()
         topology.terminate()
         raise
+    finally:
+        memory.close(drain=clean_shutdown)
+        topology.close(drain=clean_shutdown)
