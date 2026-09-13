@@ -3,7 +3,7 @@ from .arc import ARCAdapter
 from .babyai import BabyAIAdapter, make_babyai_adapter
 from .chess import ChessAdapter
 from .contract import BoundaryEvent, BoundaryScope, EnvironmentCognitionAdapter, EnvironmentTransition
-from .gym import GymDiscreteAdapter
+from .gym import GymDiscreteAdapter, GymStructuredAdapter
 from .registry import EnvironmentRegistry
 from .sudoku import SudokuAdapter
 from .synthetic_symbolic import SyntheticSymbolicConfig, SyntheticSymbolicEnvironment
@@ -11,6 +11,6 @@ from .synthetic_symbolic import SyntheticSymbolicConfig, SyntheticSymbolicEnviro
 __all__ = [
     "ARCAdapter", "AlfredAdapter", "BabyAIAdapter", "BoundaryEvent", "BoundaryScope",
     "ChessAdapter", "EnvironmentCognitionAdapter", "EnvironmentRegistry", "EnvironmentTransition",
-    "GymDiscreteAdapter", "SudokuAdapter", "SyntheticSymbolicConfig",
+    "GymDiscreteAdapter", "GymStructuredAdapter", "SudokuAdapter", "SyntheticSymbolicConfig",
     "SyntheticSymbolicEnvironment", "make_babyai_adapter",
 ]
