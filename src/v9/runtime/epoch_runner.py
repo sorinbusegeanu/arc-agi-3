@@ -54,7 +54,20 @@ def _performance_summary(metrics: dict[str, Any]) -> dict[str, Any]:
     ingested = int(diagnostic.get("ingested_steps", 0))
     backlog = int(diagnostic.get("sampling_backlog", max(0, sampled - ingested)))
     coordinator_actions = int(diagnostic.get("coordinator_action_requests", 0))
-    return {"sampled_steps": sampled, "ingested_steps": ingested, "sampling_rate": float(diagnostic.get("sampling_rate", 0.0)), "ingestion_rate": float(diagnostic.get("ingestion_rate", 0.0)), "sampling_backlog": backlog, "ingest_queue_depth": int(diagnostic.get("ingest_queue_depth", 0)), "derivation_queue_depth": int(diagnostic.get("derivation_queue_depth", 0)), "coordinator_action_requests": coordinator_actions, "policy_snapshot_generation": int(diagnostic.get("policy_snapshot_generation", 0)), "policy_snapshot_refreshes": int(diagnostic.get("policy_snapshot_refreshes", 0)), "optimized_sampling_path": bool(coordinator_actions == 0 and sampled == ingested and backlog == 0)}
+    return {
+        "sampled_steps": sampled,
+        "ingested_steps": ingested,
+        "sampling_rate": float(diagnostic.get("sampling_rate", 0.0)),
+        "ingestion_rate": float(diagnostic.get("ingestion_rate", 0.0)),
+        "sampling_backlog": backlog,
+        "ingest_queue_depth": int(diagnostic.get("ingest_queue_depth", 0)),
+        "derivation_queue_depth": int(diagnostic.get("derivation_queue_depth", 0)),
+        "coordinator_actions": coordinator_actions,
+        "coordinator_action_requests": coordinator_actions,
+        "policy_snapshot_generation": int(diagnostic.get("policy_snapshot_generation", 0)),
+        "policy_snapshot_refreshes": int(diagnostic.get("policy_snapshot_refreshes", 0)),
+        "optimized_sampling_path": bool(coordinator_actions == 0 and sampled == ingested and backlog == 0),
+    }
 
 
 def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
@@ -64,10 +77,32 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
     for epoch in range(1, int(args.epochs) + 1):
         jobs = build_epoch_jobs(specs, args, epoch=epoch)
         print(f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} sampling start actors={len(jobs)}", flush=True)
-        process_results = run_parallel_memory_jobs(runtime, jobs, actor_limit=args.actors, stage_workers=args.stage_workers, shards=args.shards, queue_capacity=max(args.stage_ring_capacity, args.shard_ring_capacity), epsilon=args.epsilon, env_root=args.env_root, alfred_backend_factory=getattr(args, "alfred_backend_factory", None), start_method=runtime.config.multiprocessing_start_method, progress_interval_seconds=args.progress_interval_seconds, ingest_workers=args.ingest_workers, derivation_workers=args.derivation_workers, ingest_queue_capacity=args.ingest_queue_capacity, derivation_queue_capacity=args.derivation_queue_capacity, publication_queue_capacity=args.publication_queue_capacity, actor_view_refresh_steps=args.actor_view_refresh_steps, actor_view_refresh_ms=args.actor_view_refresh_ms)
+        process_results = run_parallel_memory_jobs(
+            runtime,
+            jobs,
+            actor_limit=args.actors,
+            stage_workers=args.stage_workers,
+            shards=args.shards,
+            queue_capacity=max(args.stage_ring_capacity, args.shard_ring_capacity),
+            epsilon=args.epsilon,
+            env_root=args.env_root,
+            alfred_backend_factory=getattr(args, "alfred_backend_factory", None),
+            start_method=runtime.config.multiprocessing_start_method,
+            progress_interval_seconds=args.progress_interval_seconds,
+            ingest_workers=args.ingest_workers,
+            derivation_workers=args.derivation_workers,
+            ingest_queue_capacity=args.ingest_queue_capacity,
+            derivation_queue_capacity=args.derivation_queue_capacity,
+            publication_queue_capacity=args.publication_queue_capacity,
+            actor_view_refresh_steps=args.actor_view_refresh_steps,
+            actor_view_refresh_ms=args.actor_view_refresh_ms,
+        )
         actor_results.extend(process_results)
         runtime.wait_quiescent(args.drain_timeout)
         runtime.flush_deferred_memory_updates()
+
+        # Current-epoch behavioral evidence must be visible before model validation
+        # and before any memory is hidden or physically compacted.
         scenario_success, behavioral_success = _scenario_success(process_results)
         if baseline_success is None:
             baseline_success = behavioral_success
@@ -75,17 +110,52 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
         runtime.set_telemetry_gauge("behavioral_success_rate", behavioral_success)
         runtime.set_telemetry_gauge("behavioral_success_gain", behavioral_gain)
         runtime.set_telemetry_gauge("successful_scenarios", sum(rate > 0.0 for rate in scenario_success.values()))
+
+        requested_training_steps = int(args.hgt_training_epochs)
+        effective_training_steps = (
+            requested_training_steps
+            if requested_training_steps > 1
+            else int(runtime.config.scientific.hgt_gradient_accumulation)
+        )
+        training = train_hgt_epoch(
+            runtime,
+            epoch=epoch,
+            training_epochs=effective_training_steps,
+            learning_rate=args.hgt_learning_rate,
+            root=args.root,
+        )
+        print(
+            f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} training "
+            f"status={training.status} model={training.model_version} "
+            f"train_loss={training.training_loss:.4f} val_loss={training.validation_loss:.4f} "
+            f"examples={training.examples} steps={training.training_steps}",
+            flush=True,
+        )
+
+        # Compaction is evidence-gated by the just-computed behavioral and held-out
+        # HGT metrics. Newly dormant memories affect the next epoch, not the model
+        # evaluation used to decide whether forgetting is safe this epoch.
         lifecycle_result = run_lifecycle_maintenance(runtime)
         for key, value in lifecycle_result.items():
             runtime.set_telemetry_gauge(f"lifecycle_{key}", value)
-        requested_training_steps = int(args.hgt_training_epochs)
-        effective_training_steps = requested_training_steps if requested_training_steps > 1 else int(runtime.config.scientific.hgt_gradient_accumulation)
-        training = train_hgt_epoch(runtime, epoch=epoch, training_epochs=effective_training_steps, learning_rate=args.hgt_learning_rate, root=args.root)
-        print(f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} training status={training.status} model={training.model_version} train_loss={training.training_loss:.4f} val_loss={training.validation_loss:.4f} examples={training.examples} steps={training.training_steps}", flush=True)
+
         if runtime.config.enable_snapshots:
             runtime.snapshot()
         full_metrics = getattr(runtime, "full_metrics", runtime.metrics)
         metrics = full_metrics()
         performance = _performance_summary(metrics)
-        epoch_results.append(EpochRunResult(epoch=epoch, actors=tuple(asdict(row) for row in process_results), training={**asdict(training), "behavioral_success_rate": behavioral_success, "behavioral_success_gain": behavioral_gain, "scenario_success_rate": scenario_success}, performance=performance, metrics=metrics))
+        epoch_results.append(
+            EpochRunResult(
+                epoch=epoch,
+                actors=tuple(asdict(row) for row in process_results),
+                training={
+                    **asdict(training),
+                    "behavioral_success_rate": behavioral_success,
+                    "behavioral_success_gain": behavioral_gain,
+                    "scenario_success_rate": scenario_success,
+                },
+                performance=performance,
+                metrics=metrics,
+            )
+        )
     return actor_results, epoch_results
