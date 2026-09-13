@@ -11,7 +11,8 @@ from random import Random
 from typing import Any
 
 from v9.cognition.action_selection import choose_action
-from v9.environments import ARCAdapter, ChessAdapter, GymDiscreteAdapter, SudokuAdapter, SyntheticSymbolicEnvironment
+from v9.curriculum import CurriculumSelection, EnvironmentSpec, resolve_curriculum_selector
+from v9.environments import ARCAdapter, ChessAdapter, GymDiscreteAdapter, GymStructuredAdapter, SudokuAdapter, SyntheticSymbolicEnvironment, make_babyai_adapter
 from v9.environments.synthetic_symbolic import SyntheticSymbolicConfig
 from v9.modalities.symbols import DeterministicSymbolCodec
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig
@@ -40,29 +41,99 @@ class ActorResult:
     resets: int
 
 
-def resolve_games(selector: str) -> tuple[str, ...]:
+def resolve_game_specs(selector: str, *, curriculum_config: str | None = None) -> tuple[EnvironmentSpec, ...]:
     normalized = selector.strip()
+    curriculum = resolve_curriculum_selector(normalized, path=curriculum_config)
+    if curriculum is not None:
+        return curriculum.specs
     if normalized.lower() == "mix":
-        return MIX_GAMES
-    if normalized.lower() == "research_1":
-        return RESEARCH_GAMES
-    games = tuple(value.strip() for value in normalized.split(",") if value.strip())
+        games = MIX_GAMES
+    elif normalized.lower() == "research_1":
+        games = RESEARCH_GAMES
+    else:
+        games = tuple(value.strip() for value in normalized.split(",") if value.strip())
     if not games:
         raise ValueError("--games must select at least one environment")
-    return games
+    return tuple(EnvironmentSpec("auto", game) for game in games)
 
 
-def make_adapter(game_id: str, *, seed: int, env_root: str | None):
+def resolve_games(selector: str, *, curriculum_config: str | None = None) -> tuple[str, ...]:
+    return tuple(spec.display_name for spec in resolve_game_specs(selector, curriculum_config=curriculum_config))
+
+
+def _condition_config(condition: str | None) -> tuple[bool, bool, bool]:
+    value = (condition or "").upper()
+    if value == "C0":
+        return True, False, False
+    if value == "C1":
+        return False, True, False
+    if value == "C2":
+        return True, True, False
+    if value == "C3":
+        return True, True, True
+    return True, True, False
+
+
+def make_adapter(spec: EnvironmentSpec | str, *, seed: int, env_root: str | None):
+    if isinstance(spec, str):
+        spec = EnvironmentSpec("auto", spec)
+    game_id = spec.game_id
     lowered = game_id.lower()
-    if game_id == "FrozenLake-v1":
-        return GymDiscreteAdapter(game_id, seed=seed, make_kwargs={"is_slippery": False})
-    if lowered in {"chess-v0", "arcagi/chess-v0"}:
-        return ChessAdapter(seed=seed, opponent="random")
-    if lowered in {"sudoku-v0", "arcagi/sudoku-v0"}:
-        return SudokuAdapter(seed=seed)
-    if lowered in {"synthetic", "synthetic-symbolic"}:
-        return SyntheticSymbolicEnvironment(SyntheticSymbolicConfig(seed=seed))
-    return ARCAdapter(game_id, seed=seed, env_root=env_root)
+    adapter = spec.adapter.lower()
+    kwargs = dict(spec.kwargs)
+
+    if adapter == "auto":
+        if game_id == "FrozenLake-v1":
+            adapter = "gym_discrete"
+            kwargs.setdefault("is_slippery", False)
+        elif lowered in {"chess-v0", "arcagi/chess-v0"}:
+            adapter = "chess"
+        elif lowered in {"sudoku-v0", "arcagi/sudoku-v0"}:
+            adapter = "sudoku"
+        elif lowered in {"synthetic", "synthetic-symbolic"}:
+            adapter = "synthetic_symbolic"
+        else:
+            adapter = "arc"
+
+    if adapter == "gym_discrete":
+        return GymDiscreteAdapter(game_id, seed=seed, make_kwargs=kwargs)
+    if adapter in {"gym_structured", "gym_image", "sokoban"}:
+        family = "image" if adapter == "gym_image" else ("grid" if adapter == "sokoban" else "structured")
+        return GymStructuredAdapter(game_id, seed=seed, make_kwargs=kwargs, observation_family=family)
+    if adapter in {"minigrid", "babyai"}:
+        return make_babyai_adapter(
+            game_id,
+            seed=seed,
+            suppress_symbols=bool(spec.options.get("suppress_symbol_stream", adapter == "minigrid")),
+            **kwargs,
+        )
+    if adapter == "chess":
+        opponent = "random" if "random" in lowered else "first"
+        return ChessAdapter(seed=seed, opponent=opponent)
+    if adapter == "sudoku":
+        clues = 36
+        if "clues_" in lowered:
+            try:
+                clues = int(lowered.rsplit("clues_", 1)[1])
+            except ValueError:
+                clues = 36
+        return SudokuAdapter(seed=seed, clues=clues)
+    if adapter in {"synthetic_causal", "synthetic_symbolic"}:
+        interaction_enabled, symbols_enabled, shuffled = _condition_config(spec.condition)
+        return SyntheticSymbolicEnvironment(
+            SyntheticSymbolicConfig(
+                seed=seed,
+                aligned=interaction_enabled,
+                shuffled=shuffled,
+                emit_symbols=symbols_enabled if spec.condition else adapter == "synthetic_symbolic",
+                scenario=game_id,
+            )
+        )
+    if adapter == "alfred":
+        raise RuntimeError("ALFRED curriculum execution requires an injected ALFRED backend")
+    if adapter == "arc":
+        return ARCAdapter(game_id, seed=seed, env_root=env_root)
+    raise ValueError(f"unsupported curriculum adapter: {spec.adapter}")
 
 
 def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
@@ -82,12 +153,13 @@ def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-peers", action="store_true")
 
 
-def _runtime_config(args: argparse.Namespace) -> RuntimeConfig:
+def _runtime_config(args: argparse.Namespace, *, validation_mode_override: str | None = None) -> RuntimeConfig:
     scientific = ScientificConfig()
     overrides = {name: value for name, value in vars(args).items() if name.startswith("allocation_") and value is not None}
     overrides["random_seeds"] = (int(getattr(args, "seed", 0)),)
     if hasattr(args, "validation_mode"):
-        overrides["transfer_validation_mode"] = "learning_only" if args.no_automatic_experiments else args.validation_mode
+        selected_validation = validation_mode_override or args.validation_mode
+        overrides["transfer_validation_mode"] = "learning_only" if args.no_automatic_experiments else selected_validation
         overrides["transfer_validation_trials_per_interval"] = args.max_transfer_experiments
         overrides["transfer_validation_time_budget_seconds"] = args.transfer_experiment_time_budget_seconds
     if overrides:
@@ -95,11 +167,15 @@ def _runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     return RuntimeConfig.from_path(args.root, shards=args.shards, stage_workers=args.stage_workers, stage_ring_capacity=args.stage_ring_capacity, shard_ring_capacity=args.shard_ring_capacity, node_capacity_per_shard=args.node_capacity_per_shard, edge_capacity_per_shard=args.edge_capacity_per_shard, action_capacity_per_shard=args.action_capacity_per_shard, snapshot_interval_seconds=args.snapshot_interval_seconds, peer_interval_seconds=args.peer_interval_seconds, enable_snapshots=not args.no_snapshots, restore=not args.no_restore, enable_peers=not args.no_peers, enable_lifecycle=getattr(args, "lifecycle", "on") == "on", reset_persistent_identity=args.reset_persistent_identity, scientific=scientific)
 
 
-def _actor(runtime: ContinuousMemoryRuntime, game_id: str, *, actor_id: int, steps: int, seed: int, env_root: str | None, epsilon: float, progress_interval: float, verbose: bool, wait: float) -> ActorResult:
-    adapter = make_adapter(game_id, seed=seed, env_root=env_root)
+def _actor(runtime: ContinuousMemoryRuntime, spec: EnvironmentSpec, *, actor_id: int, steps: int, seed: int, env_root: str | None, epsilon: float, progress_interval: float, verbose: bool, wait: float) -> ActorResult:
+    game_id = spec.display_name
+    adapter = make_adapter(spec, seed=seed, env_root=env_root)
     identity = runtime.environments.register(adapter.identity())
     episode = runtime.environments.next_episode(identity)
     codec = DeterministicSymbolCodec(f"{adapter.identity().family}-raw-symbols")
+    runtime.unified_telemetry.set_gauge("curriculum_step", spec.curriculum_step or "")
+    runtime.unified_telemetry.set_gauge("environment_family", adapter.identity().family)
+    runtime.unified_telemetry.set_gauge("game_scenario", spec.game_id)
     rng = Random(seed)
     positives = negatives = resets = completed = 0
     next_progress = time.monotonic() + progress_interval
@@ -159,24 +235,27 @@ def run_continuous(args: argparse.Namespace) -> int:
         raise ValueError("--games is required for a normal continuous run")
     if args.actors <= 0 or args.steps_per_game <= 0 or args.graph_check <= 0 or args.wait < 0 or args.progress_interval_seconds <= 0 or not 0 <= args.epsilon <= 1:
         raise ValueError("actors, steps-per-game, graph-check and progress interval must be positive; wait and epsilon must be valid")
-    games = resolve_games(args.games)
-    runtime = ContinuousMemoryRuntime(_runtime_config(args))
+    specs = resolve_game_specs(args.games, curriculum_config=args.curriculum_config)
+    games = tuple(spec.display_name for spec in specs)
+    modes = {spec.validation_mode for spec in specs if spec.validation_mode}
+    curriculum_validation = next(iter(modes)) if len(modes) == 1 else None
+    runtime = ContinuousMemoryRuntime(_runtime_config(args, validation_mode_override=curriculum_validation))
     runtime.start()
-    jobs: list[tuple[int, str, int, int]] = []
-    lanes, actor_id = max(len(games), args.actors), 1
-    base_lanes, extra_lanes = divmod(lanes, len(games))
-    for game_index, game in enumerate(games):
+    jobs: list[tuple[int, EnvironmentSpec, int, int]] = []
+    lanes, actor_id = max(len(specs), args.actors), 1
+    base_lanes, extra_lanes = divmod(lanes, len(specs))
+    for game_index, spec in enumerate(specs):
         lane_count = base_lanes + int(game_index < extra_lanes)
         base_steps, extra_steps = divmod(args.steps_per_game, lane_count)
         for lane in range(lane_count):
             steps = base_steps + int(lane < extra_steps)
             if steps:
-                jobs.append((actor_id, game, steps, args.seed + actor_id * 1009))
+                jobs.append((actor_id, spec, steps, args.seed + actor_id * 1009))
                 actor_id += 1
     print(f"v9 continuous: games={len(games)} actors={min(args.actors, len(jobs))} shards={args.shards} stage_workers={args.stage_workers} peers={'off' if args.no_peers else 'on'} lifecycle={args.lifecycle} snapshots={'off' if args.no_snapshots else 'native'} game_ids={','.join(games)}", flush=True)
     try:
         with ThreadPoolExecutor(max_workers=min(args.actors, len(jobs)), thread_name_prefix="v9-actor") as pool:
-            futures = [pool.submit(_actor, runtime, game, actor_id=actor, steps=steps, seed=seed, env_root=args.env_root, epsilon=args.epsilon, progress_interval=args.progress_interval_seconds, verbose=args.verbose_progress, wait=args.wait) for actor, game, steps, seed in jobs]
+            futures = [pool.submit(_actor, runtime, spec, actor_id=actor, steps=steps, seed=seed, env_root=args.env_root, epsilon=args.epsilon, progress_interval=args.progress_interval_seconds, verbose=args.verbose_progress, wait=args.wait) for actor, spec, steps, seed in jobs]
             results = [future.result(timeout=args.actor_timeout) for future in futures]
         runtime.wait_quiescent(args.drain_timeout)
         final = runtime.close(normal=True, timeout=args.final_save_timeout)
@@ -215,6 +294,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous = sub.add_parser("continuous-run")
     _add_runtime_arguments(continuous)
     continuous.add_argument("--games", default=None)
+    continuous.add_argument("--curriculum-config", default=None)
     trajectory = continuous.add_mutually_exclusive_group()
     trajectory.add_argument("--show-best-trajectory", metavar="GAME_ID", default=None)
     trajectory.add_argument("--save-best-trajectory", metavar="FILE", default=None)
