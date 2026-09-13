@@ -202,13 +202,17 @@ class ProcessTopology:
         process.start()
         self.actor_processes.append(process)
 
-    def stop_pipeline(self) -> None:
+    def stop_stage_workers(self) -> None:
         for _ in self.stage_processes:
             self.stage_queue.put(WorkerStop())
         for process in self.stage_processes:
             process.join(timeout=30)
+
+    def stop_shard_workers(self) -> None:
         for shard_queue in self.shard_queues:
             shard_queue.put(WorkerStop())
+
+    def join_shard_workers(self) -> None:
         for process in self.shard_processes:
             process.join(timeout=30)
 
