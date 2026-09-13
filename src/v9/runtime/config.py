@@ -23,8 +23,8 @@ class ScientificConfigId:
 @dataclass(frozen=True, slots=True)
 class ScientificConfig:
     schema_version: int = 1
-    research_contract_version: str = "0.6.3.1"
-    design_version: str = "9.5"
+    research_contract_version: str = "0.7.0"
+    design_version: str = "9.7.6"
     random_seeds: tuple[int, ...] = (0,)
     symbol_budget_per_window: int = 8
     symbol_payload_bytes: int = 4096
@@ -79,6 +79,27 @@ class ScientificConfig:
     allocation_optimization_validation_budget: int = 2048
     allocation_min_meaningful_improvement: int = 1
     allocation_plateau_priority: bool = False
+    deliberation_mode: str = "adaptive"
+    deliberation_min_cycles: int = 1
+    deliberation_max_cycles: int = 6
+    deliberation_improvement_threshold: float = 0.001
+    deliberation_ambiguity_threshold: float = 0.10
+    deliberation_stability_cycles: int = 2
+    deliberation_compute_budget: int = 64
+    hgt_enabled: bool = False
+    hgt_hidden_dim: int = 320
+    hgt_layers: int = 3
+    hgt_heads: int = 5
+    hgt_ffn_dim: int = 1024
+    hgt_target_subgraph_nodes: int = 400
+    hgt_max_subgraph_nodes: int = 800
+    hgt_max_subgraph_edges: int = 4000
+    hgt_model_version: str = "untrained"
+    hgt_training_microbatch: int = 4
+    hgt_gradient_accumulation: int = 8
+    hgt_examples_per_train_trigger: int = 5000
+    hgt_training_duty_cycle: float = 0.50
+    hgt_target_inference_latency_ms: float = 50.0
     enabled_structural_relations: tuple[str, ...] = (
         "TEMPORAL", "CO_OCCURS", "DEPENDS_ON", "ENABLES", "BLOCKS",
         "EXPLAINS", "SIMILAR_TO", "OUTCOME_EQUIVALENT", "LEADS_TO", "PREFERENCE",
@@ -102,6 +123,12 @@ class ScientificConfig:
             self.allocation_max_validations_without_improvement,
             self.allocation_optimization_validation_budget,
             self.allocation_min_meaningful_improvement,
+            self.deliberation_min_cycles, self.deliberation_max_cycles,
+            self.deliberation_stability_cycles, self.deliberation_compute_budget,
+            self.hgt_hidden_dim, self.hgt_layers, self.hgt_heads, self.hgt_ffn_dim,
+            self.hgt_target_subgraph_nodes, self.hgt_max_subgraph_nodes,
+            self.hgt_max_subgraph_edges, self.hgt_training_microbatch,
+            self.hgt_gradient_accumulation, self.hgt_examples_per_train_trigger,
         )
         if min(int(value) for value in positive) <= 0:
             raise ValueError("scientific budgets and thresholds must be positive")
@@ -120,6 +147,20 @@ class ScientificConfig:
             raise ValueError("transfer validation time budget must be positive")
         if len(self.isf_weights_by_stage) != 8 or any(len(row) != 6 for row in self.isf_weights_by_stage):
             raise ValueError("ISF requires six fixed channel weights for each of eight stages")
+        if self.deliberation_mode not in {"off", "one_cycle", "fixed", "adaptive"}:
+            raise ValueError("unsupported deliberation mode")
+        if self.deliberation_min_cycles > self.deliberation_max_cycles:
+            raise ValueError("deliberation minimum cycles cannot exceed maximum cycles")
+        if self.deliberation_improvement_threshold < 0 or self.deliberation_ambiguity_threshold < 0:
+            raise ValueError("deliberation thresholds must be non-negative")
+        if not 0.0 < self.hgt_training_duty_cycle <= 1.0:
+            raise ValueError("HGT training duty cycle must be in (0, 1]")
+        if self.hgt_hidden_dim % self.hgt_heads != 0:
+            raise ValueError("HGT hidden dimension must be divisible by attention heads")
+        if self.hgt_target_subgraph_nodes > self.hgt_max_subgraph_nodes:
+            raise ValueError("HGT target subgraph size cannot exceed maximum")
+        if self.hgt_target_inference_latency_ms <= 0:
+            raise ValueError("HGT inference latency target must be positive")
 
     def as_dict(self, *, include_id: bool = True) -> dict[str, Any]:
         payload = asdict(self)
