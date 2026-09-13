@@ -91,3 +91,10 @@ def test_hgt_graph_sampling_keeps_relation_endpoints(monkeypatch) -> None:
     monkeypatch.setattr(training, "_require_torch", lambda: (_FakeTorch, None, None))
     _x, edge_indexes, _y, _targets, _masks, _meta = training.build_hgt_graph(read_view, max_nodes=4)
     assert ("MEMORY", "PROVENANCE", "MEMORY") in edge_indexes
+
+
+def test_hgt_promotion_compares_candidate_to_parent_on_same_current_graph() -> None:
+    assert training._should_promote("hgt-000001", 0.80, 0.76)
+    assert training._should_promote("hgt-000001", 0.80, 0.805)
+    assert not training._should_promote("hgt-000001", 0.80, 0.82)
+    assert training._should_promote(None, float("inf"), 1.20)
