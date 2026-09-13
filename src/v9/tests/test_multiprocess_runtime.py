@@ -103,3 +103,17 @@ def test_epochs_repeat_sampling_and_training(tmp_path) -> None:
     assert summary["metrics"]["memory_levels"]["M0"] >= 24
     assert summary["epochs"][0]["training"]["status"].startswith(("SKIPPED_", "PROMOTED", "REJECTED"))
     assert summary["epochs"][1]["training"]["status"].startswith(("SKIPPED_", "PROMOTED", "REJECTED"))
+
+
+def test_behavioral_success_is_game_independent() -> None:
+    from v9.runtime.epoch_runner import _scenario_success
+    from v9.runtime.parallel_memory_coordinator import ProcessActorResult
+
+    rows = [
+        ProcessActorResult(1, "game_a", 10, 8, 1, 10, 0),
+        ProcessActorResult(2, "game_b", 10, 2, 3, 4, 0),
+    ]
+    rates, macro = _scenario_success(rows)
+
+    assert rates == {"game_a": 0.8, "game_b": 0.5}
+    assert macro == 0.65
