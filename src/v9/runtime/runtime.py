@@ -143,6 +143,15 @@ class ContinuousMemoryRuntime:
             raise RuntimeError("runtime is closed")
         self._started = True
 
+    def reserve_producer_sequence(self, producer_id: int, proposed_sequence: int) -> int:
+        with self._lock:
+            sequence = max(
+                int(proposed_sequence),
+                self._producer_sequences.get(int(producer_id), 0) + 1,
+            )
+            self._producer_sequences[int(producer_id)] = sequence
+            return sequence
+
     def make_experience(self, *, producer_id: int, producer_sequence: int, environment_instance_id: int | None = None, source_game_hash: int | None = None, global_step: int, context_signature: int, action_id: int, outcome_signature: int, family_signature: int = 0, carrier_signature: int = 0, future_option_delta: float = 0.0, changed_cells: int = 0, primary_valence: int = 0, trajectory_signature: int = 0, next_context_signature: int = 0, prediction_error: float = 0.0) -> ExperienceEvent:
         with self._lock:
             environment = int(environment_instance_id if environment_instance_id is not None else source_game_hash if source_game_hash is not None else 0)
