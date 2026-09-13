@@ -806,6 +806,7 @@ class ContinuousMemoryRuntime:
     def snapshot(self) -> SnapshotResult:
         with self._lock:
             self.wait_quiescent()
+            self.evidence.flush()
             self._snapshot_id += 1
             self.telemetry["snapshot_writes"] += 1
             snapshot_id = self._snapshot_id
@@ -1104,6 +1105,7 @@ class ContinuousMemoryRuntime:
         del timeout
         if self._closed:
             return None
+        self.evidence.flush()
         result = self.snapshot() if normal and self.config.enable_snapshots else None
         if normal:
             self.write_scientific_report()
