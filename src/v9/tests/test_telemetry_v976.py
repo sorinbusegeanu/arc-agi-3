@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from threading import Event, Thread
+
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
 from v9.telemetry import (
     ConsolidationSample,
@@ -167,3 +169,37 @@ def test_dashboard_exposes_all_memory_levels(tmp_path) -> None:
     for level in range(8):
         assert f"M{level}_count" in dashboard
     assert "M4_validated" in dashboard
+
+
+def test_metrics_waits_for_an_in_progress_runtime_mutation(tmp_path) -> None:
+    runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False, enable_snapshots=False))
+    mutation_started = Event()
+    release_mutation = Event()
+    metrics_finished = Event()
+    failures: list[BaseException] = []
+
+    def hold_runtime_mutation() -> None:
+        with runtime._lock:
+            mutation_started.set()
+            release_mutation.wait(timeout=2.0)
+
+    def read_metrics() -> None:
+        try:
+            runtime.metrics()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            metrics_finished.set()
+
+    mutation = Thread(target=hold_runtime_mutation)
+    reader = Thread(target=read_metrics)
+    mutation.start()
+    assert mutation_started.wait(timeout=1.0)
+    reader.start()
+    assert not metrics_finished.wait(timeout=0.05)
+    release_mutation.set()
+    mutation.join(timeout=1.0)
+    reader.join(timeout=1.0)
+
+    assert metrics_finished.is_set()
+    assert not failures

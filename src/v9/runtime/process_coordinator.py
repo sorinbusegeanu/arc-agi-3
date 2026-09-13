@@ -186,10 +186,10 @@ def run_process_jobs(
                 shard_done += 1
         topology.join_shard_workers()
 
-        runtime.unified_telemetry.set_gauge("actor_processes", min(int(actor_limit), len(jobs)))
-        runtime.unified_telemetry.set_gauge("stage_worker_processes", int(stage_workers))
-        runtime.unified_telemetry.set_gauge("shard_worker_processes", int(shards))
-        runtime.unified_telemetry.set_gauge("multiprocess_transitions_published", int(published))
+        runtime.set_telemetry_gauge("actor_processes", min(int(actor_limit), len(jobs)))
+        runtime.set_telemetry_gauge("stage_worker_processes", int(stage_workers))
+        runtime.set_telemetry_gauge("shard_worker_processes", int(shards))
+        runtime.set_telemetry_gauge("multiprocess_transitions_published", int(published))
         _print_progress()
         return sorted(results, key=lambda row: row.actor_id)
     except BaseException:

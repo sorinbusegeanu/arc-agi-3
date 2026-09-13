@@ -138,7 +138,7 @@ def run_parallel_memory_jobs(
             prepared.transition,
             base_watermark=base if prepared.event is not None else base - 1,
         )
-        runtime.unified_telemetry.record_curriculum_event(
+        runtime.record_curriculum_event(
             step=prepared.transition.curriculum_step,
             environment_family=prepared.identity.family,
             game_scenario=prepared.transition.game_scenario,
@@ -185,7 +185,7 @@ def run_parallel_memory_jobs(
     def telemetry() -> None:
         elapsed = max(1e-9, time.monotonic() - started_at)
         for key, value in memory.queue_depths().items():
-            runtime.unified_telemetry.set_gauge(key, value)
+            runtime.set_telemetry_gauge(key, value)
         gauges = {
             "active_actor_processes": len(active),
             "active_ingest_workers": int(ingest_workers),
@@ -200,7 +200,7 @@ def run_parallel_memory_jobs(
             "derivation_rate": derived / elapsed,
         }
         for key, value in gauges.items():
-            runtime.unified_telemetry.set_gauge(key, value)
+            runtime.set_telemetry_gauge(key, value)
 
     def progress() -> None:
         telemetry()
@@ -311,7 +311,7 @@ def run_parallel_memory_jobs(
             "derivation_worker_processes": int(derivation_workers),
             "multiprocess_transitions_published": int(ingested),
         }.items():
-            runtime.unified_telemetry.set_gauge(key, value)
+            runtime.set_telemetry_gauge(key, value)
         progress()
         return sorted(results, key=lambda row: row.actor_id)
     except BaseException:

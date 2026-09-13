@@ -205,7 +205,7 @@ def _actor(runtime: ContinuousMemoryRuntime, spec: EnvironmentSpec, *, actor_id:
                 runtime.record_symbol_stream(adapter, producer_id=actor_id, producer_sequence=index + 1, episode_id=episode, symbol_codec=codec)
             else:
                 runtime.record_interaction(adapter, producer_id=actor_id, producer_sequence=index + 1, global_step=index, native_action=action, before_observation=before, after_observation=after, episode_id=episode, symbol_codec=codec)
-            runtime.unified_telemetry.record_curriculum_event(step=spec.curriculum_step, environment_family=adapter.identity().family, game_scenario=spec.game_id)
+            runtime.record_curriculum_event(step=spec.curriculum_step, environment_family=adapter.identity().family, game_scenario=spec.game_id)
             completed += 1
             boundary = adapter.boundary_event()
             positives += int(boundary.primary_valence > 0)
@@ -255,7 +255,7 @@ def run_continuous(args: argparse.Namespace) -> int:
     runtime = ContinuousMemoryRuntime(_runtime_config(args))
     curriculum_modes = sorted({spec.validation_mode for spec in specs if spec.validation_mode})
     effective_validation_mode = ("learning_only" if args.no_automatic_experiments else (curriculum_modes[0] if len(curriculum_modes) == 1 else args.validation_mode))
-    runtime.unified_telemetry.set_gauge("curriculum_validation_mode", effective_validation_mode)
+    runtime.set_telemetry_gauge("curriculum_validation_mode", effective_validation_mode)
     runtime.start()
     dashboard = None
     if not args.no_dashboard:

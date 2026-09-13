@@ -857,27 +857,46 @@ class ContinuousMemoryRuntime:
         )
 
     def record_deliberation_metrics(self, *, reasoning_cycles: int, initial_score: float, final_score: float, best_score: float, changed: bool, behavior_improved: bool | None, reasoning_cost: float, stop_reason: str, candidate_changes: int = 0, prediction_improvement: float = 0.0, strategy_changes: int = 0, provenance: TelemetryProvenance | None = None) -> None:
-        self.unified_telemetry.record_deliberation(reasoning_cycles=reasoning_cycles, initial_score=initial_score, final_score=final_score, best_score=best_score, changed=changed, behavior_improved=behavior_improved, reasoning_cost=reasoning_cost, stop_reason=stop_reason, candidate_changes=candidate_changes, prediction_improvement=prediction_improvement, strategy_changes=strategy_changes, provenance=provenance)
+        with self._lock:
+            self.unified_telemetry.record_deliberation(reasoning_cycles=reasoning_cycles, initial_score=initial_score, final_score=final_score, best_score=best_score, changed=changed, behavior_improved=behavior_improved, reasoning_cost=reasoning_cost, stop_reason=stop_reason, candidate_changes=candidate_changes, prediction_improvement=prediction_improvement, strategy_changes=strategy_changes, provenance=provenance)
 
     def record_hgt_inference(self, sample: HGTInferenceSample, *, provenance: TelemetryProvenance | None = None) -> None:
-        self.unified_telemetry.record_hgt_inference(sample, provenance=provenance)
+        with self._lock:
+            self.unified_telemetry.record_hgt_inference(sample, provenance=provenance)
 
     def record_hgt_ablation(self, *, enabled_outcome: float, hydra_baseline_outcome: float, provenance: TelemetryProvenance | None = None) -> None:
-        self.unified_telemetry.record_hgt_ablation(enabled_outcome=enabled_outcome, hydra_baseline_outcome=hydra_baseline_outcome, provenance=provenance)
+        with self._lock:
+            self.unified_telemetry.record_hgt_ablation(enabled_outcome=enabled_outcome, hydra_baseline_outcome=hydra_baseline_outcome, provenance=provenance)
 
     def record_hgt_training(self, sample: HGTTrainingSample, *, provenance: TelemetryProvenance | None = None) -> None:
-        self.unified_telemetry.record_hgt_training(sample, provenance=provenance)
+        with self._lock:
+            self.unified_telemetry.record_hgt_training(sample, provenance=provenance)
 
     def record_model_evolution(self, sample: ModelEvolutionSample, *, provenance: TelemetryProvenance | None = None) -> None:
-        self.unified_telemetry.record_model_evolution(sample, provenance=provenance)
+        with self._lock:
+            self.unified_telemetry.record_model_evolution(sample, provenance=provenance)
 
     def record_hgt_consolidation(self, sample: ConsolidationSample, *, provenance: TelemetryProvenance | None = None) -> None:
-        self.unified_telemetry.record_consolidation(sample, provenance=provenance)
+        with self._lock:
+            self.unified_telemetry.record_consolidation(sample, provenance=provenance)
 
     def record_optimization(self, sample: OptimizationSample, *, provenance: TelemetryProvenance | None = None) -> None:
-        self.unified_telemetry.record_optimization(sample, provenance=provenance)
+        with self._lock:
+            self.unified_telemetry.record_optimization(sample, provenance=provenance)
+
+    def record_curriculum_event(self, *, step: str | None, environment_family: str, game_scenario: str) -> None:
+        with self._lock:
+            self.unified_telemetry.record_curriculum_event(step=step, environment_family=environment_family, game_scenario=game_scenario)
+
+    def set_telemetry_gauge(self, key: str, value: float | int | str) -> None:
+        with self._lock:
+            self.unified_telemetry.set_gauge(key, value)
 
     def metrics(self) -> dict[str, Any]:
+        with self._lock:
+            return self._metrics_locked()
+
+    def _metrics_locked(self) -> dict[str, Any]:
         view = self.read_view
         counts = {f"M{level}": self.graph.memory_count(MemoryLevel(level)) for level in range(8)}
         normalization = {str(radius): self.scale_statistics.state(radius).value for radius in self.config.scientific.structural_radii}

@@ -80,7 +80,7 @@ def publish_encoded_transition(runtime, transition: EncodedTransition) -> None:
 
     publish_transition_symbols(runtime, transition)
 
-    runtime.unified_telemetry.record_curriculum_event(
+    runtime.record_curriculum_event(
         step=transition.curriculum_step,
         environment_family=identity.family,
         game_scenario=transition.game_scenario,
