@@ -80,6 +80,8 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
             ingest_queue_capacity=args.ingest_queue_capacity,
             derivation_queue_capacity=args.derivation_queue_capacity,
             publication_queue_capacity=args.publication_queue_capacity,
+            actor_view_refresh_steps=args.actor_view_refresh_steps,
+            actor_view_refresh_ms=args.actor_view_refresh_ms,
         )
         actor_results.extend(process_results)
         runtime.wait_quiescent(args.drain_timeout)
