@@ -39,11 +39,21 @@ class ReadView:
     normalized_action_supports: Mapping[int, float]
 
     @classmethod
-    def build(cls, generation: int, nodes: dict[MemoryUid, CanonicalNode], payloads: dict[MemoryUid, dict[str, Any]], edges: dict[tuple[MemoryUid, str, MemoryUid], RelationEdge], versions: dict[ObjectRef, int]) -> "ReadView":
+    def build(
+        cls,
+        generation: int,
+        nodes: dict[MemoryUid, CanonicalNode],
+        payloads: dict[MemoryUid, dict[str, Any]],
+        edges: dict[tuple[MemoryUid, str, MemoryUid], RelationEdge],
+        versions: dict[ObjectRef, int],
+        *,
+        include_hidden_uids: set[MemoryUid] | None = None,
+    ) -> "ReadView":
+        historical = include_hidden_uids or set()
         visible_nodes = {
             uid: node
             for uid, node in nodes.items()
-            if _cognitively_visible(payloads.get(uid, {}))
+            if uid in historical or _cognitively_visible(payloads.get(uid, {}))
         }
         visible_uids = set(visible_nodes)
         visible_payloads = {uid: payloads.get(uid, {}) for uid in visible_uids}
@@ -67,7 +77,14 @@ class ReadView:
             for key in sorted(edges)
             if edges[key].source in visible_uids and edges[key].target in visible_uids
         )
-        return cls(int(generation), MappingProxyType(visible_nodes), MappingProxyType(frozen_payloads), visible_edges, MappingProxyType(dict(versions)), MappingProxyType(action_supports))
+        return cls(
+            int(generation),
+            MappingProxyType(visible_nodes),
+            MappingProxyType(frozen_payloads),
+            visible_edges,
+            MappingProxyType(dict(versions)),
+            MappingProxyType(action_supports),
+        )
 
     def memory_count(self, level: MemoryLevel | None = None) -> int:
         return len(self.nodes) if level is None else sum(row.level is level for row in self.nodes.values())
