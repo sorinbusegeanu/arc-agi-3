@@ -33,12 +33,20 @@ class ReadView:
 
     @classmethod
     def build(cls, generation: int, nodes: dict[MemoryUid, CanonicalNode], payloads: dict[MemoryUid, dict[str, Any]], edges: dict[tuple[MemoryUid, str, MemoryUid], RelationEdge], versions: dict[ObjectRef, int]) -> "ReadView":
-        frozen_payloads = {key: _freeze(value) for key, value in payloads.items()}
+        hidden_states = {"DORMANT", "RETIRE_PENDING", "QUARANTINED", "RETIRED"}
+        visible_nodes = {
+            uid: node
+            for uid, node in nodes.items()
+            if str(payloads.get(uid, {}).get("cognitive_state", "ACTIVE")).upper() not in hidden_states
+        }
+        visible_uids = set(visible_nodes)
+        visible_payloads = {uid: payloads.get(uid, {}) for uid in visible_uids}
+        frozen_payloads = {key: _freeze(value) for key, value in visible_payloads.items()}
         action_supports: dict[int, float] = {}
-        for uid, node in nodes.items():
+        for uid, node in visible_nodes.items():
             if node.memory_type is not MemoryType.NORMALIZED_RELATION:
                 continue
-            observable = str(payloads[uid].get("observable_relation", ""))
+            observable = str(visible_payloads[uid].get("observable_relation", ""))
             prefix, separator, remainder = observable.partition(":")
             action_text, action_separator, _ = remainder.partition(":")
             if prefix != "ACTION" or not separator or not action_separator:
@@ -47,8 +55,13 @@ class ReadView:
                 action = int(action_text)
             except ValueError:
                 continue
-            action_supports[action] = action_supports.get(action, 0.0) + float(payloads[uid].get("support", 0))
-        return cls(int(generation), MappingProxyType(dict(nodes)), MappingProxyType(frozen_payloads), tuple(edges[key] for key in sorted(edges)), MappingProxyType(dict(versions)), MappingProxyType(action_supports))
+            action_supports[action] = action_supports.get(action, 0.0) + float(visible_payloads[uid].get("support", 0))
+        visible_edges = tuple(
+            edges[key]
+            for key in sorted(edges)
+            if edges[key].source in visible_uids and edges[key].target in visible_uids
+        )
+        return cls(int(generation), MappingProxyType(visible_nodes), MappingProxyType(frozen_payloads), visible_edges, MappingProxyType(dict(versions)), MappingProxyType(action_supports))
 
     def memory_count(self, level: MemoryLevel | None = None) -> int:
         return len(self.nodes) if level is None else sum(row.level is level for row in self.nodes.values())
