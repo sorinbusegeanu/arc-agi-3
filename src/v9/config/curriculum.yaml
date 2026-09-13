@@ -1,0 +1,324 @@
+version: 2
+name: hydra-v9-developmental-curriculum
+description: >
+  Fourteen-step developmental curriculum spanning synthetic causal worlds,
+  Gymnasium/toy-text/classic-control, Sokoban, Chess, Sudoku, MiniGrid/BabyAI,
+  ARC, Atari and ALFRED.
+defaults:
+  shuffle: true
+  repeat: 1
+  held_out_fraction: 0.20
+  validation_mode: learning_only
+
+adapters:
+  synthetic_causal:
+    observation_family: structured
+  synthetic_symbolic:
+    observation_family: structured+symbols
+  gym_discrete:
+    observation_family: discrete
+  gym_structured:
+    observation_family: structured
+  gym_image:
+    observation_family: image
+  sokoban:
+    observation_family: grid
+  chess:
+    observation_family: structured
+  sudoku:
+    observation_family: grid
+  minigrid:
+    observation_family: grid
+  babyai:
+    observation_family: grid+symbols
+  arc:
+    observation_family: grid
+  alfred:
+    observation_family: multimodal
+
+steps:
+  step1:
+    title: Deterministic causal primitives
+    objective: M0/M1 contingencies, prediction, enable/block, delayed effects
+    environments:
+      - adapter: synthetic_causal
+        games:
+          - syn_move
+          - syn_reversible
+          - syn_irreversible
+          - syn_enable
+          - syn_block
+          - syn_two_step
+          - syn_history_context
+          - syn_same_role_different_carrier
+          - syn_alternative_strategy
+          - syn_replan
+          - syn_contextual_rule
+          - syn_delayed_effect
+
+  step2:
+    title: Gym discrete foundations
+    objective: reachability, future options, local planning, sparse outcomes
+    environments:
+      - adapter: gym_discrete
+        games:
+          - id: FrozenLake-v1
+            kwargs: {map_name: 4x4, is_slippery: false}
+          - id: FrozenLake-v1
+            kwargs: {map_name: 8x8, is_slippery: false}
+          - id_candidates: [Taxi-v4, Taxi-v3]
+          - id_candidates: [CliffWalking-v1, CliffWalking-v0]
+
+  step3:
+    title: Sokoban and structural role invariance
+    objective: irreversible planning, manipulation, M2 recurrence, M3 roles
+    environments:
+      - adapter: sokoban
+        games:
+          - Sokoban-small-v0
+          - Sokoban-small-v1
+          - Sokoban-v0
+          - Sokoban-v1
+      - adapter: synthetic_causal
+        games:
+          - syn_role_square
+          - syn_role_circle
+          - syn_role_color
+          - syn_role_switch
+          - syn_same_appearance_different_role
+          - syn_same_role_different_actions
+          - syn_context_split
+          - syn_negative_transfer
+
+  step4:
+    title: Structured planning without language
+    objective: larger state structure, long dependencies, legality and constraint reasoning
+    environment_options:
+      suppress_symbol_stream: true
+    environments:
+      - adapter: minigrid
+        games:
+          - MiniGrid-Empty-5x5-v0
+          - MiniGrid-FourRooms-v0
+          - MiniGrid-DoorKey-5x5-v0
+          - MiniGrid-DoorKey-8x8-v0
+          - MiniGrid-Unlock-v0
+          - MiniGrid-KeyCorridorS3R1-v0
+      - adapter: chess
+        games:
+          - chess_first_white
+          - chess_random_white
+      - adapter: sudoku
+        games:
+          - sudoku_clues_45
+          - sudoku_clues_36
+          - sudoku_clues_30
+
+  step5:
+    title: Arbitrary-symbol grounding controls
+    objective: establish grounding without human lexical priors
+    validation_mode: validation_budgeted
+    environments:
+      - adapter: synthetic_symbolic
+        condition: C0
+        games: [sym_enable, sym_block, sym_navigate, sym_pick]
+      - adapter: synthetic_symbolic
+        condition: C1
+        games: [sym_enable, sym_block, sym_navigate, sym_pick]
+      - adapter: synthetic_symbolic
+        condition: C2
+        games: [sym_enable, sym_block, sym_navigate, sym_pick]
+      - adapter: synthetic_symbolic
+        condition: C3
+        games: [sym_enable, sym_block, sym_navigate, sym_pick]
+
+  step6:
+    title: BabyAI basic grounded reference
+    objective: ground simple action/object/color reference structure
+    environments:
+      - adapter: babyai
+        games:
+          - BabyAI-GoToObjS6-v1
+          - BabyAI-GoTo-v0
+          - BabyAI-GoToObjMazeS4-v0
+          - BabyAI-GoToObjMazeS5-v0
+
+  step7:
+    title: BabyAI action semantics
+    objective: distinguish go-to, pickup, open and unlock consequences
+    environments:
+      - adapter: babyai
+        games:
+          - BabyAI-Pickup-v0
+          - BabyAI-PickupLoc-v0
+          - BabyAI-Open-v0
+          - BabyAI-OpenDoor-v0
+          - BabyAI-UnlockLocal-v0
+          - BabyAI-Unlock-v0
+
+  step8:
+    title: BabyAI relational composition
+    objective: combine grounded primitives into multi-object dependencies
+    environments:
+      - adapter: babyai
+        games:
+          - BabyAI-PutNextLocal-v0
+          - BabyAI-PutNext-v0
+          - BabyAI-UnlockPickup-v0
+          - BabyAI-BlockedUnlockPickup-v0
+          - BabyAI-UnlockToUnlock-v0
+          - BabyAI-KeyCorridorS3R1-v0
+
+  step9:
+    title: BabyAI sequential composition plus non-grid Gym
+    objective: compositional semantics plus representation-general dynamics
+    validation_mode: validation_budgeted
+    environments:
+      - adapter: babyai
+        games:
+          - BabyAI-GoToSeq-v0
+          - BabyAI-OpenTwoDoors-v0
+          - BabyAI-OpenDoorsOrder-v0
+          - BabyAI-Synth-v0
+          - BabyAI-SynthLoc-v0
+          - BabyAI-SynthSeq-v0
+          - BabyAI-MiniBossLevel-v0
+      - adapter: gym_structured
+        games:
+          - CartPole-v1
+          - MountainCar-v0
+          - Acrobot-v1
+          - Blackjack-v1
+
+  step10:
+    title: ARC simple transfer
+    objective: apply learned structure to visually novel ARC interaction
+    environments:
+      - adapter: arc
+        games:
+          - ez01
+          - ez02
+          - ez03
+          - ez04
+          - ul01
+          - fs01
+          - ic01
+          - pb01
+          - tp01
+          - va01
+
+  step11:
+    title: ARC diverse structural challenge
+    objective: transfer across different mechanics, hidden state and temporal structure
+    validation_mode: validation_budgeted
+    environments:
+      - adapter: arc
+        games:
+          - fs02
+          - fs03
+          - tp02
+          - tp03
+          - ic02
+          - ic03
+          - nw01
+          - gr01
+          - dt01
+          - wk01
+          - rf01
+          - mo01
+          - ex01
+          - sq01
+          - mm01
+          - rs01
+          - lo01
+          - rp01
+          - bn01
+          - dl01
+
+  step12:
+    title: Broad cross-family curriculum
+    objective: environment-neutral M3/M4 structure and target-local transfer
+    validation_mode: validation_budgeted
+    environments:
+      - adapter: synthetic_causal
+        games: [syn_enable, syn_block, syn_two_step, syn_same_role_different_carrier]
+      - adapter: gym_discrete
+        games:
+          - id: FrozenLake-v1
+            kwargs: {map_name: 8x8, is_slippery: false}
+          - id_candidates: [Taxi-v4, Taxi-v3]
+          - id_candidates: [CliffWalking-v1, CliffWalking-v0]
+      - adapter: gym_structured
+        games: [CartPole-v1, MountainCar-v0, Acrobot-v1, Blackjack-v1]
+      - adapter: sokoban
+        games: [Sokoban-small-v0, Sokoban-v0]
+      - adapter: chess
+        games: [chess_first_white]
+      - adapter: sudoku
+        games: [sudoku_clues_36]
+      - adapter: minigrid
+        environment_options: {suppress_symbol_stream: true}
+        games: [MiniGrid-DoorKey-8x8-v0, MiniGrid-Unlock-v0]
+      - adapter: babyai
+        games: [BabyAI-GoTo-v0, BabyAI-Unlock-v0, BabyAI-PutNextLocal-v0]
+      - adapter: arc
+        games: [ul01, fs01, fs02, tp01, ic01, pb01, nw01, dt01]
+
+  step13:
+    title: Stochasticity, continuous state and visual control
+    objective: distinguish uncertainty, dynamics, regime change and high-dimensional observations
+    validation_mode: validation_budgeted
+    environments:
+      - adapter: gym_discrete
+        games:
+          - id: FrozenLake-v1
+            kwargs: {map_name: 4x4, is_slippery: true}
+          - id: FrozenLake-v1
+            kwargs: {map_name: 8x8, is_slippery: true}
+      - adapter: gym_structured
+        games:
+          - LunarLander-v3
+          - BipedalWalker-v3
+      - adapter: gym_image
+        games:
+          - ALE/Pong-v5
+          - ALE/Breakout-v5
+          - ALE/Freeway-v5
+          - ALE/Seaquest-v5
+          - ALE/Qbert-v5
+          - ALE/MontezumaRevenge-v5
+      - adapter: synthetic_causal
+        games:
+          - syn_stochastic_transition
+          - syn_partial_observation
+          - syn_action_failure
+          - syn_ambiguous_symbol
+          - syn_contextual_symbol
+          - syn_regime_shift
+      - adapter: arc
+        games: [zq01, tt02, fw01, hz01, ox01, rb01]
+
+  step14:
+    title: ALFRED long-horizon grounded semantics
+    objective: rich language, long trajectories and compositional multimodal planning
+    validation_mode: validation_budgeted
+    environments:
+      - adapter: alfred
+        games:
+          - pick_and_place_simple
+          - pick_clean_then_place_in_recep
+          - pick_heat_then_place_in_recep
+          - pick_cool_then_place_in_recep
+          - look_at_obj_in_light
+          - pick_two_obj_and_place
+
+presets:
+  gym_foundation:
+    include_steps: [step2, step3]
+  gym_broad:
+    include_steps: [step2, step3, step4, step9, step13]
+    adapters: [gym_discrete, gym_structured, gym_image, sokoban, chess, sudoku]
+  semantics:
+    include_steps: [step5, step6, step7, step8, step9]
+  cross_family:
+    include_steps: [step12]
