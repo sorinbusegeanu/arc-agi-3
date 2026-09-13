@@ -74,11 +74,14 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
         runtime.set_telemetry_gauge("behavioral_success_rate", behavioral_success)
         runtime.set_telemetry_gauge("behavioral_success_gain", behavioral_gain)
         runtime.set_telemetry_gauge("successful_scenarios", sum(rate > 0.0 for rate in scenario_success.values()))
-        training = train_hgt_epoch(runtime, epoch=epoch, training_epochs=args.hgt_training_epochs, learning_rate=args.hgt_learning_rate, root=args.root)
+        requested_training_steps = int(args.hgt_training_epochs)
+        effective_training_steps = requested_training_steps if requested_training_steps > 1 else int(runtime.config.scientific.hgt_gradient_accumulation)
+        training = train_hgt_epoch(runtime, epoch=epoch, training_epochs=effective_training_steps, learning_rate=args.hgt_learning_rate, root=args.root)
         print(f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} training status={training.status} model={training.model_version} train_loss={training.training_loss:.4f} val_loss={training.validation_loss:.4f} examples={training.examples} steps={training.training_steps}", flush=True)
         if runtime.config.enable_snapshots:
             runtime.snapshot()
-        metrics = runtime.metrics()
+        full_metrics = getattr(runtime, "full_metrics", runtime.metrics)
+        metrics = full_metrics()
         performance = _performance_summary(metrics)
         epoch_results.append(EpochRunResult(epoch=epoch, actors=tuple(asdict(row) for row in process_results), training={**asdict(training), "behavioral_success_rate": behavioral_success, "behavioral_success_gain": behavioral_gain, "scenario_success_rate": scenario_success}, performance=performance, metrics=metrics))
     return actor_results, epoch_results
