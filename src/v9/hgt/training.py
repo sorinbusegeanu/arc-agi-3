@@ -58,7 +58,19 @@ def _node_feature(node: Any, payload: dict[str, Any], dim: int, torch: Any):
         float(payload.get("support", 0)) / 64.0,
         float(len(payload.get("parents", ()))) / 8.0,
     ]
-    seed = hashlib.blake2b(json.dumps({"level": int(node.level), "key": list(node.structural_key), "context": int(payload.get("context_signature", payload.get("grounded_context_signature", 0)) or 0), "environment": int(payload.get("environment_instance_id", 0) or 0)}, sort_keys=True).encode("utf-8"), digest_size=32, person=b"v9-hgt-feature").digest()
+    seed = hashlib.blake2b(
+        json.dumps(
+            {
+                "level": int(node.level),
+                "key": list(node.structural_key),
+                "context": int(payload.get("context_signature", payload.get("grounded_context_signature", 0)) or 0),
+                "environment": int(payload.get("environment_instance_id", 0) or 0),
+            },
+            sort_keys=True,
+        ).encode("utf-8"),
+        digest_size=32,
+        person=b"v9-hgt-feature",
+    ).digest()
     while len(values) < dim:
         byte = seed[(len(values) - 10) % len(seed)]
         values.append((float(byte) / 127.5) - 1.0)
@@ -74,7 +86,11 @@ def _recent_behavior_nodes(read_view: Any, limit: int) -> list[tuple[Any, Any]]:
         if payload.get("action_id") is None or payload.get("environment_instance_id") is None:
             continue
         candidates.append((uid, node, abs(int(payload.get("primary_valence", 0)))))
-    rows = heapq.nlargest(max(0, int(limit)), candidates, key=lambda row: (row[2], int(row[1].created_watermark), row[0]))
+    rows = heapq.nlargest(
+        max(0, int(limit)),
+        candidates,
+        key=lambda row: (row[2], int(row[1].created_watermark), row[0]),
+    )
     return [(uid, node) for uid, node, _ in rows]
 
 
@@ -87,7 +103,14 @@ def _select_connected_nodes(read_view: Any, max_nodes: int) -> tuple[Any, ...]:
     def edge_recency(edge: Any) -> tuple[int, int, int]:
         source = read_view.nodes.get(edge.source)
         target = read_view.nodes.get(edge.target)
-        return (max(int(source.created_watermark) if source is not None else -1, int(target.created_watermark) if target is not None else -1), int(edge.source.hi ^ edge.target.hi), int(edge.source.lo ^ edge.target.lo))
+        return (
+            max(
+                int(source.created_watermark) if source is not None else -1,
+                int(target.created_watermark) if target is not None else -1,
+            ),
+            int(edge.source.hi ^ edge.target.hi),
+            int(edge.source.lo ^ edge.target.lo),
+        )
 
     for edge in heapq.nlargest(max(maximum, 64), read_view.edges, key=edge_recency):
         missing = [uid for uid in (edge.source, edge.target) if uid not in selected and uid in read_view.nodes]
@@ -99,12 +122,23 @@ def _select_connected_nodes(read_view: Any, max_nodes: int) -> tuple[Any, ...]:
             break
     if len(selected) < maximum:
         remaining = ((uid, node) for uid, node in read_view.nodes.items() if uid not in selected)
-        for uid, node in heapq.nlargest(maximum - len(selected), remaining, key=lambda row: (int(row[1].created_watermark), row[0])):
+        for uid, node in heapq.nlargest(
+            maximum - len(selected),
+            remaining,
+            key=lambda row: (int(row[1].created_watermark), row[0]),
+        ):
             selected[uid] = node
     return tuple(selected)
 
 
-def build_hgt_graph(read_view: Any, *, input_dim: int = 64, max_nodes: int = 800, max_edges: int = 4000, return_discount: float = 0.97):
+def build_hgt_graph(
+    read_view: Any,
+    *,
+    input_dim: int = 64,
+    max_nodes: int = 800,
+    max_edges: int = 4000,
+    return_discount: float = 0.97,
+):
     torch, _, _ = _require_torch()
     selected_uids = _select_connected_nodes(read_view, max_nodes)
     ordered_uids = sorted(selected_uids, key=lambda uid: (int(read_view.nodes[uid].created_watermark), uid))
@@ -125,7 +159,13 @@ def build_hgt_graph(read_view: Any, *, input_dim: int = 64, max_nodes: int = 800
         environment_id = payload.get("environment_instance_id")
         context_signature = payload.get("context_signature")
         episode_id = payload.get("episode_id")
-        usable_action = node.level is MemoryLevel.M0 and action_id is not None and environment_id is not None and context_signature is not None and episode_id is not None
+        usable_action = (
+            node.level is MemoryLevel.M0
+            and action_id is not None
+            and environment_id is not None
+            and context_signature is not None
+            and episode_id is not None
+        )
         action_masks.append(bool(usable_action))
         if usable_action:
             env, context, action, episode = int(environment_id), int(context_signature), int(action_id), int(episode_id)
@@ -145,17 +185,31 @@ def build_hgt_graph(read_view: Any, *, input_dim: int = 64, max_nodes: int = 800
     action_mask_dict = {NODE_TYPE: torch.tensor(action_masks, dtype=torch.bool)}
     action_meta = {NODE_TYPE: action_rows}
     eligible = (edge for edge in read_view.edges if edge.source in index_by_uid and edge.target in index_by_uid)
-    selected_edges = heapq.nlargest(max(1, int(max_edges)), eligible, key=lambda edge: max(int(read_view.nodes[edge.source].created_watermark), int(read_view.nodes[edge.target].created_watermark)))
+    selected_edges = heapq.nlargest(
+        max(1, int(max_edges)),
+        eligible,
+        key=lambda edge: max(
+            int(read_view.nodes[edge.source].created_watermark),
+            int(read_view.nodes[edge.target].created_watermark),
+        ),
+    )
     edges: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
     for edge in selected_edges:
-        edges.setdefault((NODE_TYPE, str(edge.relation.value), NODE_TYPE), []).append((index_by_uid[edge.source], index_by_uid[edge.target]))
-    edge_index_dict = {key: torch.tensor(pairs, dtype=torch.long).t().contiguous() for key, pairs in edges.items() if pairs}
+        edges.setdefault((NODE_TYPE, str(edge.relation.value), NODE_TYPE), []).append(
+            (index_by_uid[edge.source], index_by_uid[edge.target])
+        )
+    edge_index_dict = {
+        key: torch.tensor(pairs, dtype=torch.long).t().contiguous()
+        for key, pairs in edges.items()
+        if pairs
+    }
     return x_dict, edge_index_dict, y_dict, action_target_dict, action_mask_dict, action_meta
 
 
 class _HGTWrapper:
     def __init__(self, metadata: tuple[list[str], list[tuple[str, str, str]]], *, input_dim: int, hidden_dim: int, layers: int, heads: int):
         _, nn, HGTConv = _require_torch()
+
         class Model(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -163,25 +217,63 @@ class _HGTWrapper:
                 self.layers = nn.ModuleList([HGTConv(hidden_dim, hidden_dim, metadata, heads=heads) for _ in range(layers)])
                 self.valence_heads = nn.ModuleDict({node_type: nn.Linear(hidden_dim, 3) for node_type in metadata[0]})
                 self.value_heads = nn.ModuleDict({node_type: nn.Linear(hidden_dim, 1) for node_type in metadata[0]})
+
             def forward(self, x_dict, edge_index_dict):
                 state = {key: self.encoders[key](value).relu() for key, value in x_dict.items()}
                 for layer in self.layers:
                     updated = layer(state, edge_index_dict)
                     state = {key: (state[key] if updated.get(key) is None else updated[key]).relu() for key in state}
-                return ({key: self.valence_heads[key](value) for key, value in state.items()}, {key: self.value_heads[key](value).squeeze(-1) for key, value in state.items()})
+                return (
+                    {key: self.valence_heads[key](value) for key, value in state.items()},
+                    {key: self.value_heads[key](value).squeeze(-1) for key, value in state.items()},
+                )
+
         self.model = Model()
 
 
-def _split_masks(y_dict: dict[str, Any], torch: Any):
-    train_masks, val_masks = {}, {}
-    for node_type, labels in y_dict.items():
-        count = int(labels.numel())
-        index = torch.arange(count)
-        val_count = max(1, int(math.ceil(count * 0.2))) if count >= 5 else 0
-        train_count = count - val_count
-        train_masks[node_type] = index < train_count
-        val_masks[node_type] = index >= train_count if val_count else torch.zeros(count, dtype=torch.bool)
+def _episode_rank(environment_id: int, episode_id: int) -> int:
+    digest = hashlib.blake2b(
+        f"{int(environment_id)}:{int(episode_id)}".encode("ascii"),
+        digest_size=8,
+        person=b"v9-hgt-split",
+    ).digest()
+    return int.from_bytes(digest, "little")
+
+
+def _split_masks(action_meta: dict[str, list[Any]], action_masks: dict[str, Any], torch: Any):
+    """Hold out whole episodes so train and validation never share a trajectory."""
+    train_masks: dict[str, Any] = {}
+    val_masks: dict[str, Any] = {}
+    for node_type, action_mask in action_masks.items():
+        rows = action_meta[node_type]
+        count = int(action_mask.numel())
+        episodes = sorted(
+            {(int(row[0]), int(row[3])) for row in rows if row is not None},
+            key=lambda key: (_episode_rank(*key), key),
+        )
+        if len(episodes) < 2:
+            train_masks[node_type] = action_mask.clone()
+            val_masks[node_type] = torch.zeros(count, dtype=torch.bool)
+            continue
+        val_count = min(len(episodes) - 1, max(1, int(math.ceil(len(episodes) * 0.2))))
+        validation_episodes = set(episodes[:val_count])
+        train = torch.zeros(count, dtype=torch.bool)
+        validation = torch.zeros(count, dtype=torch.bool)
+        for index, row in enumerate(rows):
+            if row is None:
+                continue
+            key = (int(row[0]), int(row[3]))
+            if key in validation_episodes:
+                validation[index] = True
+            else:
+                train[index] = True
+        train_masks[node_type] = train
+        val_masks[node_type] = validation
     return train_masks, val_masks
+
+
+def _masked_count(masks: dict[str, Any], action_masks: dict[str, Any]) -> int:
+    return sum(int((masks[key] & action_masks[key]).sum().item()) for key in masks)
 
 
 def _loss(logits_dict, value_dict, y_dict, masks, action_targets, action_masks, torch):
@@ -209,30 +301,68 @@ def _loss(logits_dict, value_dict, y_dict, masks, action_targets, action_masks, 
     return 0.25 * classification + value_loss, correct / max(1, total)
 
 
-def _should_promote(parent_version: str | None, parent_validation_loss: float, candidate_validation_loss: float) -> bool:
+def _should_promote(
+    parent_version: str | None,
+    parent_validation_loss: float,
+    candidate_validation_loss: float,
+    parent_validation_accuracy: float,
+    candidate_validation_accuracy: float,
+) -> bool:
+    if not math.isfinite(candidate_validation_loss):
+        return False
     if parent_version is None or not math.isfinite(parent_validation_loss):
         return True
-    return float(candidate_validation_loss) <= float(parent_validation_loss) * 1.01
+    loss_ok = float(candidate_validation_loss) <= float(parent_validation_loss) * 1.01
+    accuracy_ok = not math.isfinite(parent_validation_accuracy) or float(candidate_validation_accuracy) >= float(parent_validation_accuracy) - 0.02
+    return bool(loss_ok and accuracy_ok)
 
 
 def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_rate: float, root: str | Path) -> HGTTrainingResult:
     try:
         torch, _, _ = _require_torch()
     except RuntimeError:
-        return HGTTrainingResult(epoch, "SKIPPED_DEPENDENCY", runtime.unified_telemetry.model_version, None, 0.0, 0.0, len(runtime.read_view.nodes), 0, None)
+        examples = int(getattr(getattr(runtime, "graph", None), "memory_count", lambda: 0)())
+        return HGTTrainingResult(epoch, "SKIPPED_DEPENDENCY", runtime.unified_telemetry.model_version, None, 0.0, 0.0, examples, 0, None)
     config = runtime.config.scientific
-    read_view = runtime.read_view
+    training_view_builder = getattr(runtime.graph, "training_view", None)
+    read_view = (
+        training_view_builder(
+            max_nodes=int(config.hgt_max_subgraph_nodes),
+            max_edges=int(config.hgt_max_subgraph_edges),
+        )
+        if callable(training_view_builder)
+        else runtime.read_view
+    )
     if len(read_view.nodes) < 8:
         return HGTTrainingResult(epoch, "SKIPPED_INSUFFICIENT_DATA", runtime.unified_telemetry.model_version, None, 0.0, 0.0, len(read_view.nodes), 0, None)
-    x_dict, edge_index_dict, y_dict, action_targets, action_masks, action_meta = build_hgt_graph(read_view, max_nodes=int(config.hgt_max_subgraph_nodes), max_edges=int(config.hgt_max_subgraph_edges))
-    examples = sum(int(v.numel()) for v in y_dict.values())
+    x_dict, edge_index_dict, y_dict, action_targets, action_masks, action_meta = build_hgt_graph(
+        read_view,
+        max_nodes=int(config.hgt_max_subgraph_nodes),
+        max_edges=int(config.hgt_max_subgraph_edges),
+    )
+    selected_examples = sum(int(v.numel()) for v in y_dict.values())
+    action_examples = sum(int(mask.sum().item()) for mask in action_masks.values())
     metadata = _stable_metadata()
     if not edge_index_dict:
-        return HGTTrainingResult(epoch, "SKIPPED_NO_RELATIONS", runtime.unified_telemetry.model_version, None, 0.0, 0.0, examples, 0, None)
-    if not any(bool(mask.any()) for mask in action_masks.values()):
-        return HGTTrainingResult(epoch, "SKIPPED_NO_ACTION_EVIDENCE", runtime.unified_telemetry.model_version, None, 0.0, 0.0, examples, 0, None)
+        return HGTTrainingResult(epoch, "SKIPPED_NO_RELATIONS", runtime.unified_telemetry.model_version, None, 0.0, 0.0, action_examples, 0, None)
+    if action_examples <= 0:
+        return HGTTrainingResult(epoch, "SKIPPED_NO_ACTION_EVIDENCE", runtime.unified_telemetry.model_version, None, 0.0, 0.0, 0, 0, None)
+    train_masks, val_masks = _split_masks(action_meta, action_masks, torch)
+    training_examples = _masked_count(train_masks, action_masks)
+    validation_examples = _masked_count(val_masks, action_masks)
+    if training_examples <= 0:
+        return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, None, 0.0, 0.0, action_examples, 0, None)
+    if validation_examples <= 0:
+        return HGTTrainingResult(epoch, "SKIPPED_NO_VALIDATION_EVIDENCE", runtime.unified_telemetry.model_version, None, 0.0, 0.0, action_examples, 0, None)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = _HGTWrapper(metadata, input_dim=64, hidden_dim=int(config.hgt_hidden_dim), layers=int(config.hgt_layers), heads=int(config.hgt_heads)).model.to(device)
+    model = _HGTWrapper(
+        metadata,
+        input_dim=64,
+        hidden_dim=int(config.hgt_hidden_dim),
+        layers=int(config.hgt_layers),
+        heads=int(config.hgt_heads),
+    ).model.to(device)
     model_dir = Path(root) / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = model_dir / "hgt_manifest.json"
@@ -254,14 +384,22 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
                 parent_version = parent_checkpoint = None
     x_device = {key: value.to(device) for key, value in x_dict.items()}
     edges_device = {key: value.to(device) for key, value in edge_index_dict.items()}
-    train_masks, val_masks = _split_masks(y_dict, torch)
 
     parent_validation_loss = float("inf")
+    parent_validation_accuracy = float("nan")
     if parent_version is not None:
         model.eval()
         with torch.no_grad():
             parent_logits, parent_values = model(x_device, edges_device)
-            parent_val_loss_t, _ = _loss(parent_logits, parent_values, y_dict, val_masks, action_targets, action_masks, torch)
+            parent_val_loss_t, parent_validation_accuracy = _loss(
+                parent_logits,
+                parent_values,
+                y_dict,
+                val_masks,
+                action_targets,
+                action_masks,
+                torch,
+            )
         if parent_val_loss_t is not None:
             parent_validation_loss = float(parent_val_loss_t.cpu().item())
 
@@ -289,12 +427,17 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         optimizer.step()
         training_loss = float(loss.detach().cpu().item())
         training_steps += 1
+    if training_steps <= 0:
+        return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, parent_version, 0.0, parent_validation_loss if math.isfinite(parent_validation_loss) else 0.0, action_examples, 0, parent_checkpoint)
+
     model.eval()
     with torch.no_grad():
         logits, values = model(x_device, edges_device)
         val_loss_t, val_accuracy = _loss(logits, values, y_dict, val_masks, action_targets, action_masks, torch)
         train_loss_t, train_accuracy = _loss(logits, values, y_dict, train_masks, action_targets, action_masks, torch)
-    validation_loss = float(val_loss_t.cpu().item()) if val_loss_t is not None else training_loss
+    if val_loss_t is None:
+        return HGTTrainingResult(epoch, "SKIPPED_NO_VALIDATION_EVIDENCE", runtime.unified_telemetry.model_version, parent_version, training_loss, 0.0, action_examples, training_steps, parent_checkpoint)
+    validation_loss = float(val_loss_t.cpu().item())
     training_loss = float(train_loss_t.cpu().item()) if train_loss_t is not None else training_loss
     elapsed = max(1e-9, time.perf_counter() - start)
     version_index = int(manifest.get("version_index", 0)) + 1
@@ -312,15 +455,65 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             score = float(predicted[index].item())
             action_score_sums.setdefault(environment_id, {}).setdefault(action_id, []).append(score)
             context_score_sums.setdefault(environment_id, {}).setdefault(context_signature, {}).setdefault(action_id, []).append(score)
-    action_scores = {environment_id: {action_id: sum(scores) / len(scores) for action_id, scores in actions.items() if scores} for environment_id, actions in action_score_sums.items()}
-    context_action_scores = {environment_id: {context: {action_id: sum(scores) / len(scores) for action_id, scores in actions.items() if scores} for context, actions in contexts.items()} for environment_id, contexts in context_score_sums.items()}
-    promote = _should_promote(parent_version, parent_validation_loss, validation_loss)
+    action_scores = {
+        environment_id: {action_id: sum(scores) / len(scores) for action_id, scores in actions.items() if scores}
+        for environment_id, actions in action_score_sums.items()
+    }
+    context_action_scores = {
+        environment_id: {
+            context: {action_id: sum(scores) / len(scores) for action_id, scores in actions.items() if scores}
+            for context, actions in contexts.items()
+        }
+        for environment_id, contexts in context_score_sums.items()
+    }
+    promote = _should_promote(
+        parent_version,
+        parent_validation_loss,
+        validation_loss,
+        parent_validation_accuracy,
+        val_accuracy,
+    )
     status = "PROMOTED" if promote else "REJECTED"
     if promote:
         temporary_checkpoint = checkpoint_path.with_suffix(".pt.tmp")
-        torch.save({"model_schema_version": MODEL_SCHEMA_VERSION, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "metadata": metadata, "input_dim": 64, "hidden_dim": int(config.hgt_hidden_dim), "layers": int(config.hgt_layers), "heads": int(config.hgt_heads), "validation_loss": validation_loss, "training_loss": training_loss, "action_scores": action_scores, "context_action_scores": context_action_scores}, temporary_checkpoint)
+        torch.save(
+            {
+                "model_schema_version": MODEL_SCHEMA_VERSION,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "metadata": metadata,
+                "input_dim": 64,
+                "hidden_dim": int(config.hgt_hidden_dim),
+                "layers": int(config.hgt_layers),
+                "heads": int(config.hgt_heads),
+                "validation_loss": validation_loss,
+                "validation_accuracy": val_accuracy,
+                "training_loss": training_loss,
+                "action_scores": action_scores,
+                "context_action_scores": context_action_scores,
+            },
+            temporary_checkpoint,
+        )
         os.replace(temporary_checkpoint, checkpoint_path)
-        manifest = {"model_schema_version": MODEL_SCHEMA_VERSION, "version_index": version_index, "current_model_version": candidate_version, "current_checkpoint": checkpoint_rel, "parent_model_version": parent_version, "validation_loss": validation_loss, "promotion_baseline_validation_loss": None if not math.isfinite(parent_validation_loss) else parent_validation_loss, "training_loss": training_loss, "graph_generation": int(read_view.generation), "examples": examples, "action_scores": action_scores, "context_action_scores": context_action_scores}
+        manifest = {
+            "model_schema_version": MODEL_SCHEMA_VERSION,
+            "version_index": version_index,
+            "current_model_version": candidate_version,
+            "current_checkpoint": checkpoint_rel,
+            "parent_model_version": parent_version,
+            "validation_loss": validation_loss,
+            "validation_accuracy": val_accuracy,
+            "promotion_baseline_validation_loss": None if not math.isfinite(parent_validation_loss) else parent_validation_loss,
+            "promotion_baseline_validation_accuracy": None if not math.isfinite(parent_validation_accuracy) else parent_validation_accuracy,
+            "training_loss": training_loss,
+            "graph_generation": int(read_view.generation),
+            "selected_nodes": selected_examples,
+            "examples": action_examples,
+            "training_examples": training_examples,
+            "validation_examples": validation_examples,
+            "action_scores": action_scores,
+            "context_action_scores": context_action_scores,
+        }
         temporary_manifest = manifest_path.with_suffix(".json.tmp")
         temporary_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary_manifest, manifest_path)
@@ -332,7 +525,46 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     else:
         model_version = str(parent_version)
     gpu = read_gpu_snapshot()
-    sample = HGTTrainingSample(training_loss=training_loss, validation_loss=validation_loss, training_step_latency_ms=1000.0 * elapsed / max(1, training_steps), training_examples_seen=examples, effective_batch_size=examples, gradient_norm=last_grad_norm, learning_rate=float(learning_rate), training_steps=training_steps, examples_per_second=(examples * max(1, training_steps)) / elapsed, gpu_memory_bytes=int(gpu.memory_used_bytes), gpu_utilization=float(gpu.utilization_percent), historical_retention=train_accuracy, current_curriculum_gain=max(0.0, val_accuracy - (1.0 / 3.0)), cross_family_validation_gain=max(0.0, val_accuracy - train_accuracy), loss_by_head={"primary_valence": validation_loss, "discounted_action_value": validation_loss})
+    sample = HGTTrainingSample(
+        training_loss=training_loss,
+        validation_loss=validation_loss,
+        training_step_latency_ms=1000.0 * elapsed / max(1, training_steps),
+        training_examples_seen=training_examples,
+        effective_batch_size=training_examples,
+        gradient_norm=last_grad_norm,
+        learning_rate=float(learning_rate),
+        training_steps=training_steps,
+        examples_per_second=(training_examples * max(1, training_steps)) / elapsed,
+        gpu_memory_bytes=int(gpu.memory_used_bytes),
+        gpu_utilization=float(gpu.utilization_percent),
+        historical_retention=val_accuracy,
+        current_curriculum_gain=max(0.0, val_accuracy - (1.0 / 3.0)),
+        cross_family_validation_gain=max(0.0, val_accuracy - train_accuracy),
+        loss_by_head={"primary_valence": validation_loss, "discounted_action_value": validation_loss},
+    )
     runtime.record_hgt_training(sample)
-    runtime.record_model_evolution(ModelEvolutionSample(model_version=model_version, parent_model_version=parent_version, training_examples_since_parent=examples, current_stage_delta=max(0.0, val_accuracy - (1.0 / 3.0)), historical_retention_delta=train_accuracy - 1.0, cross_family_transfer_delta=val_accuracy - train_accuracy, reasoning_improvement_delta=0.0, inference_latency_delta_ms=0.0, promotion_result=status))
-    return HGTTrainingResult(epoch=epoch, status=status, model_version=model_version, parent_model_version=parent_version, training_loss=training_loss, validation_loss=validation_loss, examples=examples, training_steps=training_steps, checkpoint=checkpoint_rel if promote else parent_checkpoint)
+    retention_delta = 0.0 if not math.isfinite(parent_validation_accuracy) else val_accuracy - parent_validation_accuracy
+    runtime.record_model_evolution(
+        ModelEvolutionSample(
+            model_version=model_version,
+            parent_model_version=parent_version,
+            training_examples_since_parent=training_examples,
+            current_stage_delta=max(0.0, val_accuracy - (1.0 / 3.0)),
+            historical_retention_delta=retention_delta,
+            cross_family_transfer_delta=val_accuracy - train_accuracy,
+            reasoning_improvement_delta=0.0,
+            inference_latency_delta_ms=0.0,
+            promotion_result=status,
+        )
+    )
+    return HGTTrainingResult(
+        epoch=epoch,
+        status=status,
+        model_version=model_version,
+        parent_model_version=parent_version,
+        training_loss=training_loss,
+        validation_loss=validation_loss,
+        examples=action_examples,
+        training_steps=training_steps,
+        checkpoint=checkpoint_rel if promote else parent_checkpoint,
+    )
