@@ -246,7 +246,7 @@ def run_continuous(args: argparse.Namespace) -> int:
         return 0
     if not args.games:
         raise ValueError("--games is required for a normal continuous run")
-    if args.actors <= 0 or args.steps_per_game <= 0 or args.graph_check <= 0 or args.wait < 0 or args.progress_interval_seconds <= 0 or not 0 <= args.epsilon <= 1:
+    if args.actors <= 0 or args.steps_per_game <= 0 or args.epochs <= 0 or args.hgt_training_epochs <= 0 or args.hgt_learning_rate <= 0 or args.graph_check <= 0 or args.wait < 0 or args.progress_interval_seconds <= 0 or not 0 <= args.epsilon <= 1:
         raise ValueError("actors, steps-per-game, graph-check and progress interval must be positive; wait and epsilon must be valid")
     if min(args.ingest_workers, args.derivation_workers, args.ingest_queue_capacity, args.derivation_queue_capacity, args.publication_queue_capacity) <= 0:
         raise ValueError("memory worker counts and queue capacities must be positive")
@@ -356,6 +356,9 @@ def build_parser() -> argparse.ArgumentParser:
     trajectory.add_argument("--show-best-trajectory", metavar="GAME_ID", default=None)
     trajectory.add_argument("--save-best-trajectory", metavar="FILE", default=None)
     continuous.add_argument("--steps-per-game", type=int, default=1000)
+    continuous.add_argument("--epochs", type=int, default=1)
+    continuous.add_argument("--hgt-training-epochs", type=int, default=1)
+    continuous.add_argument("--hgt-learning-rate", type=float, default=0.0003)
     continuous.add_argument("--actors", type=int, default=8)
     continuous.add_argument("--ingest-workers", type=int, default=4)
     continuous.add_argument("--derivation-workers", type=int, default=4)
