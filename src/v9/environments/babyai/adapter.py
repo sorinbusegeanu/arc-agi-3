@@ -16,11 +16,12 @@ class BabyAIObservation:
 
 
 class BabyAIAdapter(StructuralAdapter):
-    def __init__(self, native_env: Any, *, environment_name: str = "BabyAI", vocabulary: str = "babyai-bytes") -> None:
+    def __init__(self, native_env: Any, *, environment_name: str = "BabyAI", vocabulary: str = "babyai-bytes", suppress_symbols: bool = False) -> None:
         action_count = int(getattr(getattr(native_env, "action_space", None), "n", 0))
         if action_count <= 0:
             raise ValueError("BabyAI requires a discrete target-local action space")
         self.native_env, self.action_count = native_env, action_count
+        self.suppress_symbols = bool(suppress_symbols)
         self.codec = DeterministicSymbolCodec(vocabulary)
         self._identity = EnvironmentIdentity("babyai", environment_name, "raw-instruction-bytes", "default")
         self._observation_schema = ObservationSchema("babyai-world", "mission-excluded")
@@ -53,7 +54,7 @@ class BabyAIAdapter(StructuralAdapter):
         return () if not self._boundary.continuation else tuple(range(self.action_count))
 
     def optional_symbol_stream(self) -> tuple[object, ...]:
-        return tuple(self._last.instruction_bytes)
+        return () if self.suppress_symbols else tuple(self._last.instruction_bytes)
 
     def instruction_symbols(self, stream_name: str = "instruction") -> tuple[SymbolObservation, ...]:
         return self.codec.encode_stream(self.optional_symbol_stream(), stream_name=stream_name)
@@ -75,10 +76,15 @@ class BabyAIAdapter(StructuralAdapter):
         return self._last
 
 
-def make_babyai_adapter(environment_id: str, *, seed: int = 0, **kwargs: object) -> BabyAIAdapter:
+def make_babyai_adapter(environment_id: str, *, seed: int = 0, suppress_symbols: bool = False, **kwargs: object) -> BabyAIAdapter:
     try:
         import gymnasium as gym
     except ImportError as exc:
         raise RuntimeError("BabyAI live support requires the optional minigrid dependency") from exc
-    return BabyAIAdapter(gym.make(environment_id, **kwargs), environment_name=environment_id)
+    env = gym.make(environment_id, **kwargs)
+    try:
+        env.reset(seed=int(seed))
+    except TypeError:
+        pass
+    return BabyAIAdapter(env, environment_name=environment_id, suppress_symbols=suppress_symbols)
 
