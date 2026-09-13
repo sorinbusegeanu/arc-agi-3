@@ -25,7 +25,7 @@ class GymDiscreteAdapter(StructuralAdapter):
         config = ",".join(f"{key}={self.make_kwargs[key]!r}" for key in sorted(self.make_kwargs)) or "default"
         self._identity = EnvironmentIdentity("gymnasium", self.environment_id, config, f"seed={self.seed}")
         self._observation_schema = self.observation_codec.schema
-        self._action_schema = ActionSchema("discrete-codebook", f"n={self.action_codec.size}") if self._box_action_space is not None else self.action_codec.schema
+        self._action_schema = self.action_codec.schema
         self._episode = 0
         self._observation = 0
         self._boundary = BoundaryEvent()
@@ -72,12 +72,12 @@ class GymDiscreteAdapter(StructuralAdapter):
 
 
 class GymStructuredAdapter(StructuralAdapter):
-    """Gymnasium adapter for arbitrary observations with discrete action spaces."""
+    """Gymnasium adapter for arbitrary observations with target-local integer action tokens."""
 
     def __init__(self, environment_id: str, *, seed: int = 0, make_kwargs: dict[str, object] | None = None, observation_family: str = "structured") -> None:
         try:
             import gymnasium as gym
-            from gymnasium.spaces import Discrete
+            from gymnasium.spaces import Box, Discrete
         except ImportError as exc:
             raise RuntimeError("GymStructuredAdapter requires the gymnasium dependency") from exc
         self.environment_id = str(environment_id)
@@ -98,7 +98,7 @@ class GymStructuredAdapter(StructuralAdapter):
         config = ",".join(f"{key}={self.make_kwargs[key]!r}" for key in sorted(self.make_kwargs)) or "default"
         self._identity = EnvironmentIdentity("gymnasium", self.environment_id, config, f"seed={self.seed}")
         self._observation_schema = ObservationSchema(str(observation_family), repr(self.env.observation_space))
-        self._action_schema = self.action_codec.schema
+        self._action_schema = ActionSchema("discrete-codebook", f"n={self.action_codec.size}") if self._box_action_space is not None else self.action_codec.schema
         self._episode = 0
         self._observation = None
         self._boundary = BoundaryEvent()
