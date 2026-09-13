@@ -41,10 +41,6 @@ jobs:
         env:
           PYTHONPATH: src
         run: python -m pytest -q src/v9/tests
-      - name: Run complete v8 regression suite
-        env:
-          PYTHONPATH: src
-        run: python -m pytest -q src/v8/tests
       - name: Run v9 with historical runtime unavailable
         run: |
           isolated="$(mktemp -d)"

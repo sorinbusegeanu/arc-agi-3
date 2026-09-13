@@ -284,6 +284,7 @@ def run_continuous(args: argparse.Namespace) -> int:
             env_root=args.env_root,
             alfred_backend_factory=getattr(args, "alfred_backend_factory", None),
             start_method=runtime.config.multiprocessing_start_method,
+            progress_interval_seconds=args.progress_interval_seconds,
         )
         results = [
             ActorResult(

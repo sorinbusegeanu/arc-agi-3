@@ -159,3 +159,11 @@ def test_prediction_error_is_exposed_as_primary_runtime_metric(tmp_path) -> None
         prediction_error=0.75,
     ))
     assert runtime.metrics()["prediction_error"] == 0.75
+
+
+def test_dashboard_exposes_all_memory_levels(tmp_path) -> None:
+    runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False))
+    dashboard = runtime.metrics()["primary_dashboard"]
+    for level in range(8):
+        assert f"M{level}_count" in dashboard
+    assert "M4_validated" in dashboard

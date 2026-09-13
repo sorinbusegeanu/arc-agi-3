@@ -25,3 +25,25 @@ def test_process_topology_is_reported(tmp_path) -> None:
     assert metrics["stage_worker_processes"] == 2
     assert metrics["shard_worker_processes"] == 2
     assert metrics["multiprocess_transitions_published"] == 12
+
+
+def test_progress_is_written_to_stdout(tmp_path, capsys) -> None:
+    root = tmp_path / "progress"
+    args = build_parser().parse_args([
+        "continuous-run",
+        "--root", str(root),
+        "--games", "step1",
+        "--steps-per-game", "1",
+        "--actors", "2",
+        "--shards", "2",
+        "--stage-workers", "1",
+        "--progress-interval-seconds", "60",
+        "--no-peers",
+        "--no-dashboard",
+    ])
+    assert run_continuous(args) == 0
+    output = capsys.readouterr().out
+    assert "v9 progress" in output
+    assert "steps=12/12" in output
+    assert "M0=" in output
+    assert "M7=" in output
