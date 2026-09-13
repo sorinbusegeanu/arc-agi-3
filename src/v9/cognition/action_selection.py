@@ -25,7 +25,12 @@ class GroundedActionSignal:
 
 
 def action_scores(view: ReadView, actions: tuple[int, ...], *, grounded_signals: tuple[GroundedActionSignal, ...] = (), learned_scores: dict[int, float] | None = None, target_environment_id: int | None = None) -> dict[int, float]:
-    scores = {int(action): float(view.normalized_action_supports.get(int(action), 0.0)) for action in actions}
+    raw_support = {int(action): float(view.normalized_action_supports.get(int(action), 0.0)) for action in actions}
+    maximum = max(raw_support.values(), default=0.0)
+    scores = {
+        action: (0.05 * support / maximum if maximum > 0.0 else 0.0)
+        for action, support in raw_support.items()
+    }
     if learned_scores:
         for action in actions:
             scores[int(action)] += float(learned_scores.get(int(action), 0.0))
@@ -41,7 +46,7 @@ def choose_action(view: ReadView, actions: tuple[int, ...], *, rng: Random, epsi
     if not 0.0 <= float(epsilon) <= 1.0:
         raise ValueError("epsilon must be in [0, 1]")
     scores = action_scores(view, actions, grounded_signals=grounded_signals, learned_scores=learned_scores, target_environment_id=target_environment_id)
-    unseen = tuple(action for action in actions if scores[action] == 0)
+    unseen = tuple(action for action in actions if view.normalized_action_supports.get(int(action), 0.0) == 0.0 and (not learned_scores or float(learned_scores.get(int(action), 0.0)) == 0.0))
     if rng.random() < epsilon or unseen:
         candidates = unseen or actions
         return int(candidates[rng.randrange(len(candidates))])
