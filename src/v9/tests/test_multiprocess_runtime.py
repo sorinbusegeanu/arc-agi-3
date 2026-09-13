@@ -29,6 +29,8 @@ def test_process_topology_is_reported(tmp_path) -> None:
     assert metrics["derivation_worker_processes"] == 4
     assert metrics["multiprocess_transitions_published"] == 12
     assert metrics["sampling_backlog"] == 0
+    assert metrics["coordinator_action_requests"] == 0
+    assert metrics["policy_snapshot_generation"] >= 0
 
 
 def test_progress_is_written_to_stdout(tmp_path, capsys) -> None:
@@ -119,3 +121,14 @@ def test_behavioral_success_is_game_independent() -> None:
 
     assert rates == {"game_a": 0.8, "game_b": 0.5}
     assert macro == 0.65
+
+
+def test_actor_policy_snapshot_is_picklable(tmp_path) -> None:
+    import pickle
+    from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
+
+    runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False))
+    snapshot = runtime.actor_policy_snapshot()
+    restored = pickle.loads(pickle.dumps(snapshot))
+    assert restored.generation == snapshot.generation
+    assert restored.normalized_action_supports == snapshot.normalized_action_supports
