@@ -99,7 +99,7 @@ def run_parallel_memory_jobs(
                 adapter_factory_path="v9.cli:make_adapter",
                 alfred_backend_factory=alfred_backend_factory,
                 run_nonce=run_nonce,
-                initial_policy=initial_policy,
+                initial_policy=runtime.actor_policy_snapshot(),
                 epsilon=float(epsilon),
                 policy_refresh_steps=int(actor_view_refresh_steps),
                 policy_refresh_ms=float(actor_view_refresh_ms),
