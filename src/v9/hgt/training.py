@@ -209,6 +209,12 @@ def _loss(logits_dict, value_dict, y_dict, masks, action_targets, action_masks, 
     return 0.25 * classification + value_loss, correct / max(1, total)
 
 
+def _should_promote(parent_version: str | None, parent_validation_loss: float, candidate_validation_loss: float) -> bool:
+    if parent_version is None or not math.isfinite(parent_validation_loss):
+        return True
+    return float(candidate_validation_loss) <= float(parent_validation_loss) * 1.01
+
+
 def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_rate: float, root: str | Path) -> HGTTrainingResult:
     try:
         torch, _, _ = _require_torch()
@@ -249,6 +255,16 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     x_device = {key: value.to(device) for key, value in x_dict.items()}
     edges_device = {key: value.to(device) for key, value in edge_index_dict.items()}
     train_masks, val_masks = _split_masks(y_dict, torch)
+
+    parent_validation_loss = float("inf")
+    if parent_version is not None:
+        model.eval()
+        with torch.no_grad():
+            parent_logits, parent_values = model(x_device, edges_device)
+            parent_val_loss_t, _ = _loss(parent_logits, parent_values, y_dict, val_masks, action_targets, action_masks, torch)
+        if parent_val_loss_t is not None:
+            parent_validation_loss = float(parent_val_loss_t.cpu().item())
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(learning_rate))
     if checkpoint_state is not None and checkpoint_state.get("optimizer_state"):
         try:
@@ -298,14 +314,13 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             context_score_sums.setdefault(environment_id, {}).setdefault(context_signature, {}).setdefault(action_id, []).append(score)
     action_scores = {environment_id: {action_id: sum(scores) / len(scores) for action_id, scores in actions.items() if scores} for environment_id, actions in action_score_sums.items()}
     context_action_scores = {environment_id: {context: {action_id: sum(scores) / len(scores) for action_id, scores in actions.items() if scores} for context, actions in contexts.items()} for environment_id, contexts in context_score_sums.items()}
-    previous_val = float(manifest.get("validation_loss", float("inf")))
-    promote = parent_version is None or validation_loss <= previous_val * 1.05
+    promote = _should_promote(parent_version, parent_validation_loss, validation_loss)
     status = "PROMOTED" if promote else "REJECTED"
     if promote:
         temporary_checkpoint = checkpoint_path.with_suffix(".pt.tmp")
         torch.save({"model_schema_version": MODEL_SCHEMA_VERSION, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "metadata": metadata, "input_dim": 64, "hidden_dim": int(config.hgt_hidden_dim), "layers": int(config.hgt_layers), "heads": int(config.hgt_heads), "validation_loss": validation_loss, "training_loss": training_loss, "action_scores": action_scores, "context_action_scores": context_action_scores}, temporary_checkpoint)
         os.replace(temporary_checkpoint, checkpoint_path)
-        manifest = {"model_schema_version": MODEL_SCHEMA_VERSION, "version_index": version_index, "current_model_version": candidate_version, "current_checkpoint": checkpoint_rel, "parent_model_version": parent_version, "validation_loss": validation_loss, "training_loss": training_loss, "graph_generation": int(read_view.generation), "examples": examples, "action_scores": action_scores, "context_action_scores": context_action_scores}
+        manifest = {"model_schema_version": MODEL_SCHEMA_VERSION, "version_index": version_index, "current_model_version": candidate_version, "current_checkpoint": checkpoint_rel, "parent_model_version": parent_version, "validation_loss": validation_loss, "promotion_baseline_validation_loss": None if not math.isfinite(parent_validation_loss) else parent_validation_loss, "training_loss": training_loss, "graph_generation": int(read_view.generation), "examples": examples, "action_scores": action_scores, "context_action_scores": context_action_scores}
         temporary_manifest = manifest_path.with_suffix(".json.tmp")
         temporary_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary_manifest, manifest_path)
