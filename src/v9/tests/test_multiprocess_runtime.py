@@ -49,12 +49,12 @@ def test_progress_is_written_to_stdout(tmp_path, capsys) -> None:
     ])
     assert run_continuous(args) == 0
     output = capsys.readouterr().out
-    assert re.search(r"\[\d{2}:\d{2}\] progress", output)
-    assert "v9 progress" not in output
+    assert re.search(r"\[\d{2}:\d{2}\]\s+100\.0%", output)
     assert "sampled=12/12" in output
     assert "ingested=12" in output
-    assert "M0=" in output
-    assert "M7=" in output
+    assert "backlog=0" in output
+    assert "M0=" not in output
+    assert "M7=" not in output
 
 
 def test_restored_parallel_run_appends_unique_m0(tmp_path) -> None:
@@ -135,3 +135,37 @@ def test_actor_policy_snapshot_is_picklable(tmp_path) -> None:
     restored = pickle.loads(pickle.dumps(snapshot))
     assert restored.generation == snapshot.generation
     assert restored.normalized_action_supports == snapshot.normalized_action_supports
+
+
+def test_parallel_sampling_defers_raw_graph_publication(tmp_path) -> None:
+    from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
+    from v9.runtime.memory_pipeline import IngestionTask, prepare_ingestion
+    from v9.runtime.multiprocess import EncodedTransition
+
+    runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False, enable_snapshots=False))
+    identity = ("synthetic", "syn_move", 1, 1)
+    transition = EncodedTransition(
+        actor_id=1,
+        producer_sequence=1,
+        environment_identity=identity,
+        episode_id=1,
+        global_step=0,
+        before_signature=1,
+        action_id=0,
+        after_signature=2,
+        available_actions_after=2,
+        primary_valence=0,
+        observation_schema_id=1,
+        symbols=(),
+        symbols_only=False,
+        curriculum_step="step1",
+        game_scenario="syn_move",
+    )
+    prepared = prepare_ingestion(IngestionTask(1, 1, transition))
+    runtime.apply_prepared_ingestion(prepared)
+
+    assert runtime.metrics()["memory_levels"]["M0"] == 1
+    assert runtime.graph.memory_count() == 0
+
+    runtime.flush_deferred_memory_updates()
+    assert runtime.graph.memory_count() >= 3
