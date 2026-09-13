@@ -254,6 +254,11 @@ def run_parallel_memory_jobs(
                 results.append(ProcessActorResult(done.actor_id, done.game_id, done.steps, done.positive_boundaries, done.negative_boundaries, done.episode_boundaries, done.resets, done.policy_refreshes))
                 launch()
                 progressed = True
+            for actor_id, (_, process) in tuple(active.items()):
+                if not process.is_alive() and process.exitcode not in (0, None):
+                    raise RuntimeError(
+                        f"actor process {actor_id} exited before completion with code {process.exitcode}"
+                    )
             now = time.monotonic()
             if now >= next_policy_publish:
                 snapshot = runtime.actor_policy_snapshot()
