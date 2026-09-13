@@ -23,7 +23,6 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
         self._hgt_context_action_scores: dict[int, dict[int, dict[int, float]]] = {}
         self._metrics_cache: dict[str, Any] | None = None
         self._metrics_cache_at = 0.0
-        self._metrics_cache_seconds = 30.0
         restore_path = latest_snapshot(config.root) if bool(getattr(config, "restore", False)) else None
         restore_started = time.perf_counter()
         if restore_path is not None:
@@ -69,21 +68,28 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
         return metrics
 
     def metrics(self) -> dict[str, Any]:
-        now = time.monotonic()
+        # Programmatic callers rely on exact post-mutation semantics. Never serve
+        # a stale cached graph cut here; the cache is dashboard-only.
+        return self.full_metrics()
+
+    def dashboard_metrics(self) -> dict[str, Any]:
+        # The dashboard polls every two seconds. On million-node restored runs a
+        # full metrics traversal here competes directly with process startup. Use
+        # the last exact epoch cut and refresh only O(1) live counters/level sizes.
         with self._lock:
-            cached = self._metrics_cache
-            cache_age = now - self._metrics_cache_at
-        if cached is None or cache_age >= self._metrics_cache_seconds:
-            return self.full_metrics()
-        with self._lock:
-            result = dict(cached)
-            diagnostic = self.unified_telemetry.diagnostic_metrics()
+            result = dict(self._metrics_cache or {})
             result["watermark"] = self._watermark
             result["graph_generation"] = self.graph.generation
             result["edges"] = len(self.graph.edges)
+            result["memories"] = len(self.graph.nodes)
+            result["memory_levels"] = {
+                level.name: len(self.graph._uids_by_level[level])
+                for level in MemoryLevel
+            }
             result["timeline_events_seen"] = self.timeline.events_seen
             result["timeline_events_dropped"] = self.timeline.events_dropped
             result["actions_committed"] = self.timeline.actions_committed
+            diagnostic = self.unified_telemetry.diagnostic_metrics()
             result["telemetry_diagnostics"] = diagnostic
             result["primary_dashboard"] = build_primary_dashboard(result, diagnostic)
             return result
