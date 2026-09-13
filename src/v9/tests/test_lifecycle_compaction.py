@@ -36,6 +36,16 @@ def _publish_edge(graph: CanonicalGraph, edge: RelationEdge, *, watermark: int =
     assert graph.publish(proposal).outcome is MutationOutcome.ACCEPTED
 
 
+def _covered_episode_graph() -> tuple[CanonicalGraph, CanonicalNode, CanonicalNode]:
+    graph = CanonicalGraph(1)
+    episode = CanonicalNode.build(MemoryLevel.M0, MemoryType.EPISODE, (10,), 1)
+    abstraction = CanonicalNode.build(MemoryLevel.M1, MemoryType.GROUNDED_CONTINGENCY, (20,), 2)
+    _publish_node(graph, episode, {"primary_valence": 0})
+    _publish_node(graph, abstraction, {"parents": [[episode.uid.hi, episode.uid.lo]]}, watermark=2)
+    _publish_edge(graph, RelationEdge(abstraction.uid, RelationType.PROVENANCE, episode.uid), watermark=2)
+    return graph, episode, abstraction
+
+
 class _Runtime:
     def __init__(self, graph: CanonicalGraph, lifecycle: LifecycleRegistry) -> None:
         self.graph = graph
@@ -46,6 +56,9 @@ class _Runtime:
         self._deferred_base_nodes = {}
         self._latest_interaction_grounding = {}
         self.unified_telemetry = SimpleNamespace(gauges={})
+        self.transfer_trust = SimpleNamespace(records={})
+        self.telemetry = {"symbol_conditioned_prediction_observations": 0}
+        self._symbol_prediction_delta_sum = 0.0
         self.consolidation = []
 
     def record_hgt_consolidation(self, sample) -> None:
@@ -63,13 +76,7 @@ def test_capacity_values_are_pressure_signals_not_learning_stops() -> None:
 
 
 def test_dependency_safe_retirement_is_two_phase_and_persists_tombstone() -> None:
-    graph = CanonicalGraph(1)
-    episode = CanonicalNode.build(MemoryLevel.M0, MemoryType.EPISODE, (10,), 1)
-    abstraction = CanonicalNode.build(MemoryLevel.M1, MemoryType.GROUNDED_CONTINGENCY, (20,), 2)
-    _publish_node(graph, episode, {"primary_valence": 0})
-    _publish_node(graph, abstraction, {"parents": [[episode.uid.hi, episode.uid.lo]]}, watermark=2)
-    _publish_edge(graph, RelationEdge(abstraction.uid, RelationType.PROVENANCE, episode.uid), watermark=2)
-
+    graph, episode, abstraction = _covered_episode_graph()
     lifecycle = LifecycleRegistry()
     lifecycle.observe(episode.uid, support_delta=1, relevant_opportunity=True, watermark=1)
     runtime = _Runtime(graph, lifecycle)
@@ -99,6 +106,46 @@ def test_dependency_safe_retirement_is_two_phase_and_persists_tombstone() -> Non
 
     restored = CanonicalGraph.from_state_dict(graph.state_dict())
     assert restored.retired_tombstones[episode.uid].replacement_uid == abstraction.uid
+
+
+def test_retirement_waits_for_post_dormancy_retention_recovery() -> None:
+    graph, episode, _ = _covered_episode_graph()
+    lifecycle = LifecycleRegistry()
+    lifecycle.observe(episode.uid, support_delta=1, relevant_opportunity=True, watermark=1)
+    runtime = _Runtime(graph, lifecycle)
+    runtime.unified_telemetry.gauges["historical_retention"] = 0.90
+    runtime.unified_telemetry.gauges["behavioral_success_rate"] = 0.60
+
+    runtime.watermark = 5000
+    run_lifecycle_maintenance(runtime, dormancy_grace_watermarks=1000, retirement_grace_watermarks=1000)
+    row = lifecycle.records[episode.uid]
+    assert row.state is CognitiveState.DORMANT
+    assert row.baseline_hgt_retention == 0.90
+    assert row.baseline_behavioral_success == 0.60
+
+    runtime.unified_telemetry.gauges["historical_retention"] = 0.70
+    runtime.watermark = 7000
+    blocked = run_lifecycle_maintenance(runtime, dormancy_grace_watermarks=1000, retirement_grace_watermarks=1000)
+    assert blocked["blocked"] == 1
+    assert lifecycle.records[episode.uid].state is CognitiveState.DORMANT
+
+    runtime.unified_telemetry.gauges["historical_retention"] = 0.90
+    runtime.watermark = 9000
+    pending = run_lifecycle_maintenance(runtime, dormancy_grace_watermarks=1000, retirement_grace_watermarks=1000)
+    assert pending["pending"] == 1
+    assert lifecycle.records[episode.uid].state is CognitiveState.RETIRE_PENDING
+
+    runtime._replay_pool[episode.uid] = 1.0
+    runtime.watermark = 11000
+    replay_blocked = run_lifecycle_maintenance(runtime, dormancy_grace_watermarks=1000, retirement_grace_watermarks=1000)
+    assert replay_blocked["blocked"] == 1
+    assert episode.uid in graph.nodes
+
+    runtime._replay_pool.clear()
+    runtime.watermark = 13000
+    retired = run_lifecycle_maintenance(runtime, dormancy_grace_watermarks=1000, retirement_grace_watermarks=1000)
+    assert retired["retired"] == 1
+    assert episode.uid not in graph.nodes
 
 
 def test_higher_memory_can_go_dormant_but_is_not_physically_retired() -> None:
@@ -131,6 +178,7 @@ def test_positive_new_support_reactivates_dormant_memory() -> None:
     row = lifecycle.observe(uid, support_delta=1, relevant_opportunity=True, watermark=101)
     assert row.state is CognitiveState.REACTIVATED
     assert row.replacement_uid is None
+    assert row.baseline_hgt_retention is None
 
 
 def test_legacy_lifecycle_state_restores_without_new_fields() -> None:
@@ -150,3 +198,4 @@ def test_legacy_lifecycle_state_restores_without_new_fields() -> None:
     row = restored.records[uid]
     assert row.last_observed_watermark == 17
     assert row.retention_score == 1.0
+    assert row.baseline_hgt_retention is None
