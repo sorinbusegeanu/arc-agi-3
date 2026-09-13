@@ -67,17 +67,22 @@ class EvidenceLedger:
             self._flush_locked()
 
     def state_dict(self) -> dict[str, object]:
-        return {"schema_version": self.SCHEMA_VERSION, "scientific_config_id": self.scientific_config_id, "records": [asdict(row) for row in self.records]}
+        return {"schema_version": self.SCHEMA_VERSION, "scientific_config_id": self.scientific_config_id, "record_count": len(self.records), "last_uid": self.records[-1].uid if self.records else None}
 
     def load_state(self, state: dict[str, object]) -> None:
         if int(state.get("schema_version", 0)) != self.SCHEMA_VERSION or state.get("scientific_config_id") != self.scientific_config_id:
             raise ValueError("incompatible evidence ledger state")
-        incoming = [EvidenceRecord(int(row["uid"]), str(row["kind"]), int(row["causal_watermark"]), str(row["scientific_config_id"]), dict(row["payload"])) for row in state.get("records", [])]
+        raw_records = state.get("records")
+        if raw_records is None:
+            expected_count = int(state.get("record_count", 0))
+            if len(self.records) < expected_count:
+                raise ValueError("durable evidence ledger is shorter than snapshot evidence cut")
+            if expected_count and state.get("last_uid") is not None and int(self.records[expected_count - 1].uid) != int(state["last_uid"]):
+                raise ValueError("durable evidence ledger does not match snapshot evidence cut")
+            return
+        incoming = [EvidenceRecord(int(row["uid"]), str(row["kind"]), int(row["causal_watermark"]), str(row["scientific_config_id"]), dict(row["payload"])) for row in raw_records]
         shared_length = min(len(self.records), len(incoming))
         if incoming[:shared_length] != self.records[:shared_length]:
             raise ValueError("snapshot would rewrite append-only scientific evidence")
-        # The ledger is persisted before a later runtime snapshot. After a crash,
-        # it can therefore be a valid append-only extension of the newest snapshot.
-        # Preserve that durable suffix rather than rolling it back to the older cut.
         if len(incoming) > len(self.records):
             self.records = incoming
