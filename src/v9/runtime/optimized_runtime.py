@@ -124,6 +124,36 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
         with self._lock:
             return tuple(self.apply_prepared_ingestion(row) for row in prepared_rows)
 
+    @staticmethod
+    def _publication_row_dependency_cost(row: tuple[CanonicalNode, dict[str, Any], tuple[Any, ...]]) -> int:
+        _node, payload, _evidence = row
+        parents = {
+            (int(raw_parent[0]), int(raw_parent[1]))
+            for raw_parent in payload.get("parents", [])
+            if isinstance(raw_parent, (list, tuple)) and len(raw_parent) == 2
+        }
+        return 1 + len(parents)
+
+    def _publish_derivation_rows(self, publication_rows: Iterable[tuple[CanonicalNode, dict[str, Any], tuple[Any, ...]]]) -> None:
+        maximum_dependencies = int(self.config.scientific.maximum_read_set_size)
+        maximum_nodes = 384
+        batch: list[tuple[CanonicalNode, dict[str, Any], tuple[Any, ...]]] = []
+        dependency_budget = 0
+
+        for row in publication_rows:
+            row_cost = self._publication_row_dependency_cost(row)
+            if row_cost > maximum_dependencies:
+                raise ValueError("single derivation row exceeds configured read set bound")
+            if batch and (len(batch) >= maximum_nodes or dependency_budget + row_cost > maximum_dependencies):
+                self._publish_group(tuple(batch))
+                batch = []
+                dependency_budget = 0
+            batch.append(row)
+            dependency_budget += row_cost
+
+        if batch:
+            self._publish_group(tuple(batch))
+
     def apply_derivation_results_batch(self, results: Iterable[DerivationResult]) -> None:
         result_rows = tuple(results)
         if not result_rows:
@@ -143,9 +173,7 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                         continue
                     self._m4[candidate.uid] = candidate
                     publication_rows.append((CanonicalNode(candidate.uid, MemoryLevel.M4, MemoryType.CONCEPT, candidate.invariant_descriptor, self._watermark), {"invariant_descriptor": list(candidate.invariant_descriptor), "compression_benefit": candidate.compression_benefit, "explanatory_reach": candidate.explanatory_reach, "transfer_prior": candidate.transfer_prior, "formation_scope": list(candidate.provenance.formation_scope), "held_out_targets": [], "validated": False, "concept_state": candidate.state.value, "parents": [[uid.hi, uid.lo] for uid in candidate.provenance.parents]}, candidate.provenance.evidence))
-            node_batch = 384
-            for offset in range(0, len(publication_rows), node_batch):
-                self._publish_group(tuple(publication_rows[offset:offset + node_batch]))
+            self._publish_derivation_rows(publication_rows)
 
     def state_dict(self) -> dict[str, Any]:
         state = super().state_dict()
