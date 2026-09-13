@@ -89,7 +89,7 @@ class ContinuousMemoryRuntime:
         self.replay = ReplayScheduler(candidate_limit=scientific.replay_candidates_per_interval)
         self.payloads = PayloadStore()
         self.symbol_codecs: dict[int, DeterministicSymbolCodec] = {}
-        self.evidence = EvidenceLedger(self.root / "evidence" / "ledger.jsonl", scientific.config_id.value)
+        self.evidence = EvidenceLedger(self.root / "evidence" / "ledger.jsonl", scientific.config_id.value, flush_records=256, flush_interval_seconds=0.5)
         self._watermark = 0
         self._snapshot_id = 0
         self._producer_sequences: dict[int, int] = {}
