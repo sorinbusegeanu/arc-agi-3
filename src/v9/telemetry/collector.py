@@ -24,6 +24,7 @@ class UnifiedTelemetry:
         self.gauges: dict[str, float | int | str] = {}
         self.stop_reasons: Counter[str] = Counter()
         self.loss_by_head: dict[str, float] = {}
+        self.optimization_transfer_matrix: Counter[str] = Counter()
         self.last_provenance: dict[str, Any] = {}
 
     def _sum(self, key: str, value: float) -> None:
@@ -43,6 +44,9 @@ class UnifiedTelemetry:
         behavior_improved: bool | None,
         reasoning_cost: float,
         stop_reason: str,
+        candidate_changes: int = 0,
+        prediction_improvement: float = 0.0,
+        strategy_changes: int = 0,
         provenance: TelemetryProvenance | None = None,
     ) -> None:
         self.counters["deliberation_decisions"] += 1
@@ -56,6 +60,9 @@ class UnifiedTelemetry:
         self._sum("best_candidate_score", best_score)
         self._sum("candidate_improvement", best_score - initial_score)
         self._sum("reasoning_cost", reasoning_cost)
+        self.counters["candidate_changes"] += max(0, int(candidate_changes))
+        self.counters["strategy_changes"] += max(0, int(strategy_changes))
+        self._sum("prediction_improvement_during_deliberation", prediction_improvement)
         self.stop_reasons[str(stop_reason)] += 1
         if provenance:
             self.last_provenance = provenance.as_dict()
@@ -79,6 +86,12 @@ class UnifiedTelemetry:
             self._sum("hgt_behavior_delta", sample.behavior_delta)
             self.counters["hgt_behavior_improvements"] += int(sample.behavior_delta > 0)
             self.counters["hgt_behavior_regressions"] += int(sample.behavior_delta < 0)
+        if provenance:
+            self.last_provenance = provenance.as_dict()
+
+    def record_hgt_ablation(self, *, enabled_outcome: float, hydra_baseline_outcome: float, provenance: TelemetryProvenance | None = None) -> None:
+        self.counters["hgt_ablation_samples"] += 1
+        self._sum("hgt_contribution", float(enabled_outcome) - float(hydra_baseline_outcome))
         if provenance:
             self.last_provenance = provenance.as_dict()
 
@@ -157,6 +170,9 @@ class UnifiedTelemetry:
         self._sum("predicted_reliability", sample.predicted_reliability)
         self._sum("optimization_reasoning_cost", sample.reasoning_cost)
         self._sum("relative_efficiency_gain", sample.relative_efficiency_gain)
+        if sample.source_environment_family and sample.target_environment_family:
+            key = f"{sample.source_environment_family}->{sample.target_environment_family}"
+            self.optimization_transfer_matrix[key] += 1
         if provenance:
             self.last_provenance = provenance.as_dict()
 
@@ -172,6 +188,7 @@ class UnifiedTelemetry:
             **dict(self.gauges),
             "loss_by_head": dict(self.loss_by_head),
             "reasoning_stop_reasons": dict(self.stop_reasons),
+            "optimization_transfer_matrix": dict(self.optimization_transfer_matrix),
             "last_provenance": dict(self.last_provenance),
         }
         d = self.counters["deliberation_decisions"]
@@ -191,10 +208,30 @@ class UnifiedTelemetry:
         result["correspondence_accuracy"] = self._ratio(self.sums.get("hgt_correspondence_accuracy", 0.0), self.counters["hgt_correspondence_samples"])
         result["hgt_behavior_improvement_rate"] = self._ratio(self.counters["hgt_behavior_improvements"], self.counters["hgt_behavior_samples"])
         result["hgt_behavior_regression_rate"] = self._ratio(self.counters["hgt_behavior_regressions"], self.counters["hgt_behavior_samples"])
+        result["hgt_contribution"] = self._ratio(self.sums.get("hgt_contribution", 0.0), self.counters["hgt_ablation_samples"])
         o = self.counters["optimization_events"]
         result["mean_relative_efficiency_gain"] = self._ratio(self.sums.get("relative_efficiency_gain", 0.0), o)
         result["optimization_outcome_preservation_rate"] = self._ratio(self.counters["optimization_outcome_preserved"], o)
         result["replay_compression_ratio"] = 1.0 - self._ratio(self.counters["replay_examples_after"], self.counters["replay_examples_before"]) if self.counters["replay_examples_before"] else 0.0
+        train_loss = float(self.gauges.get("hgt_training_loss", 0.0))
+        validation_loss = float(self.gauges.get("hgt_validation_loss", 0.0))
+        retention = float(self.gauges.get("historical_retention", 1.0))
+        current_gain = float(self.gauges.get("current_curriculum_gain", 0.0))
+        cross_gain = float(self.gauges.get("cross_family_validation_gain", 0.0))
+        gradient = float(self.gauges.get("gradient_norm", 0.0))
+        if gradient > 1e4 or gradient != gradient:
+            status = "GRADIENT_INSTABILITY"
+        elif validation_loss > train_loss * 1.5 and train_loss > 0:
+            status = "OVERFITTING"
+        elif current_gain > 0 and retention < 0.8:
+            status = "CATASTROPHIC_FORGETTING"
+        elif current_gain > 0 and cross_gain <= 0:
+            status = "POOR_CROSS_FAMILY_GENERALIZATION"
+        elif train_loss > 0 and validation_loss > 0 and self.counters["hgt_training_reports"] > 0:
+            status = "TRAINING_ACTIVE"
+        else:
+            status = "NO_TRAINING_EVIDENCE"
+        result["hgt_training_status"] = status
         return result
 
     def state_dict(self) -> dict[str, Any]:
@@ -206,6 +243,7 @@ class UnifiedTelemetry:
             "gauges": dict(self.gauges),
             "stop_reasons": dict(self.stop_reasons),
             "loss_by_head": dict(self.loss_by_head),
+            "optimization_transfer_matrix": dict(self.optimization_transfer_matrix),
             "last_provenance": dict(self.last_provenance),
         }
 
@@ -219,5 +257,6 @@ class UnifiedTelemetry:
         result.gauges = dict(state.get("gauges", {}))
         result.stop_reasons.update({str(k): int(v) for k, v in dict(state.get("stop_reasons", {})).items()})
         result.loss_by_head = {str(k): float(v) for k, v in dict(state.get("loss_by_head", {})).items()}
+        result.optimization_transfer_matrix.update({str(k): int(v) for k, v in dict(state.get("optimization_transfer_matrix", {})).items()})
         result.last_provenance = dict(state.get("last_provenance", {}))
         return result
