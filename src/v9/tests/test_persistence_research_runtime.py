@@ -97,7 +97,7 @@ def test_cli_smoke_uses_only_v9_named_artifacts(tmp_path: Path) -> None:
     assert report["scientific_config"]["design_version"] == "9.7.6"
 
 
-def test_native_snapshot_uses_content_addressed_chunks(tmp_path: Path) -> None:
+def test_native_snapshot_uses_content_addressed_binary_graph_shards(tmp_path: Path) -> None:
     runtime = _learn(tmp_path, 3, restore=False)
     result = runtime.close()
     assert result is not None
@@ -106,6 +106,13 @@ def test_native_snapshot_uses_content_addressed_chunks(tmp_path: Path) -> None:
     assert (result.path / "COMPLETE").is_file()
     chunks = list((tmp_path / "snapshot_chunks").glob("*.bin"))
     assert chunks
+
+    manifest = json.loads((result.path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["snapshot_version"] == 4
+    assert manifest["state_format"] == "pickle5-fixed-graph-shards-v1"
+    assert len(manifest["graph_shards"]) == runtime.graph.partition_count
+    assert sum(int(row["nodes"]) for row in manifest["graph_shards"]) == runtime.graph.memory_count()
+    assert sum(int(row["edges"]) for row in manifest["graph_shards"]) == len(runtime.graph.edges)
 
     restored = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path))
     assert restored.metrics()["memory_levels"]["M0"] >= 3
