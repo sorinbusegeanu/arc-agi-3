@@ -7,7 +7,7 @@ from typing import Any
 
 from .memory_pipeline import DerivationResult, IngestionTask, PreparedIngestion
 from .memory_worker_topology import MemoryWorkerTopology
-from .multiprocess import ActorDone, ProcessTopology
+from .multiprocess import ActorDone, ActorError, ProcessTopology
 from .multiprocess_ingest import publish_transition_symbols
 
 
@@ -255,6 +255,10 @@ def run_parallel_memory_jobs(
                     done = topology.result_queue.get_nowait()
                 except queue.Empty:
                     break
+                if isinstance(done, ActorError):
+                    raise RuntimeError(
+                        f"actor {done.actor_id} ({done.game_id}) failed: {done.message}\n{done.traceback_text}"
+                    )
                 if not isinstance(done, ActorDone):
                     continue
                 slot, _ = active.pop(done.actor_id)
