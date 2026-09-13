@@ -404,6 +404,69 @@ class ContinuousMemoryRuntime:
         else:
             self.telemetry["rejected"] += 1
 
+    def _publish_group(
+        self,
+        rows: tuple[tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]], ...],
+    ) -> None:
+        writes: list[MutationWrite] = []
+        target_partitions: set[int] = set()
+        dependencies: list[ReadDependency] = []
+        evidence_refs: set[MemoryUid] = set()
+
+        for node, raw_payload, evidence in rows:
+            payload = dict(raw_payload)
+            payload.setdefault("evidence_refs", [[uid.hi, uid.lo] for uid in sorted(set(evidence))])
+            writes.append(MutationWrite(node=node, payload=payload))
+            target_partitions.add(self.partitions.owner(node.uid))
+            dependencies.append(ReadDependency(node_ref(node.uid), self.graph.versions.get(node_ref(node.uid))))
+            evidence_refs.update(evidence)
+            for raw_parent in payload.get("parents", []):
+                if not isinstance(raw_parent, (list, tuple)) or len(raw_parent) != 2:
+                    continue
+                parent = MemoryUid(int(raw_parent[0]), int(raw_parent[1]))
+                edge = RelationEdge(node.uid, RelationType.PROVENANCE, parent, evidence)
+                writes.append(MutationWrite(edge=edge))
+                target_partitions.add(self.partitions.owner(parent))
+                edge_reference = edge_ref(edge)
+                dependencies.append(ReadDependency(edge_reference, self.graph.versions.get(edge_reference)))
+
+        proposal = MutationProposal.build(
+            MutationKind.UPSERT_NODE,
+            target_partitions=tuple(sorted(target_partitions)),
+            read_set=ReadSet.build(
+                tuple(dependencies),
+                maximum_size=self.config.scientific.maximum_read_set_size,
+            ),
+            evidence_refs=tuple(sorted(evidence_refs)),
+            causal_watermark=self._watermark,
+            writes=tuple(writes),
+            proposal_class=ProposalClass.ADDITIVE,
+        )
+        self.telemetry["proposals"] += 1
+        self.telemetry["cross_partition_transactions"] += int(len(target_partitions) > 1)
+        previous_generation = self.graph.generation
+        result = self.graph.publish(proposal)
+        if result.outcome.value == "ACCEPTED":
+            self.telemetry["accepted"] += 1
+            if result.graph_generation == previous_generation:
+                self.telemetry["canonical_reuse"] += 1
+            else:
+                for node, _, _ in rows:
+                    if node.level >= MemoryLevel.M2:
+                        self.structural_index.add(node)
+                    if self.config.enable_lifecycle:
+                        self.lifecycle.observe(
+                            node.uid,
+                            support_delta=1,
+                            relevant_opportunity=True,
+                            watermark=self._watermark,
+                        )
+        elif result.outcome.value == "STALE_READ_SET":
+            self.telemetry["stale"] += 1
+            self.telemetry["read_set_conflicts"] += 1
+        else:
+            self.telemetry["rejected"] += 1
+
     def _record_normalized(self, relation: M1NormalizedRelation) -> int:
         occurrences = self._m1n_occurrences.setdefault(relation.structural_signature, [])
         support = self._m1n_supports.get(relation.structural_signature, 0) + 1
@@ -542,49 +605,49 @@ class ContinuousMemoryRuntime:
             if m0 is None or m1g is None or m1n is None:
                 raise RuntimeError("prepared interaction is incomplete")
 
-            self._publish(
-                CanonicalNode(
-                    m0.uid,
-                    MemoryLevel.M0,
-                    MemoryType.EPISODE,
-                    (event.identity.event_id.hi, event.identity.event_id.lo),
-                    self._watermark,
-                ),
-                {
-                    "modality_id": m0.modality_id,
-                    "environment_instance_id": m0.provenance.environment_instance_id,
-                    "episode_id": m0.provenance.episode_id.value,
-                    "context_signature": m0.context_signature,
-                    "payload_digest": m0.payload_digest,
-                    "action_id": m0.action_id,
-                    "outcome_signature": m0.outcome_signature,
-                    "next_context_signature": m0.next_context_signature,
-                    "symbol_identity": m0.symbol_identity,
-                    "primary_valence": m0.primary_valence,
-                    "future_option_delta": m0.future_option_delta,
-                    "realized_cost": m0.realized_cost,
-                },
-                (m0.uid,),
+            m0_node = CanonicalNode(
+                m0.uid,
+                MemoryLevel.M0,
+                MemoryType.EPISODE,
+                (event.identity.event_id.hi, event.identity.event_id.lo),
+                self._watermark,
             )
-            self._publish(
-                CanonicalNode(
-                    m1g.uid,
-                    MemoryLevel.M1,
-                    MemoryType.GROUNDED_CONTINGENCY,
-                    (m1g.uid.hi, m1g.uid.lo),
-                    self._watermark,
-                ),
-                {
-                    "relation": m1g.relation.value,
-                    "environment_instance_id": m1g.environment_instance_id,
-                    "episode_id": m1g.episode_id,
-                    "grounded_context_signature": m1g.grounded_context_signature,
-                    "executable_action_token": m1g.executable_action_token,
-                    "realized_transition_signature": m1g.realized_transition_signature,
-                    "grounded_next_context_signature": m1g.grounded_next_context_signature,
-                    "parents": [[m0.uid.hi, m0.uid.lo]],
-                },
-                (m0.uid,),
+            m0_payload = {
+                "modality_id": m0.modality_id,
+                "environment_instance_id": m0.provenance.environment_instance_id,
+                "episode_id": m0.provenance.episode_id.value,
+                "context_signature": m0.context_signature,
+                "payload_digest": m0.payload_digest,
+                "action_id": m0.action_id,
+                "outcome_signature": m0.outcome_signature,
+                "next_context_signature": m0.next_context_signature,
+                "symbol_identity": m0.symbol_identity,
+                "primary_valence": m0.primary_valence,
+                "future_option_delta": m0.future_option_delta,
+                "realized_cost": m0.realized_cost,
+            }
+            m1g_node = CanonicalNode(
+                m1g.uid,
+                MemoryLevel.M1,
+                MemoryType.GROUNDED_CONTINGENCY,
+                (m1g.uid.hi, m1g.uid.lo),
+                self._watermark,
+            )
+            m1g_payload = {
+                "relation": m1g.relation.value,
+                "environment_instance_id": m1g.environment_instance_id,
+                "episode_id": m1g.episode_id,
+                "grounded_context_signature": m1g.grounded_context_signature,
+                "executable_action_token": m1g.executable_action_token,
+                "realized_transition_signature": m1g.realized_transition_signature,
+                "grounded_next_context_signature": m1g.grounded_next_context_signature,
+                "parents": [[m0.uid.hi, m0.uid.lo]],
+            }
+            self._publish_group(
+                (
+                    (m0_node, m0_payload, (m0.uid,)),
+                    (m1g_node, m1g_payload, (m0.uid,)),
+                )
             )
             key = (m1g.environment_instance_id, m1g.episode_id)
             self._latest_interaction_grounding[key] = m1g
