@@ -38,6 +38,7 @@ class CognitiveState(IntEnum):
     RETIRE_PENDING = 5
     RETIRED = 6
     REACTIVATED = 7
+    DORMANT = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,4 +88,3 @@ class CanonicalNode:
     ) -> "CanonicalNode":
         key = tuple(int(value) for value in structural_key)
         return cls(MemoryUid.from_key(level, memory_type, key), level, memory_type, key, int(created_watermark))
-
