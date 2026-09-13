@@ -35,6 +35,9 @@ class CurriculumSelection:
 
 
 def default_curriculum_path() -> Path:
+    packaged = Path(__file__).resolve().parent / "config" / "curriculum.yaml"
+    if packaged.exists():
+        return packaged
     return Path(__file__).resolve().parents[2] / "docs" / "v9" / "curriculum.yaml"
 
 
