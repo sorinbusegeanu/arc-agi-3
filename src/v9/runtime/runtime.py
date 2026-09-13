@@ -100,6 +100,7 @@ class ContinuousMemoryRuntime:
         self._m1n_supports: dict[int, int] = {}
         self._m1n_dirty: set[int] = set()
         self._actor_action_supports: dict[int, float] = {}
+        self._actor_policy_generation = 0
         self._deferred_base_nodes: dict[MemoryUid, tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]]] = {}
         self._replay_pool: dict[MemoryUid, float] = {}
         self._formation_environments: set[int] = set()
@@ -152,6 +153,8 @@ class ContinuousMemoryRuntime:
                 for environment, actions in scores.items()
             }
 
+            self._actor_policy_generation += 1
+
     def hgt_action_scores(self, environment_id: int, actions: tuple[int, ...]) -> dict[int, float]:
         with self._lock:
             source = self._hgt_action_scores.get(int(environment_id), {})
@@ -179,7 +182,7 @@ class ContinuousMemoryRuntime:
     def actor_policy_snapshot(self) -> ActorPolicySnapshot:
         with self._lock:
             return ActorPolicySnapshot.build(
-                generation=self.graph.generation,
+                generation=max(self.graph.generation, self._actor_policy_generation),
                 normalized_action_supports=self._actor_action_supports,
                 hgt_action_scores=self._hgt_action_scores,
                 hgt_action_scores_by_type=self._hgt_scores_by_environment_type(),
@@ -487,6 +490,7 @@ class ContinuousMemoryRuntime:
                 action = None
             if action is not None:
                 self._actor_action_supports[action] = self._actor_action_supports.get(action, 0.0) + 1.0
+                self._actor_policy_generation += 1
         if len(occurrences) < max(2, self.config.scientific.m1n_facts_per_channel):
             occurrences.append(relation)
         self._replay_pool[relation.uid] = float(support)
@@ -1098,6 +1102,7 @@ class ContinuousMemoryRuntime:
             self._m1n_occurrences[int(signature)] = [dummy] if int(count) > 0 else []
         self._m1n_supports = {int(key): int(value) for key, value in dict(state.get("m1n_supports", state.get("m1n_occurrences", {}))).items()}
         self._actor_action_supports = {}
+        self._actor_policy_generation = self.graph.generation
         for signature, support in self._m1n_supports.items():
             rows = self._m1n_occurrences.get(int(signature), ())
             if not rows:
