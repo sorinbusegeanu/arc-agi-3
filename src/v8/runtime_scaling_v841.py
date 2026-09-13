@@ -17,6 +17,7 @@ _DEFERRED_TIME_BUDGET_SECONDS = 0.025
 _DEFERRED_CHUNK_SIZE = 1
 _OPTIMIZER_OVERFLOW_PER_GAME = 256
 _OPTIMIZER_DISPATCH_INTERVAL_SECONDS = 0.02
+_FEEDBACK_SQLITE_BATCH_ROWS = 1
 
 _BASE_PEER_INIT = None
 _BASE_PEER_CLOSE = None
@@ -48,10 +49,14 @@ class _SqliteBatchWorker:
         self._writer.execute(
             "CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY, payload BLOB NOT NULL)"
         )
-        # This is a runtime queue, not durable evidence. Never replay an interrupted
-        # callback from a previous process because actor feedback is not idempotent.
-        self._writer.execute("DELETE FROM feedback")
-        self._writer.commit()
+        # Rows still present were never handed to the callback and are safe to
+        # resume after an interrupted run. Rows are deleted immediately before a
+        # callback so already-started, non-idempotent feedback is never replayed.
+        existing = int(
+            self._writer.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+        )
+        self._submitted = existing
+        self._max_pending = existing
         self._thread = threading.Thread(target=self._run, name=name, daemon=True)
         self._thread.start()
 
@@ -82,7 +87,8 @@ class _SqliteBatchWorker:
                     if self._closed:
                         return
                 rows = reader.execute(
-                    "SELECT id, payload FROM feedback ORDER BY id LIMIT 32"
+                    "SELECT id, payload FROM feedback ORDER BY id LIMIT ?",
+                    (_FEEDBACK_SQLITE_BATCH_ROWS,),
                 ).fetchall()
                 if not rows:
                     self._wake.clear()
@@ -121,17 +127,24 @@ class _SqliteBatchWorker:
 
     def flush(self, timeout: float = 300.0) -> None:
         with self._done:
-            finished = self._done.wait_for(
-                lambda: self._completed >= self._submitted or self._error is not None,
-                timeout=max(0.01, float(timeout)),
-            )
+            stall_timeout = max(0.01, float(timeout))
+            deadline = time.monotonic() + stall_timeout
+            observed_completed = self._completed
+            while self._completed < self._submitted and self._error is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                self._done.wait(timeout=remaining)
+                if self._completed > observed_completed:
+                    observed_completed = self._completed
+                    deadline = time.monotonic() + stall_timeout
             pending = max(0, self._submitted - self._completed)
             error = self._error
         if error is not None:
             raise RuntimeError(
                 f"{self._thread.name} failed: {type(error).__name__}: {error}"
             ) from error
-        if not finished or pending:
+        if pending:
             raise TimeoutError(f"{self._thread.name} did not drain (pending={pending})")
 
     def close(self, timeout: float = 300.0) -> None:
@@ -335,7 +348,12 @@ def _parallel_analyses_v841(self, nodes, edges):
         "roles": pool.submit(role_fn, *role_args),
         "future": pool.submit(self.future_options.evaluate, nodes),
         "compression": pool.submit(self.compression.evaluate, nodes, edges),
-        "similarity": pool.submit(self.similarity.evaluate, nodes, edges),
+        "similarity": pool.submit(
+            self.similarity.evaluate,
+            nodes,
+            edges,
+            cancel_event=self._v841_peer_cancel,
+        ),
         "transfer": pool.submit(
             self.transfer.candidates,
             nodes,

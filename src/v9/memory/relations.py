@@ -1,0 +1,44 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+
+from .identity import MemoryUid
+
+
+class RelationType(str, Enum):
+    TEMPORAL = "TEMPORAL"
+    CO_OCCURS = "CO_OCCURS"
+    PROVENANCE = "PROVENANCE"
+    DEPENDS_ON = "DEPENDS_ON"
+    ENABLES = "ENABLES"
+    BLOCKS = "BLOCKS"
+    EXPLAINS = "EXPLAINS"
+    SIMILAR_TO = "SIMILAR_TO"
+    TRANSFER_CORRESPONDENCE = "TRANSFER_CORRESPONDENCE"
+    OUTCOME_EQUIVALENT = "OUTCOME_EQUIVALENT"
+    LEADS_TO = "LEADS_TO"
+    PREFERENCE = "PREFERENCE"
+    GROUNDS = "GROUNDS"
+    SUPERSEDES = "SUPERSEDES"
+
+
+class EdgeAuthority(str, Enum):
+    ACTIVE = "ACTIVE"
+    SUSPENDED = "SUSPENDED"
+    REJECTED = "REJECTED"
+
+
+@dataclass(frozen=True, slots=True)
+class RelationEdge:
+    source: MemoryUid
+    relation: RelationType
+    target: MemoryUid
+    evidence_uids: tuple[MemoryUid, ...] = ()
+    authority: EdgeAuthority = EdgeAuthority.ACTIVE
+    object_version: int = 0
+
+    @property
+    def key(self) -> tuple[MemoryUid, str, MemoryUid]:
+        return self.source, self.relation.value, self.target
+

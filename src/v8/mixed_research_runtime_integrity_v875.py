@@ -198,6 +198,7 @@ class _GenericProcessRuntime:
         watermark,
         stop_event,
         snapshot_freeze,
+        record_cut_path=None,
     ) -> None:
         from v8.ring import SharedRingBuffer
 
@@ -206,6 +207,20 @@ class _GenericProcessRuntime:
         self._stop = stop_event
         self._snapshot_freeze = snapshot_freeze
         self._ring = SharedRingBuffer(**experience_ring_args)
+        self._record_cut_path = record_cut_path
+        self._prepared_actor_read_view = None
+
+    def prepare_actor_read_view(self) -> None:
+        from v8 import actor
+
+        cuts = None
+        if self._record_cut_path:
+            cuts, _versions = actor.load_actor_record_cut_file(self._record_cut_path)
+        self._prepared_actor_read_view = actor.open_actor_read_view(
+            self.shard_descriptors,
+            refresh_interval_seconds=None,
+            record_cuts=cuts,
+        )
 
     @property
     def watermark(self) -> int:
@@ -260,6 +275,9 @@ class _GenericProcessRuntime:
             raise RuntimeError("generic actor failed to publish experience")
 
     def close(self) -> None:
+        if self._prepared_actor_read_view is not None:
+            self._prepared_actor_read_view.close()
+            self._prepared_actor_read_view = None
         self._ring.close()
 
 
@@ -273,15 +291,35 @@ def _generic_process_worker_v875(
     snapshot_freeze,
     result_queue,
     reporting_queue,
+    record_cut_path=None,
+    verified_success_root=None,
+    startup_ready=None,
+    startup_gate=None,
 ) -> None:
+    if verified_success_root:
+        from v8.verified_success_metrics_v866 import SUCCESS_ROOT_ENV
+
+        os.environ[SUCCESS_ROOT_ENV] = str(verified_success_root)
     runtime = _GenericProcessRuntime(
         experience_ring_args=experience_ring_args,
         read_descriptors=read_descriptors,
         watermark=watermark,
         stop_event=stop_event,
         snapshot_freeze=snapshot_freeze,
+        record_cut_path=record_cut_path,
     )
     try:
+        runtime.prepare_actor_read_view()
+        if startup_ready is not None:
+            startup_ready.set()
+        while (
+            startup_gate is not None
+            and not startup_gate.wait(0.05)
+            and not stop_event.is_set()
+        ):
+            pass
+        if stop_event.is_set():
+            return
         from v8 import mixed_environment_v859 as mixed
 
         result = mixed.run_generic_actor_job(
@@ -326,6 +364,11 @@ def _run_generic_jobs_v875(runtime, jobs, *, reporting_queue=None):
     runtime._v875_generic_active = True
     ctx = runtime._mp_ctx
     results = ctx.Queue()
+    startup_ready = tuple(ctx.Event() for _job in jobs)
+    startup_gate = ctx.Event()
+    from v8 import actor
+
+    record_cut_path = os.environ.get(actor.ACTOR_RECORD_CUT_ENV)
     processes = [
         ctx.Process(
             target=_generic_process_worker_v875,
@@ -338,17 +381,36 @@ def _run_generic_jobs_v875(runtime, jobs, *, reporting_queue=None):
                 "snapshot_freeze": runtime._snapshot_freeze,
                 "result_queue": results,
                 "reporting_queue": reporting_queue,
+                "record_cut_path": record_cut_path,
+                "startup_ready": startup_ready[index],
+                "startup_gate": startup_gate,
             },
             name=f"v8-generic-{int(job.actor_id):03d}-{job.game_id}",
             daemon=True,
         )
-        for job in jobs
+        for index, job in enumerate(jobs)
     ]
     by_actor = {}
     errors: list[str] = []
     try:
         for process in processes:
             process.start()
+        while not all(event.is_set() for event in startup_ready):
+            failed = [
+                process for process in processes
+                if process.exitcode not in (None, 0)
+            ]
+            if failed:
+                detail = ", ".join(
+                    f"{process.name}={process.exitcode}" for process in failed
+                )
+                raise RuntimeError(f"generic actor failed during startup: {detail}")
+            time.sleep(0.01)
+        startup_gate.set()
+        optimizer = getattr(runtime, "_v814_trajectory_optimizer", None)
+        resume_optimizer = getattr(optimizer, "resume_after_actor_startup", None)
+        if callable(resume_optimizer):
+            resume_optimizer()
         while len(by_actor) < len(jobs):
             try:
                 message = results.get(timeout=0.05)
@@ -379,6 +441,7 @@ def _run_generic_jobs_v875(runtime, jobs, *, reporting_queue=None):
             process.join(timeout=2.0)
         return tuple(by_actor[key] for key in sorted(by_actor))
     except BaseException:
+        startup_gate.set()
         for process in processes:
             if process.is_alive():
                 process.terminate()

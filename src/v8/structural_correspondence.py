@@ -81,9 +81,17 @@ class StructuralCorrespondenceEstimator:
         uids: set[MemoryUid],
         edges: tuple[EdgeRecord, ...],
         by_uid: dict[MemoryUid, NodeRecord],
+        *,
+        cancel_event=None,
     ) -> dict[MemoryUid, Counter[tuple[int, int, int, int]]]:
         descriptors = {uid: Counter() for uid in uids}
-        for edge in edges:
+        for index, edge in enumerate(edges):
+            if (
+                index % 4096 == 0
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                return {}
             relation = int(edge.relation_type)
             if relation not in cls._STRUCTURAL_RELATIONS:
                 continue
@@ -125,16 +133,26 @@ class StructuralCorrespondenceEstimator:
         edges: tuple[EdgeRecord, ...],
         *,
         budget: int = 256,
+        cancel_event=None,
     ) -> tuple[StructuralCorrespondence, ...]:
+        if cancel_event is not None and cancel_event.is_set():
+            return ()
         by_uid = {row.uid: row for row in nodes}
-        similarities = [
-            edge
-            for edge in edges
-            if int(edge.relation_type) == int(RelationType.SIMILAR_TO)
-            and float(edge.score) >= self.min_similarity
-            and edge.source_uid in by_uid
-            and edge.target_uid in by_uid
-        ]
+        similarities = []
+        for index, edge in enumerate(edges):
+            if (
+                index % 4096 == 0
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                return ()
+            if (
+                int(edge.relation_type) == int(RelationType.SIMILAR_TO)
+                and float(edge.score) >= self.min_similarity
+                and edge.source_uid in by_uid
+                and edge.target_uid in by_uid
+            ):
+                similarities.append(edge)
         similarities.sort(key=lambda edge: (-float(edge.score), edge.source_uid, edge.target_uid))
         selected = similarities[: max(0, int(budget))]
         descriptor_uids = {
@@ -142,9 +160,25 @@ class StructuralCorrespondenceEstimator:
             for edge in selected
             for uid in (edge.source_uid, edge.target_uid)
         }
-        descriptor_cache = self._descriptors(descriptor_uids, edges, by_uid)
+        if cancel_event is None:
+            descriptor_cache = self._descriptors(descriptor_uids, edges, by_uid)
+        else:
+            descriptor_cache = self._descriptors(
+                descriptor_uids,
+                edges,
+                by_uid,
+                cancel_event=cancel_event,
+            )
+        if cancel_event is not None and cancel_event.is_set():
+            return ()
         result: list[StructuralCorrespondence] = []
-        for edge in selected:
+        for index, edge in enumerate(selected):
+            if (
+                index % 64 == 0
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                return ()
             left = descriptor_cache[edge.source_uid]
             right = descriptor_cache[edge.target_uid]
             preserved_lr, mismatched_lr, mapping_lr, epsilon_lr = self._error(left, right)

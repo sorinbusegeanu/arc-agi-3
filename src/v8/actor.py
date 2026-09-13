@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import math
 import multiprocessing as mp
+import os
+import pickle
 import queue
+import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from random import Random
 from typing import Callable, Iterable
 
@@ -29,6 +33,81 @@ _LEARNING_PUBLISH_INTERVAL_SECONDS = 5.0
 _ACTOR_GRAPH_CHECK_INTERVAL_STEPS = 1_000
 _ACTOR_STARTUP_TIMEOUT_SECONDS = 300.0
 _ACTOR_RING_RETRY_SECONDS = 0.001
+ACTOR_RECORD_CUT_ENV = "ARC_AGI3_V8_ACTOR_RECORD_CUT"
+_ACTOR_RECORD_CUT_SCHEMA = 1
+
+
+def prepare_actor_record_cut_file(
+    read_descriptors: tuple[ShardReadDescriptor, ...],
+    directory: str | Path,
+) -> Path:
+    """Materialize one coherent actor cut for all workers in this invocation."""
+
+    record_cuts: dict[tuple[str, str], tuple[tuple[object, ...], int]] = {}
+    view = open_actor_read_view(
+        tuple(read_descriptors),
+        refresh_interval_seconds=None,
+        record_cuts=record_cuts,
+    )
+    try:
+        warm = getattr(view, "_warm_compact_cut", None)
+        if callable(warm):
+            warm()
+        versions = tuple(
+            int(arena.sequence)
+            for arena in (*tuple(view._nodes), *tuple(view._edges))
+        )
+        if any(version & 1 for version in versions):
+            raise RuntimeError("actor startup cut captured an in-flight graph version")
+        payload = (_ACTOR_RECORD_CUT_SCHEMA, versions, record_cuts)
+        target_dir = Path(directory)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        fd, raw_path = tempfile.mkstemp(
+            prefix=".actor-record-cut-",
+            suffix=".pickle",
+            dir=target_dir,
+        )
+        path = Path(raw_path)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        return path
+    finally:
+        view.close()
+
+
+def load_actor_record_cut_file(
+    path: str | Path,
+) -> tuple[
+    dict[tuple[str, str], tuple[tuple[object, ...], int]],
+    tuple[int, ...],
+]:
+    """Load the trusted, invocation-local compact cut prepared by the parent."""
+
+    with Path(path).open("rb") as stream:
+        payload = pickle.load(stream)
+    if not isinstance(payload, tuple) or len(payload) != 3:
+        raise RuntimeError("invalid actor startup cut payload")
+    schema, versions, record_cuts = payload
+    if int(schema) != _ACTOR_RECORD_CUT_SCHEMA:
+        raise RuntimeError(f"unsupported actor startup cut schema: {schema}")
+    if not isinstance(record_cuts, dict):
+        raise RuntimeError("invalid actor startup record-cut mapping")
+    return record_cuts, tuple(int(version) for version in versions)
+
+
+def _validate_actor_record_cut(view, expected_versions: tuple[int, ...]) -> None:
+    actual = tuple(
+        int(arena.sequence)
+        for arena in (*tuple(view._nodes), *tuple(view._edges))
+    )
+    if actual != tuple(expected_versions) or any(version & 1 for version in actual):
+        raise RuntimeError(
+            "actor startup graph changed while the shared coherent cut was distributed"
+        )
 
 
 def _publish_actor_packet(
@@ -445,6 +524,7 @@ def actor_worker(
     startup_ready: mp.synchronize.Event | None = None,
     startup_gate: mp.synchronize.Event | None = None,
     record_cuts: dict[tuple[str, str], tuple[tuple[object, ...], int]] | None = None,
+    record_cut_path: str | None = None,
 ) -> None:
     from v7.environment.arc_adapter import ArcGridEnvironment
     from v7.environment.encoding import (
@@ -455,12 +535,18 @@ def actor_worker(
         transition_signature,
     )
 
+    expected_record_versions: tuple[int, ...] | None = None
+    if record_cuts is None and record_cut_path:
+        record_cuts, expected_record_versions = load_actor_record_cut_file(record_cut_path)
+
     ring = SharedRingBuffer(**experience_ring_args)
     view = open_actor_read_view(
         read_descriptors,
         refresh_interval_seconds=None,
         record_cuts=record_cuts,
     )
+    if expected_record_versions is not None:
+        _validate_actor_record_cut(view, expected_record_versions)
     rng = Random(job.seed)
     env = ArcGridEnvironment(game_id=job.game_id, seed=job.seed, env_root=job.env_root)
     terminal_wait_seconds = max(0.0, float(env.game_wait_seconds))

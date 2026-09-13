@@ -614,6 +614,25 @@ def _prefix_for(service, candidate) -> tuple[int, ...]:
     return original
 
 
+def _wait_until_optimizer_resumed(service) -> bool:
+    gate = getattr(service, "_v818_actor_startup_gate", None)
+    if gate is None:
+        return not service._stop.is_set()
+    while not service._stop.is_set():
+        if gate.wait(0.10):
+            return True
+    return False
+
+
+def _pause_for_actor_startup(service) -> None:
+    """Suspend backlog generation and validation while actors load one graph cut."""
+    service._v818_actor_startup_gate.clear()
+
+
+def _resume_after_actor_startup(service) -> None:
+    service._v818_actor_startup_gate.set()
+
+
 def _record_validated_prefix(service, candidate, result) -> None:
     game = str(candidate.source.anchor.source_id)
     level = max(0, int(candidate.source.target.levels_completed))
@@ -630,6 +649,8 @@ def _optimizer_loop_v818(service) -> None:
 
     try:
         while not service._stop.is_set():
+            if not _wait_until_optimizer_resumed(service):
+                return
             _restore_pending_sources(service)
             _ingest_inbox_v818(service)
             _start_waiting_validators(service)
@@ -707,6 +728,8 @@ def _game_validator_loop(service, game_id: str) -> None:
     processed = 0
     try:
         while not service._stop.is_set():
+            if not _wait_until_optimizer_resumed(service):
+                return
             with service._v818_validator_lock:
                 q = service._v818_game_queues.setdefault(
                     game, queue.Queue(maxsize=_PER_GAME_QUEUE_CAPACITY)
@@ -979,6 +1002,9 @@ def _start_v818(service) -> None:
 
 
 def _stop_v818(service, *, drain: bool = True, timeout: float = 10.0) -> None:
+    gate = getattr(service, "_v818_actor_startup_gate", None)
+    if gate is not None:
+        gate.set()
     if drain:
         _drain_v818(service, timeout=max(0.0, float(timeout) * 0.7))
     service._stop.set()
@@ -1425,6 +1451,8 @@ def install_trajectory_optimizer_v818() -> None:
 
     def service_init(self, *args, **kwargs):
         _BASE_SERVICE_INIT(self, *args, **kwargs)
+        self._v818_actor_startup_gate = threading.Event()
+        self._v818_actor_startup_gate.set()
         self._v818_validator_lock = threading.RLock()
         self._v818_game_queues: dict[str, queue.Queue] = {}
         self._v818_pending_sources: dict[str, dict[str, object]] = {}
@@ -1450,6 +1478,8 @@ def install_trajectory_optimizer_v818() -> None:
     optimizer.TrajectoryOptimizationService._ingest_inbox = _ingest_inbox_v818
     optimizer.TrajectoryOptimizationService.start = _start_v818
     optimizer.TrajectoryOptimizationService.stop = _stop_v818
+    optimizer.TrajectoryOptimizationService.pause_for_actor_startup = _pause_for_actor_startup
+    optimizer.TrajectoryOptimizationService.resume_after_actor_startup = _resume_after_actor_startup
     optimizer.TrajectoryOptimizationService.drain = _drain_v818
     optimizer.TrajectoryOptimizationService.state_dict = _state_dict_v818
     optimizer.TrajectoryOptimizationService.load_state = _load_state_v818

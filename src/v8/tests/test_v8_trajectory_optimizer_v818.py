@@ -4,6 +4,7 @@ import io
 import queue
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
@@ -252,6 +253,29 @@ class MigrationTests(unittest.TestCase):
                 [row.trajectory_id],
             )
             self.assertNotIn(row.trajectory_id, state["seen_sources"])
+
+
+class ActorStartupOptimizerGateTests(unittest.TestCase):
+    def test_optimizer_backlog_waits_until_actor_startup_is_released(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            service = TrajectoryOptimizationService(
+                Path(root),
+                validator=lambda _candidate: None,
+            )
+            service.pause_for_actor_startup()
+            service.start()
+            try:
+                self.assertTrue(service.submit_trajectory(source((1, 2, 3, 4))))
+                threading.Event().wait(0.10)
+                self.assertEqual(service._candidates_generated, 0)
+
+                service.resume_after_actor_startup()
+                deadline = time.monotonic() + 2.0
+                while service._candidates_generated == 0 and time.monotonic() < deadline:
+                    threading.Event().wait(0.01)
+                self.assertGreater(service._candidates_generated, 0)
+            finally:
+                service.stop(drain=False, timeout=1.0)
 
 
 class CandidateSchedulingTests(unittest.TestCase):

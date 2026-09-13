@@ -21,6 +21,7 @@ rest of the run.
 """
 
 import math
+import os
 import statistics
 from collections import defaultdict
 from collections import deque
@@ -152,20 +153,37 @@ def configure_actor_exploration_v848(env, sampler, *, actor_id: int) -> None:
     env._v848_actor_lane = lane
     sampler._v848_actor_lane = lane
 
-    # One lane in four resumes the strongest verified prefix.  The remaining
-    # lanes continue independent discovery, so replay cannot collapse the whole
-    # pool onto one trajectory.
-    if int(actor_id) <= 0 or int(actor_id) % 4:
-        return
+    from v8 import adaptive_learning_allocation_v819 as v819
+
+    mode = os.environ.get(
+        v819._SAMPLING_MODE_ENV,
+        v819.SamplingMode.DISCOVERY.value,
+    ).strip().upper()
     try:
         from v8.verified_success_metrics_v866 import (
             best_durable_complete_v866,
             best_historical_partial_v866,
         )
 
-        partial = best_durable_complete_v866(str(sampler.game_id))
-        if partial is None:
-            partial = best_historical_partial_v866(str(sampler.game_id))
+        complete = best_durable_complete_v866(str(sampler.game_id))
+        if complete is not None and mode == v819.SamplingMode.VERIFY.value:
+            # VERIFY has one job: reproduce the strongest reset-relative route.
+            # Do this on every verification lease so actor-id scheduling cannot
+            # silently skip durable competence.
+            partial = complete
+        elif (
+            mode == v819.SamplingMode.DISCOVERY.value
+            and int(actor_id) > 0
+            and int(actor_id) % 4 == 0
+        ):
+            # Only one discovery lane in four receives historical guidance;
+            # independent lanes retain action diversity.
+            partial = complete
+            if partial is None:
+                partial = best_historical_partial_v866(str(sampler.game_id))
+        else:
+            # Preferred replay would invalidate ALTERNATIVE and TRANSFER trials.
+            return
     except (OSError, TypeError, ValueError):
         partial = None
     if not isinstance(partial, dict):

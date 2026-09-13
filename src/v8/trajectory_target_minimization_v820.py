@@ -635,6 +635,8 @@ def _game_validator_loop_v820(service, game_id: str) -> None:
     processed = 0
     try:
         while not service._stop.is_set():
+            if not v818._wait_until_optimizer_resumed(service):
+                return
             if _validation_cancel_requested(service):
                 break
             with service._v818_validator_lock:

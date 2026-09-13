@@ -59,6 +59,19 @@ class LearningControlContinuityV826Tests(unittest.TestCase):
         base.assert_called_once_with(view, 456, (1, 2))
         self.assertTrue(v822._PROBE_STATE.before_plan)
 
+    def test_bootstrap_is_only_consulted_after_base_planner_is_empty(self) -> None:
+        bootstrap_plan = object()
+        with (
+            patch.object(repair, "_BASE_PLAN_CANDIDATES", return_value=()),
+            patch(
+                "v8.strategy_empirical_bootstrap_v881._bootstrap_plan",
+                return_value=bootstrap_plan,
+            ) as bootstrap,
+        ):
+            rows = repair._plan_candidates_v826(object(), 789, (1, 2))
+        self.assertEqual(rows, (bootstrap_plan,))
+        bootstrap.assert_called_once()
+
     def test_unsolved_budget_is_not_split_at_2048(self) -> None:
         self.assertEqual(
             repair.episode_aligned_unsolved_lease_steps_v826(

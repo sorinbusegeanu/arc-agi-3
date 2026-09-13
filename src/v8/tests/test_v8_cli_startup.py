@@ -135,6 +135,13 @@ class HypothesisStartupDelayTests(unittest.TestCase):
         runtime = Mock()
         runtime.read_view.memory_count = 0
         runtime.peers = Mock()
+        runtime.shard_descriptors = ()
+        startup: list[str] = []
+        runtime._v814_trajectory_optimizer = SimpleNamespace(
+            pause_for_actor_startup=lambda: startup.append("optimizer paused"),
+            resume_after_actor_startup=lambda: startup.append("optimizer resumed"),
+        )
+        runtime.start.side_effect = lambda: startup.append("runtime started")
         runtime._v819_adaptive_learning = SimpleNamespace(
             game_state=lambda _game: SimpleNamespace(value="SOLVED_OPTIMIZING")
         )
@@ -146,6 +153,7 @@ class HypothesisStartupDelayTests(unittest.TestCase):
         runtime.close.return_value = None
         reporter = Mock()
         reporter.progress_queue = object()
+        reporter.start.side_effect = lambda: startup.append("reporter started")
         lifecycle: list[str] = []
         reporter.close.side_effect = lambda **_kwargs: lifecycle.append("reporter stopped")
         runtime.wait_quiescent.side_effect = lambda **_kwargs: lifecycle.append("runtime drained")
@@ -168,6 +176,11 @@ class HypothesisStartupDelayTests(unittest.TestCase):
             patch("v8.cli._runtime_config"),
             patch("v8.cli.ContinuousMemoryRuntime", return_value=runtime),
             patch("v8.cli.DedicatedReporter", return_value=reporter) as reporter_type,
+            patch(
+                "v8.cli.prepare_actor_record_cut_file",
+                side_effect=lambda *_args: startup.append("cut prepared")
+                or Path("unused/.test-actor-cut"),
+            ) as prepare_cut,
             patch("v8.cli.run_actor_jobs", side_effect=run_jobs),
             patch(
                 "v8.cli.run_automatic_transfer_experiments",
@@ -179,8 +192,20 @@ class HypothesisStartupDelayTests(unittest.TestCase):
             self.assertEqual(run_continuous(args), 0)
 
         reporter_type.assert_called_once()
+        prepare_cut.assert_called_once()
+        self.assertEqual(
+            startup[:4],
+            [
+                "optimizer paused",
+                "runtime started",
+                "reporter started",
+                "cut prepared",
+            ],
+        )
+        self.assertIn("optimizer resumed", startup)
         self.assertEqual(reporter_type.call_args.kwargs["interval_seconds"], 60.0)
         self.assertEqual(reporter_type.call_args.kwargs["total_steps"], 1)
+        self.assertTrue(reporter_type.call_args.kwargs["emit_startup_heartbeat"])
         progress_baseline = reporter_type.call_args.kwargs["baseline"]
         self.assertEqual(progress_baseline.game_ids, ("tt01",))
         self.assertEqual(progress_baseline.solved_games, 1)

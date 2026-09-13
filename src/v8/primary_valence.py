@@ -798,6 +798,9 @@ def _install_runtime_learning_semantics() -> None:
     def record_actor_results(self, results):
         results = tuple(results); original_record(self, results)
         if not hasattr(self, "_primary_valence_sequence"): self._primary_valence_sequence = 0
+        evidence_rows = []
+        cached_nodes = getattr(self.read_view, "_node_by_uid", {})
+        m6_by_uid = None
         for result in results:
             game_hash = world_id(result.game_id)
             for credit in getattr(result, "primary_valence_credits", ()):
@@ -810,9 +813,13 @@ def _install_runtime_learning_semantics() -> None:
                     primary_valence_sum=float(credit.valence_sum), primary_valence_sq_sum=float(credit.valence_sq_sum),
                     primary_valence_weight=float(credit.weight), positive_valence_count=float(credit.positive_count),
                     negative_valence_count=float(credit.negative_count))
-                self.submit_proposal(proposal)
+                accepted = self.submit_proposal(proposal, timeout=None)
+                if accepted is False:
+                    raise RuntimeError(
+                        "runtime stopped before primary-valence credit was committed"
+                    )
                 if self.peers is not None:
-                    self.peers.ledger.append(EvidenceRecord.for_uid(
+                    evidence_rows.append(EvidenceRecord.for_uid(
                         f"primary-valence:{result.actor_id}:{self._primary_valence_sequence}", credit.uid,
                         evidence_kind="primary_valence_credit", watermark=self.watermark, raw_value=float(credit.valence_sum),
                         normalized_value=min(1.0, abs(float(credit.valence_sum))), developmental_stage=int(credit.level),
@@ -824,12 +831,32 @@ def _install_runtime_learning_semantics() -> None:
                     self.peers.record_preference_probe(outcome_a=preference.preferred, outcome_b=preference.other,
                         context_bucket=preference.context_bucket, chosen_outcome=preference.preferred,
                         both_reachable=True, preference_influenced=False)
-                    preferred = next((row for row in self.read_view.node_records(level=_model.MemoryLevel.M6)
-                        if row.uid == preference.preferred), None)
+                    preferred = cached_nodes.get(preference.preferred)
+                    if preferred is None:
+                        if m6_by_uid is None:
+                            m6_by_uid = {
+                                row.uid: row
+                                for row in self.read_view.node_records(
+                                    level=_model.MemoryLevel.M6
+                                )
+                            }
+                        preferred = m6_by_uid.get(preference.preferred)
                     if preferred is not None:
-                        self.peers._append_evidence("primary_valence_preference", preferred,
-                            min(1.0, abs(float(preference.strength))), unique=True,
-                            causal_intervention="realized_primary_valence", effect_direction=1)
+                        self.peers._append_evidence(
+                            "primary_valence_preference",
+                            preferred,
+                            min(1.0, abs(float(preference.strength))),
+                            unique=True,
+                            causal_intervention="realized_primary_valence",
+                            effect_direction=1,
+                        )
+        if self.peers is not None and evidence_rows:
+            append_many = getattr(self.peers.ledger, "append_many", None)
+            if callable(append_many):
+                append_many(evidence_rows)
+            else:
+                for evidence in evidence_rows:
+                    self.peers.ledger.append(evidence)
 
     runtime_module.ContinuousMemoryRuntime.record_actor_results = record_actor_results
 

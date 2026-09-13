@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import deque
+import os
+import threading
 
 from v8.actor import ActorResult, StrategyRunStat, _stats_tuple, _trajectory_step_cost
 from v8.behavior_recovery import _score_strategy_rows, _strategy_can_probe
@@ -13,6 +15,7 @@ _BASE_PLAN_CANDIDATES = None
 _BASE_ACTOR_PLAN_CANDIDATES = None
 _BASE_RUN_MIXED_ACTOR_JOBS = None
 _BOOTSTRAP_ATTEMPTS = 3
+_BOOTSTRAP_SCOPE = threading.local()
 
 
 def _missing_bootstrap_attempts(row, local_attempts: int) -> int:
@@ -20,7 +23,49 @@ def _missing_bootstrap_attempts(row, local_attempts: int) -> int:
     return max(0, _BOOTSTRAP_ATTEMPTS - committed - max(0, int(local_attempts)))
 
 
+def _bootstrap_discovery_enabled() -> bool:
+    from v8 import adaptive_learning_allocation_v819 as v819
+
+    mode = os.environ.get(
+        v819._SAMPLING_MODE_ENV,
+        v819.SamplingMode.DISCOVERY.value,
+    ).strip().upper()
+    return mode in {"", v819.SamplingMode.DISCOVERY.value}
+
+
+def _current_source_game_hash() -> int | None:
+    scoped = getattr(_BOOTSTRAP_SCOPE, "source_game_hash", None)
+    if scoped is not None:
+        return int(scoped)
+
+    from v8 import trajectory_optimizer_v814 as optimizer
+
+    game_id = str(getattr(optimizer, "_CAPTURE_SOURCE_ID", "")).strip()
+    if not game_id:
+        return None
+    from v8.persistent_identity import arc_world_id
+
+    return int(arc_world_id(game_id))
+
+
+def _strategy_matches_current_world(view, strategy_uid) -> bool:
+    """Bootstrap only direct or inherited evidence from the actor's world."""
+
+    current_world = _current_source_game_hash()
+    source_games = getattr(view, "source_games", None)
+    if current_world is None or not callable(source_games):
+        return False
+    try:
+        return int(current_world) in {
+            int(value) for value in source_games(strategy_uid)
+        }
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _bootstrap_plan(view: LiveReadView, context_signature: int, action_ids):
+    if not _bootstrap_discovery_enabled():
+        return None
     if not (
         bool(getattr(view, "_behavior_actor_mode", False))
         or bool(getattr(view, "_v881_generic_actor_mode", False))
@@ -42,6 +87,8 @@ def _bootstrap_plan(view: LiveReadView, context_signature: int, action_ids):
             continue
         local_count = int(local.get(item.strategy_uid, 0))
         if _missing_bootstrap_attempts(source, local_count) <= 0:
+            continue
+        if not _strategy_matches_current_world(view, item.strategy_uid):
             continue
         if not _strategy_can_probe(view, item.strategy_uid, item.outcome_uid):
             continue
@@ -79,24 +126,26 @@ def _bootstrap_plan(view: LiveReadView, context_signature: int, action_ids):
 
 def _plan_candidates_v881(self: LiveReadView, context_signature: int, action_ids, **kwargs):
     # Explicit replanning/target-selection calls keep their original semantics.
-    if not kwargs:
-        bootstrap = _bootstrap_plan(self, context_signature, action_ids)
-        if bootstrap is not None:
-            return (bootstrap,)
-    return _BASE_PLAN_CANDIDATES(self, context_signature, action_ids, **kwargs)
+    plans = tuple(_BASE_PLAN_CANDIDATES(self, context_signature, action_ids, **kwargs))
+    if plans or kwargs:
+        return plans
+    bootstrap = _bootstrap_plan(self, context_signature, action_ids)
+    return () if bootstrap is None else (bootstrap,)
 
 
 def _actor_plan_candidates_v881(self, context_signature: int, action_ids, **kwargs):
     # ``memory_efficiency_v851`` installs a compact ActorReadView with its own
     # planner implementation. Preserve that class-specific delegate rather than
     # invoking the publication-view method on a different representation.
-    if not kwargs:
-        bootstrap = _bootstrap_plan(self, context_signature, action_ids)
-        if bootstrap is not None:
-            return (bootstrap,)
-    return _BASE_ACTOR_PLAN_CANDIDATES(
-        self, context_signature, action_ids, **kwargs
+    plans = tuple(
+        _BASE_ACTOR_PLAN_CANDIDATES(
+            self, context_signature, action_ids, **kwargs
+        )
     )
+    if plans or kwargs:
+        return plans
+    bootstrap = _bootstrap_plan(self, context_signature, action_ids)
+    return () if bootstrap is None else (bootstrap,)
 
 
 def _selected_generic_plan(view, action: int, planned: bool):
@@ -136,6 +185,8 @@ def _run_generic_actor_job_v881(runtime, job, *, reporting_queue=None) -> ActorR
     adapter = mixed.make_adapter(job.game_id, seed=adapter_seed)
     view, owns_view = mixed._generic_read_view(runtime)
     view._v881_generic_actor_mode = True
+    prior_source_game_hash = getattr(_BOOTSTRAP_SCOPE, "source_game_hash", None)
+    _BOOTSTRAP_SCOPE.source_game_hash = int(adapter.identity.source_hash)
     rng = Random(int(job.seed))
     sequence = wins = failures = resets = planned_steps = 0
     strategy_stats = {}
@@ -314,6 +365,13 @@ def _run_generic_actor_job_v881(runtime, job, *, reporting_queue=None) -> ActorR
             _stats_tuple(strategy_stats),
         )
     finally:
+        if prior_source_game_hash is None:
+            try:
+                del _BOOTSTRAP_SCOPE.source_game_hash
+            except AttributeError:
+                pass
+        else:
+            _BOOTSTRAP_SCOPE.source_game_hash = int(prior_source_game_hash)
         if owns_view:
             view.close()
         adapter.close()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -519,6 +520,100 @@ class V088LearningFixTests(unittest.TestCase):
         from random import Random
 
         self.assertEqual(_memory_free_action((1, 2, 3), Random(11)), _memory_free_action((1, 2, 3), Random(11)))
+
+    def test_indexed_probe_plan_is_reused_without_graph_ancestry_queries(self):
+        from v8 import behavior_recovery
+
+        ancestor = MemoryUid(11, 12)
+        strategy = MemoryUid(13, 14)
+        outcome = MemoryUid(15, 16)
+        row = _StrategyRow(2, outcome, strategy, 3, 0.8, 2.0, 7, False, False)
+        index = learning._TransferAnalysisIndex(
+            token=("test",),
+            node_by_uid={},
+            uid_by_text={},
+            parents={},
+            children={},
+            descendant_rows={ancestor: ()},
+            strategies_by_ancestor={ancestor: (row,)},
+            controllable_strategies=frozenset({strategy}),
+            plan_cache={},
+            neighborhood_descriptors=None,
+            structural_descriptors={},
+        )
+        bucket = learning.stable_u64(99, person=b"v8-context")
+        view = SimpleNamespace(
+            _v088_transfer_analysis_index=index,
+            _strategy_by_context={bucket: (row,)},
+            _strategy_fallback=(row,),
+            _preferred_outcomes=frozenset(),
+        )
+        plan = SimpleNamespace(strategy_uid=strategy)
+        with patch.object(
+            behavior_recovery, "_score_strategy_rows", return_value=(plan,)
+        ) as score:
+            first = learning._indexed_ancestor_plan(view, ancestor, 99, (2,))
+            second = learning._indexed_ancestor_plan(view, ancestor, 99, (2,))
+
+        self.assertEqual(first, (True, plan))
+        self.assertEqual(second, first)
+        score.assert_called_once()
+
+    def test_matched_probe_worker_keeps_both_branches_on_one_capture(self):
+        ancestor = MemoryUid(21, 22)
+        captured = SimpleNamespace(environment=object(), capture_id="same-state")
+        calls = []
+
+        def probe(**kwargs):
+            calls.append(
+                (
+                    kwargs["required_ancestor"],
+                    kwargs["target_state_capture_id"],
+                )
+            )
+            kwargs["diagnostic"]["branch"] = (
+                "on" if kwargs["required_ancestor"] is not None else "off"
+            )
+            return (1.0, 1) if kwargs["required_ancestor"] is not None else (0.0, 0)
+
+        with patch.object(
+            learning, "_capture_target_probe_state", return_value=captured
+        ) as capture, patch.object(
+            learning, "_restore_target_probe_state", side_effect=(object(), object())
+        ) as restore, patch.object(learning, "_probe_policy_v088", side_effect=probe):
+            result = learning._run_matched_probe_pair_v088(
+                {
+                    "read_view": object(),
+                    "game_id": "target",
+                    "env_root": None,
+                    "seed": 7,
+                    "steps": 4,
+                    "required_ancestor": ancestor,
+                    "target_hash": 987654321,
+                    "execution_evidence": {},
+                }
+            )
+
+        capture.assert_called_once()
+        self.assertEqual(restore.call_count, 2)
+        self.assertEqual(calls, [(ancestor, "same-state"), (None, "same-state")])
+        self.assertEqual(result["capture_id"], "same-state")
+        self.assertEqual(result["probe_diagnostic"]["branch"], "on")
+        self.assertEqual(result["control_diagnostic"]["branch"], "off")
+
+    def test_parallel_transfer_workers_are_production_only(self):
+        ProductionRuntime = type(
+            "ProductionRuntime", (), {"__module__": "v8.runtime_v82"}
+        )
+        runtime = ProductionRuntime()
+        runtime._mp_ctx = object()
+
+        with patch.dict(os.environ, {"ARC_AGI3_V8_TRANSFER_WORKERS": "3"}):
+            self.assertEqual(learning._parallel_transfer_worker_count(runtime, 8), 3)
+        self.assertEqual(
+            learning._parallel_transfer_worker_count(SimpleNamespace(_mp_ctx=object()), 8),
+            0,
+        )
 
 
 if __name__ == "__main__":

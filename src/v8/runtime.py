@@ -409,17 +409,22 @@ class ContinuousMemoryRuntime:
                 self._watermark.value = max(current, assigned)
             self._submitted_event_ids.add(event_key)
 
-    def submit_proposal(self, proposal: MemoryProposal, *, timeout: float = 0.25) -> None:
+    def submit_proposal(
+        self, proposal: MemoryProposal, *, timeout: float | None = 0.25
+    ) -> bool:
         if self._closed or self._stop.is_set():
-            return
+            return False
         shard = proposal.uid.shard(len(self._shard_rings))
-        deadline = time.monotonic() + float(timeout)
+        deadline = (
+            None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        )
         payload = encode_proposal(proposal)
         while not self._stop.is_set():
             if self._shard_rings[shard].put(payload, timeout=0.05):
-                return
-            if time.monotonic() >= deadline:
-                return
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+        return False
 
     def raise_worker_errors(self) -> None:
         errors = []
@@ -611,6 +616,8 @@ class ContinuousMemoryRuntime:
     def record_actor_results(self, results) -> None:
         if self.peers is None:
             return
+        cached_nodes = getattr(self.read_view, "_node_by_uid", {})
+        m7_by_uid = None
         for result in results:
             game_hash = world_id(result.game_id)
             for stat in getattr(result, "strategy_stats", ()):
@@ -643,14 +650,16 @@ class ContinuousMemoryRuntime:
                 )
                 recorded_trials.append(recorded)
                 if not recorded.valid_recovery:
-                    alternative = next(
-                        (
-                            row
-                            for row in self.read_view.node_records(level=MemoryLevel.M7)
-                            if row.uid == trial.alternative_strategy_uid
-                        ),
-                        None,
-                    )
+                    alternative = cached_nodes.get(trial.alternative_strategy_uid)
+                    if alternative is None:
+                        if m7_by_uid is None:
+                            m7_by_uid = {
+                                row.uid: row
+                                for row in self.read_view.node_records(
+                                    level=MemoryLevel.M7
+                                )
+                            }
+                        alternative = m7_by_uid.get(trial.alternative_strategy_uid)
                     if alternative is not None:
                         self.peers._append_evidence(
                             "replanning_recovery_fail",

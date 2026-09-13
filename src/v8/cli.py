@@ -7,7 +7,12 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-from v8.actor import ActorJob, run_actor_jobs
+from v8.actor import (
+    ACTOR_RECORD_CUT_ENV,
+    ActorJob,
+    prepare_actor_record_cut_file,
+    run_actor_jobs,
+)
 from v8.capacity import plan_capacities
 from v8.experiments import ExperimentSummary, run_automatic_transfer_experiments
 from v8.lifecycle_switch_v827 import LIFECYCLE_ENV
@@ -257,6 +262,12 @@ def run_continuous(args) -> int:
     try:
         previous_wait = os.environ.get(_GAME_WAIT_ENV)
         previous_lifecycle = os.environ.get(LIFECYCLE_ENV)
+        previous_actor_record_cut = os.environ.get(ACTOR_RECORD_CUT_ENV)
+        actor_record_cut_path: Path | None = None
+        optimizer = getattr(runtime, "_v814_trajectory_optimizer", None)
+        pause_optimizer = getattr(optimizer, "pause_for_actor_startup", None)
+        resume_optimizer = getattr(optimizer, "resume_after_actor_startup", None)
+        optimizer_paused = False
         os.environ[_GAME_WAIT_ENV] = str(float(args.wait))
         os.environ[LIFECYCLE_ENV] = lifecycle
         try:
@@ -265,7 +276,9 @@ def run_continuous(args) -> int:
             # has obtained that coherent cut.
             if runtime.peers is not None:
                 runtime.peers.pause()
-            runtime.start()
+            if callable(pause_optimizer):
+                pause_optimizer()
+                optimizer_paused = True
             print(
                 f"v8 continuous: games={len(games)} actors={len(jobs)} shards={args.shards} "
                 f"stage_workers={args.stage_workers} peers={'off' if args.no_peers else 'on'} "
@@ -286,6 +299,13 @@ def run_continuous(args) -> int:
                 games=games,
                 durable_solved_games=restored_solved,
             )
+            # ``DedicatedReporter`` is a process.  With the forkserver start
+            # method, the first child freezes the environment inherited by all
+            # later workers.  Start the runtime first so v8.66 installs the
+            # invocation-local verified-success root before any child exists.
+            # Peers and the optimizer are already paused, so no graph writer can
+            # race the coherent actor cut below.
+            runtime.start()
             reporter = DedicatedReporter(
                 runtime._mp_ctx,
                 watermark=runtime._watermark,
@@ -293,13 +313,27 @@ def run_continuous(args) -> int:
                 interval_seconds=args.progress_interval_seconds,
                 total_steps=total_steps,
                 baseline=progress_baseline,
+                emit_progress=False,
+                emit_startup_heartbeat=True,
             )
             reporter.start()
-            if runtime.peers is not None:
-                runtime.peers.ledger.set_append_listener(
-                    reporter.publish_evidence,
-                    replay=True,
+            descriptors = getattr(runtime, "shard_descriptors", None)
+            if isinstance(descriptors, tuple):
+                _log("actor startup: preparing one shared coherent read view")
+                cut_started = time.monotonic()
+                actor_record_cut_path = prepare_actor_record_cut_file(
+                    descriptors,
+                    Path(args.root) / "maintenance",
                 )
+                os.environ[ACTOR_RECORD_CUT_ENV] = str(actor_record_cut_path)
+                _log(
+                    "actor startup: shared coherent read view ready "
+                    f"seconds={time.monotonic() - cut_started:.1f} "
+                    f"bytes={actor_record_cut_path.stat().st_size if actor_record_cut_path.exists() else 0}"
+                )
+            # The installed reporter reads the disk-backed ledger at its own
+            # hypothesis interval. Mirroring every evidence row through an IPC
+            # queue duplicates work and can block actor-feedback ingestion.
             results = run_actor_jobs(
                 runtime,
                 jobs,
@@ -317,6 +351,14 @@ def run_continuous(args) -> int:
                 os.environ.pop(LIFECYCLE_ENV, None)
             else:
                 os.environ[LIFECYCLE_ENV] = previous_lifecycle
+            if previous_actor_record_cut is None:
+                os.environ.pop(ACTOR_RECORD_CUT_ENV, None)
+            else:
+                os.environ[ACTOR_RECORD_CUT_ENV] = previous_actor_record_cut
+            if actor_record_cut_path is not None:
+                actor_record_cut_path.unlink(missing_ok=True)
+            if optimizer_paused and callable(resume_optimizer):
+                resume_optimizer()
 
         sampling_complete_queued = (
             getattr(runtime, "_v839_sampling_done_reported", False) is True

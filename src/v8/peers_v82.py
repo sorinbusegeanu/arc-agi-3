@@ -261,7 +261,10 @@ class V82DevelopmentalPeerSupervisor(DevelopmentalPeerSupervisor):
 
         by_uid = {row.uid: row for row in cut.nodes}
         evaluated = tuple(self.correspondence.evaluate(
-            cut.nodes, cut.edges, budget=self.candidate_budget,
+            cut.nodes,
+            cut.edges,
+            budget=self.candidate_budget,
+            cancel_event=getattr(self, "_v841_peer_cancel", None),
         ))
         rejected: Counter[str] = Counter()
         examples: list[dict[str, object]] = []

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import queue
+import pickle
+import sqlite3
 import tempfile
 import threading
 import time
@@ -17,6 +19,31 @@ from v8.peers_v82 import _FrozenCutReadView, V82DevelopmentalPeerSupervisor
 
 
 class FeedbackScalingTests(unittest.TestCase):
+    def test_feedback_worker_resumes_rows_not_started_by_previous_process(self):
+        seen = []
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "feedback_queue.sqlite3"
+            database = sqlite3.connect(path)
+            database.execute(
+                "CREATE TABLE feedback (id INTEGER PRIMARY KEY, payload BLOB NOT NULL)"
+            )
+            database.execute(
+                "INSERT INTO feedback(payload) VALUES (?)",
+                (pickle.dumps(("preserved",)),),
+            )
+            database.commit()
+            database.close()
+
+            worker = v841._SqliteBatchWorker(
+                lambda rows: seen.extend(rows),
+                name="v841-feedback-resume-test",
+                root=Path(root),
+            )
+            worker.close(timeout=1.0)
+
+            self.assertEqual(seen, ["preserved"])
+            self.assertEqual(worker.metrics()[:3], (1, 1, 0))
+
     def test_strategy_statistics_use_existing_index_without_graph_scan(self):
         uid = MemoryUid(1, 2)
         row = SimpleNamespace(uid=uid, level=int(MemoryLevel.M7))

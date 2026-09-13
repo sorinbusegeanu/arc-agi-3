@@ -56,32 +56,41 @@ class DiskBackedEvidenceLedger:
         return EvidenceRecord(**payload)
 
     def append(self, row) -> bool:
-        if row.evidence_available_watermark > row.decision_watermark:
-            raise ValueError("future evidence cannot influence an earlier decision")
-        if not row.quality_valid():
-            raise ValueError("invalid scientific evidence quality/normalization")
+        return self.append_many((row,)) == 1
+
+    def append_many(self, rows) -> int:
+        rows = tuple(rows)
+        for row in rows:
+            if row.evidence_available_watermark > row.decision_watermark:
+                raise ValueError("future evidence cannot influence an earlier decision")
+            if not row.quality_valid():
+                raise ValueError("invalid scientific evidence quality/normalization")
+        inserted = []
         with self._lock:
-            cursor = self._db.execute(
-                "INSERT OR IGNORE INTO evidence "
-                "(evidence_id,available,decision,uid,effect_direction,causal,payload) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (
-                    str(row.evidence_id),
-                    int(row.evidence_available_watermark),
-                    int(row.decision_watermark),
-                    row.uid.hex(),
-                    int(row.effect_direction),
-                    str(row.causal_intervention),
-                    self._encode(row),
-                ),
-            )
-            inserted = int(cursor.rowcount) > 0
+            for row in rows:
+                cursor = self._db.execute(
+                    "INSERT OR IGNORE INTO evidence "
+                    "(evidence_id,available,decision,uid,effect_direction,causal,payload) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (
+                        str(row.evidence_id),
+                        int(row.evidence_available_watermark),
+                        int(row.decision_watermark),
+                        row.uid.hex(),
+                        int(row.effect_direction),
+                        str(row.causal_intervention),
+                        self._encode(row),
+                    ),
+                )
+                if int(cursor.rowcount) > 0:
+                    inserted.append(row)
             if inserted:
                 self._db.commit()
-            listener = self._append_listener if inserted else None
+            listener = self._append_listener
         if listener is not None:
-            listener(row)
-        return inserted
+            for row in inserted:
+                listener(row)
+        return len(inserted)
 
     def set_append_listener(self, listener, *, replay: bool = False) -> None:
         with self._lock:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import types
+import time
 import unittest
 from unittest.mock import patch
 
@@ -168,6 +169,31 @@ class StabilizationNoopRetryV883Tests(unittest.TestCase):
         finally:
             v883._BASE_FULL_CUT_RUN_ONCE = original
             v883._run_formation_cut_once = original_formation
+
+    def test_deadline_never_cancels_a_developmental_cut_mid_transaction(self):
+        supervisor = _Supervisor()
+        original_formation = v883._run_formation_cut_once
+
+        def formation(current, **_kwargs):
+            time.sleep(0.03)
+            current._cycles += 1
+            current._cut = types.SimpleNamespace(nodes=())
+
+        started = time.monotonic()
+        try:
+            v883._run_formation_cut_once = formation
+            result = v883._run_until_stable_v883(
+                supervisor,
+                max_cycles=2,
+                commit_proposals=lambda: None,
+                timeout=0.01,
+            )
+        finally:
+            v883._run_formation_cut_once = original_formation
+
+        self.assertEqual(result, "timeout")
+        self.assertLess(time.monotonic() - started, 0.30)
+        self.assertEqual(supervisor._cycles, 5)
 
     def test_aborted_cut_skips_all_post_cut_evidence_wrappers(self):
         from v8 import outcome_holdout_diagnostics_v828 as diagnostics

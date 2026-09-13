@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import threading
 
 import v8.development as development
 import v8.runtime as runtime_module
@@ -139,6 +140,20 @@ class DevelopmentalFormationTests(unittest.TestCase):
 
 
 class StructuralTransferTests(unittest.TestCase):
+    def test_correspondence_scan_honors_cancellation(self) -> None:
+        left = node(MemoryLevel.M3, MemoryType.ROLE, (1, 1))
+        right = node(MemoryLevel.M3, MemoryType.ROLE, (2, 1))
+        cancel = threading.Event()
+        cancel.set()
+
+        result = StructuralCorrespondenceEstimator().evaluate(
+            (left, right),
+            (edge(left.uid, RelationType.SIMILAR_TO, right.uid, score=0.9),),
+            cancel_event=cancel,
+        )
+
+        self.assertEqual(result, ())
+
     def test_correspondence_descriptors_use_one_edge_pass(self) -> None:
         class CountingEstimator(StructuralCorrespondenceEstimator):
             descriptor_passes = 0

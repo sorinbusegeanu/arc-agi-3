@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import os
 import threading
 import unittest
 from types import SimpleNamespace
@@ -55,6 +56,42 @@ class _Stop:
 
 
 class MixedResearchRuntimeIntegrityV875Tests(unittest.TestCase):
+    def test_generic_worker_installs_explicit_verified_success_scope(self):
+        class Stopped:
+            def is_set(self):
+                return True
+
+        prepared = []
+        closed = []
+        fake_runtime = SimpleNamespace(
+            prepare_actor_read_view=lambda: prepared.append(True),
+            close=lambda: closed.append(True),
+        )
+        name = "ARC_AGI3_V8_VERIFIED_SUCCESS_ROOT"
+        prior = os.environ.get(name)
+        try:
+            os.environ.pop(name, None)
+            with patch.object(v875, "_GenericProcessRuntime", return_value=fake_runtime):
+                v875._generic_process_worker_v875(
+                    job=SimpleNamespace(actor_id=1),
+                    experience_ring_args={},
+                    read_descriptors=(),
+                    watermark=object(),
+                    stop_event=Stopped(),
+                    snapshot_freeze=object(),
+                    result_queue=object(),
+                    reporting_queue=None,
+                    verified_success_root="/tmp/v8-current-run-success",
+                )
+            self.assertEqual(os.environ[name], "/tmp/v8-current-run-success")
+            self.assertEqual(prepared, [True])
+            self.assertEqual(closed, [True])
+        finally:
+            if prior is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = prior
+
     def test_normalized_m2_uses_canonical_family_compression_only(self):
         proposal = intelligence.CompressionProposal(
             uid=MemoryUid.from_key(MemoryLevel.M2, MemoryType.FAMILY, (1, 2)),
@@ -219,6 +256,58 @@ class MixedResearchRuntimeIntegrityV875Tests(unittest.TestCase):
         emitted = [call.args[0] for call in base_emit.call_args_list]
         self.assertTrue(any(value.startswith("100% - effectiveness") for value in emitted))
         self.assertIn("sampling done", emitted)
+
+    def test_cli_mode_can_leave_effectiveness_output_to_parent(self):
+        from v8 import learning_effectiveness_report_v850 as effectiveness
+
+        events = queue.Queue()
+        events.put(actor.ActorProgress(1, "tp01", 3, 0, 0, 0))
+        events.put(reporter.SAMPLING_COMPLETE)
+        with patch.object(effectiveness, "_BASE_REPORTER_EMIT_LINE") as base_emit:
+            v875._reporting_worker_v875(
+                event_queue=events,
+                stop_event=_Stop(),
+                watermark=_Watermark(),
+                actors=((1, "tp01"),),
+                interval_seconds=60.0,
+                output_queue=None,
+                total_steps=3,
+                emit_progress=False,
+            )
+
+        emitted = [call.args[0] for call in base_emit.call_args_list]
+        self.assertFalse(any("effectiveness" in value for value in emitted))
+        self.assertIn("sampling done", emitted)
+
+    def test_cli_mode_emits_only_a_lightweight_startup_heartbeat(self):
+        from v8 import learning_effectiveness_report_v850 as effectiveness
+        from v8 import mixed_research_runtime_integrity_v876 as v876
+
+        events = queue.Queue()
+
+        def finish():
+            threading.Event().wait(0.035)
+            events.put(reporter.SAMPLING_COMPLETE)
+
+        thread = threading.Thread(target=finish, daemon=True)
+        thread.start()
+        with patch.object(effectiveness, "_BASE_REPORTER_EMIT_LINE") as base_emit:
+            v876._reporting_worker_v851_integrity(
+                event_queue=events,
+                stop_event=_Stop(),
+                watermark=_Watermark(),
+                actors=((1, "tp01"),),
+                interval_seconds=0.01,
+                output_queue=None,
+                total_steps=3,
+                emit_progress=False,
+                emit_startup_heartbeat=True,
+            )
+        thread.join(timeout=1.0)
+
+        emitted = [call.args[0] for call in base_emit.call_args_list]
+        self.assertTrue(any(value.startswith("actor startup:") for value in emitted))
+        self.assertFalse(any("effectiveness" in value for value in emitted))
 
     def test_generic_production_path_prefers_process_workers(self):
         runtime = SimpleNamespace(

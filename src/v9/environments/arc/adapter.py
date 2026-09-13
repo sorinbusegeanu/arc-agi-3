@@ -1,0 +1,128 @@
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+from typing import Any, Callable
+
+import numpy as np
+
+from v9.environments.base import StructuralAdapter
+from v9.environments.contract import BoundaryEvent, BoundaryScope, WithinActionFrame, WithinActionTrace
+from v9.environments.schemas import ActionSchema, EnvironmentIdentity, ObservationSchema
+
+
+def _has_environment(root: Path, game_id: str) -> bool:
+    return (root / game_id).is_dir() and any((root / game_id).glob("*/metadata.json"))
+
+
+def _resolve_root(game_id: str, explicit: str | None) -> str | None:
+    repository = Path(__file__).resolve().parents[5]
+    candidates = [explicit, os.environ.get("ENVIRONMENTS_DIR"), str(repository / "other_repos/arc-interactive/environment_files"), str(repository / "environment_files")]
+    paths = [Path(value).expanduser() for value in candidates if value]
+    for path in paths:
+        if _has_environment(path, game_id):
+            return str(path)
+    return str(next((path for path in paths if path.is_dir()), "")) or None
+
+
+def make_arc_environment(game_id: str, *, seed: int, env_root: str | None = None, op_mode: str = "normal", render_mode: str | None = None) -> Any:
+    try:
+        from arc_agi import Arcade, OperationMode
+    except ImportError as exc:
+        raise RuntimeError("ARCAdapter requires the arc-agi environment package") from exc
+    resolved = _resolve_root(game_id, env_root)
+    if resolved:
+        os.environ["ENVIRONMENTS_DIR"] = resolved
+    local = bool(resolved and _has_environment(Path(resolved), game_id))
+    logger = logging.getLogger("v9.arc.local") if local else None
+    arcade = Arcade(operation_mode=OperationMode("offline" if local else op_mode), logger=logger)
+    environment = arcade.make(game_id, seed=int(seed), render_mode=render_mode)
+    if environment is None:
+        raise RuntimeError(f"arcade.make failed for {game_id}")
+    return environment
+
+
+def _grid(raw: Any) -> np.ndarray:
+    frame = getattr(raw, "frame", raw)
+    if isinstance(frame, list):
+        if not frame:
+            raise ValueError("ARC returned an empty frame")
+        frame = frame[0]
+    result = np.asarray(frame, dtype=np.int64)
+    if result.ndim != 2 or not result.size:
+        raise ValueError("ARC observation must be a non-empty two-dimensional grid")
+    return result
+
+
+def _state(raw: Any) -> str:
+    value = getattr(raw, "state", "NOT_FINISHED")
+    return str(getattr(value, "value", value))
+
+
+class ARCAdapter(StructuralAdapter):
+    def __init__(self, game_id: str, *, seed: int = 0, env_root: str | None = None, env_factory: Callable[..., Any] | None = None) -> None:
+        self.game_id, self.seed, self.env_root = str(game_id), int(seed), env_root
+        factory = env_factory or make_arc_environment
+        self.env = factory(self.game_id, seed=self.seed, env_root=env_root)
+        self._identity = EnvironmentIdentity("arc", self.game_id, "default", f"seed={seed}")
+        self._observation_schema = ObservationSchema("grid", "arc-color-grid")
+        self._action_schema = ActionSchema("environment-local", "arc-native-actions")
+        self._raw = None
+        self._observation = np.zeros((1, 1), dtype=np.int64)
+        self._boundary = BoundaryEvent()
+        self._last_trace = None
+        self._levels = 0
+        self.reset()
+
+    def reset(self) -> np.ndarray:
+        self._raw = self.env.reset()
+        self._observation = _grid(self._raw)
+        self._levels = int(getattr(self._raw, "levels_completed", 0) or 0)
+        self._boundary = BoundaryEvent()
+        self._last_trace = None
+        return self.observe()
+
+    def observe(self) -> np.ndarray:
+        return self._observation.copy()
+
+    def available_actions(self) -> tuple[int, ...]:
+        values = getattr(self._raw, "available_actions", None)
+        if values is None:
+            callback = getattr(self.env, "available_actions", None)
+            values = () if callback is None else callback()
+        return tuple(int(value) for value in values or ())
+
+    def step(self, native_action: Any) -> np.ndarray:
+        before = self.observe()
+        try:
+            from arcengine import GameAction
+            action = GameAction.from_id(int(native_action))
+        except ImportError:
+            action = int(native_action)
+        raw = self.env.step(action)
+        state = _state(raw)
+        levels = int(getattr(raw, "levels_completed", self._levels) or 0)
+        advanced = levels > self._levels
+        self._levels = levels
+        try:
+            after = _grid(raw)
+        except ValueError:
+            after = _grid(self.env.reset())
+        self._raw, self._observation = raw, after
+        if state == "WIN":
+            self._boundary = BoundaryEvent(BoundaryScope.EPISODE, 1, False)
+        elif state == "GAME_OVER":
+            self._boundary = BoundaryEvent(BoundaryScope.EPISODE, -1, False)
+        elif advanced:
+            self._boundary = BoundaryEvent(BoundaryScope.SUBEPISODE, 1, True)
+        else:
+            self._boundary = BoundaryEvent()
+        self._last_trace = WithinActionTrace(before, (WithinActionFrame(after.copy(), 0),), after.copy())
+        return self.observe()
+
+    def close(self) -> None:
+        callback = getattr(self.env, "close", None)
+        if callable(callback):
+            callback()
+

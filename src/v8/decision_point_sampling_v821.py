@@ -418,8 +418,19 @@ def _fallback_action(view, context, before_actions, local_overlay, rng, epsilon:
 def _bootstrap_before_forced_action(view, sampler, *, level, context, actions, history):
     from v8 import strategy_empirical_bootstrap_v881 as empirical
 
-    bootstrap_plan = empirical._bootstrap_plan(view, context, actions)
-    if bootstrap_plan is None:
+    base = getattr(sampler, "base", sampler)
+    explicit_control = bool(
+        getattr(base, "replay_actions", ())
+        or getattr(base, "replay_target", None) is not None
+        or getattr(base, "verification", None) is not None
+        or getattr(sampler, "active_sequence", ())
+        or getattr(sampler, "_v832_persist_action", None) is not None
+        or getattr(sampler, "_v860_pending_action", None) is not None
+        or getattr(sampler, "_v844_causal_action", None) is not None
+        or bool(getattr(sampler, "_v833_random_rollout", False))
+        or bool(getattr(sampler, "_v833_transfer_rollout", False))
+    )
+    if explicit_control:
         return (
             sampler.forced_action(
                 level=level,
@@ -430,15 +441,28 @@ def _bootstrap_before_forced_action(view, sampler, *, level, context, actions, h
             None,
             (),
         )
-    base_plans = tuple(
+
+    # Planning is stateful: restored trajectory selection advances its cursor.
+    # Therefore a candidate may only be requested when it will actually execute.
+    plans = tuple(
         empirical._BASE_ACTOR_PLAN_CANDIDATES(view, context, actions)
     )
-    plans = (bootstrap_plan,) + tuple(
-        row
-        for row in base_plans
-        if row.strategy_uid != bootstrap_plan.strategy_uid
+    if plans:
+        return None, plans[0], plans
+
+    bootstrap_plan = empirical._bootstrap_plan(view, context, actions)
+    if bootstrap_plan is not None:
+        return None, bootstrap_plan, (bootstrap_plan,)
+    return (
+        sampler.forced_action(
+            level=level,
+            context=context,
+            actions=actions,
+            history=history,
+        ),
+        None,
+        (),
     )
-    return None, bootstrap_plan, plans
 
 
 def _actor_experience_event(actor_module, **kwargs):
@@ -572,10 +596,8 @@ def _decision_actor_worker_impl(
             before_level = int(env.last_levels_completed)
             history_before = tuple(int(value) for value in optimizer._ACTOR_ACTION_HISTORY)
 
-            # A scientifically eligible M7 bootstrap probe must precede forced
-            # discovery. Otherwise the coverage sampler can consume the complete
-            # lease without ever consulting the planner, leaving every canonical
-            # strategy structurally formed but empirically unattempted.
+            # Existing control has authority. Empirical bootstrap is consulted
+            # only when no replay/verification/sequence or executable plan exists.
             action, planned, plans = _bootstrap_before_forced_action(
                 view,
                 sampler,

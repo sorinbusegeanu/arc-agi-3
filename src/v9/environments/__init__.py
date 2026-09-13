@@ -1,1 +1,16 @@
-"""Optional v9 environment adapters. Imports stay lazy at call sites."""
+from .alfred import AlfredAdapter
+from .arc import ARCAdapter
+from .babyai import BabyAIAdapter, make_babyai_adapter
+from .chess import ChessAdapter
+from .contract import BoundaryEvent, BoundaryScope, EnvironmentCognitionAdapter, EnvironmentTransition
+from .gym import GymDiscreteAdapter
+from .registry import EnvironmentRegistry
+from .sudoku import SudokuAdapter
+from .synthetic_symbolic import SyntheticSymbolicConfig, SyntheticSymbolicEnvironment
+
+__all__ = [
+    "ARCAdapter", "AlfredAdapter", "BabyAIAdapter", "BoundaryEvent", "BoundaryScope",
+    "ChessAdapter", "EnvironmentCognitionAdapter", "EnvironmentRegistry", "EnvironmentTransition",
+    "GymDiscreteAdapter", "SudokuAdapter", "SyntheticSymbolicConfig",
+    "SyntheticSymbolicEnvironment", "make_babyai_adapter",
+]

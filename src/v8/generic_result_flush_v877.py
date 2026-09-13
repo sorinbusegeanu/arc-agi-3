@@ -16,6 +16,7 @@ barriers:
   result drain before deciding that an actor result is genuinely missing.
 """
 
+import os
 import queue
 import time
 
@@ -76,11 +77,23 @@ def _run_generic_jobs_v877(runtime, jobs, *, reporting_queue=None):
             runtime, jobs, reporting_queue=reporting_queue
         )
 
+    optimizer = getattr(runtime, "_v814_trajectory_optimizer", None)
+    pause_optimizer = getattr(optimizer, "pause_for_actor_startup", None)
+    resume_optimizer = getattr(optimizer, "resume_after_actor_startup", None)
+    optimizer_paused = False
+    if callable(pause_optimizer):
+        pause_optimizer()
+        optimizer_paused = True
     runtime.start()
     v875._emit_phase(runtime, "generic_sampling")
     runtime._v875_generic_active = True
     ctx = runtime._mp_ctx
     results = ctx.Queue()
+    startup_ready = tuple(ctx.Event() for _job in jobs)
+    startup_gate = ctx.Event()
+    from v8 import actor
+
+    record_cut_path = os.environ.get(actor.ACTOR_RECORD_CUT_ENV)
     processes = [
         ctx.Process(
             target=v875._generic_process_worker_v875,
@@ -93,17 +106,44 @@ def _run_generic_jobs_v877(runtime, jobs, *, reporting_queue=None):
                 "snapshot_freeze": runtime._snapshot_freeze,
                 "result_queue": results,
                 "reporting_queue": reporting_queue,
+                "record_cut_path": record_cut_path,
+                "verified_success_root": getattr(
+                    runtime, "_v866_success_root", None
+                ),
+                "startup_ready": startup_ready[index],
+                "startup_gate": startup_gate,
             },
             name=f"v8-generic-{int(job.actor_id):03d}-{job.game_id}",
             daemon=True,
         )
-        for job in jobs
+        for index, job in enumerate(jobs)
     ]
     by_actor: dict[int, object] = {}
     errors: list[str] = []
+    startup_started = time.monotonic()
     try:
         for process in processes:
             process.start()
+        while not all(event.is_set() for event in startup_ready):
+            failed = [
+                process for process in processes
+                if process.exitcode not in (None, 0)
+            ]
+            if failed:
+                detail = ", ".join(
+                    f"{process.name}={process.exitcode}" for process in failed
+                )
+                raise RuntimeError(f"generic actor failed during startup: {detail}")
+            time.sleep(0.01)
+        print(
+            f'[{time.strftime("%H:%M")}] generic actor startup ready '
+            f"workers={len(processes)} seconds={time.monotonic() - startup_started:.1f}",
+            flush=True,
+        )
+        startup_gate.set()
+        if optimizer_paused and callable(resume_optimizer):
+            resume_optimizer()
+            optimizer_paused = False
         while len(by_actor) < len(jobs):
             try:
                 message = results.get(timeout=0.05)
@@ -157,6 +197,7 @@ def _run_generic_jobs_v877(runtime, jobs, *, reporting_queue=None):
             process.join(timeout=2.0)
         return tuple(by_actor[key] for key in sorted(by_actor))
     except BaseException:
+        startup_gate.set()
         for process in processes:
             if process.is_alive():
                 process.terminate()
@@ -164,6 +205,8 @@ def _run_generic_jobs_v877(runtime, jobs, *, reporting_queue=None):
             process.join(timeout=2.0)
         raise
     finally:
+        if optimizer_paused and callable(resume_optimizer):
+            resume_optimizer()
         runtime._v875_generic_active = False
         if not bool(getattr(runtime, "_v875_arc_done", False)):
             v875._emit_phase(runtime, "arc_tail")

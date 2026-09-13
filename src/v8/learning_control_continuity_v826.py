@@ -56,22 +56,29 @@ def _plan_candidates_v826(self, context_signature, action_ids, **kwargs):
 
     from v8 import runtime_repair_v822 as v822
 
-    # v8.81 contributes empirical bootstrap candidates, but planner authority
-    # remains here so the complete composed control contract stays inspectable.
-    if not kwargs:
-        from v8 import strategy_empirical_bootstrap_v881 as v881
-
-        bootstrap = v881._bootstrap_plan(self, context_signature, action_ids)
-        if bootstrap:
-            return tuple(bootstrap)
-
     prior_probe = bool(getattr(v822._PROBE_STATE, "before_plan", False))
     if prior_probe:
         v822._PROBE_STATE.before_plan = False
     try:
-        return _BASE_PLAN_CANDIDATES(self, context_signature, action_ids, **kwargs)
+        plans = tuple(
+            _BASE_PLAN_CANDIDATES(
+                self,
+                context_signature,
+                action_ids,
+                **kwargs,
+            )
+        )
     finally:
         v822._PROBE_STATE.before_plan = prior_probe
+    if plans or kwargs:
+        return plans
+
+    # Empirical M7 coverage is a discovery fallback. It must never displace an
+    # executable learned/restored plan or alter explicit selection semantics.
+    from v8 import strategy_empirical_bootstrap_v881 as v881
+
+    bootstrap = v881._bootstrap_plan(self, context_signature, action_ids)
+    return () if bootstrap is None else (bootstrap,)
 
 
 def install_learning_control_continuity_v826() -> None:

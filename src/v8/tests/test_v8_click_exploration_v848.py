@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,6 +13,7 @@ from v8 import click_exploration_v848 as v848
 from v8 import sampling_evidence_frontier_v847 as frontier
 from v8 import sampling_portfolio_v831 as portfolio
 from v8.adaptive_learning_allocation_v819 import AdaptiveLearningCoordinator
+from v8 import adaptive_learning_allocation_v819 as v819
 from v8.learning_blockers_v055 import pack_action_choice, unpack_action_choice
 from v8.model import MemoryUid
 from v8.publication import ActionScore, PlannedAction
@@ -233,9 +235,15 @@ class CompleteClickCoverageTests(unittest.TestCase):
         action = pack_action_choice(6, 1, 1)
         partial = {"levels_completed": 3, "actions": [action]}
         replay_counts = []
-        with patch(
-            "v8.verified_success_metrics_v866.best_historical_partial_v866",
-            return_value=partial,
+        with (
+            patch(
+                "v8.verified_success_metrics_v866.best_durable_complete_v866",
+                return_value=None,
+            ),
+            patch(
+                "v8.verified_success_metrics_v866.best_historical_partial_v866",
+                return_value=partial,
+            ),
         ):
             for actor_id in (1, 2, 3, 4):
                 env = SimpleNamespace()
@@ -246,6 +254,37 @@ class CompleteClickCoverageTests(unittest.TestCase):
                 )
                 replay_counts.append(len(sampler.base.replay_actions))
         self.assertEqual(replay_counts, [0, 0, 0, 1])
+
+    def test_complete_route_replays_on_every_verify_lane_but_not_alternative(self):
+        action = pack_action_choice(6, 1, 1)
+        complete = {"levels_completed": 5, "actions": [action]}
+        prior = os.environ.get(v819._SAMPLING_MODE_ENV)
+        try:
+            with patch(
+                "v8.verified_success_metrics_v866.best_durable_complete_v866",
+                return_value=complete,
+            ):
+                os.environ[v819._SAMPLING_MODE_ENV] = v819.SamplingMode.VERIFY.value
+                for actor_id in (1, 2):
+                    sampler = PortfolioSampler("gp01", seed=actor_id)
+                    sampler.begin_lease(actor_id)
+                    v848.configure_actor_exploration_v848(
+                        SimpleNamespace(), sampler, actor_id=actor_id
+                    )
+                    self.assertEqual(tuple(sampler.base.replay_actions), (action,))
+
+                os.environ[v819._SAMPLING_MODE_ENV] = v819.SamplingMode.ALTERNATIVE.value
+                sampler = PortfolioSampler("gp01", seed=4)
+                sampler.begin_lease(4)
+                v848.configure_actor_exploration_v848(
+                    SimpleNamespace(), sampler, actor_id=4
+                )
+                self.assertEqual(tuple(sampler.base.replay_actions), ())
+        finally:
+            if prior is None:
+                os.environ.pop(v819._SAMPLING_MODE_ENV, None)
+            else:
+                os.environ[v819._SAMPLING_MODE_ENV] = prior
 
     def test_click_scan_keeps_long_observable_sweep_in_one_episode(self):
         # 60 distinct cells while the rendered display remains inside the exact

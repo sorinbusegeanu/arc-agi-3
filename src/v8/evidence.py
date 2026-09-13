@@ -96,19 +96,29 @@ class EvidenceLedger:
         self._append_listener: Callable[[EvidenceRecord], None] | None = None
 
     def append(self, row: EvidenceRecord) -> bool:
-        if row.evidence_available_watermark > row.decision_watermark:
-            raise ValueError("future evidence cannot influence an earlier decision")
-        if not row.quality_valid():
-            raise ValueError("invalid scientific evidence quality/normalization")
+        return self.append_many((row,)) == 1
+
+    def append_many(self, rows) -> int:
+        rows = tuple(rows)
+        for row in rows:
+            if row.evidence_available_watermark > row.decision_watermark:
+                raise ValueError("future evidence cannot influence an earlier decision")
+            if not row.quality_valid():
+                raise ValueError("invalid scientific evidence quality/normalization")
+        inserted = []
+        listeners = []
         with self._lock:
-            if row.evidence_id in self._ids:
-                return False
-            self._ids.add(row.evidence_id)
-            self._rows.append(row)
-            listener = self._append_listener
-        if listener is not None:
+            for row in rows:
+                if row.evidence_id in self._ids:
+                    continue
+                self._ids.add(row.evidence_id)
+                self._rows.append(row)
+                inserted.append(row)
+                if self._append_listener is not None:
+                    listeners.append((self._append_listener, row))
+        for listener, row in listeners:
             listener(row)
-        return True
+        return len(inserted)
 
     def set_append_listener(
         self,

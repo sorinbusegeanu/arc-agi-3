@@ -40,21 +40,38 @@ def _worker_until_completed_win(
     actor_throttle,
     snapshot_freeze,
     trajectory_root: str,
+    record_cut_path: str | None = None,
+    verified_success_root: str | None = None,
 ) -> None:
     from v8 import actor as actor_module
     from v8 import adaptive_learning_allocation_v819 as v819
     from v8 import trajectory_inspection_v819 as inspection
 
-    # The parent keeps peers and canonical writers quiescent until every worker is
-    # ready. Warm the actor's installed read-view implementation inside that window.
-    # ActorReadView publishes only its compact indexes into record_cuts; the generic
-    # fallback retains the historical full coherent cut for unpatched runtimes.
-    record_cuts: dict[tuple[str, str], tuple[tuple[object, ...], int]] = {}
+    if verified_success_root:
+        from v8.verified_success_metrics_v866 import SUCCESS_ROOT_ENV
+
+        # A persistent worker may be forked by a forkserver created before the
+        # run scope existed.  Carry the authoritative scope as process input
+        # instead of relying on the forkserver's stale environment snapshot.
+        os.environ[SUCCESS_ROOT_ENV] = str(verified_success_root)
+
+    # The CLI normally prepares this cut once while every canonical writer is
+    # stopped. Keep the local-build fallback for direct/library callers.
+    shared_path = record_cut_path or os.environ.get(actor_module.ACTOR_RECORD_CUT_ENV)
+    expected_versions = None
+    if shared_path:
+        record_cuts, expected_versions = actor_module.load_actor_record_cut_file(
+            shared_path
+        )
+    else:
+        record_cuts = {}
     warm_view = actor_module.open_actor_read_view(
         read_descriptors,
         refresh_interval_seconds=None,
         record_cuts=record_cuts,
     )
+    if expected_versions is not None:
+        actor_module._validate_actor_record_cut(warm_view, expected_versions)
     warm_compact_cut = getattr(warm_view, "_warm_compact_cut", None)
     if callable(warm_compact_cut):
         warm_compact_cut()

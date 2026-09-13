@@ -1,42 +1,56 @@
-# Repository Guidelines
+# Repository Development Rules
 
-## Project Structure & Module Organization
-Primary work in this repository currently centers on `src/v6/`. Key areas:
-- `src/v6/main.py`: core runtime and step loop.
-- `src/v6/environment/`, `context/`, `contingency/`, `prediction/`, `transformation/`: environment adapters and learning logic.
-- `src/v6/memory/`: SQLite stores, compact-memory fold/restore, substrate, and lifecycle logic.
-- `src/v6/evaluation/`: sampling, continuous research, and diagnostics.
-- `src/v6/tests/`: pytest coverage, including `test_v6_core.py` and `test_v6_higher_order.py`.
+## Architecture
+- Keep one authoritative implementation per responsibility.
+- Prefer clear modules and explicit composition over runtime patching or installation order.
+- Version behavior through Git history and design documents, not production filenames.
 
-Generated outputs live under `runs/`. Treat them as runtime artifacts, not source.
+## Changes
+Before changing code:
+1. Read the affected implementation and its callers.
+2. Search for existing fixes, overrides, wrappers, duplicate implementations, and relevant regression tests.
+3. Identify the current authoritative runtime path.
 
-## Build, Test, and Development Commands
-Use `PYTHONPATH=src` for all local runs.
+Modify or refactor that implementation instead of adding another layer.
 
-```bash
-PYTHONPATH=src pytest src/v6/tests/test_v6_core.py -q
-PYTHONPATH=src pytest src/v6/tests/test_v6_higher_order.py -q
-PYTHONPATH=src pytest src/v6/tests -q
-PYTHONPATH=src python -m v6.cli interaction-sampling-v05c --games tt01 --samplers random_baseline --seeds 0 --steps 100 --output-dir runs/v6/smoke
-PYTHONPATH=src python -m v6.cli continuous-research-run ...
-```
+## New Files
+Create a production module only for a genuinely new architectural responsibility.
 
-Prefer focused test files while iterating, then run the broader `src/v6/tests` suite before submitting.
+Do not create new production files merely for:
+- bug fixes or behavior corrections;
+- performance fixes;
+- parameter or lifecycle changes;
+- another implementation version;
+- fixups, overrides, or compatibility patches.
 
-## Coding Style & Naming Conventions
-Python style is conventional: 4-space indentation, `snake_case` for functions/variables, `PascalCase` for classes, and type hints on new code. Match the existing style in the touched module. Keep logic deterministic, bounded, and backward-compatible with existing SQLite schemas by using additive migrations (`ALTER TABLE` / compatibility helpers) instead of destructive changes.
+Avoid names such as `*_fix.py`, `*_fixups.py`, and version-suffixed implementation files when an existing module owns the responsibility.
 
-Use `rg` for code search and keep comments sparse and technical.
+## Refactoring
+When touching code with historical patches, duplicated logic, or multiple implementations:
+- consolidate behavior into the owning module;
+- remove obsolete layers when safe;
+- reduce architectural debt rather than extending it.
 
-## Testing Guidelines
-Tests use `pytest`. Add focused regression tests in `src/v6/tests/` alongside the subsystem you change. Name files `test_*.py` and test functions `test_*`. For storage/reporting changes, verify both behavior and persisted schema/rows.
+Refactoring directly required for a correct change is part of the task.
 
-## Commit & Pull Request Guidelines
-Recent history contains very terse commit subjects (`update`), but contributors should use specific imperative messages, e.g. `Fix H10 attention saturation diagnostics`. PRs should include:
-- scope of changed modules
-- commands run
-- exact test results
-- notes on schema changes or runtime artifact impact
+## Runtime Composition
+Do not introduce new monkey patches or installer chains that replace functions, methods, classes, or module globals at runtime.
 
-## Runtime & Data Hygiene
-`runs/` can grow quickly. Avoid committing generated SQLite, JSON, or smoke-run outputs. When changing reports or memory fold behavior, preserve idempotence and avoid duplicating derived rows on rerun.
+Runtime behavior should be understandable from normal imports, explicit dependencies, and composition.
+
+## Regression Safety
+Every bug fix must include a regression test reproducing the failure.
+
+Preserve regression tests for historical bugs during refactoring. Do not remove tests simply because the implementation changed.
+
+## Duplication
+Search before implementing. If equivalent functionality exists, reuse, generalize, or consolidate it instead of creating a parallel implementation.
+
+## Completion Criteria
+A change is complete when:
+- the changed behavior has one clear owner;
+- no unnecessary patch/version module was added;
+- relevant regression coverage exists;
+- obsolete code introduced by previous fixes is removed when safe;
+- existing tests pass;
+- runtime behavior does not depend on new patch ordering.

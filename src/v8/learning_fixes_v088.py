@@ -4,6 +4,8 @@ import copy
 import json
 import os
 import queue
+import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from random import Random
@@ -67,6 +69,297 @@ class _CapturedTargetProbeState:
     capture_id: str
     initial_state_signature: int
     initial_available_actions: tuple[int, ...]
+
+
+@dataclass(slots=True)
+class _TransferAnalysisIndex:
+    """Immutable-cut indexes shared by transfer scheduling and probe diagnostics."""
+
+    token: tuple[object, ...]
+    node_by_uid: dict[MemoryUid, object]
+    uid_by_text: dict[str, MemoryUid]
+    parents: dict[MemoryUid, set[MemoryUid]]
+    children: dict[MemoryUid, set[MemoryUid]]
+    descendant_rows: dict[MemoryUid, tuple[object, ...]]
+    strategies_by_ancestor: dict[MemoryUid, tuple[object, ...]]
+    controllable_strategies: frozenset[MemoryUid]
+    plan_cache: dict[tuple[MemoryUid, int, tuple[int, ...]], object | None]
+    neighborhood_descriptors: dict[MemoryUid, object] | None
+    structural_descriptors: dict[MemoryUid, object]
+
+
+@dataclass(slots=True)
+class _TransferProbeReadView:
+    """Pickle-safe, candidate-scoped view used by held-out trial workers."""
+
+    _v088_transfer_analysis_index: _TransferAnalysisIndex
+    _strategy_by_context: dict[int, tuple[object, ...]]
+    _strategy_fallback: tuple[object, ...]
+    _preferred_outcomes: frozenset[MemoryUid]
+
+
+def _candidate_probe_view(read_view, ancestor: MemoryUid) -> _TransferProbeReadView:
+    index = getattr(read_view, "_v088_transfer_analysis_index", None)
+    if not isinstance(index, _TransferAnalysisIndex):
+        raise RuntimeError("transfer analysis index unavailable for parallel probe")
+    rows = tuple(index.strategies_by_ancestor.get(ancestor, ()))
+    row_uids = frozenset(row.strategy_uid for row in rows)
+    by_context = {
+        int(bucket): tuple(row for row in bucket_rows if row.strategy_uid in row_uids)
+        for bucket, bucket_rows in getattr(read_view, "_strategy_by_context", {}).items()
+        if any(row.strategy_uid in row_uids for row in bucket_rows)
+    }
+    compact_index = _TransferAnalysisIndex(
+        token=("probe", ancestor),
+        node_by_uid={},
+        uid_by_text={},
+        parents={},
+        children={},
+        descendant_rows={ancestor: tuple(index.descendant_rows.get(ancestor, ()))},
+        strategies_by_ancestor={ancestor: rows},
+        controllable_strategies=frozenset(
+            uid for uid in index.controllable_strategies if uid in row_uids
+        ),
+        plan_cache={},
+        neighborhood_descriptors=None,
+        structural_descriptors={},
+    )
+    return _TransferProbeReadView(
+        compact_index,
+        by_context,
+        tuple(row for row in getattr(read_view, "_strategy_fallback", ()) if row.strategy_uid in row_uids),
+        frozenset(getattr(read_view, "_preferred_outcomes", ())),
+    )
+
+
+def _take_pending_target_grounding(target_hash: int) -> tuple[object, object]:
+    from v8 import learning_fixes_v088_target_grounding_fix as grounding
+
+    return (
+        grounding._PENDING_TARGET_TEMPLATES.pop(int(target_hash), None),
+        grounding._PENDING_TARGET_STRUCTURES.pop(int(target_hash), ()),
+    )
+
+
+def _run_matched_probe_pair_v088(payload: dict[str, object]) -> dict[str, object]:
+    """Execute both causal branches from one captured hidden target state."""
+    from v8 import learning_fixes_v088_target_grounding_fix as grounding
+    from v8 import learning_fixes_v088_immediate_structural_transfer_fix as immediate
+
+    target_hash = int(payload["target_hash"])
+    template = payload.get("target_grounding_template")
+    references = payload.get("target_grounding_structures", ())
+    if isinstance(template, dict) and references:
+        grounding._PENDING_TARGET_TEMPLATES[target_hash] = dict(template)
+        grounding._PENDING_TARGET_STRUCTURES[target_hash] = tuple(references)
+    started = time.monotonic()
+    try:
+        captured = _capture_target_probe_state(
+            game_id=str(payload["game_id"]),
+            env_root=payload.get("env_root"),
+            seed=int(payload["seed"]),
+        )
+        intervention: dict[str, object] = {}
+        on_metric, used = _probe_policy_v088(
+            read_view=payload["read_view"],
+            game_id=str(payload["game_id"]),
+            env_root=payload.get("env_root"),
+            seed=int(payload["seed"]),
+            steps=int(payload["steps"]),
+            required_ancestor=payload["required_ancestor"],
+            execution_evidence=payload["execution_evidence"],
+            diagnostic=intervention,
+            environment=_restore_target_probe_state(captured),
+            target_state_capture_id=captured.capture_id,
+        )
+        control: dict[str, object] = {}
+        off_metric, _ = _probe_policy_v088(
+            read_view=payload["read_view"],
+            game_id=str(payload["game_id"]),
+            env_root=payload.get("env_root"),
+            seed=int(payload["seed"]),
+            steps=int(payload["steps"]),
+            required_ancestor=None,
+            diagnostic=control,
+            environment=_restore_target_probe_state(captured),
+            target_state_capture_id=captured.capture_id,
+        )
+        return {
+            "capture_id": captured.capture_id,
+            "on_metric": float(on_metric),
+            "off_metric": float(off_metric),
+            "used": int(used),
+            "probe_diagnostic": intervention,
+            "control_diagnostic": control,
+            "execution_evidence": payload["execution_evidence"],
+            "structural_branches": immediate._BRANCH_STRUCTURAL.pop(target_hash, {}),
+            "duration_seconds": max(0.0, time.monotonic() - started),
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "error": f"{type(exc).__name__}: {exc}",
+            "duration_seconds": max(0.0, time.monotonic() - started),
+            "structural_branches": immediate._BRANCH_STRUCTURAL.pop(target_hash, {}),
+        }
+    finally:
+        grounding._PENDING_TARGET_TEMPLATES.pop(target_hash, None)
+        grounding._PENDING_TARGET_STRUCTURES.pop(target_hash, None)
+
+
+def _parallel_transfer_worker_count(runtime, max_trials: int) -> int:
+    if (
+        max_trials <= 1
+        or not runtime.__class__.__module__.startswith("v8.runtime")
+        or getattr(runtime, "_mp_ctx", None) is None
+    ):
+        return 0
+    requested = int(os.environ.get("ARC_AGI3_V8_TRANSFER_WORKERS", "4"))
+    return min(max(0, requested), max(1, int(max_trials)), os.cpu_count() or 1)
+
+
+def _transfer_phase_timing(flow, phase: str, started: float, **fields) -> None:
+    flow.emit(
+        "transfer",
+        "phase_timing",
+        input_count=1,
+        output_count=1,
+        fields={
+            "phase": str(phase),
+            "duration_seconds": max(0.0, time.monotonic() - float(started)),
+            **fields,
+        },
+    )
+
+
+def _prepare_transfer_analysis_index(read_view, nodes, candidate_uids) -> _TransferAnalysisIndex:
+    candidates = tuple(sorted(set(candidate_uids)))
+    node_by_uid = getattr(read_view, "_node_by_uid", None)
+    if not isinstance(node_by_uid, dict):
+        node_by_uid = {row.uid: row for row in nodes}
+    parents = getattr(read_view, "_parents", None)
+    if not isinstance(parents, dict):
+        parents = {}
+    token = (
+        id(node_by_uid),
+        id(parents),
+        len(node_by_uid),
+        tuple(getattr(read_view, "_strategy_version", ())),
+        candidates,
+    )
+    cached = getattr(read_view, "_v088_transfer_analysis_index", None)
+    if isinstance(cached, _TransferAnalysisIndex) and cached.token == token:
+        return cached
+
+    children: dict[MemoryUid, set[MemoryUid]] = {}
+    for child, ancestors in parents.items():
+        for ancestor in ancestors:
+            children.setdefault(ancestor, set()).add(child)
+
+    descendant_rows: dict[MemoryUid, tuple[object, ...]] = {}
+    descendant_uids: dict[MemoryUid, frozenset[MemoryUid]] = {}
+    for ancestor in candidates:
+        reached = {ancestor}
+        frontier = {ancestor}
+        for _depth in range(8):
+            following = {
+                child
+                for current in frontier
+                for child in children.get(current, ())
+                if child not in reached
+            }
+            if not following:
+                break
+            reached.update(following)
+            frontier = following
+        descendant_uids[ancestor] = frozenset(reached)
+        descendant_rows[ancestor] = tuple(
+            node_by_uid[uid] for uid in reached if uid in node_by_uid
+        )
+
+    strategies = _strategy_cache_rows(read_view)
+    strategies_by_ancestor = {
+        ancestor: tuple(
+            row
+            for row in strategies
+            if row.strategy_uid in descendant_uids.get(ancestor, ())
+        )
+        for ancestor in candidates
+    }
+    controllable: set[MemoryUid] = set()
+    try:
+        from v8.behavior_recovery import strategy_can_control
+
+        for row in strategies:
+            if strategy_can_control(read_view, row.strategy_uid, row.outcome_uid):
+                controllable.add(row.strategy_uid)
+    except (AttributeError, TypeError, ValueError):
+        controllable = {row.strategy_uid for row in strategies}
+
+    index = _TransferAnalysisIndex(
+        token=token,
+        node_by_uid=node_by_uid,
+        uid_by_text={_uid_value(uid): uid for uid in node_by_uid},
+        parents=parents,
+        children=children,
+        descendant_rows=descendant_rows,
+        strategies_by_ancestor=strategies_by_ancestor,
+        controllable_strategies=frozenset(controllable),
+        plan_cache={},
+        neighborhood_descriptors=None,
+        structural_descriptors={},
+    )
+    read_view._v088_transfer_analysis_index = index
+    return index
+
+
+def _indexed_ancestor_plan(read_view, ancestor_uid, context, actions):
+    """Return the diagnostic plan without repeating ancestry walks per step."""
+
+    index = getattr(read_view, "_v088_transfer_analysis_index", None)
+    if not isinstance(index, _TransferAnalysisIndex):
+        return False, None
+    available = tuple(sorted(set(int(value) for value in actions)))
+    bucket = stable_u64(int(context), person=b"v8-context")
+    key = (ancestor_uid, int(bucket), available)
+    if key in index.plan_cache:
+        return True, index.plan_cache[key]
+
+    descendants = {
+        row.strategy_uid
+        for row in index.strategies_by_ancestor.get(ancestor_uid, ())
+    }
+    exact_all = tuple(
+        row
+        for row in getattr(read_view, "_strategy_by_context", {}).get(bucket, ())
+        if row.strategy_uid in index.controllable_strategies
+    )
+    if exact_all:
+        rows = tuple(row for row in exact_all if row.strategy_uid in descendants)
+        cross_context = False
+    else:
+        rows = tuple(
+            row
+            for row in getattr(read_view, "_strategy_fallback", ())
+            if row.strategy_uid in descendants
+            and row.strategy_uid in index.controllable_strategies
+        )
+        cross_context = bool(rows)
+    from v8.behavior_recovery import _score_strategy_rows
+
+    plans = _score_strategy_rows(
+        read_view,
+        rows,
+        available=set(available),
+        outcome_uid=None,
+        required_ancestor=None,
+        excluded_strategies=frozenset(),
+        ignore_preference=True,
+        cross_context=cross_context,
+    )
+    plan = None if not plans else plans[0]
+    index.plan_cache[key] = plan
+    return True, plan
 
 
 def _provisional_concept_ready(row) -> bool:
@@ -445,12 +738,19 @@ def _probe_policy_v088(
             context = int(structural_grid_signature(before))
             observed_contexts.add(context)
             memory_queries += 1
-            plan = read_view.planned_action(
+            indexed, plan = _indexed_ancestor_plan(
+                read_view,
+                required_ancestor,
                 context,
                 actions,
-                required_ancestor=required_ancestor,
-                ignore_preference=True,
             )
+            if not indexed:
+                plan = read_view.planned_action(
+                    context,
+                    actions,
+                    required_ancestor=required_ancestor,
+                    ignore_preference=True,
+                )
             if plan is None:
                 plan_misses += 1
             else:
@@ -809,27 +1109,47 @@ def _candidate_execution_snapshot(
     execution_evidence: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Describe the already-built planning cache without making another decision."""
-    node_by_uid = getattr(read_view, "_node_by_uid", None)
+    index = getattr(read_view, "_v088_transfer_analysis_index", None)
+    node_by_uid = (
+        index.node_by_uid
+        if isinstance(index, _TransferAnalysisIndex)
+        else getattr(read_view, "_node_by_uid", None)
+    )
     if not isinstance(node_by_uid, dict):
         node_by_uid = {row.uid: row for row in nodes}
-    parents = getattr(read_view, "_parents", {})
+    parents = (
+        index.parents
+        if isinstance(index, _TransferAnalysisIndex)
+        else getattr(read_view, "_parents", {})
+    )
     if not isinstance(parents, dict):
         parents = {}
     candidate = node_by_uid.get(candidate_uid)
     relevant_levels = {int(MemoryLevel.M4), int(MemoryLevel.M7)}
-    descendants = [
-        row
-        for row in nodes
-        if int(row.level) in relevant_levels
-        and _has_cached_ancestor(parents, row.uid, candidate_uid)
-    ]
+    if isinstance(index, _TransferAnalysisIndex):
+        descendants = [
+            row
+            for row in index.descendant_rows.get(candidate_uid, ())
+            if int(row.level) in relevant_levels
+        ]
+    else:
+        descendants = [
+            row
+            for row in nodes
+            if int(row.level) in relevant_levels
+            and _has_cached_ancestor(parents, row.uid, candidate_uid)
+        ]
     m4_descendants = [row for row in descendants if int(row.level) == int(MemoryLevel.M4)]
     m7_descendants = [row for row in descendants if int(row.level) == int(MemoryLevel.M7)]
-    cached = [
-        row
-        for row in _strategy_cache_rows(read_view)
-        if _has_cached_ancestor(parents, row.strategy_uid, candidate_uid)
-    ]
+    cached = (
+        list(index.strategies_by_ancestor.get(candidate_uid, ()))
+        if isinstance(index, _TransferAnalysisIndex)
+        else [
+            row
+            for row in _strategy_cache_rows(read_view)
+            if _has_cached_ancestor(parents, row.strategy_uid, candidate_uid)
+        ]
+    )
     missing_fields: list[str] = []
     if candidate is None:
         reason = "required_ancestor_lookup_returned_none"
@@ -903,21 +1223,55 @@ def _direct_target_memory_inventories(
         for value in wanted.intersection(int(game) for game in games):
             rows_by_hash[value].append(row)
             seen_by_hash[value].add(row.uid)
-    source_games = getattr(read_view, "source_games", None)
-    if callable(source_games):
-        for row in nodes:
-            if int(row.level) not in {
+    index = getattr(read_view, "_v088_transfer_analysis_index", None)
+    if isinstance(index, _TransferAnalysisIndex):
+        inherited_by_uid: dict[MemoryUid, set[int]] = {}
+        frontier: dict[MemoryUid, set[int]] = {}
+        for uid, games in direct.items():
+            selected = wanted.intersection(int(game) for game in games)
+            if selected:
+                inherited_by_uid[uid] = set(selected)
+                frontier[uid] = set(selected)
+        for _depth in range(8):
+            following: dict[MemoryUid, set[int]] = {}
+            for parent, games in frontier.items():
+                for child in index.children.get(parent, ()):
+                    new_games = games - inherited_by_uid.setdefault(child, set())
+                    if not new_games:
+                        continue
+                    inherited_by_uid[child].update(new_games)
+                    following.setdefault(child, set()).update(new_games)
+            if not following:
+                break
+            frontier = following
+        for uid, inherited in inherited_by_uid.items():
+            row = by_uid.get(uid)
+            if row is None or int(row.level) not in {
                 int(MemoryLevel.M3), int(MemoryLevel.M4), int(MemoryLevel.M7)
             }:
-                continue
-            try:
-                inherited = wanted.intersection(int(game) for game in source_games(row.uid))
-            except BaseException:
                 continue
             for value in inherited:
                 if row.uid not in seen_by_hash[value]:
                     rows_by_hash[value].append(row)
                     seen_by_hash[value].add(row.uid)
+    else:
+        source_games = getattr(read_view, "source_games", None)
+        if callable(source_games):
+            for row in nodes:
+                if int(row.level) not in {
+                    int(MemoryLevel.M3), int(MemoryLevel.M4), int(MemoryLevel.M7)
+                }:
+                    continue
+                try:
+                    inherited = wanted.intersection(
+                        int(game) for game in source_games(row.uid)
+                    )
+                except BaseException:
+                    continue
+                for value in inherited:
+                    if row.uid not in seen_by_hash[value]:
+                        rows_by_hash[value].append(row)
+                        seen_by_hash[value].add(row.uid)
     result: dict[int, dict[str, object]] = {}
     for target_hash, rows in rows_by_hash.items():
         levels: dict[str, int] = {}
@@ -1071,7 +1425,12 @@ def _transfer_execution_evidence(
     target_game_hash: int,
 ) -> dict[str, object]:
     """Resolve explicit structural correspondence into target-local actions."""
-    node_by_uid = getattr(read_view, "_node_by_uid", None)
+    index = getattr(read_view, "_v088_transfer_analysis_index", None)
+    node_by_uid = (
+        index.node_by_uid
+        if isinstance(index, _TransferAnalysisIndex)
+        else getattr(read_view, "_node_by_uid", None)
+    )
     if not isinstance(node_by_uid, dict):
         node_by_uid = {row.uid: row for row in nodes}
     source_structural = node_by_uid.get(candidate.uid)
@@ -1152,13 +1511,17 @@ def _transfer_execution_evidence(
     def grounded_on_target(memory_id: object) -> bool:
         if not callable(source_games) or not memory_id:
             return False
-        uid = next(
-            (
-                row.uid
-                for row in nodes
-                if _uid_value(row.uid) == str(memory_id)
-            ),
-            None,
+        uid = (
+            index.uid_by_text.get(str(memory_id))
+            if isinstance(index, _TransferAnalysisIndex)
+            else next(
+                (
+                    row.uid
+                    for row in nodes
+                    if _uid_value(row.uid) == str(memory_id)
+                ),
+                None,
+            )
         )
         if uid is None:
             return False
@@ -1192,9 +1555,17 @@ def _transfer_execution_evidence(
         parents = getattr(read_view, "_parents", {})
         if not isinstance(parents, dict):
             parents = {}
-        for strategy in _strategy_cache_rows(read_view):
-            if not _has_cached_ancestor(
-                parents, strategy.strategy_uid, correspondence_uid
+        strategy_rows = (
+            index.strategies_by_ancestor.get(correspondence_uid, ())
+            if isinstance(index, _TransferAnalysisIndex)
+            else _strategy_cache_rows(read_view)
+        )
+        for strategy in strategy_rows:
+            if (
+                not isinstance(index, _TransferAnalysisIndex)
+                and not _has_cached_ancestor(
+                    parents, strategy.strategy_uid, correspondence_uid
+                )
             ):
                 continue
             try:
@@ -1715,6 +2086,7 @@ def _run_automatic_transfer_experiments_v088(
                   output_count=0, rejection_counts={"no_held_out_worlds": 1})
         return ExperimentSummary(0, 0, 0)
 
+    cut_started = time.monotonic()
     cached_cut = _coherent_cached_transfer_cut(runtime.read_view)
     if cached_cut is None:
         nodes = runtime.read_view.node_records()
@@ -1722,6 +2094,14 @@ def _run_automatic_transfer_experiments_v088(
     else:
         nodes, edges = cached_cut
     by_uid = {row.uid: row for row in nodes}
+    _transfer_phase_timing(
+        flow,
+        "coherent_cut",
+        cut_started,
+        node_count=len(nodes),
+        cached_cut=edges is not None,
+    )
+    candidate_started = time.monotonic()
     if edges is None:
         candidates = runtime.peers.transfer.candidates(
             nodes,
@@ -1733,6 +2113,12 @@ def _run_automatic_transfer_experiments_v088(
             edges=edges,
             provenance=runtime.read_view.source_games,
         )
+    _transfer_phase_timing(
+        flow,
+        "candidate_selection",
+        candidate_started,
+        candidate_count=len(candidates),
+    )
     attempted = completed = passed = 0
     eligible_target_worlds = 0
     considered_pairs = 0
@@ -1741,15 +2127,104 @@ def _run_automatic_transfer_experiments_v088(
     eligibility_probes = 0
     eligibility_probe_limit = max(1, int(max_trials))
     game_hashes = {game: world_id(game) for game in holdouts}
+    index_started = time.monotonic()
+    indexed_uids = tuple(
+        uid
+        for candidate in candidates
+        for uid in (candidate.uid, candidate.correspondence_uid)
+        if not uid.is_zero
+    )
+    _prepare_transfer_analysis_index(runtime.read_view, nodes, indexed_uids)
     target_inventories = _direct_target_memory_inventories(
         runtime.read_view, nodes, tuple(game_hashes.values())
     )
     trajectories = _trajectory_inventory(holdouts)
     source_trajectories = _source_trajectory_index(tuple(games))
     executable_reference = _executable_reference(runtime.read_view, nodes)
+    _transfer_phase_timing(
+        flow,
+        "analysis_index",
+        index_started,
+        indexed_ancestor_count=len(set(indexed_uids)),
+        target_world_count=len(game_hashes),
+    )
     candidate_execution: dict[tuple[MemoryUid, int], dict[str, object]] = {}
     candidate_evidence: dict[tuple[MemoryUid, int], dict[str, object]] = {}
     mapped_sequence_targets: dict[tuple[int, ...], set[str]] = {}
+    parallel_results: dict[tuple[MemoryUid, int], dict[str, object]] = {}
+    parallel_payloads: dict[tuple[MemoryUid, int], dict[str, object]] = {}
+
+    worker_count = _parallel_transfer_worker_count(runtime, max_trials)
+    if worker_count > 0:
+        ranked_pairs = []
+        for candidate in sorted(
+            candidates, key=lambda row: (-row.structural_score, row.uid)
+        ):
+            formation = tuple(candidate.formation_games)
+            for game_id in holdouts:
+                target_hash = int(game_hashes[game_id])
+                if target_hash in formation:
+                    continue
+                ranked_pairs.append((candidate, game_id, target_hash))
+                if len(ranked_pairs) >= eligibility_probe_limit:
+                    break
+            if len(ranked_pairs) >= eligibility_probe_limit:
+                break
+
+        parallel_started = time.monotonic()
+        for ordinal, (candidate, game_id, target_hash) in enumerate(ranked_pairs, 1):
+            evidence_key = (candidate.uid, target_hash)
+            execution_evidence = _transfer_execution_evidence(
+                runtime.read_view,
+                nodes,
+                edges,
+                candidate,
+                source_trajectories,
+                target_game_hash=target_hash,
+            )
+            candidate_evidence[evidence_key] = execution_evidence
+            template, references = _take_pending_target_grounding(target_hash)
+            parallel_payloads[evidence_key] = {
+                "read_view": _candidate_probe_view(runtime.read_view, candidate.uid),
+                "game_id": game_id,
+                "env_root": env_root,
+                "seed": int(seed) + ordinal * 7919,
+                "steps": int(steps_per_trial),
+                "required_ancestor": candidate.uid,
+                "target_hash": target_hash,
+                "execution_evidence": execution_evidence,
+                "target_grounding_template": template,
+                "target_grounding_structures": references,
+            }
+        try:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=runtime._mp_ctx,
+            ) as pool:
+                futures = {
+                    key: pool.submit(_run_matched_probe_pair_v088, payload)
+                    for key, payload in parallel_payloads.items()
+                }
+                for key, future in futures.items():
+                    parallel_results[key] = future.result()
+        except Exception as exc:
+            parallel_results.clear()
+            flow.emit(
+                "transfer",
+                "parallel_probe_fallback",
+                input_count=len(parallel_payloads),
+                output_count=0,
+                rejection_counts={"process_pool_unavailable": 1},
+                fields={"error": f"{type(exc).__name__}: {exc}"},
+            )
+        _transfer_phase_timing(
+            flow,
+            "matched_trial_execution",
+            parallel_started,
+            trial_pair_count=len(parallel_payloads),
+            worker_count=worker_count,
+            parallel_result_count=len(parallel_results),
+        )
 
     def reject(reason: str) -> None:
         scheduling_rejections[reason] = scheduling_rejections.get(reason, 0) + 1
@@ -1855,13 +2330,32 @@ def _run_automatic_transfer_experiments_v088(
                     target_game_hash=target_hash,
                 )
                 candidate_evidence[evidence_key] = execution_evidence
-            try:
-                captured_target = _capture_target_probe_state(
-                    game_id=game_id,
-                    env_root=env_root,
-                    seed=trial_seed,
+            prepared = parallel_results.get(evidence_key)
+            if prepared is not None:
+                trial_seed = int(
+                    parallel_payloads[evidence_key]["seed"]
                 )
-            except Exception as exc:
+                capture_error = prepared.get("error")
+            else:
+                fallback_payload = parallel_payloads.get(evidence_key)
+                if fallback_payload is not None:
+                    template = fallback_payload.get("target_grounding_template")
+                    references = fallback_payload.get("target_grounding_structures", ())
+                    if isinstance(template, dict) and references:
+                        from v8 import learning_fixes_v088_target_grounding_fix as grounding
+
+                        grounding._PENDING_TARGET_TEMPLATES[target_hash] = dict(template)
+                        grounding._PENDING_TARGET_STRUCTURES[target_hash] = tuple(references)
+                try:
+                    captured_target = _capture_target_probe_state(
+                        game_id=game_id,
+                        env_root=env_root,
+                        seed=trial_seed,
+                    )
+                    capture_error = None
+                except Exception as exc:
+                    capture_error = f"{type(exc).__name__}: {exc}"
+            if capture_error is not None:
                 rejection_reason = "TARGET_STATE_CAPTURE_FAILED"
                 reject(rejection_reason)
                 add_example(
@@ -1881,34 +2375,50 @@ def _run_automatic_transfer_experiments_v088(
                         "selected_transfer_structure_uid": None,
                         "computed_transfer_effect": None,
                         "only_transfer_policy_differs": False,
-                        "capture_error": f"{type(exc).__name__}: {exc}",
+                        "capture_error": str(capture_error),
                     },
                 )
                 continue
-            on_metric, used = _probe_policy_v088(
-                read_view=runtime.read_view,
-                game_id=game_id,
-                env_root=env_root,
-                seed=trial_seed,
-                steps=steps_per_trial,
-                required_ancestor=candidate.uid,
-                execution_evidence=execution_evidence,
-                diagnostic=probe_diagnostic,
-                environment=_restore_target_probe_state(captured_target),
-                target_state_capture_id=captured_target.capture_id,
-            )
-            control_diagnostic: dict[str, object] = {}
-            off_metric, _ = _probe_policy_v088(
-                read_view=runtime.read_view,
-                game_id=game_id,
-                env_root=env_root,
-                seed=trial_seed,
-                steps=steps_per_trial,
-                required_ancestor=None,
-                diagnostic=control_diagnostic,
-                environment=_restore_target_probe_state(captured_target),
-                target_state_capture_id=captured_target.capture_id,
-            )
+            if prepared is not None:
+                capture_id = str(prepared["capture_id"])
+                on_metric = float(prepared["on_metric"])
+                off_metric = float(prepared["off_metric"])
+                used = int(prepared["used"])
+                probe_diagnostic = dict(prepared["probe_diagnostic"])
+                control_diagnostic = dict(prepared["control_diagnostic"])
+                execution_evidence = dict(prepared["execution_evidence"])
+                candidate_evidence[evidence_key] = execution_evidence
+                from v8 import learning_fixes_v088_immediate_structural_transfer_fix as immediate
+
+                immediate._BRANCH_STRUCTURAL[target_hash] = dict(
+                    prepared.get("structural_branches", {})
+                )
+            else:
+                capture_id = captured_target.capture_id
+                on_metric, used = _probe_policy_v088(
+                    read_view=runtime.read_view,
+                    game_id=game_id,
+                    env_root=env_root,
+                    seed=trial_seed,
+                    steps=steps_per_trial,
+                    required_ancestor=candidate.uid,
+                    execution_evidence=execution_evidence,
+                    diagnostic=probe_diagnostic,
+                    environment=_restore_target_probe_state(captured_target),
+                    target_state_capture_id=capture_id,
+                )
+                control_diagnostic: dict[str, object] = {}
+                off_metric, _ = _probe_policy_v088(
+                    read_view=runtime.read_view,
+                    game_id=game_id,
+                    env_root=env_root,
+                    seed=trial_seed,
+                    steps=steps_per_trial,
+                    required_ancestor=None,
+                    diagnostic=control_diagnostic,
+                    environment=_restore_target_probe_state(captured_target),
+                    target_state_capture_id=capture_id,
+                )
             candidate_snapshot = candidate_execution.get(evidence_key)
             if candidate_snapshot is None:
                 candidate_snapshot = _candidate_execution_snapshot(
@@ -2096,7 +2606,7 @@ def _run_automatic_transfer_experiments_v088(
                         **intervention_fields,
                         "source_ancestor_id": _uid_value(candidate.uid),
                         "target_world": str(game_id),
-                        "target_state_capture_id": captured_target.capture_id,
+                        "target_state_capture_id": capture_id,
                         "trial_classification": rejection_reason,
                         "matched_control_checks": matched_control,
                         "computed_transfer_effect": None,
@@ -2201,7 +2711,7 @@ def _run_automatic_transfer_experiments_v088(
                     )[:8],
                     "target_world": str(game_id),
                     "target_world_hash": int(target_hash),
-                    "target_state_capture_id": captured_target.capture_id,
+                    "target_state_capture_id": capture_id,
                     "intervention": {
                         "outcome": dict(probe_diagnostic.get("outcome", {})),
                         "score": float(on_metric),

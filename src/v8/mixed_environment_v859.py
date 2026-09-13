@@ -160,6 +160,9 @@ def _publish_generic_progress(
 
 
 def _generic_read_view(runtime):
+    prepared = getattr(runtime, "_prepared_actor_read_view", None)
+    if prepared is not None:
+        return prepared, False
     descriptors = getattr(runtime, "shard_descriptors", None)
     if descriptors:
         return open_actor_read_view(

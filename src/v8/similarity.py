@@ -92,6 +92,8 @@ class BoundedNeighborhoodSimilarity:
     def descriptors(
         nodes: Iterable[NodeRecord],
         edges: Iterable[EdgeRecord],
+        *,
+        cancel_event=None,
     ) -> dict[MemoryUid, NeighborhoodDescriptor]:
         nodes = tuple(nodes)
         edges = tuple(edges)
@@ -119,7 +121,13 @@ class BoundedNeighborhoodSimilarity:
             row.uid: int(row.updated_watermark) for row in nodes if row.uid in eligible
         }
 
-        for edge in edges:
+        for index, edge in enumerate(edges):
+            if (
+                index % 4096 == 0
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                return {}
             src = by_uid.get(edge.source_uid)
             dst = by_uid.get(edge.target_uid)
             if src is None or dst is None:
@@ -251,8 +259,14 @@ class BoundedNeighborhoodSimilarity:
         self,
         nodes: Iterable[NodeRecord],
         edges: Iterable[EdgeRecord],
+        *,
+        cancel_event=None,
     ) -> tuple[SimilarityEvidence, ...]:
-        descriptors = self.descriptors(nodes, edges)
+        if cancel_event is not None and cancel_event.is_set():
+            return ()
+        descriptors = self.descriptors(nodes, edges, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return ()
         index: dict[
             tuple[int, int, int, int], list[NeighborhoodDescriptor]
         ] = defaultdict(list)
@@ -275,7 +289,14 @@ class BoundedNeighborhoodSimilarity:
             > self._processed_versions.get(descriptor.uid, -1)
         ]
         results: dict[tuple[MemoryUid, MemoryUid], SimilarityEvidence] = {}
-        for descriptor in dirty:
+        processed_versions: list[tuple[MemoryUid, int]] = []
+        for descriptor_index, descriptor in enumerate(dirty):
+            if (
+                descriptor_index % 64 == 0
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                return ()
             candidates: list[NeighborhoodDescriptor] = []
             relation_bucket = self._relation_bucket(descriptor)
             for future_delta in (0, -1, 1):
@@ -300,9 +321,15 @@ class BoundedNeighborhoodSimilarity:
                 if candidate.uid != descriptor.uid
             }
             scored: list[SimilarityEvidence] = []
-            for candidate in sorted(
+            for candidate_index, candidate in enumerate(sorted(
                 unique_candidates.values(), key=lambda item: item.uid
-            )[: self.max_candidates]:
+            )[: self.max_candidates]):
+                if (
+                    candidate_index % 64 == 0
+                    and cancel_event is not None
+                    and cancel_event.is_set()
+                ):
+                    return ()
                 self.candidate_comparisons += 1
                 evidence = self.score(descriptor, candidate)
                 if evidence.score >= self.threshold:
@@ -312,8 +339,14 @@ class BoundedNeighborhoodSimilarity:
                 key=lambda item: (-item.score, item.source_uid, item.target_uid),
             )[: self.top_results]:
                 results[(evidence.source_uid, evidence.target_uid)] = evidence
-            self._processed_versions[descriptor.uid] = descriptor.descriptor_version
-            self.processed_descriptors += 1
+            processed_versions.append(
+                (descriptor.uid, descriptor.descriptor_version)
+            )
+        if cancel_event is not None and cancel_event.is_set():
+            return ()
+        for uid, descriptor_version in processed_versions:
+            self._processed_versions[uid] = descriptor_version
+        self.processed_descriptors += len(processed_versions)
         return tuple(
             results[key]
             for key in sorted(results, key=lambda pair: (pair[0], pair[1]))

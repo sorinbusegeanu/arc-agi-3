@@ -165,7 +165,36 @@ def _install_target_local_transfer_grounding() -> None:
             return result
 
         graph_edges = tuple(edges or ())
-        descriptors = BoundedNeighborhoodSimilarity.descriptors(nodes, graph_edges)
+        analysis_index = getattr(
+            read_view, "_v088_transfer_analysis_index", None
+        )
+        descriptors = getattr(analysis_index, "neighborhood_descriptors", None)
+        if not isinstance(descriptors, dict):
+            descriptors = BoundedNeighborhoodSimilarity.descriptors(
+                nodes, graph_edges
+            )
+            if analysis_index is not None:
+                analysis_index.neighborhood_descriptors = descriptors
+        structural_descriptors = getattr(
+            analysis_index, "structural_descriptors", None
+        )
+        if not isinstance(structural_descriptors, dict):
+            structural_descriptors = {}
+        missing_structural = {
+            row.uid
+            for row in (source, correspondence_row)
+            if row.uid not in structural_descriptors
+        }
+        if missing_structural:
+            structural_descriptors.update(
+                StructuralCorrespondenceEstimator._descriptors(
+                    missing_structural,
+                    graph_edges,
+                    by_uid,
+                )
+            )
+            if analysis_index is not None:
+                analysis_index.structural_descriptors = structural_descriptors
         reference_structures = []
         for row in (source, correspondence_row):
             descriptor = descriptors.get(row.uid)
@@ -175,8 +204,8 @@ def _install_target_local_transfer_grounding() -> None:
                 {
                     "uid": _uid_text(row.uid),
                     "descriptor": descriptor,
-                    "structural_counter": StructuralCorrespondenceEstimator._descriptor(
-                        row.uid, graph_edges, by_uid
+                    "structural_counter": structural_descriptors.get(
+                        row.uid, Counter()
                     ),
                 }
             )

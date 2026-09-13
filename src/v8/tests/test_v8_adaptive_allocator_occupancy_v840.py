@@ -3,17 +3,61 @@ from __future__ import annotations
 import os
 import queue
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import v8  # noqa: F401 - install chronological runtime stack
 from v8 import adaptive_allocator_breadth_v840 as breadth
 from v8 import adaptive_allocator_occupancy_v840 as v840
 from v8 import adaptive_learning_allocation_v819_performance_fix as perf
+from v8 import adaptive_learning_allocation_v819_worker_fix as worker_fix
+from v8 import adaptive_learning_allocation_v819 as v819
 from v8 import cli_v819
 from v8 import sampling_control_repair_v823 as v823
 
 
 class AdaptiveAllocatorOccupancyV840Tests(unittest.TestCase):
+    def test_persistent_worker_installs_explicit_verified_success_scope(self) -> None:
+        class Stopped:
+            def is_set(self):
+                return True
+
+        class Ready:
+            def __init__(self):
+                self.ready = False
+
+            def set(self):
+                self.ready = True
+
+        view = SimpleNamespace(_warm_compact_cut=lambda: None, close=lambda: None)
+        ready = Ready()
+        name = "ARC_AGI3_V8_VERIFIED_SUCCESS_ROOT"
+        prior = os.environ.get(name)
+        try:
+            os.environ.pop(name, None)
+            with patch("v8.actor.open_actor_read_view", return_value=view):
+                worker_fix._worker_until_completed_win(
+                    worker_id=1,
+                    assignment_queue=object(),
+                    event_queue=object(),
+                    ready_event=ready,
+                    experience_ring_args={},
+                    read_descriptors=(),
+                    watermark=object(),
+                    stop_event=Stopped(),
+                    actor_throttle=object(),
+                    snapshot_freeze=object(),
+                    trajectory_root="unused/trajectory_optimizer",
+                    verified_success_root="/tmp/v8-current-run-success",
+                )
+            self.assertTrue(ready.ready)
+            self.assertEqual(os.environ[name], "/tmp/v8-current-run-success")
+        finally:
+            if prior is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = prior
+
     def test_reporting_rows_are_published_as_one_cumulative_snapshot(self) -> None:
         target = queue.Queue(maxsize=3)
         rows = (object(), object(), object())
@@ -194,6 +238,64 @@ class AdaptiveAllocatorOccupancyV840Tests(unittest.TestCase):
                 attempt_steps=2_000,
             ),
             1,
+        )
+
+    def test_failed_full_durable_verification_is_detected(self) -> None:
+        lease = SimpleNamespace(
+            mode=v819.SamplingMode.VERIFY,
+            steps=1_200,
+        )
+        self.assertTrue(
+            v840._durable_verification_failed_v840(
+                lease,
+                SimpleNamespace(steps=1_200, wins=0),
+                1_083,
+            )
+        )
+        self.assertFalse(
+            v840._durable_verification_failed_v840(
+                lease,
+                SimpleNamespace(steps=1_200, wins=1),
+                1_083,
+            )
+        )
+        self.assertFalse(
+            v840._durable_verification_failed_v840(
+                lease,
+                SimpleNamespace(steps=500, wins=0),
+                1_083,
+            )
+        )
+
+    def test_only_executable_exact_click_routes_arm_verification_fallback(self) -> None:
+        with (
+            patch(
+                "v8.verified_success_metrics_v866.best_durable_complete_v866",
+                return_value={"actions": [11, 12]},
+            ),
+            patch(
+                "v8.click_exploration_v848._is_exact_click_token",
+                side_effect=lambda action: action == 11,
+            ),
+        ):
+            self.assertEqual(v840._durable_completion_steps_v840("gp01"), 0)
+
+    def test_failed_durable_verification_restores_unsolved_allocation_weight(self) -> None:
+        coordinator = SimpleNamespace(
+            sampling_weight=lambda game: 0.075,
+            config=SimpleNamespace(unsolved_weight=1.0),
+        )
+        self.assertEqual(
+            v840._effective_sampling_weight_v840(coordinator, "tp01", set()),
+            0.075,
+        )
+        self.assertEqual(
+            v840._effective_sampling_weight_v840(
+                coordinator,
+                "tp01",
+                {"tp01"},
+            ),
+            1.0,
         )
 
     def test_actor_option_is_a_cap_and_all_job_descriptors_survive(self) -> None:

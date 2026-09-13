@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 import queue
 import time
@@ -12,6 +13,22 @@ from pathlib import Path
 _INSTALLED = False
 _ACTOR_POOL_ENV = "ARC_AGI3_V8_ACTOR_POOL_SIZE"
 _REPORTING_REFRESH_SECONDS = 5.0
+
+
+def _worker_accepts_argument(worker, name: str) -> bool:
+    try:
+        parameters = inspect.signature(worker).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == str(name)
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _worker_accepts_record_cut(worker) -> bool:
+    return _worker_accepts_argument(worker, "record_cut_path")
 
 
 @dataclass(slots=True)
@@ -206,6 +223,49 @@ def _historical_completion_attempt_limit_v840(
     return max(1, min(4, budget // (2 * attempt)))
 
 
+def _durable_completion_steps_v840(game_id: str) -> int:
+    """Return an executable exact-click replay length, never inferred evidence."""
+
+    from v8.click_exploration_v848 import _is_exact_click_token
+    from v8.verified_success_metrics_v866 import best_durable_complete_v866
+
+    row = best_durable_complete_v866(str(game_id))
+    if not isinstance(row, dict):
+        return 0
+    actions = row.get("actions")
+    if not isinstance(actions, list) or not actions:
+        return 0
+    try:
+        if not all(_is_exact_click_token(int(action)) for action in actions):
+            return 0
+    except (TypeError, ValueError):
+        return 0
+    return len(actions)
+
+
+def _durable_verification_failed_v840(lease, result, replay_steps: int) -> bool:
+    """Detect a fully budgeted replay that did not reproduce its durable WIN."""
+
+    from v8 import adaptive_learning_allocation_v819 as v819
+
+    return bool(
+        lease.mode == v819.SamplingMode.VERIFY
+        and int(replay_steps) > 0
+        and int(lease.steps) >= int(replay_steps)
+        and int(getattr(result, "steps", 0)) >= int(replay_steps)
+        and int(getattr(result, "wins", 0)) <= 0
+    )
+
+
+def _effective_sampling_weight_v840(coordinator, game_id: str, failed_games) -> float:
+    weight = float(coordinator.sampling_weight(str(game_id)))
+    if str(game_id) in failed_games:
+        # A durable record remains historical evidence, but a failed clean replay
+        # means this run must relearn instead of staying permanently downweighted.
+        weight = max(weight, float(coordinator.config.unsolved_weight))
+    return max(1e-9, weight)
+
+
 def _adaptive_run_actor_jobs_v840(
     runtime,
     jobs,
@@ -263,37 +323,73 @@ def _adaptive_run_actor_jobs_v840(
     peers = getattr(runtime, "peers", None)
     if peers is not None:
         peers.pause()
+    optimizer = getattr(runtime, "_v814_trajectory_optimizer", None)
+    pause_optimizer = getattr(optimizer, "pause_for_actor_startup", None)
+    resume_optimizer = getattr(optimizer, "resume_after_actor_startup", None)
+    optimizer_paused = False
+    if callable(pause_optimizer):
+        pause_optimizer()
+        optimizer_paused = True
     runtime.start()
     ctx = runtime._mp_ctx
-    if peers is not None:
-        startup_timeout = 300.0 if timeout is None else max(0.01, min(float(timeout), 300.0))
-        if not peers.wait_idle(startup_timeout):
-            raise TimeoutError("v8 peers did not pause before adaptive actor startup")
-        runtime.wait_quiescent(
-            timeout=startup_timeout,
-            resume_peers=False,
-            settle_peers=False,
-        )
+    worker_supports_record_cut = _worker_accepts_record_cut(perf._worker_until_win)
+    worker_supports_success_root = _worker_accepts_argument(
+        perf._worker_until_win, "verified_success_root"
+    )
+    startup_timeout = 300.0 if timeout is None else max(0.01, min(float(timeout), 300.0))
+    owned_record_cut = False
+    record_cut_path = os.environ.get(actor_module.ACTOR_RECORD_CUT_ENV)
+    try:
+        if peers is not None:
+            if not peers.wait_idle(startup_timeout):
+                raise TimeoutError("v8 peers did not pause before adaptive actor startup")
+            runtime.wait_quiescent(
+                timeout=startup_timeout,
+                resume_peers=False,
+                settle_peers=False,
+            )
+        if worker_supports_record_cut and not record_cut_path:
+            prepared = actor_module.prepare_actor_record_cut_file(
+                tuple(runtime.shard_descriptors),
+                Path(runtime.root) / "maintenance",
+            )
+            record_cut_path = str(prepared)
+            owned_record_cut = True
+    except BaseException:
+        if optimizer_paused and callable(resume_optimizer):
+            resume_optimizer()
+        raise
 
     assignments = [ctx.Queue(maxsize=2) for _ in range(worker_count)]
     events = ctx.Queue(maxsize=max(64, worker_count * 16))
     ready = [ctx.Event() for _ in range(worker_count)]
+
+    def worker_kwargs(index: int) -> dict[str, object]:
+        values = {
+            "worker_id": index + 1,
+            "assignment_queue": assignments[index],
+            "event_queue": events,
+            "ready_event": ready[index],
+            "experience_ring_args": runtime._stage_rings[0].attachment_args(),
+            "read_descriptors": runtime.shard_descriptors,
+            "watermark": runtime._watermark,
+            "stop_event": runtime._stop,
+            "actor_throttle": runtime._actor_throttle,
+            "snapshot_freeze": runtime._snapshot_freeze,
+            "trajectory_root": trajectory_root,
+        }
+        if worker_supports_success_root:
+            values["verified_success_root"] = getattr(
+                runtime, "_v866_success_root", None
+            )
+        if worker_supports_record_cut:
+            values["record_cut_path"] = record_cut_path
+        return values
+
     processes = [
         ctx.Process(
             target=perf._worker_until_win,
-            kwargs={
-                "worker_id": index + 1,
-                "assignment_queue": assignments[index],
-                "event_queue": events,
-                "ready_event": ready[index],
-                "experience_ring_args": runtime._stage_rings[0].attachment_args(),
-                "read_descriptors": runtime.shard_descriptors,
-                "watermark": runtime._watermark,
-                "stop_event": runtime._stop,
-                "actor_throttle": runtime._actor_throttle,
-                "snapshot_freeze": runtime._snapshot_freeze,
-                "trajectory_root": trajectory_root,
-            },
+            kwargs=worker_kwargs(index),
             name=f"v8-adaptive-actor-{index + 1:03d}",
             daemon=True,
         )
@@ -317,6 +413,11 @@ def _adaptive_run_actor_jobs_v840(
     provisional_wins: dict[str, float] = {}
     leases_by_game: dict[str, int] = {}
     completion_leases_by_game: dict[str, int] = {}
+    durable_completion_steps = {
+        game: _durable_completion_steps_v840(game)
+        for game in games
+    }
+    failed_durable_verification_games: set[str] = set()
     initial_games = list(games)
     no_progress_retries = 0
     final_peer_drain_requested = False
@@ -360,7 +461,11 @@ def _adaptive_run_actor_jobs_v840(
                         float(coordinator._run[game].sample_steps)
                         + float(active_reserved.get(game, 0))
                     )
-                    / max(1e-9, float(coordinator.sampling_weight(game))),
+                    / _effective_sampling_weight_v840(
+                        coordinator,
+                        game,
+                        failed_durable_verification_games,
+                    ),
                     int(coordinator._run[game].leases) + int(active_counts.get(game, 0)),
                     game,
                 ),
@@ -376,8 +481,16 @@ def _adaptive_run_actor_jobs_v840(
             game = initial_games.pop(0)
         else:
             game = choose_game()
-        mode = coordinator.choose_mode(game)
-        if coordinator.game_state(game) == v819.GameLearningState.UNSOLVED:
+        failed_verification = game in failed_durable_verification_games
+        mode = (
+            v819.SamplingMode.DISCOVERY
+            if failed_verification
+            else coordinator.choose_mode(game)
+        )
+        if (
+            failed_verification
+            or coordinator.game_state(game) == v819.GameLearningState.UNSOLVED
+        ):
             steps = perf._v823_initial_unsolved_lease_steps(
                 available=int(available),
                 base_steps=max(1, int(base_budget_by_game.get(game, 1))),
@@ -456,8 +569,16 @@ def _adaptive_run_actor_jobs_v840(
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("adaptive actor startup timed out")
             time.sleep(0.01)
+        print(
+            f'[{time.strftime("%H:%M")}] actor startup ready '
+            f"workers={worker_count} seconds={time.monotonic() - started:.1f}",
+            flush=True,
+        )
         if peers is not None:
             peers.resume()
+        if optimizer_paused and callable(resume_optimizer):
+            resume_optimizer()
+            optimizer_paused = False
         refill()
 
         while active_leases or budget.available > 0:
@@ -487,6 +608,12 @@ def _adaptive_run_actor_jobs_v840(
                 budget.complete(worker_id, actual)
                 idle_workers.add(worker_id)
                 coordinator.record_lease(lease.game_id, lease.mode, actual)
+                if _durable_verification_failed_v840(
+                    lease,
+                    result,
+                    int(durable_completion_steps.get(str(lease.game_id), 0)),
+                ):
+                    failed_durable_verification_games.add(str(lease.game_id))
                 values = bucket(str(lease.game_id))
                 prior_steps = int(values["steps"])
                 values["steps"] += actual
@@ -509,6 +636,7 @@ def _adaptive_run_actor_jobs_v840(
                 if pending is not None:
                     runtime.record_actor_results((pending,))
                 if int(getattr(result, "wins", 0)) > 0:
+                    failed_durable_verification_games.discard(str(lease.game_id))
                     provisional_wins[str(lease.game_id)] = (
                         time.monotonic() + perf._PROVISIONAL_WIN_SECONDS
                     )
@@ -658,6 +786,10 @@ def _adaptive_run_actor_jobs_v840(
             process.join(timeout=2.0)
         raise
     finally:
+        if optimizer_paused and callable(resume_optimizer):
+            resume_optimizer()
+        if owned_record_cut and record_cut_path:
+            Path(record_cut_path).unlink(missing_ok=True)
         for q in assignments:
             try:
                 q.put_nowait(None)

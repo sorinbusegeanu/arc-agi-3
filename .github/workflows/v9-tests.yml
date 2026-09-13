@@ -1,4 +1,4 @@
-name: v9 bootstrap tests
+name: v9 independent runtime tests
 
 on:
   push:
@@ -6,10 +6,14 @@ on:
       - main
     paths:
       - 'src/v9/**'
+      - 'docs/v9/**'
+      - 'pyproject.toml'
       - '.github/workflows/v9-tests.yml'
   pull_request:
     paths:
       - 'src/v9/**'
+      - 'docs/v9/**'
+      - 'pyproject.toml'
       - '.github/workflows/v9-tests.yml'
   workflow_dispatch:
 
@@ -36,8 +40,16 @@ jobs:
       - name: Run focused v9 tests
         env:
           PYTHONPATH: src
-        run: python -m unittest discover -s src/v9/tests -p 'test_*.py' -v
+        run: python -m pytest -q src/v9/tests
       - name: Run complete v8 regression suite
         env:
           PYTHONPATH: src
-        run: python -m unittest discover -s src/v8/tests -p 'test_*.py' -v
+        run: python -m pytest -q src/v8/tests
+      - name: Run v9 with historical runtime unavailable
+        run: |
+          isolated="$(mktemp -d)"
+          cp -R src/v9 "$isolated/v9"
+          mv src/v8 "$isolated/reference-v8"
+          PYTHONPATH="$isolated" python -m pytest -q "$isolated/v9/tests"
+          PYTHONPATH="$isolated" python -m v9 --help
+          PYTHONPATH="$isolated" python -m v9 smoke --root "$isolated/run" --events 8 --no-restore

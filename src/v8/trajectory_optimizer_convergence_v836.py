@@ -80,6 +80,8 @@ def _optimizer_loop_v836(service) -> None:
 
     try:
         while not service._stop.is_set():
+            if not v818._wait_until_optimizer_resumed(service):
+                return
             v818._restore_pending_sources(service)
             v818._ingest_inbox_v818(service)
             v818._start_waiting_validators(service)

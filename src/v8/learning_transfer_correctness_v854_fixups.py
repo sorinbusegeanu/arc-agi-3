@@ -62,14 +62,25 @@ def _locked_record_transfer_trial(self, *args, **kwargs):
         return v854._record_trial_v854(self, *args, **kwargs)
 
 
-def _similarity_v854_fixup(self, nodes, edges):
+def _similarity_v854_fixup(self, nodes, edges, *, cancel_event=None):
     """Reserve structurally ranked cross-world candidates before bucket truncation."""
     from v8 import learning_transfer_correctness_v854 as v854
     from v8.model import stable_u64
 
+    if cancel_event is not None and cancel_event.is_set():
+        return ()
     nodes, edges = tuple(nodes), tuple(edges)
-    descriptors = self.descriptors(nodes, edges)
+    if cancel_event is None:
+        descriptors = self.descriptors(nodes, edges)
+    else:
+        descriptors = self.descriptors(
+            nodes, edges, cancel_event=cancel_event
+        )
+    if cancel_event is not None and cancel_event.is_set():
+        return ()
     by_uid, _parents, games = v854._graph_index(nodes, edges)
+    if cancel_event is not None and cancel_event.is_set():
+        return ()
     index, fallback = defaultdict(list), defaultdict(list)
     for descriptor in descriptors.values():
         index[(
@@ -101,7 +112,14 @@ def _similarity_v854_fixup(self, nodes, edges):
         right_mask = 0 if right_row is None else int(right_row.game_mask)
         return bool(left_mask and right_mask and left_mask != right_mask)
 
-    for source in dirty:
+    processed_versions = []
+    for source_index, source in enumerate(dirty):
+        if (
+            source_index % 32 == 0
+            and cancel_event is not None
+            and cancel_event.is_set()
+        ):
+            return ()
         relation_bucket = self._relation_bucket(source)
         bucket_candidates = []
         for delta in (0, -1, 1):
@@ -156,7 +174,13 @@ def _similarity_v854_fixup(self, nodes, edges):
         )[: self.max_candidates]
 
         scored = []
-        for candidate in ranked_candidates:
+        for candidate_index, candidate in enumerate(ranked_candidates):
+            if (
+                candidate_index % 32 == 0
+                and cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                return ()
             self.candidate_comparisons += 1
             evidence = self.score(source, candidate)
             if evidence.score >= self.threshold:
@@ -184,8 +208,12 @@ def _similarity_v854_fixup(self, nodes, edges):
                 break
         for evidence in chosen[: self.top_results]:
             results[(evidence.source_uid, evidence.target_uid)] = evidence
-        self._processed_versions[source.uid] = source.descriptor_version
-        self.processed_descriptors += 1
+        processed_versions.append((source.uid, source.descriptor_version))
+    if cancel_event is not None and cancel_event.is_set():
+        return ()
+    for uid, descriptor_version in processed_versions:
+        self._processed_versions[uid] = descriptor_version
+    self.processed_descriptors += len(processed_versions)
     return tuple(results[key] for key in sorted(results))
 
 

@@ -180,12 +180,15 @@ def reporting_worker(
     output_queue: mp.Queue | None = None,
     total_steps: int | None = None,
     baseline: ContinuousProgressBaseline | None = None,
+    emit_progress: bool = True,
+    emit_startup_heartbeat: bool = False,
 ) -> None:
     latest = {
         int(actor_id): ActorProgress(int(actor_id), str(game_id), 0, 0, 0, 0)
         for actor_id, game_id in actors
     }
     next_report = time.monotonic() + float(interval_seconds)
+    saw_actor_progress = False
 
     while not stop_event.is_set():
         now = time.monotonic()
@@ -197,6 +200,7 @@ def reporting_worker(
 
         if isinstance(row, ActorProgress):
             latest[int(row.actor_id)] = row
+            saw_actor_progress = True
         elif isinstance(row, EvidenceRecord):
             # Evidence remains authoritative in the runtime ledger and final reports.
             # The dedicated stdout reporter intentionally ignores it for now.
@@ -210,10 +214,16 @@ def reporting_worker(
             continue
 
         rows = tuple(latest[key] for key in sorted(latest))
-        _emit_line(
-            format_periodic_progress_line(rows, total_steps, baseline),
-            output_queue,
-        )
+        if emit_progress:
+            _emit_line(
+                format_periodic_progress_line(rows, total_steps, baseline),
+                output_queue,
+            )
+        elif emit_startup_heartbeat and not saw_actor_progress:
+            _emit_line(
+                "actor startup: loading shared coherent read view in workers",
+                output_queue,
+            )
         while next_report <= now:
             next_report += float(interval_seconds)
 
@@ -231,6 +241,8 @@ class DedicatedReporter:
         output_queue: mp.Queue | None = None,
         total_steps: int | None = None,
         baseline: ContinuousProgressBaseline | None = None,
+        emit_progress: bool = True,
+        emit_startup_heartbeat: bool = False,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("reporting interval must be positive")
@@ -247,6 +259,8 @@ class DedicatedReporter:
                 "output_queue": output_queue,
                 "total_steps": total_steps,
                 "baseline": baseline,
+                "emit_progress": bool(emit_progress),
+                "emit_startup_heartbeat": bool(emit_startup_heartbeat),
             },
             name="v8-dedicated-reporter",
             daemon=True,

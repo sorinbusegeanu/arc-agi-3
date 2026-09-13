@@ -46,6 +46,8 @@ def _reporting_worker_v851_integrity(
     hypothesis_interval_seconds: float = 300.0,
     total_steps: int | None = None,
     baseline=None,
+    emit_progress: bool = True,
+    emit_startup_heartbeat: bool = False,
 ) -> None:
     """Disk-authoritative reporter with one terminal all-job 100% flush."""
     from v8 import memory_efficiency_v851_integrity as memory_integrity
@@ -68,7 +70,9 @@ def _reporting_worker_v851_integrity(
 
     while not stop_event.is_set():
         now = time.monotonic()
-        timeout = max(0.0, min(0.25, next_report - now, next_hypotheses - now))
+        timeout = max(
+            0.0, min(0.25, next_report - now, next_hypotheses - now)
+        )
         try:
             row = event_queue.get(timeout=timeout)
         except queue.Empty:
@@ -81,27 +85,36 @@ def _reporting_worker_v851_integrity(
             # The authoritative evidence source is the disk ledger read below.
             pass
         elif row == reporter.SAMPLING_COMPLETE:
-            if saw_progress:
+            if emit_progress and saw_progress:
                 rows = tuple(latest[key] for key in sorted(latest))
                 line = reporter.format_periodic_progress_line(
                     rows, total_steps, baseline
                 )
                 from v8 import mixed_research_runtime_integrity_v875 as v875
 
-                _dedicated_emit(v875._force_complete_percentage(line), output_queue)
+                _dedicated_emit(
+                    v875._force_complete_percentage(line), output_queue
+                )
             reporter._emit_sampling_complete(output_queue)
             return
 
         now = time.monotonic()
         if now >= next_report:
-            rows = tuple(latest[key] for key in sorted(latest))
-            _dedicated_emit(
-                reporter.format_periodic_progress_line(rows, total_steps, baseline),
-                output_queue,
-            )
+            if emit_progress:
+                rows = tuple(latest[key] for key in sorted(latest))
+                _dedicated_emit(
+                    reporter.format_periodic_progress_line(
+                        rows, total_steps, baseline
+                    ),
+                    output_queue,
+                )
+            elif emit_startup_heartbeat and not saw_progress:
+                _dedicated_emit(
+                    "actor startup: loading shared coherent read view in workers",
+                    output_queue,
+                )
             while next_report <= now:
                 next_report += float(interval_seconds)
-
         if now >= next_hypotheses:
             current = int(getattr(watermark, "value", 0))
             evidence = memory_integrity._read_evidence_for_report(root, current)
@@ -217,8 +230,8 @@ def install_mixed_research_runtime_integrity_v876() -> None:
         _authoritative_telemetry_game_state_v875
     )
 
-    # v8.50 still suppresses duplicate parent-side effectiveness lines. The
-    # dedicated worker bypasses that suppression through _dedicated_emit.
+    # v8.50 suppresses reporter-side effectiveness lines. The parent allocator
+    # is the sole stdout owner for the complete effectiveness snapshot.
     effectiveness._reporter_emit_line_v850 = _reporter_emit_line_v850
     reporter._emit_line = effectiveness._reporter_emit_line_v850
 

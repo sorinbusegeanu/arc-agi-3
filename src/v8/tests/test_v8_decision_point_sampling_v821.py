@@ -25,7 +25,7 @@ class _Env:
 
 
 class DecisionPointSamplingV821Tests(unittest.TestCase):
-    def test_eligible_bootstrap_precedes_forced_discovery(self) -> None:
+    def test_existing_plan_precedes_bootstrap_without_discarding_cursor(self) -> None:
         chosen = SimpleNamespace(strategy_uid=MemoryUid(7, 1))
         alternative = SimpleNamespace(strategy_uid=MemoryUid(7, 2))
         sampler = SimpleNamespace(
@@ -34,7 +34,7 @@ class DecisionPointSamplingV821Tests(unittest.TestCase):
             )
         )
         with (
-            patch.object(empirical, "_bootstrap_plan", return_value=chosen),
+            patch.object(empirical, "_bootstrap_plan", return_value=chosen) as bootstrap,
             patch.object(
                 empirical,
                 "_BASE_ACTOR_PLAN_CANDIDATES",
@@ -50,8 +50,60 @@ class DecisionPointSamplingV821Tests(unittest.TestCase):
                 history=(),
             )
         self.assertIsNone(action)
+        self.assertIs(planned, alternative)
+        self.assertEqual(plans, (alternative,))
+        bootstrap.assert_not_called()
+
+    def test_bootstrap_runs_only_after_planner_has_no_executable_plan(self) -> None:
+        chosen = SimpleNamespace(strategy_uid=MemoryUid(7, 1))
+        sampler = SimpleNamespace(
+            forced_action=lambda **kwargs: self.fail(
+                "forced discovery must not hide an eligible M7 bootstrap"
+            )
+        )
+        with (
+            patch.object(empirical, "_bootstrap_plan", return_value=chosen),
+            patch.object(empirical, "_BASE_ACTOR_PLAN_CANDIDATES", return_value=()),
+        ):
+            action, planned, plans = sampling._bootstrap_before_forced_action(
+                object(),
+                sampler,
+                level=0,
+                context=10,
+                actions=(1, 2),
+                history=(),
+            )
+        self.assertIsNone(action)
         self.assertIs(planned, chosen)
-        self.assertEqual(plans, (chosen, alternative))
+        self.assertEqual(plans, (chosen,))
+
+    def test_explicit_replay_precedes_planner_and_bootstrap(self) -> None:
+        sampler = SimpleNamespace(
+            base=SimpleNamespace(
+                replay_actions=(3,),
+                replay_target=None,
+                verification=None,
+            ),
+            active_sequence=(),
+            forced_action=lambda **kwargs: 3,
+        )
+        with (
+            patch.object(empirical, "_bootstrap_plan") as bootstrap,
+            patch.object(empirical, "_BASE_ACTOR_PLAN_CANDIDATES") as planner,
+        ):
+            action, planned, plans = sampling._bootstrap_before_forced_action(
+                object(),
+                sampler,
+                level=0,
+                context=10,
+                actions=(3, 4),
+                history=(),
+            )
+        self.assertEqual(action, 3)
+        self.assertIsNone(planned)
+        self.assertEqual(plans, ())
+        planner.assert_not_called()
+        bootstrap.assert_not_called()
 
     def test_installed_actor_uses_v822_wrapper_over_v821_discovery_controller(self) -> None:
         self.assertIs(actor_module.actor_worker, repair._actor_worker_v822)

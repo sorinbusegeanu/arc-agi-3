@@ -213,6 +213,68 @@ class MemoryEfficiencyV851Tests(unittest.TestCase):
             edges.dispose()
             actions.dispose()
 
+    def test_parent_prepared_actor_cut_is_reused_by_multiple_workers(self):
+        nodes = SharedNodeArena(capacity=16)
+        edges = SharedEdgeArena(capacity=16)
+        actions = SharedActionArena(capacity=16)
+        descriptor = ShardReadDescriptor(nodes.descriptor, edges.descriptor, actions.descriptor)
+        views = []
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                path = actor_module.prepare_actor_record_cut_file(
+                    (descriptor,), Path(root)
+                )
+                self.assertTrue(path.exists())
+                with patch.object(
+                    ActorReadView,
+                    "_scan_node_arena",
+                    side_effect=AssertionError("worker rebuilt the shared actor cut"),
+                ):
+                    for _worker in range(2):
+                        cuts, versions = actor_module.load_actor_record_cut_file(path)
+                        view = actor_module.open_actor_read_view(
+                            (descriptor,),
+                            refresh_interval_seconds=None,
+                            record_cuts=cuts,
+                        )
+                        views.append(view)
+                        actor_module._validate_actor_record_cut(view, versions)
+                        self.assertEqual(view.node_records(), ())
+        finally:
+            for view in views:
+                view.close()
+            nodes.dispose()
+            edges.dispose()
+            actions.dispose()
+
+    def test_shared_actor_cut_rejects_a_changed_graph_version(self):
+        nodes = SharedNodeArena(capacity=16)
+        edges = SharedEdgeArena(capacity=16)
+        actions = SharedActionArena(capacity=16)
+        descriptor = ShardReadDescriptor(nodes.descriptor, edges.descriptor, actions.descriptor)
+        view = None
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                path = actor_module.prepare_actor_record_cut_file(
+                    (descriptor,), Path(root)
+                )
+                cuts, versions = actor_module.load_actor_record_cut_file(path)
+                nodes.begin_write()
+                nodes.end_write(count=0)
+                view = actor_module.open_actor_read_view(
+                    (descriptor,),
+                    refresh_interval_seconds=None,
+                    record_cuts=cuts,
+                )
+                with self.assertRaisesRegex(RuntimeError, "graph changed"):
+                    actor_module._validate_actor_record_cut(view, versions)
+        finally:
+            if view is not None:
+                view.close()
+            nodes.dispose()
+            edges.dispose()
+            actions.dispose()
+
     def test_action_arena_snapshot_rehashes_when_capacity_changes(self):
         source = SharedActionArena(capacity=16)
         target = SharedActionArena(capacity=32)
@@ -291,6 +353,39 @@ class MemoryEfficiencyV851Tests(unittest.TestCase):
                 self.assertEqual(ledger.truncate_after(5), 1)
                 self.assertEqual(ledger.count(), 1)
                 self.assertEqual(tuple(row.evidence_id for row in ledger.cut(5)), ("e1",))
+            finally:
+                ledger.close()
+        if prior is None:
+            os.environ.pop(_ROOT_ENV, None)
+        else:
+            os.environ[_ROOT_ENV] = prior
+
+    def test_disk_evidence_append_many_preserves_each_distinct_record(self):
+        prior = os.environ.get(_ROOT_ENV)
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ[_ROOT_ENV] = tmp
+            ledger = DiskBackedEvidenceLedger()
+            try:
+                uid = MemoryUid(7, 8)
+                rows = tuple(
+                    EvidenceRecord.for_uid(
+                        f"batch-{index}",
+                        uid,
+                        evidence_kind="primary_valence_credit",
+                        watermark=index + 1,
+                        raw_value=1.0,
+                        normalized_value=1.0,
+                        developmental_stage=int(MemoryLevel.M1),
+                        validation_state=int(ValidationState.STRUCTURAL),
+                    )
+                    for index in range(3)
+                )
+                self.assertEqual(ledger.append_many(rows), 3)
+                self.assertEqual(ledger.append_many(rows), 0)
+                self.assertEqual(
+                    tuple(row.evidence_id for row in ledger.cut(3)),
+                    ("batch-0", "batch-1", "batch-2"),
+                )
             finally:
                 ledger.close()
         if prior is None:

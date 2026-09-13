@@ -33,6 +33,7 @@ _BASE_RUN_UNTIL_STABLE = None
 _BASE_FULL_CUT_RUN_ONCE = None
 _RETRY_POLL_SECONDS = 0.005
 _NOOP_RETRY_LIMIT = 2
+_CUT_BUDGET_SAFETY_FACTOR = 1.25
 
 
 def _process_role_formation(self, cut, frozen) -> None:
@@ -173,6 +174,7 @@ def _run_until_stable_v883(
     was_cancelled = bool(cancel is not None and cancel.is_set())
     submit = self.submit_proposal
     prior_stabilizing = getattr(self, "_v82_stabilizing", False)
+    previous_cut_seconds = 0.0
     try:
         if not self.wait_idle(remaining_timeout()):
             flow.emit(
@@ -191,7 +193,16 @@ def _run_until_stable_v883(
 
         formation_only = True
         for cycle in range(1, limit + 1):
-            if remaining_timeout() <= 0.0:
+            remaining = remaining_timeout()
+            projected_cut_seconds = (
+                previous_cut_seconds * _CUT_BUDGET_SAFETY_FACTOR
+                if previous_cut_seconds > 0.0
+                else 0.0
+            )
+            if remaining <= 0.0 or (
+                projected_cut_seconds > 0.0
+                and remaining < projected_cut_seconds
+            ):
                 flow.emit(
                     "developmental",
                     "stabilization",
@@ -204,6 +215,8 @@ def _run_until_stable_v883(
                             "formation" if formation_only else "full_analysis"
                         ),
                         "stop_reason": "timeout",
+                        "remaining_seconds": remaining,
+                        "projected_cut_seconds": projected_cut_seconds,
                     },
                 )
                 return "timeout"
@@ -230,6 +243,7 @@ def _run_until_stable_v883(
                     submitted[proposal.uid] = "new_m7_count"
 
             noop_attempts = 0
+            cut_started = time.monotonic()
             while True:
                 before_cut = self.last_developmental_cut
                 before_cycles = self._cycles
@@ -319,7 +333,12 @@ def _run_until_stable_v883(
                 "new_m5_count": counts["new_m5_count"],
                 "new_m6_count": counts["new_m6_count"],
                 "new_m7_count": counts["new_m7_count"],
+                "elapsed_seconds": max(0.0, time.monotonic() - cut_started),
             }
+            previous_cut_seconds = max(
+                previous_cut_seconds,
+                float(fields["elapsed_seconds"]),
+            )
             if reason is not None:
                 fields["stop_reason"] = reason
             flow.emit(
@@ -334,8 +353,11 @@ def _run_until_stable_v883(
     finally:
         self.submit_proposal = submit
         self._v82_stabilizing = prior_stabilizing
-        if cancel is not None and was_cancelled:
-            cancel.set()
+        if cancel is not None:
+            if was_cancelled:
+                cancel.set()
+            else:
+                cancel.clear()
         if not was_paused:
             self.resume()
 
