@@ -90,6 +90,7 @@ def ensure_process_server_ready(start_method: str | None = None) -> str:
         raise RuntimeError("v9 forkserver bootstrap timed out")
     if process.exitcode != 0:
         raise RuntimeError(f"v9 forkserver bootstrap failed with code {process.exitcode}")
+    process.close()
     _FORKSERVER_READY = True
     return method
 
@@ -111,6 +112,18 @@ def _close_queue(queue_obj: Any, *, drain: bool) -> None:
             queue_obj.join_thread()
         except (AttributeError, AssertionError, OSError, ValueError):
             pass
+
+
+def _close_process(process: Any) -> None:
+    try:
+        if process.is_alive():
+            return
+    except (AttributeError, ValueError):
+        return
+    try:
+        process.close()
+    except (AttributeError, OSError, ValueError):
+        pass
 
 
 def _load_factory(path: str):
@@ -330,6 +343,8 @@ class ProcessTopology:
         )
         for queue_obj in queues:
             _close_queue(queue_obj, drain=drain)
+        for process in (*self.actor_processes, *self.stage_processes, *self.shard_processes):
+            _close_process(process)
 
     @property
     def process_count(self) -> int:
