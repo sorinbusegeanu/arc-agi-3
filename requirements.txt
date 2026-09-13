@@ -5,7 +5,7 @@
 arc-agi>=0.9.9,<1.0
 chess>=1.11,<2.0
 duckdb>=1.0
-gymnasium[atari]>=1.0,<2.0
+gymnasium[box2d,atari]>=1.0,<2.0
 networkx>=3.0
 numpy>=1.26
 pandas>=2.0
