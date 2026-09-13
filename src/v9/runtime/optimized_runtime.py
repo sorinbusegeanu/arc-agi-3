@@ -4,11 +4,15 @@ from dataclasses import asdict
 import time
 from typing import Any, Iterable
 
+from v9.memory.identity import MemoryUid
+from v9.memory.m1_normalized import M1NormalizedRelation, NormalizedChannel
 from v9.memory.model import CanonicalNode, MemoryLevel, MemoryType
+from v9.memory.provenance import DerivationProvenance
 from v9.modalities.symbols import DeterministicSymbolCodec
 from v9.runtime.actor_policy import ActorPolicySnapshot
 from v9.runtime.memory_pipeline import DerivationResult, PreparedIngestion, PreparedSymbolIngestion
 from v9.runtime.runtime import ContinuousMemoryRuntime as BaseContinuousMemoryRuntime
+from v9.runtime.snapshot_backend import latest_snapshot
 from v9.telemetry import build_primary_dashboard
 
 
@@ -20,7 +24,18 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
         self._metrics_cache: dict[str, Any] | None = None
         self._metrics_cache_at = 0.0
         self._metrics_cache_seconds = 30.0
+        restore_path = latest_snapshot(config.root) if bool(getattr(config, "restore", False)) else None
+        restore_started = time.perf_counter()
+        if restore_path is not None:
+            print(f"{time.strftime('[%H:%M]')} restoring snapshot: {restore_path}", flush=True)
         super().__init__(config)
+        if restore_path is not None:
+            print(
+                f"{time.strftime('[%H:%M]')} restore complete "
+                f"memories={len(self.graph.nodes)} edges={len(self.graph.edges)} "
+                f"seconds={time.perf_counter() - restore_started:.2f}",
+                flush=True,
+            )
 
     def set_hgt_action_scores(self, scores: dict[int, dict[int, float]], *, context_action_scores: dict[int, dict[int, dict[int, float]]] | None = None) -> None:
         with self._lock:
@@ -181,6 +196,68 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
         return state
 
     def _restore(self, snapshot: dict[str, Any]) -> None:
-        super()._restore(snapshot)
         state = dict(snapshot.get("state", {}))
+        saved_occurrences = dict(state.get("m1n_occurrences", {}))
+
+        if saved_occurrences:
+            restore_state = dict(state)
+            restore_state["m1n_occurrences"] = {}
+            if "m1n_supports" not in restore_state:
+                restore_state["m1n_supports"] = saved_occurrences
+            restore_snapshot = dict(snapshot)
+            restore_snapshot["state"] = restore_state
+            super()._restore(restore_snapshot)
+
+            normalized_by_signature: dict[int, MemoryUid] = {}
+            for uid, node in self.graph.nodes.items():
+                if node.memory_type is not MemoryType.NORMALIZED_RELATION:
+                    continue
+                payload = self.graph.payloads.get(uid, {})
+                raw_signature = payload.get("structural_signature")
+                if raw_signature is None:
+                    continue
+                signature = int(raw_signature)
+                current = normalized_by_signature.get(signature)
+                if current is None or uid < current:
+                    normalized_by_signature[signature] = uid
+
+            self._m1n_occurrences = {}
+            for raw_signature, count in saved_occurrences.items():
+                signature = int(raw_signature)
+                uid = normalized_by_signature.get(signature)
+                if uid is None:
+                    continue
+                payload = self.graph.payloads[uid]
+                evidence_refs = tuple(
+                    MemoryUid(int(raw[0]), int(raw[1]))
+                    for raw in payload.get("evidence_refs", [[uid.hi, uid.lo]])
+                )
+                dummy = M1NormalizedRelation(
+                    uid,
+                    str(payload["observable_relation"]),
+                    NormalizedChannel(str(payload["channel"])),
+                    signature,
+                    DerivationProvenance((uid,), evidence_refs),
+                )
+                self._m1n_occurrences[signature] = [dummy] if int(count) > 0 else []
+
+            self._actor_action_supports = {}
+            for signature, support in self._m1n_supports.items():
+                rows = self._m1n_occurrences.get(int(signature), ())
+                if not rows:
+                    continue
+                observable = str(rows[0].observable_relation)
+                prefix, separator, remainder = observable.partition(":")
+                action_text, action_separator, _ = remainder.partition(":")
+                if prefix != "ACTION" or not separator or not action_separator:
+                    continue
+                try:
+                    action = int(action_text)
+                except ValueError:
+                    continue
+                self._actor_action_supports[action] = self._actor_action_supports.get(action, 0.0) + float(support)
+            self._actor_policy_generation = self.graph.generation
+        else:
+            super()._restore(snapshot)
+
         self._hgt_context_action_scores = {int(environment): {int(context): {int(action): float(score) for action, score in dict(actions).items()} for context, actions in dict(contexts).items()} for environment, contexts in dict(state.get("hgt_context_action_scores", {})).items()}
