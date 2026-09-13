@@ -94,3 +94,19 @@ def test_step1_continuous_run_executes_curriculum(tmp_path) -> None:
     counts = summary["metrics"]["telemetry_diagnostics"]["curriculum_counts"]
     assert sum(counts.values()) == 12
     assert all(key.startswith("step1|synthetic|") for key in counts)
+
+
+def test_broad_preset_resolves_exactly_thirty_games() -> None:
+    selection = resolve_curriculum_selector("broad")
+    assert selection is not None
+    assert len(selection.specs) == 30
+    assert {spec.adapter for spec in selection.specs} == {
+        "synthetic_causal",
+        "gym_discrete",
+        "gym_structured",
+        "sokoban",
+        "minigrid",
+        "babyai",
+        "arc",
+    }
+    assert all(spec.curriculum_step == "broad" for spec in selection.specs)
