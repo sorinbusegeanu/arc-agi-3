@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from v9.memory.identity import MemoryUid
-from v9.memory.model import CognitiveState, MemoryLevel
+from v9.memory.model import CognitiveState, MemoryLevel, MemoryType
 from v9.telemetry import ConsolidationSample
 
 from .publication import node_ref
@@ -113,7 +113,15 @@ class LifecycleRegistry:
         self.records[uid] = row
         return row
 
-    def retire_if_exhausted(self, uid: MemoryUid, *, required_opportunities: int, watermark: int, has_authoritative_dependency: bool = False, has_provenance_obligation: bool = False) -> LifecycleRecord:
+    def retire_if_exhausted(
+        self,
+        uid: MemoryUid,
+        *,
+        required_opportunities: int,
+        watermark: int,
+        has_authoritative_dependency: bool = False,
+        has_provenance_obligation: bool = False,
+    ) -> LifecycleRecord:
         current = self.records[uid]
         state = current.state
         if current.support <= 0 and current.relevant_opportunities >= required_opportunities:
@@ -284,6 +292,14 @@ def _sync_cognitive_visibility(graph: Any, updates: dict[MemoryUid, CognitiveSta
             graph._cached_read_view = None
 
 
+def _retirement_floor(node: Any, *, m0_floor: int, m1_floor: int) -> int:
+    if node.level is MemoryLevel.M0:
+        return max(1, int(m0_floor))
+    if node.level is MemoryLevel.M1 and node.memory_type is MemoryType.GROUNDED_CONTINGENCY:
+        return max(1, int(m1_floor))
+    return 2**31 - 1
+
+
 def run_lifecycle_maintenance(
     runtime: Any,
     *,
@@ -294,6 +310,9 @@ def run_lifecycle_maintenance(
     dormancy_grace_cycles: int = 3,
     retirement_grace_cycles: int = 3,
     validation_tolerance: float = 0.05,
+    compaction_pressure_threshold: float = 1.0,
+    m0_representative_floor: int = 8,
+    m1_representative_floor: int = 2,
 ) -> dict[str, int | float]:
     if not runtime.config.enable_lifecycle:
         return {"cycle": 0, "scanned": 0, "dormant": 0, "pending": 0, "retired": 0, "reactivated": 0, "blocked": 0, "pressure": 0.0}
@@ -309,32 +328,65 @@ def run_lifecycle_maintenance(
     effective_scan_limit = max(1, int(scan_limit)) * pressure_multiplier
     effective_retirement_limit = max(1, int(retirement_limit)) * pressure_multiplier
     replacements = graph.provenance_replacements(maximum_level=MemoryLevel.M1)
+    compaction_enabled = pressure >= float(compaction_pressure_threshold)
     blocked = 0
 
+    # Physical deletion is a pressure-driven storage operation, distinct from
+    # cognitive dormancy. Prefer the least useful pending records and preserve
+    # low-level witnesses for every abstraction.
     pending_plans: list[tuple[MemoryUid, MemoryUid, str]] = []
-    for uid, row in registry.records.items():
-        if len(pending_plans) >= effective_retirement_limit:
-            break
-        if row.state is not CognitiveState.RETIRE_PENDING:
-            continue
-        node = graph.nodes.get(uid)
-        replacement_uid = replacements.get(uid)
-        if node is None or replacement_uid is None or node.level > MemoryLevel.M1:
-            continue
-        if cycle - int(row.last_transition_cycle) < int(retirement_grace_cycles):
-            continue
-        if uid in runtime._replay_pool or not _validation_preserved(row, runtime, tolerance=validation_tolerance):
-            blocked += 1
-            continue
-        pending_plans.append((uid, replacement_uid, "retention_compaction"))
+    planned_by_group: dict[tuple[MemoryUid, MemoryLevel, MemoryType], int] = {}
+    live_group_sizes: dict[tuple[MemoryUid, MemoryLevel, MemoryType], int] = {}
+    pending_rows = sorted(
+        (
+            row
+            for row in registry.records.values()
+            if row.state is CognitiveState.RETIRE_PENDING and row.uid in graph.nodes
+        ),
+        key=lambda row: (float(row.retention_score), int(row.last_observed_cycle), row.uid),
+    )
+    if compaction_enabled:
+        for row in pending_rows:
+            if len(pending_plans) >= effective_retirement_limit:
+                break
+            uid = row.uid
+            node = graph.nodes.get(uid)
+            replacement_uid = replacements.get(uid)
+            if node is None or replacement_uid is None or node.level > MemoryLevel.M1:
+                continue
+            if node.memory_type is MemoryType.NORMALIZED_RELATION:
+                blocked += 1
+                continue
+            if cycle - int(row.last_transition_cycle) < int(retirement_grace_cycles):
+                continue
+            if uid in runtime._replay_pool or not _validation_preserved(row, runtime, tolerance=validation_tolerance):
+                blocked += 1
+                continue
+            group = (replacement_uid, node.level, node.memory_type)
+            if group not in live_group_sizes:
+                live_group_sizes[group] = sum(
+                    1
+                    for target_uid in graph.replacement_target_uids(replacement_uid)
+                    if (target := graph.nodes.get(target_uid)) is not None
+                    and target.level is node.level
+                    and target.memory_type is node.memory_type
+                )
+            floor = _retirement_floor(node, m0_floor=m0_representative_floor, m1_floor=m1_representative_floor)
+            already_planned = planned_by_group.get(group, 0)
+            if live_group_sizes[group] - already_planned <= floor:
+                blocked += 1
+                continue
+            pending_plans.append((uid, replacement_uid, "retention_compaction"))
+            planned_by_group[group] = already_planned + 1
 
     replay_before = len(runtime._replay_pool)
     retired_records = {uid: registry.records[uid] for uid, _, _ in pending_plans if uid in registry.records}
     retired_uids = graph.retire_nodes_batch(tuple(pending_plans))
     retired_set = set(retired_uids)
     for uid in retired_uids:
-        row = registry.records.get(uid, registry._new_record(uid))
-        registry.transition(uid, CognitiveState.RETIRED, watermark=watermark, retention_score=row.retention_score, replacement_uid=row.replacement_uid or replacements.get(uid))
+        # The tombstone is the compact persistent retirement record. Keeping the
+        # full lifecycle row as well would make lifecycle state grow forever.
+        registry.records.pop(uid, None)
         runtime._replay_pool.pop(uid, None)
         runtime._deferred_base_nodes.pop(uid, None)
     if retired_set:
@@ -342,7 +394,14 @@ def run_lifecycle_maintenance(
             key: row for key, row in runtime._latest_interaction_grounding.items() if row.uid not in retired_set
         }
 
-    protected_states = {CognitiveState.CANDIDATE, CognitiveState.PROBATION, CognitiveState.VALIDATED, CognitiveState.QUARANTINED, CognitiveState.RETIRED, CognitiveState.RETIRE_PENDING}
+    protected_states = {
+        CognitiveState.CANDIDATE,
+        CognitiveState.PROBATION,
+        CognitiveState.VALIDATED,
+        CognitiveState.QUARANTINED,
+        CognitiveState.RETIRED,
+        CognitiveState.RETIRE_PENDING,
+    }
     eligible = (
         row
         for uid, row in registry.records.items()
@@ -351,17 +410,31 @@ def run_lifecycle_maintenance(
     candidates = heapq.nsmallest(
         effective_scan_limit,
         eligible,
-        key=lambda row: (0 if row.state is CognitiveState.DORMANT else 1, int(row.last_observed_cycle), int(row.last_observed_watermark), row.uid),
+        key=lambda row: (
+            0 if row.state is CognitiveState.DORMANT else 1,
+            int(row.last_observed_cycle),
+            int(row.last_observed_watermark),
+            row.uid,
+        ),
     )
 
     dormant = 0
-    pending = 0
+    pending_count = 0
     reactivated = 0
     visibility_updates: dict[MemoryUid, CognitiveState] = {}
     current_validation = _validation_metrics(runtime)
     for row in candidates:
         node = graph.nodes.get(row.uid)
         if node is None:
+            continue
+        # Normalized M1 relations are already the compact reusable behavioral
+        # substrate. Hiding/deleting them would leave actor support caches stale
+        # and discard exactly the abstraction compaction is meant to preserve.
+        if node.memory_type is MemoryType.NORMALIZED_RELATION:
+            if row.state is CognitiveState.DORMANT:
+                registry.transition(row.uid, CognitiveState.REACTIVATED, watermark=watermark, retention_score=row.retention_score)
+                visibility_updates[row.uid] = CognitiveState.REACTIVATED
+                reactivated += 1
             continue
         payload = graph.payloads.get(row.uid, {})
         score = retention_score(row, payload, watermark=watermark)
@@ -373,7 +446,12 @@ def run_lifecycle_maintenance(
                 state = CognitiveState.REACTIVATED
                 registry.transition(row.uid, state, watermark=watermark, retention_score=score)
                 reactivated += 1
-            elif node.level <= MemoryLevel.M1 and covered and cycle - int(row.last_transition_cycle) >= int(dormancy_grace_cycles):
+            elif (
+                compaction_enabled
+                and node.level <= MemoryLevel.M1
+                and covered
+                and cycle - int(row.last_transition_cycle) >= int(dormancy_grace_cycles)
+            ):
                 if row.uid in runtime._replay_pool or not _validation_preserved(row, runtime, tolerance=validation_tolerance):
                     state = CognitiveState.DORMANT
                     registry.transition(row.uid, state, watermark=watermark, retention_score=score, replacement_uid=replacement_uid)
@@ -381,7 +459,7 @@ def run_lifecycle_maintenance(
                 else:
                     state = CognitiveState.RETIRE_PENDING
                     registry.transition(row.uid, state, watermark=watermark, retention_score=score, replacement_uid=replacement_uid)
-                    pending += 1
+                    pending_count += 1
             else:
                 state = CognitiveState.DORMANT
                 registry.transition(row.uid, state, watermark=watermark, retention_score=score, replacement_uid=replacement_uid)
@@ -409,8 +487,16 @@ def run_lifecycle_maintenance(
     replay_after = len(runtime._replay_pool)
     if retired_uids or reactivated:
         after_hgt = _validation_metrics(runtime)[0]
-        before_hgt_values = [retired_records[uid].baseline_hgt_retention for uid in retired_uids if uid in retired_records and retired_records[uid].baseline_hgt_retention is not None]
-        before_hgt = sum(before_hgt_values) / len(before_hgt_values) if before_hgt_values else (after_hgt if after_hgt is not None else 1.0)
+        before_hgt_values = [
+            retired_records[uid].baseline_hgt_retention
+            for uid in retired_uids
+            if uid in retired_records and retired_records[uid].baseline_hgt_retention is not None
+        ]
+        before_hgt = (
+            sum(before_hgt_values) / len(before_hgt_values)
+            if before_hgt_values
+            else (after_hgt if after_hgt is not None else 1.0)
+        )
         runtime.record_hgt_consolidation(
             ConsolidationSample(
                 hydra_bytes_retired=len(retired_uids) * 192,
@@ -429,7 +515,7 @@ def run_lifecycle_maintenance(
         "cycle": cycle,
         "scanned": len(candidates),
         "dormant": dormant,
-        "pending": pending,
+        "pending": pending_count,
         "retired": len(retired_uids),
         "reactivated": reactivated,
         "blocked": blocked,
