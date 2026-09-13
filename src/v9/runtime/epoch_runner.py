@@ -5,6 +5,7 @@ import time
 from typing import Any
 
 from v9.hgt import train_hgt_epoch
+from .lifecycle import run_lifecycle_maintenance
 from .parallel_memory_coordinator import run_parallel_memory_jobs
 
 
@@ -67,6 +68,9 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
         actor_results.extend(process_results)
         runtime.wait_quiescent(args.drain_timeout)
         runtime.flush_deferred_memory_updates()
+        lifecycle_result = run_lifecycle_maintenance(runtime)
+        for key, value in lifecycle_result.items():
+            runtime.set_telemetry_gauge(f"lifecycle_{key}", value)
         scenario_success, behavioral_success = _scenario_success(process_results)
         if baseline_success is None:
             baseline_success = behavioral_success
