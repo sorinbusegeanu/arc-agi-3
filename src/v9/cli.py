@@ -17,7 +17,7 @@ from v9.environments import ARCAdapter, ChessAdapter, GymDiscreteAdapter, GymStr
 from v9.environments.synthetic_symbolic import SyntheticSymbolicConfig
 from v9.modalities.symbols import DeterministicSymbolCodec
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig
-from v9.runtime.parallel_memory_coordinator import run_parallel_memory_jobs
+from v9.runtime.epoch_runner import run_epochs
 from v9.telemetry import MetricsHTTPServer
 
 MIX_GAMES = ("gp03", "tp02", "FrozenLake-v1", "Chess-v0", "Sudoku-v0")
