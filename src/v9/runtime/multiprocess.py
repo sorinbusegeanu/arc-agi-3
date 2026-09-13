@@ -114,6 +114,13 @@ def _close_queue(queue_obj: Any, *, drain: bool) -> None:
             pass
 
 
+def _publish_actor_terminal(stage_queue: Any, result_queue: Any, terminal: ActorDone | ActorError) -> None:
+    """Flush all actor transitions before publishing a terminal record, then flush it too."""
+    _close_queue(stage_queue, drain=True)
+    result_queue.put(terminal)
+    _close_queue(result_queue, drain=True)
+
+
 def _close_process(process: Any) -> None:
     try:
         if process.is_alive():
@@ -210,9 +217,16 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     adapter.reset()
                     episode_ordinal += 1
                     resets += 1
-            result_queue.put(ActorDone(actor_id, game_id, completed, positives, negatives, episode_boundaries, resets, policy_refreshes))
+            _publish_actor_terminal(
+                stage_queue,
+                result_queue,
+                ActorDone(actor_id, game_id, completed, positives, negatives, episode_boundaries, resets, policy_refreshes),
+            )
     except BaseException as exc:
-        result_queue.put(ActorError(actor_id, game_id, repr(exc), traceback.format_exc()))
+        try:
+            _publish_actor_terminal(stage_queue, result_queue, ActorError(actor_id, game_id, repr(exc), traceback.format_exc()))
+        except BaseException:
+            pass
         raise SystemExit(1)
     finally:
         if adapter is not None:
