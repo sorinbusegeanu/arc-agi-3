@@ -383,6 +383,9 @@ class ContinuousMemoryRuntime:
             if int(identity.value) != int(event.identity.environment_instance_id):
                 raise RuntimeError("prepared environment identity mismatch")
             self._watermark = max(self._watermark, int(event.identity.causal_watermark))
+            self.timeline.events_seen += 1
+            self.timeline.actions_committed += 1
+            self.timeline.last_ordering_key = event.identity.ordering_key
             self.telemetry["events"] += 1
             modality = int(event.identity.modality_id.value)
             self._modality_events[modality] = self._modality_events.get(modality, 0) + 1
