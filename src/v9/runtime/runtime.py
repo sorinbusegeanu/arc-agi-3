@@ -680,3 +680,39 @@ class ContinuousMemoryRuntime:
         base["primary_dashboard"] = build_primary_dashboard(base, diagnostic)
         return base
 
+
+
+    def scientific_statuses(self) -> dict[str, str]:
+        return {"H16": "UNTESTED", "H17": "UNTESTED", "H18": "UNTESTED", "H19": "UNTESTED"}
+
+    def write_scientific_report(self) -> Path:
+        assessments = {
+            name: asdict(
+                untested_assessment(
+                    name,
+                    scientific_config_id=self.config.scientific.config_id.value,
+                    blocker="required matched causal evaluation has not run",
+                )
+            )
+            for name in self.scientific_statuses()
+        }
+        return write_report(
+            self.root,
+            "reporting_cut.json",
+            {
+                "metrics": self.metrics(),
+                "hypotheses": self.scientific_statuses(),
+                "hypothesis_assessments": assessments,
+                "scientific_config": self.config.scientific.as_dict(),
+            },
+        )
+
+    def close(self, *, normal: bool = True, timeout: float = 300.0) -> SnapshotResult | None:
+        del timeout
+        if self._closed:
+            return None
+        result = self.snapshot() if normal and self.config.enable_snapshots else None
+        if normal:
+            self.write_scientific_report()
+        self._closed = True
+        return result
