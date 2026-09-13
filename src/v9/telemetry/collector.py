@@ -25,6 +25,7 @@ class UnifiedTelemetry:
         self.stop_reasons: Counter[str] = Counter()
         self.loss_by_head: dict[str, float] = {}
         self.optimization_transfer_matrix: Counter[str] = Counter()
+        self.curriculum_counts: Counter[str] = Counter()
         self.last_provenance: dict[str, Any] = {}
 
     def _sum(self, key: str, value: float) -> None:
@@ -32,6 +33,13 @@ class UnifiedTelemetry:
 
     def set_gauge(self, key: str, value: float | int | str) -> None:
         self.gauges[str(key)] = value
+
+    def record_curriculum_event(self, *, step: str | None, environment_family: str, game_scenario: str) -> None:
+        step_key = step or "none"
+        self.curriculum_counts[f"{step_key}|{environment_family}|{game_scenario}"] += 1
+        self.gauges["curriculum_step"] = step_key
+        self.gauges["environment_family"] = str(environment_family)
+        self.gauges["game_scenario"] = str(game_scenario)
 
     def record_deliberation(
         self,
@@ -189,6 +197,7 @@ class UnifiedTelemetry:
             "loss_by_head": dict(self.loss_by_head),
             "reasoning_stop_reasons": dict(self.stop_reasons),
             "optimization_transfer_matrix": dict(self.optimization_transfer_matrix),
+            "curriculum_counts": dict(self.curriculum_counts),
             "last_provenance": dict(self.last_provenance),
         }
         d = self.counters["deliberation_decisions"]
@@ -244,6 +253,7 @@ class UnifiedTelemetry:
             "stop_reasons": dict(self.stop_reasons),
             "loss_by_head": dict(self.loss_by_head),
             "optimization_transfer_matrix": dict(self.optimization_transfer_matrix),
+            "curriculum_counts": dict(self.curriculum_counts),
             "last_provenance": dict(self.last_provenance),
         }
 
@@ -258,5 +268,6 @@ class UnifiedTelemetry:
         result.stop_reasons.update({str(k): int(v) for k, v in dict(state.get("stop_reasons", {})).items()})
         result.loss_by_head = {str(k): float(v) for k, v in dict(state.get("loss_by_head", {})).items()}
         result.optimization_transfer_matrix.update({str(k): int(v) for k, v in dict(state.get("optimization_transfer_matrix", {})).items()})
+        result.curriculum_counts.update({str(k): int(v) for k, v in dict(state.get("curriculum_counts", {})).items()})
         result.last_provenance = dict(state.get("last_provenance", {}))
         return result
