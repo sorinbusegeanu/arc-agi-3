@@ -17,6 +17,9 @@ from v9.runtime.actor_policy import ActorPolicySnapshot
 from v9.memory.identity import stable_u64
 
 
+_FORKSERVER_READY = False
+
+
 @dataclass(frozen=True, slots=True)
 class EncodedTransition:
     actor_id: int
@@ -59,6 +62,42 @@ class ActorError:
 @dataclass(frozen=True, slots=True)
 class WorkerStop:
     reason: str = "stop"
+
+
+def _forkserver_bootstrap_main() -> None:
+    return None
+
+
+def resolve_start_method(start_method: str | None = None) -> str:
+    return str(start_method or ("forkserver" if "forkserver" in mp.get_all_start_methods() else "spawn"))
+
+
+def ensure_process_server_ready(start_method: str | None = None) -> str:
+    """Start the multiprocessing server while the parent is still small.
+
+    Forkserver is useful only if the server exists before the parent restores the
+    multi-gigabyte memory graph. Starting it after restore still makes the large,
+    threaded parent participate in process bootstrap. Production continuous runs
+    call this before importing the full CLI/runtime path.
+    """
+    global _FORKSERVER_READY
+    method = resolve_start_method(start_method)
+    if method != "forkserver" or _FORKSERVER_READY:
+        return method
+    if mp.current_process().name != "MainProcess":
+        return method
+    ctx = mp.get_context(method)
+    process = ctx.Process(target=_forkserver_bootstrap_main, name="v9-forkserver-bootstrap")
+    process.start()
+    process.join(timeout=15.0)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5.0)
+        raise RuntimeError("v9 forkserver bootstrap timed out")
+    if process.exitcode != 0:
+        raise RuntimeError(f"v9 forkserver bootstrap failed with code {process.exitcode}")
+    _FORKSERVER_READY = True
+    return method
 
 
 def _load_factory(path: str):
@@ -187,28 +226,24 @@ def shard_worker_main(shard_id: int, shard_queue: Any, publication_queue: Any) -
 
 class ProcessTopology:
     def __init__(self, *, actors: int, stage_workers: int, shards: int, queue_capacity: int, start_method: str | None = None) -> None:
-        method = start_method or ("forkserver" if "forkserver" in mp.get_all_start_methods() else "spawn")
+        method = resolve_start_method(start_method)
         self.ctx = mp.get_context(method)
-        # Actor creation is intentionally isolated from forkserver. On large restored
-        # runtimes Linux forkserver can block synchronously while handing off a new
-        # actor after the fixed worker topology has already been created. Actors are
-        # small and receive only a compact policy snapshot, so spawn is both safe and
-        # bounded. The shard/stage/ingest/derivation topology keeps forkserver speed.
-        actor_method = "spawn" if method == "forkserver" and "spawn" in mp.get_all_start_methods() else method
-        self.actor_ctx = mp.get_context(actor_method)
+        self.actor_ctx = self.ctx
         self.worker_start_method = str(method)
-        self.actor_start_method = str(actor_method)
+        self.actor_start_method = str(method)
         self.actors = int(actors)
         self.stage_workers = int(stage_workers)
         self.shards = int(shards)
-        # Queues crossing the actor boundary are created from the actor context. A
-        # spawn-context SemLock can safely be inherited by forkserver children; the
-        # reverse direction is the problematic one on multiprocessing.
-        self.stage_queue = self.actor_ctx.Queue(maxsize=int(queue_capacity))
-        self.result_queue = self.actor_ctx.Queue(maxsize=max(64, int(actors) * 2))
-        self.policy_updates = tuple(self.actor_ctx.Queue(maxsize=1) for _ in range(self.actors))
+        # Keep the whole process graph in one context. The previous mixed
+        # spawn/forkserver topology still started actors directly from the huge
+        # restored parent and crossed semaphore contexts. Forkserver is prewarmed
+        # before restore instead, so later actor starts are served by the small
+        # server process.
+        self.stage_queue = self.ctx.Queue(maxsize=int(queue_capacity))
         self.publication_queue = self.ctx.Queue(maxsize=int(queue_capacity))
+        self.result_queue = self.ctx.Queue(maxsize=max(64, int(actors) * 2))
         self.shard_queues = tuple(self.ctx.Queue(maxsize=int(queue_capacity)) for _ in range(self.shards))
+        self.policy_updates = tuple(self.ctx.Queue(maxsize=1) for _ in range(self.actors))
         self.stage_processes: list[Any] = []
         self.shard_processes: list[Any] = []
         self.actor_processes: list[Any] = []
