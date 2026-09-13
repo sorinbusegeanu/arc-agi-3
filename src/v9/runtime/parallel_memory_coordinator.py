@@ -80,6 +80,7 @@ def run_parallel_memory_jobs(
     derive_results = {}
     inflight = set()
     last_support = {}
+    coordinator_batch_size = 256
 
     def launch() -> None:
         while pending and free_slots:
@@ -164,7 +165,7 @@ def run_parallel_memory_jobs(
     def drain_results(*, block: bool = False, timeout: float = 0.0) -> bool:
         progressed = False
         first = True
-        while True:
+        for _ in range(coordinator_batch_size):
             try:
                 item = memory.result_queue.get(timeout=timeout) if block and first else memory.result_queue.get_nowait()
             except queue.Empty:
@@ -220,7 +221,7 @@ def run_parallel_memory_jobs(
     try:
         while active:
             progressed = False
-            while True:
+            for _ in range(coordinator_batch_size):
                 try:
                     request = topology.action_requests.get_nowait()
                 except queue.Empty:
@@ -235,7 +236,7 @@ def run_parallel_memory_jobs(
                 )
                 topology.action_responses[slot].put((request.request_id, int(action)))
                 progressed = True
-            while True:
+            for _ in range(coordinator_batch_size):
                 try:
                     item = topology.publication_queue.get_nowait()
                 except queue.Empty:
@@ -244,7 +245,7 @@ def run_parallel_memory_jobs(
                     dispatch_transition(item[3])
                     progressed = True
             progressed = drain_results() or progressed
-            while True:
+            for _ in range(coordinator_batch_size):
                 try:
                     done = topology.result_queue.get_nowait()
                 except queue.Empty:
