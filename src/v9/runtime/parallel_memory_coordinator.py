@@ -10,6 +10,9 @@ from .memory_worker_topology import MemoryWorkerTopology
 from .multiprocess import ActorDone, ActorError, ProcessTopology
 
 
+_ACTOR_COMPLETION_GRACE_SECONDS = 2.0
+
+
 @dataclass(frozen=True, slots=True)
 class ProcessActorResult:
     actor_id: int
@@ -20,6 +23,33 @@ class ProcessActorResult:
     episode_boundaries: int
     resets: int
     policy_refreshes: int = 0
+
+
+def _reconcile_actor_liveness(
+    active: dict[int, tuple[int, Any]],
+    clean_exit_without_done: dict[int, float],
+    *,
+    now: float | None = None,
+    grace_seconds: float = _ACTOR_COMPLETION_GRACE_SECONDS,
+) -> int:
+    current_time = time.monotonic() if now is None else float(now)
+    missing = 0
+    for actor_id, (_, process) in tuple(active.items()):
+        exitcode = process.exitcode
+        if exitcode is None:
+            clean_exit_without_done.pop(actor_id, None)
+            continue
+        if exitcode != 0:
+            raise RuntimeError(f"actor process {actor_id} exited before completion with code {exitcode}")
+        missing += 1
+        first_seen = clean_exit_without_done.setdefault(actor_id, current_time)
+        if current_time - first_seen >= float(grace_seconds):
+            process_name = getattr(process, "name", f"actor-{actor_id}")
+            raise RuntimeError(
+                f"actor {actor_id} ({process_name}) exited cleanly but no ActorDone was received "
+                f"within {float(grace_seconds):.1f}s; actor completion queue protocol failed"
+            )
+    return missing
 
 
 def run_parallel_memory_jobs(
@@ -52,6 +82,7 @@ def run_parallel_memory_jobs(
     active: dict[int, tuple[int, Any]] = {}
     free_slots = list(range(topology.actors))
     results: list[ProcessActorResult] = []
+    clean_exit_without_done: dict[int, float] = {}
     initial_policy = runtime.actor_policy_snapshot()
     published_policy_generation = int(initial_policy.generation)
     next_policy_publish = time.monotonic() + max(0.01, float(actor_view_refresh_ms) / 1000.0)
@@ -175,11 +206,33 @@ def run_parallel_memory_jobs(
                 progressed = True
         return apply_ready() or progressed
 
+    def drain_actor_results() -> bool:
+        progressed = False
+        for _ in range(coordinator_batch_size):
+            try:
+                done = topology.result_queue.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(done, ActorError):
+                raise RuntimeError(f"actor {done.actor_id} ({done.game_id}) failed: {done.message}\n{done.traceback_text}")
+            if not isinstance(done, ActorDone):
+                continue
+            entry = active.pop(done.actor_id, None)
+            if entry is None:
+                continue
+            slot, _ = entry
+            clean_exit_without_done.pop(done.actor_id, None)
+            free_slots.append(slot)
+            free_slots.sort()
+            results.append(ProcessActorResult(done.actor_id, done.game_id, done.steps, done.positive_boundaries, done.negative_boundaries, done.episode_boundaries, done.resets, done.policy_refreshes))
+            progressed = True
+        return progressed
+
     def telemetry() -> None:
         elapsed = max(1e-9, time.monotonic() - started_at)
         for key, value in memory.queue_depths().items():
             runtime.set_telemetry_gauge(key, value)
-        gauges = {"active_actor_processes": len(active), "coordinator_action_requests": 0, "policy_snapshot_generation": int(published_policy_generation), "active_ingest_workers": int(ingest_workers), "active_derivation_workers": int(derivation_workers), "sampled_steps": sampled, "ingested_steps": ingested, "derivations_applied": derived, "sampling_backlog": max(0, sampled - ingested), "derivation_inflight": len(inflight), "sampling_rate": sampled / elapsed, "ingestion_rate": ingested / elapsed, "derivation_rate": derived / elapsed, "canonical_apply_rate": canonical_apply_events / max(1e-9, canonical_apply_seconds), "canonical_apply_latency_ms": 1000.0 * canonical_apply_seconds / max(1, canonical_apply_events), "canonical_batch_size": coordinator_batch_size}
+        gauges = {"active_actor_processes": len(active), "coordinator_action_requests": 0, "policy_snapshot_generation": int(published_policy_generation), "active_ingest_workers": int(ingest_workers), "active_derivation_workers": int(derivation_workers), "sampled_steps": sampled, "ingested_steps": ingested, "derivations_applied": derived, "sampling_backlog": max(0, sampled - ingested), "derivation_inflight": len(inflight), "sampling_rate": sampled / elapsed, "ingestion_rate": ingested / elapsed, "derivation_rate": derived / elapsed, "canonical_apply_rate": canonical_apply_events / max(1e-9, canonical_apply_seconds), "canonical_apply_latency_ms": 1000.0 * canonical_apply_seconds / max(1, canonical_apply_events), "canonical_batch_size": coordinator_batch_size, "actors_exited_without_done": len(clean_exit_without_done)}
         for key, value in gauges.items():
             runtime.set_telemetry_gauge(key, value)
 
@@ -209,23 +262,9 @@ def run_parallel_memory_jobs(
             progressed = launch_one()
             progressed = drain_publication_queue() or progressed
             progressed = drain_results() or progressed
-            for _ in range(coordinator_batch_size):
-                try:
-                    done = topology.result_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if isinstance(done, ActorError):
-                    raise RuntimeError(f"actor {done.actor_id} ({done.game_id}) failed: {done.message}\n{done.traceback_text}")
-                if not isinstance(done, ActorDone):
-                    continue
-                slot, _ = active.pop(done.actor_id)
-                free_slots.append(slot)
-                free_slots.sort()
-                results.append(ProcessActorResult(done.actor_id, done.game_id, done.steps, done.positive_boundaries, done.negative_boundaries, done.episode_boundaries, done.resets, done.policy_refreshes))
-                progressed = True
-            for actor_id, (_, process) in tuple(active.items()):
-                if not process.is_alive() and process.exitcode not in (0, None):
-                    raise RuntimeError(f"actor process {actor_id} exited before completion with code {process.exitcode}")
+            progressed = drain_actor_results() or progressed
+            missing = _reconcile_actor_liveness(active, clean_exit_without_done)
+            runtime.set_telemetry_gauge("actors_exited_without_done", missing)
             now = time.monotonic()
             if now >= next_policy_publish:
                 snapshot = runtime.actor_policy_snapshot()
@@ -243,6 +282,7 @@ def run_parallel_memory_jobs(
         while any(process.is_alive() for process in topology.actor_processes):
             progressed = drain_publication_queue()
             progressed = drain_results() or progressed
+            progressed = drain_actor_results() or progressed
             if not progressed:
                 time.sleep(0.001)
         topology.join_actor_workers()
@@ -279,7 +319,7 @@ def run_parallel_memory_jobs(
         memory.join_derivation()
         drain_results()
 
-        for key, value in {"actor_processes": min(int(actor_limit), len(jobs)), "stage_worker_processes": int(stage_workers), "shard_worker_processes": int(shards), "ingest_worker_processes": int(ingest_workers), "derivation_worker_processes": int(derivation_workers), "multiprocess_transitions_published": int(ingested), "coordinator_action_requests": 0, "policy_snapshot_generation": int(published_policy_generation), "policy_snapshot_refreshes": sum(int(row.policy_refreshes) for row in results)}.items():
+        for key, value in {"actor_processes": min(int(actor_limit), len(jobs)), "stage_worker_processes": int(stage_workers), "shard_worker_processes": int(shards), "ingest_worker_processes": int(ingest_workers), "derivation_worker_processes": int(derivation_workers), "multiprocess_transitions_published": int(ingested), "coordinator_action_requests": 0, "policy_snapshot_generation": int(published_policy_generation), "policy_snapshot_refreshes": sum(int(row.policy_refreshes) for row in results), "actors_exited_without_done": 0}.items():
             runtime.set_telemetry_gauge(key, value)
         progress()
         clean_shutdown = True
