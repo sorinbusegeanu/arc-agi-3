@@ -189,14 +189,26 @@ class ProcessTopology:
     def __init__(self, *, actors: int, stage_workers: int, shards: int, queue_capacity: int, start_method: str | None = None) -> None:
         method = start_method or ("forkserver" if "forkserver" in mp.get_all_start_methods() else "spawn")
         self.ctx = mp.get_context(method)
+        # Actor creation is intentionally isolated from forkserver. On large restored
+        # runtimes Linux forkserver can block synchronously while handing off a new
+        # actor after the fixed worker topology has already been created. Actors are
+        # small and receive only a compact policy snapshot, so spawn is both safe and
+        # bounded. The shard/stage/ingest/derivation topology keeps forkserver speed.
+        actor_method = "spawn" if method == "forkserver" and "spawn" in mp.get_all_start_methods() else method
+        self.actor_ctx = mp.get_context(actor_method)
+        self.worker_start_method = str(method)
+        self.actor_start_method = str(actor_method)
         self.actors = int(actors)
         self.stage_workers = int(stage_workers)
         self.shards = int(shards)
-        self.stage_queue = self.ctx.Queue(maxsize=int(queue_capacity))
+        # Queues crossing the actor boundary are created from the actor context. A
+        # spawn-context SemLock can safely be inherited by forkserver children; the
+        # reverse direction is the problematic one on multiprocessing.
+        self.stage_queue = self.actor_ctx.Queue(maxsize=int(queue_capacity))
+        self.result_queue = self.actor_ctx.Queue(maxsize=max(64, int(actors) * 2))
+        self.policy_updates = tuple(self.actor_ctx.Queue(maxsize=1) for _ in range(self.actors))
         self.publication_queue = self.ctx.Queue(maxsize=int(queue_capacity))
-        self.result_queue = self.ctx.Queue(maxsize=max(64, int(actors) * 2))
         self.shard_queues = tuple(self.ctx.Queue(maxsize=int(queue_capacity)) for _ in range(self.shards))
-        self.policy_updates = tuple(self.ctx.Queue(maxsize=1) for _ in range(self.actors))
         self.stage_processes: list[Any] = []
         self.shard_processes: list[Any] = []
         self.actor_processes: list[Any] = []
@@ -212,7 +224,7 @@ class ProcessTopology:
             self.stage_processes.append(process)
 
     def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, initial_policy: ActorPolicySnapshot, epsilon: float, policy_refresh_steps: int, policy_refresh_ms: float) -> None:
-        process = self.ctx.Process(target=actor_process_main, kwargs={"spec": spec, "actor_id": actor_id, "steps": steps, "seed": seed, "env_root": env_root, "initial_policy": initial_policy, "policy_updates": self.policy_updates[index], "epsilon": float(epsilon), "policy_refresh_steps": int(policy_refresh_steps), "policy_refresh_ms": float(policy_refresh_ms), "stage_queue": self.stage_queue, "result_queue": self.result_queue, "adapter_factory_path": adapter_factory_path, "alfred_backend_factory": alfred_backend_factory, "run_nonce": int(run_nonce)}, name=f"v9-actor-{actor_id}")
+        process = self.actor_ctx.Process(target=actor_process_main, kwargs={"spec": spec, "actor_id": actor_id, "steps": steps, "seed": seed, "env_root": env_root, "initial_policy": initial_policy, "policy_updates": self.policy_updates[index], "epsilon": float(epsilon), "policy_refresh_steps": int(policy_refresh_steps), "policy_refresh_ms": float(policy_refresh_ms), "stage_queue": self.stage_queue, "result_queue": self.result_queue, "adapter_factory_path": adapter_factory_path, "alfred_backend_factory": alfred_backend_factory, "run_nonce": int(run_nonce)}, name=f"v9-actor-{actor_id}")
         process.start()
         self.actor_processes.append(process)
 
