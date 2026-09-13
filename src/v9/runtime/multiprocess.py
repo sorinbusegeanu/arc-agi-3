@@ -18,6 +18,7 @@ from v9.memory.identity import stable_u64
 
 
 _FORKSERVER_READY = False
+_PROCESS_JOIN_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,13 +115,6 @@ def _close_queue(queue_obj: Any, *, drain: bool) -> None:
             pass
 
 
-def _publish_actor_terminal(stage_queue: Any, result_queue: Any, terminal: ActorDone | ActorError) -> None:
-    """Flush all actor transitions before publishing a terminal record, then flush it too."""
-    _close_queue(stage_queue, drain=True)
-    result_queue.put(terminal)
-    _close_queue(result_queue, drain=True)
-
-
 def _close_process(process: Any) -> None:
     try:
         if process.is_alive():
@@ -140,10 +134,20 @@ def _load_factory(path: str):
     return getattr(importlib.import_module(module_name), attr)
 
 
+def _flush_child_queue(queue_obj: Any) -> None:
+    """Ensure this child process has flushed all payloads it put on a queue."""
+    try:
+        queue_obj.close()
+        queue_obj.join_thread()
+    except (AttributeError, AssertionError, OSError, ValueError):
+        pass
+
+
 def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, initial_policy: ActorPolicySnapshot, policy_updates: Any, epsilon: float, policy_refresh_steps: int, policy_refresh_ms: float, stage_queue: Any, result_queue: Any, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int) -> None:
     game_id = str(getattr(spec, "display_name", getattr(spec, "game_id", "unknown")))
     adapter = None
     devnull = open(os.devnull, "w", encoding="utf-8")
+    completion_sent = False
     try:
         logging.disable(logging.INFO)
         warnings.filterwarnings("ignore")
@@ -217,18 +221,25 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     adapter.reset()
                     episode_ordinal += 1
                     resets += 1
-            _publish_actor_terminal(
-                stage_queue,
-                result_queue,
-                ActorDone(actor_id, game_id, completed, positives, negatives, episode_boundaries, resets, policy_refreshes),
-            )
+            # ActorDone is an end-of-stream marker. Ensure every transition this
+            # actor produced has left its feeder before publishing completion.
+            _flush_child_queue(stage_queue)
+            result_queue.put(ActorDone(actor_id, game_id, completed, positives, negatives, episode_boundaries, resets, policy_refreshes))
+            completion_sent = True
     except BaseException as exc:
         try:
-            _publish_actor_terminal(stage_queue, result_queue, ActorError(actor_id, game_id, repr(exc), traceback.format_exc()))
+            _flush_child_queue(stage_queue)
+        except BaseException:
+            pass
+        try:
+            result_queue.put(ActorError(actor_id, game_id, repr(exc), traceback.format_exc()))
+            completion_sent = True
         except BaseException:
             pass
         raise SystemExit(1)
     finally:
+        if completion_sent:
+            _flush_child_queue(result_queue)
         if adapter is not None:
             close = getattr(adapter, "close", None)
             if callable(close):
@@ -295,7 +306,27 @@ class ProcessTopology:
             self.stage_processes.append(process)
 
     def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, initial_policy: ActorPolicySnapshot, epsilon: float, policy_refresh_steps: int, policy_refresh_ms: float) -> None:
-        process = self.actor_ctx.Process(target=actor_process_main, kwargs={"spec": spec, "actor_id": actor_id, "steps": steps, "seed": seed, "env_root": env_root, "initial_policy": initial_policy, "policy_updates": self.policy_updates[index], "epsilon": float(epsilon), "policy_refresh_steps": int(policy_refresh_steps), "policy_refresh_ms": float(policy_refresh_ms), "stage_queue": self.stage_queue, "result_queue": self.result_queue, "adapter_factory_path": adapter_factory_path, "alfred_backend_factory": alfred_backend_factory, "run_nonce": int(run_nonce)}, name=f"v9-actor-{actor_id}")
+        process = self.actor_ctx.Process(
+            target=actor_process_main,
+            kwargs={
+                "spec": spec,
+                "actor_id": actor_id,
+                "steps": steps,
+                "seed": seed,
+                "env_root": env_root,
+                "initial_policy": initial_policy,
+                "policy_updates": self.policy_updates[index],
+                "epsilon": float(epsilon),
+                "policy_refresh_steps": int(policy_refresh_steps),
+                "policy_refresh_ms": float(policy_refresh_ms),
+                "stage_queue": self.stage_queue,
+                "result_queue": self.result_queue,
+                "adapter_factory_path": adapter_factory_path,
+                "alfred_backend_factory": alfred_backend_factory,
+                "run_nonce": int(run_nonce),
+            },
+            name=f"v9-actor-{actor_id}",
+        )
         process.start()
         self.actor_processes.append(process)
 
@@ -318,25 +349,27 @@ class ProcessTopology:
         for _ in self.stage_processes:
             self.stage_queue.put(WorkerStop())
 
-    def join_actor_workers(self) -> None:
-        for process in self.actor_processes:
-            process.join(timeout=0)
+    @staticmethod
+    def _join_checked(processes: tuple[Any, ...] | list[Any], *, role: str, timeout: float = _PROCESS_JOIN_TIMEOUT_SECONDS) -> None:
+        for process in processes:
+            process.join(timeout=float(timeout))
             if process.is_alive():
-                raise RuntimeError(f"actor process {process.name} has not finished flushing")
+                raise RuntimeError(f"{role} process {process.name} did not exit within {float(timeout):.1f}s")
             if process.exitcode != 0:
-                raise RuntimeError(f"actor process {process.name} exited with code {process.exitcode}")
+                raise RuntimeError(f"{role} process {process.name} exited with code {process.exitcode}")
+
+    def join_actor_workers(self) -> None:
+        self._join_checked(self.actor_processes, role="actor")
 
     def join_stage_workers(self) -> None:
-        for process in self.stage_processes:
-            process.join(timeout=30)
+        self._join_checked(self.stage_processes, role="stage", timeout=30.0)
 
     def stop_shard_workers(self) -> None:
         for shard_queue in self.shard_queues:
             shard_queue.put(WorkerStop())
 
     def join_shard_workers(self) -> None:
-        for process in self.shard_processes:
-            process.join(timeout=30)
+        self._join_checked(self.shard_processes, role="shard", timeout=30.0)
 
     def terminate(self) -> None:
         for process in (*self.actor_processes, *self.stage_processes, *self.shard_processes):
