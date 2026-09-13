@@ -27,15 +27,19 @@ class MemoryWorkerTopology:
             process.start()
             self.derivation_processes.append(process)
 
-    def stop_ingest(self) -> None:
+    def signal_ingest_stop(self) -> None:
         for _ in self.ingest_processes:
             self.ingest_queue.put(WorkerStop())
+
+    def join_ingest(self) -> None:
         for process in self.ingest_processes:
             process.join(timeout=30)
 
-    def stop_derivation(self) -> None:
+    def signal_derivation_stop(self) -> None:
         for _ in self.derivation_processes:
             self.derivation_queue.put(WorkerStop())
+
+    def join_derivation(self) -> None:
         for process in self.derivation_processes:
             process.join(timeout=30)
 
