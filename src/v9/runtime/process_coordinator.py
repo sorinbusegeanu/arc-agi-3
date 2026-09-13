@@ -135,10 +135,7 @@ def run_process_jobs(
                     break
                 if not isinstance(done, ActorDone):
                     continue
-                slot, process = active.pop(done.actor_id)
-                process.join(timeout=30)
-                if process.exitcode not in (0, None):
-                    raise RuntimeError(f"actor process {done.actor_id} exited with code {process.exitcode}")
+                slot, _ = active.pop(done.actor_id)
                 free_slots.append(slot)
                 free_slots.sort()
                 results.append(ProcessActorResult(
@@ -163,6 +160,21 @@ def run_process_jobs(
 
             if not progressed:
                 time.sleep(0.001)
+
+        while any(process.is_alive() for process in topology.actor_processes):
+            progressed = False
+            while True:
+                try:
+                    item = topology.publication_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(item, tuple) and len(item) == 4 and item[0] == "transition":
+                    publish_encoded_transition(runtime, item[3])
+                    published += 1
+                    progressed = True
+            if not progressed:
+                time.sleep(0.001)
+        topology.join_actor_workers()
 
         topology.signal_stage_stop()
         while any(process.is_alive() for process in topology.stage_processes):

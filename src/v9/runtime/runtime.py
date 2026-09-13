@@ -396,7 +396,34 @@ class ContinuousMemoryRuntime:
         if len(self._replay_pool) > self.config.scientific.replay_candidates:
             victim = min(self._replay_pool, key=lambda uid: (self._replay_pool[uid], uid))
             del self._replay_pool[victim]
-        self._publish(CanonicalNode(relation.uid, MemoryLevel.M1, MemoryType.NORMALIZED_RELATION, (relation.structural_signature,), self._watermark), {"observable_relation": relation.observable_relation, "channel": relation.channel.value, "structural_signature": relation.structural_signature, "support": support, "parents": [[uid.hi, uid.lo] for uid in relation.provenance.parents]}, relation.provenance.evidence)
+        retained_parents = tuple(
+            uid
+            for occurrence in occurrences
+            for uid in occurrence.provenance.parents
+        )
+        retained_evidence = tuple(
+            uid
+            for occurrence in occurrences
+            for uid in occurrence.provenance.evidence
+        )
+        self._publish(
+            CanonicalNode(
+                relation.uid,
+                MemoryLevel.M1,
+                MemoryType.NORMALIZED_RELATION,
+                (relation.structural_signature,),
+                self._watermark,
+            ),
+            {
+                "observable_relation": relation.observable_relation,
+                "channel": relation.channel.value,
+                "structural_signature": relation.structural_signature,
+                "support": support,
+                "parents": [[uid.hi, uid.lo] for uid in retained_parents],
+            },
+            retained_evidence,
+            proposal_class=ProposalClass.STATEFUL,
+        )
         return relation.structural_signature
 
     def _ingest(self, event: TimelineEvent) -> tuple[int, ...]:

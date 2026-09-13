@@ -253,6 +253,14 @@ class ProcessTopology:
         for _ in self.stage_processes:
             self.stage_queue.put(WorkerStop())
 
+    def join_actor_workers(self) -> None:
+        for process in self.actor_processes:
+            process.join(timeout=0)
+            if process.is_alive():
+                raise RuntimeError(f"actor process {process.name} has not finished flushing")
+            if process.exitcode != 0:
+                raise RuntimeError(f"actor process {process.name} exited with code {process.exitcode}")
+
     def join_stage_workers(self) -> None:
         for process in self.stage_processes:
             process.join(timeout=30)

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -131,6 +134,27 @@ def test_babyai_and_alfred_optional_backend_contracts() -> None:
     alfred.step(4)
     assert alfred.boundary_event().primary_valence == 1
     assert alfred.payload_store.hot_bytes > 0
+
+
+def test_babyai_factory_registers_environments_in_a_clean_process() -> None:
+    pytest.importorskip("minigrid")
+    environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[2]))
+    script = """
+from v9.environments.babyai.adapter import make_babyai_adapter
+for environment_id in ('MiniGrid-Unlock-v0', 'BabyAI-GoTo-v0'):
+    adapter = make_babyai_adapter(environment_id, seed=1)
+    adapter.native_env.close()
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_babyai_world_symbols_and_cross_modal_alignment_enter_one_runtime(tmp_path: Path) -> None:

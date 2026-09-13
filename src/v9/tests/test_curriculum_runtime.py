@@ -110,3 +110,11 @@ def test_broad_preset_resolves_exactly_thirty_games() -> None:
         "arc",
     }
     assert all(spec.curriculum_step == "broad" for spec in selection.specs)
+    assert tuple(spec.game_id for spec in selection.specs if spec.adapter == "arc") == (
+        "g50t",
+        "ls20",
+        "re86",
+        "tr87",
+        "tu93",
+        "wa30",
+    )

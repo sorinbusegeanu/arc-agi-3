@@ -153,12 +153,15 @@ def run_parallel_memory_jobs(
         for signature in signatures:
             schedule(int(signature))
 
-    def apply_ready() -> None:
+    def apply_ready() -> bool:
         nonlocal ingest_apply, derive_apply, derived
-        while ingest_apply in ingest_results:
+        ingest_applied = 0
+        while ingest_apply in ingest_results and ingest_applied < coordinator_batch_size:
             apply_ingest(ingest_results.pop(ingest_apply))
             ingest_apply += 1
-        while derive_apply in derive_results:
+            ingest_applied += 1
+        derive_applied = 0
+        while derive_apply in derive_results and derive_applied < coordinator_batch_size:
             result = derive_results.pop(derive_apply)
             runtime.apply_derivation_result(result)
             signature = int(result.structural_signature)
@@ -167,10 +170,12 @@ def run_parallel_memory_jobs(
             derived += 1
             derive_apply += 1
             schedule(signature)
+            derive_applied += 1
+        return ingest_applied > 0 or derive_applied > 0
 
     def drain_results(*, block: bool = False, timeout: float = 0.0) -> bool:
-        progressed = False
-        first = True
+        progressed = apply_ready()
+        first = not progressed
         for _ in range(coordinator_batch_size):
             try:
                 item = memory.result_queue.get(timeout=timeout) if block and first else memory.result_queue.get_nowait()
@@ -185,8 +190,7 @@ def run_parallel_memory_jobs(
             elif item[0] == "derivation":
                 derive_results[int(item[1])] = item[2]
                 progressed = True
-        apply_ready()
-        return progressed
+        return apply_ready() or progressed
 
     def telemetry() -> None:
         elapsed = max(1e-9, time.monotonic() - started_at)
@@ -245,10 +249,7 @@ def run_parallel_memory_jobs(
                     break
                 if not isinstance(done, ActorDone):
                     continue
-                slot, process = active.pop(done.actor_id)
-                process.join(timeout=30)
-                if process.exitcode not in (0, None):
-                    raise RuntimeError(f"actor process {done.actor_id} exited with code {process.exitcode}")
+                slot, _ = active.pop(done.actor_id)
                 free_slots.append(slot)
                 free_slots.sort()
                 results.append(ProcessActorResult(done.actor_id, done.game_id, done.steps, done.positive_boundaries, done.negative_boundaries, done.episode_boundaries, done.resets, done.policy_refreshes))
@@ -275,6 +276,21 @@ def run_parallel_memory_jobs(
                 next_progress = time.monotonic() + max(1.0, float(progress_interval_seconds))
             if not progressed:
                 time.sleep(0.001)
+
+        while any(process.is_alive() for process in topology.actor_processes):
+            progressed = False
+            for _ in range(coordinator_batch_size):
+                try:
+                    item = topology.publication_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item[0] == "transition":
+                    dispatch_transition(item[3])
+                    progressed = True
+            progressed = drain_results() or progressed
+            if not progressed:
+                time.sleep(0.001)
+        topology.join_actor_workers()
 
         topology.signal_stage_stop()
         while any(p.is_alive() for p in topology.stage_processes):

@@ -79,6 +79,7 @@ class BabyAIAdapter(StructuralAdapter):
 def make_babyai_adapter(environment_id: str, *, seed: int = 0, suppress_symbols: bool = False, **kwargs: object) -> BabyAIAdapter:
     try:
         import gymnasium as gym
+        import minigrid  # noqa: F401  # registers MiniGrid and BabyAI environments
     except ImportError as exc:
         raise RuntimeError("BabyAI live support requires the optional minigrid dependency") from exc
     env = gym.make(environment_id, **kwargs)
@@ -87,4 +88,3 @@ def make_babyai_adapter(environment_id: str, *, seed: int = 0, suppress_symbols:
     except TypeError:
         pass
     return BabyAIAdapter(env, environment_name=environment_id, suppress_symbols=suppress_symbols)
-

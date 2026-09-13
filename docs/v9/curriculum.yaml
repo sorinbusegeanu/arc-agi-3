@@ -365,9 +365,9 @@ presets:
           - BabyAI-PutNextLocal-v0
       - adapter: arc
         games:
-          - ez01
-          - fs01
-          - ic01
-          - tp01
-          - nw01
-          - dt01
+          - g50t
+          - ls20
+          - re86
+          - tr87
+          - tu93
+          - wa30
