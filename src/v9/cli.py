@@ -17,6 +17,7 @@ from v9.environments import ARCAdapter, ChessAdapter, GymDiscreteAdapter, GymStr
 from v9.environments.synthetic_symbolic import SyntheticSymbolicConfig
 from v9.modalities.symbols import DeterministicSymbolCodec
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig
+from v9.runtime.process_coordinator import run_process_jobs
 from v9.telemetry import MetricsHTTPServer
 
 MIX_GAMES = ("gp03", "tp02", "FrozenLake-v1", "Chess-v0", "Sudoku-v0")
@@ -272,9 +273,29 @@ def run_continuous(args: argparse.Namespace) -> int:
                 actor_id += 1
     print(f"v9 continuous: games={len(games)} actors={min(args.actors, len(jobs))} shards={args.shards} stage_workers={args.stage_workers} peers={'off' if args.no_peers else 'on'} lifecycle={args.lifecycle} snapshots={'off' if args.no_snapshots else 'native'} game_ids={','.join(games)}", flush=True)
     try:
-        with ThreadPoolExecutor(max_workers=min(args.actors, len(jobs)), thread_name_prefix="v9-actor") as pool:
-            futures = [pool.submit(_actor, runtime, spec, actor_id=actor, steps=steps, seed=seed, env_root=args.env_root, epsilon=args.epsilon, progress_interval=args.progress_interval_seconds, verbose=args.verbose_progress, wait=args.wait) for actor, spec, steps, seed in jobs]
-            results = [future.result(timeout=args.actor_timeout) for future in futures]
+        process_results = run_process_jobs(
+            runtime,
+            jobs,
+            actor_limit=args.actors,
+            stage_workers=args.stage_workers,
+            shards=args.shards,
+            queue_capacity=max(args.stage_ring_capacity, args.shard_ring_capacity),
+            epsilon=args.epsilon,
+            env_root=args.env_root,
+            alfred_backend_factory=getattr(args, "alfred_backend_factory", None),
+            start_method=runtime.config.multiprocessing_start_method,
+        )
+        results = [
+            ActorResult(
+                row.actor_id,
+                row.game_id,
+                row.steps,
+                row.positive_boundaries,
+                row.negative_boundaries,
+                row.resets,
+            )
+            for row in process_results
+        ]
         runtime.wait_quiescent(args.drain_timeout)
         final = runtime.close(normal=True, timeout=args.final_save_timeout)
         metrics = runtime.metrics()
