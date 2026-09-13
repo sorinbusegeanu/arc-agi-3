@@ -3,14 +3,11 @@ from __future__ import annotations
 import queue
 import time
 from dataclasses import dataclass, replace
-from random import Random
 from typing import Any
-
-from v9.cognition.action_selection import choose_action
 
 from .memory_pipeline import DerivationResult, IngestionTask, PreparedIngestion
 from .memory_worker_topology import MemoryWorkerTopology
-from .multiprocess import ActionRequest, ActorDone, ProcessTopology
+from .multiprocess import ActorDone, ProcessTopology
 from .multiprocess_ingest import publish_transition_symbols
 
 
@@ -23,6 +20,7 @@ class ProcessActorResult:
     negative_boundaries: int
     episode_boundaries: int
     resets: int
+    policy_refreshes: int = 0
 
 
 def run_parallel_memory_jobs(
@@ -43,6 +41,8 @@ def run_parallel_memory_jobs(
     ingest_queue_capacity: int,
     derivation_queue_capacity: int,
     publication_queue_capacity: int,
+    actor_view_refresh_steps: int = 64,
+    actor_view_refresh_ms: float = 250.0,
 ) -> list[ProcessActorResult]:
     topology = ProcessTopology(
         actors=min(int(actor_limit), len(jobs)),
@@ -65,8 +65,10 @@ def run_parallel_memory_jobs(
     pending = list(jobs)
     active = {}
     free_slots = list(range(topology.actors))
-    rngs = {}
     results = []
+    initial_policy = runtime.actor_policy_snapshot()
+    published_policy_generation = int(initial_policy.generation)
+    next_policy_publish = time.monotonic() + max(0.01, float(actor_view_refresh_ms) / 1000.0)
     run_nonce = int(runtime.watermark)
     watermark_cursor = int(runtime.watermark)
     total_steps = sum(int(row[2]) for row in jobs)
@@ -87,7 +89,6 @@ def run_parallel_memory_jobs(
         while pending and free_slots:
             actor_id, spec, steps, seed = pending.pop(0)
             slot = free_slots.pop(0)
-            rngs[actor_id] = Random(seed)
             topology.start_actor(
                 index=slot,
                 spec=spec,
@@ -98,6 +99,10 @@ def run_parallel_memory_jobs(
                 adapter_factory_path="v9.cli:make_adapter",
                 alfred_backend_factory=alfred_backend_factory,
                 run_nonce=run_nonce,
+                initial_policy=runtime.actor_policy_snapshot(),
+                epsilon=float(epsilon),
+                policy_refresh_steps=int(actor_view_refresh_steps),
+                policy_refresh_ms=float(actor_view_refresh_ms),
             )
             active[actor_id] = (slot, topology.actor_processes[-1])
 
@@ -189,6 +194,8 @@ def run_parallel_memory_jobs(
             runtime.set_telemetry_gauge(key, value)
         gauges = {
             "active_actor_processes": len(active),
+            "coordinator_action_requests": 0,
+            "policy_snapshot_generation": int(published_policy_generation),
             "active_ingest_workers": int(ingest_workers),
             "active_derivation_workers": int(derivation_workers),
             "sampled_steps": sampled,
@@ -222,24 +229,6 @@ def run_parallel_memory_jobs(
     try:
         while active:
             progressed = False
-            action_view = None
-            for _ in range(coordinator_batch_size):
-                try:
-                    request = topology.action_requests.get_nowait()
-                except queue.Empty:
-                    break
-                slot, _ = active[request.actor_id]
-                if action_view is None:
-                    action_view = runtime.read_view
-                action = choose_action(
-                    action_view,
-                    request.actions,
-                    rng=rngs[request.actor_id],
-                    epsilon=float(epsilon),
-                    target_environment_id=request.environment_instance_id,
-                )
-                topology.action_responses[slot].put((request.request_id, int(action)))
-                progressed = True
             for _ in range(coordinator_batch_size):
                 try:
                     item = topology.publication_queue.get_nowait()
@@ -262,7 +251,7 @@ def run_parallel_memory_jobs(
                     raise RuntimeError(f"actor process {done.actor_id} exited with code {process.exitcode}")
                 free_slots.append(slot)
                 free_slots.sort()
-                results.append(ProcessActorResult(done.actor_id, done.game_id, done.steps, done.positive_boundaries, done.negative_boundaries, done.episode_boundaries, done.resets))
+                results.append(ProcessActorResult(done.actor_id, done.game_id, done.steps, done.positive_boundaries, done.negative_boundaries, done.episode_boundaries, done.resets, done.policy_refreshes))
                 launch()
                 progressed = True
             if time.monotonic() >= next_progress:
