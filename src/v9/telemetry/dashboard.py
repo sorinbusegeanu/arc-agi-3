@@ -35,6 +35,17 @@ PRIMARY_KEYS = (
     "GPU_memory",
     "inference_latency",
     "training_step_latency",
+    "active_actor_processes",
+    "active_ingest_workers",
+    "active_derivation_workers",
+    "sampled_steps",
+    "ingested_steps",
+    "sampling_backlog",
+    "ingest_queue_depth",
+    "derivation_queue_depth",
+    "sampling_rate",
+    "ingestion_rate",
+    "derivation_rate",
 )
 
 
@@ -79,5 +90,16 @@ def build_primary_dashboard(runtime_metrics: dict[str, Any], diagnostic: dict[st
         "GPU_memory": int(diagnostic.get("gpu_memory_bytes", 0)),
         "inference_latency": float(diagnostic.get("inference_latency_ms", 0.0)),
         "training_step_latency": float(diagnostic.get("training_step_latency_ms", 0.0)),
+        "active_actor_processes": int(diagnostic.get("active_actor_processes", 0)),
+        "active_ingest_workers": int(diagnostic.get("active_ingest_workers", 0)),
+        "active_derivation_workers": int(diagnostic.get("active_derivation_workers", 0)),
+        "sampled_steps": int(diagnostic.get("sampled_steps", 0)),
+        "ingested_steps": int(diagnostic.get("ingested_steps", 0)),
+        "sampling_backlog": int(diagnostic.get("sampling_backlog", 0)),
+        "ingest_queue_depth": int(diagnostic.get("ingest_queue_depth", 0)),
+        "derivation_queue_depth": int(diagnostic.get("derivation_queue_depth", 0)),
+        "sampling_rate": float(diagnostic.get("sampling_rate", 0.0)),
+        "ingestion_rate": float(diagnostic.get("ingestion_rate", 0.0)),
+        "derivation_rate": float(diagnostic.get("derivation_rate", 0.0)),
     }
     return {key: dashboard[key] for key in PRIMARY_KEYS}
