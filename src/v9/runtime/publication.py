@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from threading import RLock
 from typing import Any
 
@@ -38,7 +39,11 @@ class CanonicalGraph:
         self.edges: dict[tuple[MemoryUid, str, MemoryUid], RelationEdge] = {}
         self.versions = VersionTable()
         self.applied_proposals: set[int] = set()
-        self._applied_order: list[int] = []
+        self._applied_order: deque[int] = deque()
+        self._node_counts_by_partition = [0] * self.partition_count
+        self._edge_counts_by_partition = [0] * self.partition_count
+        self._uids_by_level = {level: set() for level in MemoryLevel}
+        self._cached_read_view: ReadView | None = None
         self._coordinator = TransactionCoordinator(partition_count)
         self._publication_lock = RLock()
 
@@ -59,71 +64,110 @@ class CanonicalGraph:
                 return MutationResult(proposal.proposal_uid, MutationOutcome.ACCEPTED, self.generation)
             if not proposal.read_set.valid(self.versions):
                 return MutationResult(proposal.proposal_uid, MutationOutcome.STALE_READ_SET, self.generation)
-            next_nodes = dict(self.nodes)
-            next_payloads = {key: dict(value) for key, value in self.payloads.items()}
-            next_edges = dict(self.edges)
+
+            # Validate and stage only the objects touched by this proposal.  The
+            # publication lock keeps readers from observing the later in-place
+            # commit, so cloning the complete graph for every write is neither
+            # required for atomicity nor affordable as the graph grows.
+            node_updates: dict[MemoryUid, tuple[CanonicalNode, dict[str, Any]]] = {}
+            edge_updates: dict[tuple[MemoryUid, str, MemoryUid], RelationEdge | None] = {}
+            node_count_deltas = [0] * self.partition_count
+            edge_count_deltas = [0] * self.partition_count
             refs: list[ObjectRef] = []
             for write in proposal.writes:
                 if write.node is not None:
                     ref = node_ref(write.node.uid)
-                    current = next_nodes.get(write.node.uid)
+                    staged = node_updates.get(write.node.uid)
+                    current = staged[0] if staged is not None else self.nodes.get(write.node.uid)
                     if current is not None and (
                         current.level != write.node.level
                         or current.memory_type != write.node.memory_type
                         or current.structural_key != write.node.structural_key
                     ):
                         return MutationResult(proposal.proposal_uid, MutationOutcome.INVALID, self.generation)
-                    owner_count = sum(uid.shard(self.partition_count) == write.node.uid.shard(self.partition_count) for uid in next_nodes)
-                    if write.node.uid not in next_nodes and owner_count >= self.node_capacity_per_partition:
-                        return MutationResult(proposal.proposal_uid, MutationOutcome.INVALID, self.generation)
-                    next_nodes[write.node.uid] = write.node
+                    owner = write.node.uid.shard(self.partition_count)
+                    if current is None:
+                        if self._node_counts_by_partition[owner] + node_count_deltas[owner] >= self.node_capacity_per_partition:
+                            return MutationResult(proposal.proposal_uid, MutationOutcome.INVALID, self.generation)
+                        node_count_deltas[owner] += 1
                     incoming_payload = dict(write.payload or {})
                     if current is not None and proposal.proposal_class.value == "ADDITIVE":
-                        merged_payload = dict(next_payloads.get(write.node.uid, {}))
+                        current_payload = staged[1] if staged is not None else self.payloads.get(write.node.uid, {})
+                        merged_payload = dict(current_payload)
                         merged_payload.update(incoming_payload)
                         if "parents" in incoming_payload:
-                            merged_payload["parents"] = sorted({tuple(map(int, row)) for row in next_payloads.get(write.node.uid, {}).get("parents", [])} | {tuple(map(int, row)) for row in incoming_payload.get("parents", [])})
+                            merged_payload["parents"] = sorted({tuple(map(int, row)) for row in current_payload.get("parents", [])} | {tuple(map(int, row)) for row in incoming_payload.get("parents", [])})
                         incoming_payload = merged_payload
-                    next_payloads[write.node.uid] = incoming_payload
+                    node_updates[write.node.uid] = (write.node, incoming_payload)
                     refs.append(ref)
                 elif write.edge is not None:
                     ref = edge_ref(write.edge)
+                    current_edge = edge_updates.get(write.edge.key, self.edges.get(write.edge.key))
+                    owner = write.edge.source.shard(self.partition_count)
                     if proposal.mutation_kind is MutationKind.REMOVE_EDGE:
-                        next_edges.pop(write.edge.key, None)
+                        if current_edge is not None:
+                            edge_count_deltas[owner] -= 1
+                        edge_updates[write.edge.key] = None
                     else:
-                        owner = write.edge.source.shard(self.partition_count)
-                        owner_count = sum(edge.source.shard(self.partition_count) == owner for edge in next_edges.values())
-                        if write.edge.key not in next_edges and owner_count >= self.edge_capacity_per_partition:
-                            return MutationResult(proposal.proposal_uid, MutationOutcome.INVALID, self.generation)
-                        next_edges[write.edge.key] = write.edge
+                        if current_edge is None:
+                            if self._edge_counts_by_partition[owner] + edge_count_deltas[owner] >= self.edge_capacity_per_partition:
+                                return MutationResult(proposal.proposal_uid, MutationOutcome.INVALID, self.generation)
+                            edge_count_deltas[owner] += 1
+                        edge_updates[write.edge.key] = write.edge
                     refs.append(ref)
-            self.nodes, self.payloads, self.edges = next_nodes, next_payloads, next_edges
+
+            for uid, (node, payload) in node_updates.items():
+                if uid not in self.nodes:
+                    self._uids_by_level[node.level].add(uid)
+                self.nodes[uid] = node
+                self.payloads[uid] = payload
+            for key, edge in edge_updates.items():
+                if edge is None:
+                    self.edges.pop(key, None)
+                else:
+                    self.edges[key] = edge
+            for partition, delta in enumerate(node_count_deltas):
+                self._node_counts_by_partition[partition] += delta
+            for partition, delta in enumerate(edge_count_deltas):
+                self._edge_counts_by_partition[partition] += delta
             for ref in refs:
                 self.versions.bump(ref)
+            if len(self._applied_order) >= self.applied_proposal_capacity:
+                expired = self._applied_order.popleft()
+                self.applied_proposals.discard(expired)
             self.applied_proposals.add(proposal.proposal_uid)
             self._applied_order.append(proposal.proposal_uid)
-            if len(self._applied_order) > self.applied_proposal_capacity:
-                expired = self._applied_order.pop(0)
-                self.applied_proposals.discard(expired)
             self.generation += 1
+            self._cached_read_view = None
             return MutationResult(proposal.proposal_uid, MutationOutcome.ACCEPTED, self.generation)
 
     def read_view(self) -> ReadView:
         with self._publication_lock:
-            return ReadView.build(self.generation, self.nodes, self.payloads, self.edges, dict(self.versions._versions))
+            if self._cached_read_view is None:
+                self._cached_read_view = ReadView.build(self.generation, self.nodes, self.payloads, self.edges, dict(self.versions._versions))
+            return self._cached_read_view
+
+    def memory_count(self, level: MemoryLevel | None = None) -> int:
+        with self._publication_lock:
+            return len(self.nodes) if level is None else len(self._uids_by_level[level])
+
+    def uids_at_level(self, level: MemoryLevel) -> tuple[MemoryUid, ...]:
+        with self._publication_lock:
+            return tuple(self._uids_by_level[level])
 
     def state_dict(self) -> dict[str, object]:
-        return {
-            "schema_version": self.SCHEMA_VERSION, "partition_count": self.partition_count,
-            "node_capacity_per_partition": self.node_capacity_per_partition,
-            "edge_capacity_per_partition": self.edge_capacity_per_partition,
-            "applied_proposal_capacity": self.applied_proposal_capacity,
-            "generation": self.generation,
-            "nodes": [{"hi": uid.hi, "lo": uid.lo, "level": int(node.level), "memory_type": int(node.memory_type), "structural_key": list(node.structural_key), "created_watermark": node.created_watermark, "payload": self.payloads.get(uid, {})} for uid, node in sorted(self.nodes.items())],
-            "edges": [{"source_hi": row.source.hi, "source_lo": row.source.lo, "relation": row.relation.value, "target_hi": row.target.hi, "target_lo": row.target.lo, "evidence": [[uid.hi, uid.lo] for uid in row.evidence_uids], "authority": row.authority.value, "object_version": row.object_version} for row in (self.edges[key] for key in sorted(self.edges))],
-            "versions": self.versions.state_dict(),
-            "applied_proposals": list(self._applied_order),
-        }
+        with self._publication_lock:
+            return {
+                "schema_version": self.SCHEMA_VERSION, "partition_count": self.partition_count,
+                "node_capacity_per_partition": self.node_capacity_per_partition,
+                "edge_capacity_per_partition": self.edge_capacity_per_partition,
+                "applied_proposal_capacity": self.applied_proposal_capacity,
+                "generation": self.generation,
+                "nodes": [{"hi": uid.hi, "lo": uid.lo, "level": int(node.level), "memory_type": int(node.memory_type), "structural_key": list(node.structural_key), "created_watermark": node.created_watermark, "payload": self.payloads.get(uid, {})} for uid, node in sorted(self.nodes.items())],
+                "edges": [{"source_hi": row.source.hi, "source_lo": row.source.lo, "relation": row.relation.value, "target_hi": row.target.hi, "target_lo": row.target.lo, "evidence": [[uid.hi, uid.lo] for uid in row.evidence_uids], "authority": row.authority.value, "object_version": row.object_version} for row in (self.edges[key] for key in sorted(self.edges))],
+                "versions": self.versions.state_dict(),
+                "applied_proposals": list(self._applied_order),
+            }
 
     @classmethod
     def from_state_dict(cls, state: dict[str, object]) -> "CanonicalGraph":
@@ -133,12 +177,17 @@ class CanonicalGraph:
         result.generation = int(state.get("generation", 0))
         for raw in state.get("nodes", []):
             uid = MemoryUid(int(raw["hi"]), int(raw["lo"]))
-            result.nodes[uid] = CanonicalNode(uid, MemoryLevel(int(raw["level"])), MemoryType(int(raw["memory_type"])), tuple(int(v) for v in raw["structural_key"]), int(raw["created_watermark"]))
+            node = CanonicalNode(uid, MemoryLevel(int(raw["level"])), MemoryType(int(raw["memory_type"])), tuple(int(v) for v in raw["structural_key"]), int(raw["created_watermark"]))
+            result.nodes[uid] = node
             result.payloads[uid] = dict(raw.get("payload", {}))
+            result._node_counts_by_partition[uid.shard(result.partition_count)] += 1
+            result._uids_by_level[node.level].add(uid)
         for raw in state.get("edges", []):
             edge = RelationEdge(MemoryUid(int(raw["source_hi"]), int(raw["source_lo"])), RelationType(str(raw["relation"])), MemoryUid(int(raw["target_hi"]), int(raw["target_lo"])), tuple(MemoryUid(int(v[0]), int(v[1])) for v in raw.get("evidence", [])), EdgeAuthority(str(raw["authority"])), int(raw.get("object_version", 0)))
             result.edges[edge.key] = edge
+            result._edge_counts_by_partition[edge.source.shard(result.partition_count)] += 1
         result.versions = VersionTable.from_state_dict(list(state.get("versions", [])))
-        result._applied_order = [int(value) for value in state.get("applied_proposals", [])][-result.applied_proposal_capacity :]
+        applied_order = [int(value) for value in state.get("applied_proposals", [])]
+        result._applied_order = deque(applied_order[-result.applied_proposal_capacity :])
         result.applied_proposals = set(result._applied_order)
         return result

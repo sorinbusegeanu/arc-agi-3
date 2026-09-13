@@ -221,14 +221,17 @@ def run_parallel_memory_jobs(
     try:
         while active:
             progressed = False
+            action_view = None
             for _ in range(coordinator_batch_size):
                 try:
                     request = topology.action_requests.get_nowait()
                 except queue.Empty:
                     break
                 slot, _ = active[request.actor_id]
+                if action_view is None:
+                    action_view = runtime.read_view
                 action = choose_action(
-                    runtime.read_view,
+                    action_view,
                     request.actions,
                     rng=rngs[request.actor_id],
                     epsilon=float(epsilon),

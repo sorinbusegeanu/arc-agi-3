@@ -39,6 +39,33 @@ def test_read_views_are_immutable_cuts() -> None:
         raise AssertionError("read view mapping must be immutable")
 
 
+def test_read_view_is_cached_until_the_graph_changes() -> None:
+    graph = CanonicalGraph(1)
+    first = graph.read_view()
+    assert graph.read_view() is first
+
+    node = CanonicalNode.build(MemoryLevel.M0, MemoryType.EPISODE, (1,), 1)
+    graph.publish(_proposal(graph, node, 0))
+    second = graph.read_view()
+    assert second is not first
+    assert graph.read_view() is second
+
+
+def test_publication_does_not_clone_unchanged_graph_payloads() -> None:
+    graph = CanonicalGraph(1)
+    first = CanonicalNode.build(MemoryLevel.M0, MemoryType.EPISODE, (1,), 1)
+    second = CanonicalNode.build(MemoryLevel.M0, MemoryType.EPISODE, (2,), 2)
+    graph.publish(_proposal(graph, first, 0))
+    stored_payload = graph.payloads[first.uid]
+    cut = graph.read_view()
+
+    graph.publish(_proposal(graph, second, 0, watermark=2))
+
+    assert graph.payloads[first.uid] is stored_payload
+    assert first.uid in cut.nodes
+    assert second.uid not in cut.nodes
+
+
 def test_dependency_scoped_suspension_preserves_independently_supported_child() -> None:
     store = LineageStore()
     parent, supported, unsupported = (MemoryUid.derive("node", value) for value in range(3))
@@ -81,6 +108,29 @@ def test_cross_partition_invalid_proposal_is_all_or_nothing() -> None:
     proposal = MutationProposal.build(MutationKind.UPSERT_EDGE, target_partitions=(0,), read_set=ReadSet.build((), maximum_size=1), evidence_refs=(), causal_watermark=1, writes=(MutationWrite(edge=edge),))
     assert graph.publish(proposal).outcome is MutationOutcome.INVALID
     assert not graph.edges
+
+
+def test_invalid_multi_write_does_not_publish_earlier_staged_writes() -> None:
+    graph = CanonicalGraph(1)
+    existing = CanonicalNode.build(MemoryLevel.M1, MemoryType.NORMALIZED_RELATION, (1,), 1)
+    graph.publish(_proposal(graph, existing, 0))
+    new_node = CanonicalNode.build(MemoryLevel.M0, MemoryType.EPISODE, (2,), 2)
+    conflicting = CanonicalNode(existing.uid, MemoryLevel.M2, MemoryType.FAMILY, (3,), 2)
+    proposal = MutationProposal.build(
+        MutationKind.UPSERT_NODE,
+        target_partitions=(0,),
+        read_set=ReadSet.build((), maximum_size=1),
+        evidence_refs=(),
+        causal_watermark=2,
+        writes=(
+            MutationWrite(node=new_node, payload={"value": "staged"}),
+            MutationWrite(node=conflicting, payload={"value": "invalid"}),
+        ),
+    )
+
+    assert graph.publish(proposal).outcome is MutationOutcome.INVALID
+    assert new_node.uid not in graph.nodes
+    assert graph.payloads[existing.uid] == {"value": 0}
 
 
 def test_lineage_and_object_versions_round_trip() -> None:

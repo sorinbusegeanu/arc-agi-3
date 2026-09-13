@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 from v9.cognition.grounding import GroundingMaturity
 from v9.memory.model import MemoryLevel
-from v9.memory.model import MemoryType
 from v9.runtime.read_view import ReadView
 
 
@@ -26,15 +25,7 @@ class GroundedActionSignal:
 
 
 def action_scores(view: ReadView, actions: tuple[int, ...], *, grounded_signals: tuple[GroundedActionSignal, ...] = (), target_environment_id: int | None = None) -> dict[int, float]:
-    scores = {int(action): 0.0 for action in actions}
-    for uid, node in view.nodes.items():
-        if node.memory_type is not MemoryType.NORMALIZED_RELATION:
-            continue
-        payload = view.payloads[uid]
-        observable = str(payload.get("observable_relation", ""))
-        for action in scores:
-            if observable.startswith(f"ACTION:{action}:"):
-                scores[action] += float(payload.get("support", 0))
+    scores = {int(action): float(view.normalized_action_supports.get(int(action), 0.0)) for action in actions}
     for signal in grounded_signals:
         if signal.authoritative and target_environment_id is not None and signal.target_environment_id == int(target_environment_id) and signal.native_action in scores:
             scores[signal.native_action] += float(signal.score)

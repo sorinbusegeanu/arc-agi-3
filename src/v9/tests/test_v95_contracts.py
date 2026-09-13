@@ -102,6 +102,25 @@ def test_stateful_mutation_requires_read_set_and_nested_read_view_is_immutable()
         graph.read_view().payloads[node.uid]["nested"]["new"] = 3
 
 
+def test_developmental_stage_evidence_does_not_rebuild_a_full_read_view(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False, enable_snapshots=False))
+
+    def unexpected_read_view():
+        raise AssertionError("stage evidence must use indexed canonical graph state")
+
+    monkeypatch.setattr(runtime.graph, "read_view", unexpected_read_view)
+    evidence = runtime.make_experience(
+        producer_id=1,
+        producer_sequence=1,
+        environment_instance_id=7,
+        global_step=0,
+        context_signature=3,
+        action_id=2,
+        outcome_signature=4,
+    )
+    assert runtime.submit(evidence)
+
+
 def test_structural_candidate_index_retrieval_is_bounded() -> None:
     index = StructuralCandidateIndex(bucket_capacity=3, bucket_scan_limit=1)
     nodes = [CanonicalNode.build(MemoryLevel.M2, MemoryType.FAMILY, (1 + 256 * value,), value) for value in range(10)]
@@ -152,18 +171,27 @@ def test_stage_isf_replay_and_restart_are_causally_persisted(tmp_path: Path) -> 
 
 def test_grounded_action_influence_requires_g4_validated_higher_memory() -> None:
     graph = CanonicalGraph(1)
+    normalized = CanonicalNode.build(MemoryLevel.M1, MemoryType.NORMALIZED_RELATION, (99,), 1)
+    graph.publish(MutationProposal.build(
+        MutationKind.UPSERT_NODE,
+        target_partitions=(0,),
+        read_set=ReadSet.build((), maximum_size=1),
+        evidence_refs=(),
+        causal_watermark=1,
+        writes=(MutationWrite(node=normalized, payload={"observable_relation": "ACTION:2:TEST", "support": 7}),),
+    ))
     signals = (
         GroundedActionSignal(2, 10.0, GroundingMaturity.G3, MemoryLevel.M4, True, 7, 7),
         GroundedActionSignal(3, 5.0, GroundingMaturity.G4, MemoryLevel.M3, True, 7, 7),
         GroundedActionSignal(4, 3.0, GroundingMaturity.G4, MemoryLevel.M4, True, 7, 7),
     )
     scores = action_scores(graph.read_view(), (2, 3, 4), grounded_signals=signals, target_environment_id=7)
-    assert scores == {2: 0.0, 3: 0.0, 4: 3.0}
+    assert scores == {2: 7.0, 3: 0.0, 4: 3.0}
     cross_environment = (
         GroundedActionSignal(2, 4.0, GroundingMaturity.G4, MemoryLevel.M4, True, 6, 7),
         GroundedActionSignal(3, 5.0, GroundingMaturity.G5, MemoryLevel.M4, True, 6, 7),
     )
-    assert action_scores(graph.read_view(), (2, 3), grounded_signals=cross_environment, target_environment_id=7) == {2: 0.0, 3: 5.0}
+    assert action_scores(graph.read_view(), (2, 3), grounded_signals=cross_environment, target_environment_id=7) == {2: 7.0, 3: 5.0}
 
 
 def test_lifecycle_retirement_preserves_authoritative_dependencies() -> None:

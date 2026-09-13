@@ -266,14 +266,13 @@ class ContinuousMemoryRuntime:
                 self.evidence.append("ISF_DECISION", self._watermark, {"stage": int(decision.developmental_stage), "next_stage": int(decision.next_developmental_stage), "score": decision.score, "raw": asdict(decision.raw_components), "normalized": asdict(decision.normalized_components), "graph_generation": decision.graph_generation})
 
     def _stage_evidence(self) -> StageEvidence:
-        view = self.read_view
-        strategies = [payload for uid, payload in view.payloads.items() if view.nodes[uid].level is MemoryLevel.M7]
+        strategies = [self.graph.payloads[uid] for uid in self.graph.uids_at_level(MemoryLevel.M7)]
         return StageEvidence(
             stable_contingencies=sum(len(rows) >= 2 for rows in self._m1n_occurrences.values()),
             structural_abstractions=len(self._m3),
             held_out_transfer_successes=sum(bool(row.validated) for row in self._m4.values()),
-            mature_consequences=sum(bool(payload.get("mature")) for uid, payload in view.payloads.items() if view.nodes[uid].level is MemoryLevel.M5),
-            outcome_equivalences=view.memory_count(MemoryLevel.M6),
+            mature_consequences=sum(bool(self.graph.payloads[uid].get("mature")) for uid in self.graph.uids_at_level(MemoryLevel.M5)),
+            outcome_equivalences=self.graph.memory_count(MemoryLevel.M6),
             learned_preferences=sum(int(row.get("primary_valence_sum", 0)) != 0 for row in strategies),
             alternative_strategies=max(0, len(strategies) - 1),
             demonstrated_replans=self._replans_demonstrated,
@@ -630,7 +629,7 @@ class ContinuousMemoryRuntime:
         return outcome
 
     def replay_once(self) -> ReplayResult:
-        before_m0 = self.read_view.memory_count(MemoryLevel.M0)
+        before_m0 = self.graph.memory_count(MemoryLevel.M0)
         candidates = tuple(ReplayCandidate(uid, fitness) for uid, fitness in sorted(self._replay_pool.items()))
 
         def process(_candidate: ReplayCandidate) -> tuple[int, int, int]:
@@ -640,7 +639,7 @@ class ContinuousMemoryRuntime:
             return len(self.graph.nodes) - before_nodes, int(self.graph.generation > before_generation), 0
 
         result = self.replay.run(candidates, process)
-        if self.read_view.memory_count(MemoryLevel.M0) != before_m0:
+        if self.graph.memory_count(MemoryLevel.M0) != before_m0:
             raise RuntimeError("replay may not fabricate M0 environment evidence")
         self.evidence.append("REPLAY", self._watermark, asdict(result))
         return result
@@ -880,7 +879,7 @@ class ContinuousMemoryRuntime:
 
     def metrics(self) -> dict[str, Any]:
         view = self.read_view
-        counts = {f"M{level}": view.memory_count(MemoryLevel(level)) for level in range(8)}
+        counts = {f"M{level}": self.graph.memory_count(MemoryLevel(level)) for level in range(8)}
         normalization = {str(radius): self.scale_statistics.state(radius).value for radius in self.config.scientific.structural_radii}
         grounding_counts = {f"G{level}": sum(int(row.maturity) == level for row in self.grounding.states.values()) for level in range(6)}
         persistent_bytes = max(1, len(json.dumps(self.graph.state_dict(), sort_keys=True, separators=(",", ":"))))
