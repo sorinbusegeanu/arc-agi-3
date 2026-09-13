@@ -4,6 +4,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import RLock
+from time import monotonic
 from typing import Any
 
 from v9.memory.identity import stable_u64
@@ -21,11 +22,15 @@ class EvidenceRecord:
 class EvidenceLedger:
     SCHEMA_VERSION = 1
 
-    def __init__(self, path: Path | None, scientific_config_id: str) -> None:
+    def __init__(self, path: Path | None, scientific_config_id: str, *, flush_records: int = 256, flush_interval_seconds: float = 0.5) -> None:
         self.path = path
         self.scientific_config_id = scientific_config_id
         self.records: list[EvidenceRecord] = []
         self._lock = RLock()
+        self._pending_lines: list[str] = []
+        self._flush_records = max(1, int(flush_records))
+        self._flush_interval_seconds = max(0.01, float(flush_interval_seconds))
+        self._last_flush = monotonic()
         if path is not None and path.exists():
             for line in path.read_text(encoding="utf-8").splitlines():
                 raw = json.loads(line)
@@ -40,10 +45,26 @@ class EvidenceLedger:
             record = EvidenceRecord(uid, str(kind), int(causal_watermark), self.scientific_config_id, dict(payload))
             self.records.append(record)
             if self.path is not None:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps(asdict(record), sort_keys=True, separators=(",", ":")) + "\n")
+                self._pending_lines.append(json.dumps(asdict(record), sort_keys=True, separators=(",", ":")) + "\n")
+                now = monotonic()
+                if len(self._pending_lines) >= self._flush_records or now - self._last_flush >= self._flush_interval_seconds:
+                    self._flush_locked(now=now)
             return record
+
+    def _flush_locked(self, *, now: float | None = None) -> None:
+        if self.path is None or not self._pending_lines:
+            self._last_flush = monotonic() if now is None else float(now)
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = "".join(self._pending_lines)
+        self._pending_lines.clear()
+        with self.path.open("a", encoding="utf-8") as stream:
+            stream.write(payload)
+        self._last_flush = monotonic() if now is None else float(now)
+
+    def flush(self) -> None:
+        with self._lock:
+            self._flush_locked()
 
     def state_dict(self) -> dict[str, object]:
         return {"schema_version": self.SCHEMA_VERSION, "scientific_config_id": self.scientific_config_id, "records": [asdict(row) for row in self.records]}
