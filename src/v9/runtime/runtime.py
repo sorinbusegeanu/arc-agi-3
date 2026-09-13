@@ -98,6 +98,7 @@ class ContinuousMemoryRuntime:
         self._lock = RLock()
         self._m1n_occurrences: dict[int, list[M1NormalizedRelation]] = {}
         self._m1n_supports: dict[int, int] = {}
+        self._m1n_dirty: set[int] = set()
         self._replay_pool: dict[MemoryUid, float] = {}
         self._formation_environments: set[int] = set()
         self._latest_interaction_grounding: dict[tuple[int, int], M1GroundedContingency] = {}
@@ -423,25 +424,67 @@ class ContinuousMemoryRuntime:
             for occurrence in occurrences
             for uid in occurrence.provenance.evidence
         )
-        self._publish(
-            CanonicalNode(
-                relation.uid,
-                MemoryLevel.M1,
-                MemoryType.NORMALIZED_RELATION,
-                (relation.structural_signature,),
-                self._watermark,
-            ),
-            {
-                "observable_relation": relation.observable_relation,
-                "channel": relation.channel.value,
-                "structural_signature": relation.structural_signature,
-                "support": support,
-                "parents": [[uid.hi, uid.lo] for uid in retained_parents],
-            },
-            retained_evidence,
-            proposal_class=ProposalClass.STATEFUL,
-        )
+        if support == 1:
+            self._publish(
+                CanonicalNode(
+                    relation.uid,
+                    MemoryLevel.M1,
+                    MemoryType.NORMALIZED_RELATION,
+                    (relation.structural_signature,),
+                    self._watermark,
+                ),
+                {
+                    "observable_relation": relation.observable_relation,
+                    "channel": relation.channel.value,
+                    "structural_signature": relation.structural_signature,
+                    "support": support,
+                    "parents": [[uid.hi, uid.lo] for uid in retained_parents],
+                },
+                retained_evidence,
+                proposal_class=ProposalClass.STATEFUL,
+            )
+        else:
+            self._m1n_dirty.add(int(relation.structural_signature))
         return relation.structural_signature
+
+    def flush_deferred_memory_updates(self) -> None:
+        with self._lock:
+            dirty = tuple(self._m1n_dirty)
+            self._m1n_dirty.clear()
+            for signature in dirty:
+                rows = self._m1n_occurrences.get(int(signature), ())
+                if not rows:
+                    continue
+                relation = rows[0]
+                support = int(self._m1n_supports.get(int(signature), len(rows)))
+                retained_parents = tuple(
+                    uid
+                    for occurrence in rows
+                    for uid in occurrence.provenance.parents
+                )
+                retained_evidence = tuple(
+                    uid
+                    for occurrence in rows
+                    for uid in occurrence.provenance.evidence
+                )
+                self._publish(
+                    CanonicalNode(
+                        relation.uid,
+                        MemoryLevel.M1,
+                        MemoryType.NORMALIZED_RELATION,
+                        (relation.structural_signature,),
+                        self._watermark,
+                    ),
+                    {
+                        "observable_relation": relation.observable_relation,
+                        "channel": relation.channel.value,
+                        "structural_signature": relation.structural_signature,
+                        "support": support,
+                        "parents": [[uid.hi, uid.lo] for uid in retained_parents],
+                    },
+                    retained_evidence,
+                    proposal_class=ProposalClass.STATEFUL,
+                )
 
     def _ingest(self, event: TimelineEvent) -> tuple[int, ...]:
         self._formation_environments.add(int(event.identity.environment_instance_id))
