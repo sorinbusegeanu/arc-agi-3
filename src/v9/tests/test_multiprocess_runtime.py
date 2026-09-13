@@ -119,7 +119,7 @@ def test_tiny_worker_queues_complete_three_epochs_without_backpressure_deadlock(
     args = build_parser().parse_args([
         "continuous-run",
         "--root", str(root),
-        "--games", "synthetic_symbolic",
+        "--games", "synthetic-symbolic",
         "--steps-per-game", "24",
         "--epochs", "3",
         "--actors", "4",
