@@ -79,12 +79,14 @@ def test_dependency_safe_retirement_is_two_phase_and_persists_tombstone() -> Non
     assert first["dormant"] == 1
     assert lifecycle.records[episode.uid].state is CognitiveState.DORMANT
     assert episode.uid in graph.nodes
+    assert episode.uid not in graph.read_view().nodes
 
     runtime.watermark = 7000
     second = run_lifecycle_maintenance(runtime, dormancy_grace_watermarks=1000, retirement_grace_watermarks=1000)
     assert second["pending"] == 1
     assert lifecycle.records[episode.uid].state is CognitiveState.RETIRE_PENDING
     assert episode.uid in graph.nodes
+    assert episode.uid not in graph.read_view().nodes
 
     runtime.watermark = 9000
     third = run_lifecycle_maintenance(runtime, dormancy_grace_watermarks=1000, retirement_grace_watermarks=1000)
@@ -110,6 +112,8 @@ def test_higher_memory_can_go_dormant_but_is_not_physically_retired() -> None:
     runtime.watermark = 5000
     run_lifecycle_maintenance(runtime, dormancy_grace_watermarks=1000, retirement_grace_watermarks=1000)
     assert lifecycle.records[concept.uid].state is CognitiveState.DORMANT
+    assert concept.uid in graph.nodes
+    assert concept.uid not in graph.read_view().nodes
 
     runtime.watermark = 9000
     result = run_lifecycle_maintenance(runtime, dormancy_grace_watermarks=1000, retirement_grace_watermarks=1000)
