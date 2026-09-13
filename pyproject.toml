@@ -16,6 +16,7 @@ dependencies = [
     "numpy>=1.26",
     "pandas>=2.0",
     "pyarrow>=15.0",
+    "PyYAML>=6.0",
     "scikit-learn>=1.4",
     "tqdm>=4.66",
 ]
@@ -25,5 +26,6 @@ arc-agi3-v7 = "v7.cli:main"
 arc-agi3-v9 = "v9.cli:main"
 
 [project.optional-dependencies]
+curriculum = ["minigrid>=2.3,<3.0", "gymnasium[box2d,atari]>=1.0,<2.0", "ale-py>=0.10,<1.0"]
 test = ["pytest>=8.0"]
 babyai = ["minigrid>=2.3,<3.0"]
