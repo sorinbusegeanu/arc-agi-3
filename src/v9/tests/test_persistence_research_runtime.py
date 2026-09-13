@@ -87,3 +87,31 @@ def test_cli_smoke_uses_only_v9_named_artifacts(tmp_path: Path) -> None:
     assert not (tmp_path / "v8_run_summary.json").exists()
     report = json.loads((tmp_path / "reports" / "reporting_cut.json").read_text())
     assert report["scientific_config"]["design_version"] == "9.7.6"
+
+
+def test_native_snapshot_uses_content_addressed_chunks(tmp_path: Path) -> None:
+    runtime = _learn(tmp_path, 3, restore=False)
+    result = runtime.close()
+    assert result is not None
+    assert result.path.is_dir()
+    assert (result.path / "manifest.json").is_file()
+    assert (result.path / "COMPLETE").is_file()
+    chunks = list((tmp_path / "snapshot_chunks").glob("*.bin"))
+    assert chunks
+
+    restored = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path))
+    assert restored.metrics()["memory_levels"]["M0"] >= 3
+
+
+def test_snapshot_chunks_are_content_addressed_and_reused(tmp_path: Path) -> None:
+    from v9.runtime.snapshot_chunks import write_chunks
+
+    payload = b"x" * (4 * 1024 * 1024 + 17)
+    first = write_chunks(tmp_path, payload)
+    before = {path.name for path in (tmp_path / "snapshot_chunks").glob("*.bin")}
+    second = write_chunks(tmp_path, payload)
+    after = {path.name for path in (tmp_path / "snapshot_chunks").glob("*.bin")}
+
+    assert first == second
+    assert before == after
+    assert len(after) == 2
