@@ -83,6 +83,7 @@ def test_step1_continuous_run_executes_curriculum(tmp_path) -> None:
         "--shards", "2",
         "--stage-workers", "1",
         "--no-peers",
+        "--no-dashboard",
     ])
     assert run_continuous(args) == 0
 
