@@ -219,7 +219,7 @@ def _actor(runtime: ContinuousMemoryRuntime, spec: EnvironmentSpec, *, actor_id:
                 episode = runtime.environments.next_episode(identity)
                 resets += 1
             if verbose and time.monotonic() >= next_progress:
-                print(f"v9 progress actor={actor_id} game={game_id} steps={completed}", flush=True)
+                print(f"{time.strftime('[%H:%M]')} progress actor={actor_id} game={game_id} steps={completed}", flush=True)
                 next_progress = time.monotonic() + progress_interval
     finally:
         close = getattr(adapter, "close", None)
@@ -263,8 +263,8 @@ def run_continuous(args: argparse.Namespace) -> int:
     if not args.no_dashboard:
         dashboard = MetricsHTTPServer(runtime.metrics, host=args.dashboard_host, port=args.dashboard_port)
         dashboard.start()
-        print(f"v9 dashboard: http://{args.dashboard_host}:{args.dashboard_port}/", flush=True)
-    print(f"v9 continuous: games={len(games)} actors={args.actors} epochs={args.epochs} shards={args.shards} stage_workers={args.stage_workers} ingest_workers={args.ingest_workers} derivation_workers={args.derivation_workers} peers={'off' if args.no_peers else 'on'} lifecycle={args.lifecycle} snapshots={'off' if args.no_snapshots else 'native'} game_ids={','.join(games)}", flush=True)
+        print(f"{time.strftime('[%H:%M]')} dashboard: http://{args.dashboard_host}:{args.dashboard_port}/", flush=True)
+    print(f"{time.strftime('[%H:%M]')} continuous: games={len(games)} actors={args.actors} epochs={args.epochs} shards={args.shards} stage_workers={args.stage_workers} ingest_workers={args.ingest_workers} derivation_workers={args.derivation_workers} peers={'off' if args.no_peers else 'on'} lifecycle={args.lifecycle} snapshots={'off' if args.no_snapshots else 'native'} game_ids={','.join(games)}", flush=True)
     try:
         process_results, epoch_results = run_epochs(runtime, specs, args)
         results = [
@@ -302,7 +302,7 @@ def run_smoke(args: argparse.Namespace) -> int:
             runtime.submit(runtime.make_experience(producer_id=1, producer_sequence=index + 1, environment_instance_id=1, global_step=index, context_signature=10 + index % 3, action_id=index % 4, outcome_signature=100 + index % 5, family_signature=200 + index % 3, carrier_signature=300 + index % 7, future_option_delta=float(index % 3 - 1), changed_cells=1 + index % 12, trajectory_signature=400 + index % 9, next_context_signature=10 + (index + 1) % 3))
         runtime.wait_quiescent(args.drain_timeout)
         metrics = runtime.metrics()
-        print(f"v9 smoke done events={args.events} memories={metrics['memories']} edges={metrics['edges']}", flush=True)
+        print(f"{time.strftime('[%H:%M]')} smoke done events={args.events} memories={metrics['memories']} edges={metrics['edges']}", flush=True)
         runtime.close(normal=True, timeout=args.final_save_timeout)
         return 0
     except BaseException:

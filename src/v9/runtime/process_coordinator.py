@@ -59,7 +59,7 @@ def run_process_jobs(
         levels = dict(metrics.get("memory_levels", {}))
         percent = (100.0 * published / total_steps) if total_steps else 100.0
         print(
-            "v9 progress "
+            f"{time.strftime('[%H:%M]')} progress "
             f"{percent:5.1f}% "
             f"steps={published}/{total_steps} "
             f"memories={metrics.get('memories', 0)} "

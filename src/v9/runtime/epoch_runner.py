@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import time
 from typing import Any
 
 from v9.hgt import train_hgt_epoch
@@ -61,7 +62,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
     baseline_success: float | None = None
     for epoch in range(1, int(args.epochs) + 1):
         jobs = build_epoch_jobs(specs, args, epoch=epoch)
-        print(f"v9 epoch {epoch}/{args.epochs} sampling start actors={len(jobs)}", flush=True)
+        print(f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} sampling start actors={len(jobs)}", flush=True)
         process_results = run_parallel_memory_jobs(
             runtime,
             jobs,
@@ -90,7 +91,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
         runtime.set_telemetry_gauge("behavioral_success_gain", behavioral_gain)
         runtime.set_telemetry_gauge("successful_scenarios", sum(rate > 0.0 for rate in scenario_success.values()))
 
-        print(f"v9 epoch {epoch}/{args.epochs} training start", flush=True)
+        print(f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} training start", flush=True)
         training = train_hgt_epoch(
             runtime,
             epoch=epoch,
@@ -99,7 +100,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
             root=args.root,
         )
         print(
-            f"v9 epoch {epoch}/{args.epochs} training status={training.status} "
+            f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} training status={training.status} "
             f"model={training.model_version} train_loss={training.training_loss:.4f} "
             f"val_loss={training.validation_loss:.4f} examples={training.examples}",
             flush=True,

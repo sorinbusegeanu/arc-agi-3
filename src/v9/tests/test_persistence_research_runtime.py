@@ -81,7 +81,8 @@ def test_cli_smoke_uses_only_v9_named_artifacts(tmp_path: Path) -> None:
     environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[2]))
     result = subprocess.run([sys.executable, "-m", "v9", "smoke", "--root", str(tmp_path), "--events", "4", "--no-restore"], env=environment, text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
-    assert "v9 smoke done" in result.stdout
+    assert "smoke done" in result.stdout
+    assert "v9 smoke done" not in result.stdout
     assert (tmp_path / "snapshots").is_dir()
     assert not (tmp_path / "v8_run_summary.json").exists()
     report = json.loads((tmp_path / "reports" / "reporting_cut.json").read_text())

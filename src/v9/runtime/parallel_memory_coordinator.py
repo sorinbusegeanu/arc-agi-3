@@ -210,7 +210,7 @@ def run_parallel_memory_jobs(
         diag = dict(metrics.get("telemetry_diagnostics", {}))
         pct = 100.0 * ingested / total_steps if total_steps else 100.0
         print(
-            f"v9 progress {pct:5.1f}% sampled={sampled}/{total_steps} ingested={ingested} "
+            f"{time.strftime('[%H:%M]')} progress {pct:5.1f}% sampled={sampled}/{total_steps} ingested={ingested} "
             f"ingest_q={diag.get('ingest_queue_depth', -1)} derive_q={diag.get('derivation_queue_depth', -1)} "
             f"M0={levels.get('M0',0)} M1={levels.get('M1',0)} M2={levels.get('M2',0)} "
             f"M3={levels.get('M3',0)} M4={levels.get('M4',0)} M5={levels.get('M5',0)} "

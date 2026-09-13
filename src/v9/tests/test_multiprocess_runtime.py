@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from v9.cli import build_parser, run_continuous
 
@@ -46,7 +47,8 @@ def test_progress_is_written_to_stdout(tmp_path, capsys) -> None:
     ])
     assert run_continuous(args) == 0
     output = capsys.readouterr().out
-    assert "v9 progress" in output
+    assert re.search(r"\[\d{2}:\d{2}\] progress", output)
+    assert "v9 progress" not in output
     assert "sampled=12/12" in output
     assert "ingested=12" in output
     assert "M0=" in output
