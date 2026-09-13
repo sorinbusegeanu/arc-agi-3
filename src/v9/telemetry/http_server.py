@@ -9,7 +9,9 @@ from typing import Any, Callable
 class MetricsHTTPServer:
     def __init__(self, metrics_provider: Callable[[], dict[str, Any]], *, host: str = "0.0.0.0", port: int = 8765) -> None:
         self.metrics_provider = metrics_provider
-        provider = metrics_provider
+        owner = getattr(metrics_provider, "__self__", None)
+        dashboard_provider = getattr(owner, "dashboard_metrics", None)
+        provider = dashboard_provider if callable(dashboard_provider) else metrics_provider
 
         class Handler(BaseHTTPRequestHandler):
             def _write(self, status: int, content_type: str, payload: bytes) -> None:
