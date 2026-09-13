@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from v9.research.grounding_h16 import GroundingCondition, evaluate_h16, run_matched_controls, run_synthetic_h16_controls
+from v9.research.evidence import EvidenceLedger
 from v9.research.hypotheses import HypothesisStatus
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
 
@@ -44,6 +45,19 @@ def test_evidence_is_append_only_across_restart(tmp_path: Path) -> None:
     first.close()
     restored = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path))
     assert len(restored.evidence.records) == count
+
+
+def test_restore_preserves_durable_evidence_ahead_of_snapshot(tmp_path: Path) -> None:
+    path = tmp_path / "evidence" / "ledger.jsonl"
+    ledger = EvidenceLedger(path, "config")
+    first = ledger.append("INGESTION", 1, {"event": 1})
+    snapshot_state = ledger.state_dict()
+    second = ledger.append("ISF_DECISION", 2, {"score": 0.5})
+
+    restored = EvidenceLedger(path, "config")
+    restored.load_state(snapshot_state)
+
+    assert restored.records == [first, second]
 
 
 def test_h16_requires_matched_c0_through_c3_and_aligned_advantage() -> None:

@@ -108,7 +108,7 @@ def build_hgt_graph(read_view: Any, *, input_dim: int = 64, max_nodes: int = 800
         action_meta[node_type] = action_rows
 
     edges: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
-    for edge in read_view.edges.values():
+    for edge in read_view.edges:
         source = index_by_uid.get(edge.source)
         target = index_by_uid.get(edge.target)
         if source is None or target is None:

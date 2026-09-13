@@ -52,7 +52,11 @@ class EvidenceLedger:
         if int(state.get("schema_version", 0)) != self.SCHEMA_VERSION or state.get("scientific_config_id") != self.scientific_config_id:
             raise ValueError("incompatible evidence ledger state")
         incoming = [EvidenceRecord(int(row["uid"]), str(row["kind"]), int(row["causal_watermark"]), str(row["scientific_config_id"]), dict(row["payload"])) for row in state.get("records", [])]
-        if self.records and incoming[: len(self.records)] != self.records:
+        shared_length = min(len(self.records), len(incoming))
+        if incoming[:shared_length] != self.records[:shared_length]:
             raise ValueError("snapshot would rewrite append-only scientific evidence")
-        self.records = incoming
-
+        # The ledger is persisted before a later runtime snapshot. After a crash,
+        # it can therefore be a valid append-only extension of the newest snapshot.
+        # Preserve that durable suffix rather than rolling it back to the older cut.
+        if len(incoming) > len(self.records):
+            self.records = incoming
