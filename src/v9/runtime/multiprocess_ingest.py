@@ -11,36 +11,37 @@ from .multiprocess import EncodedTransition
 def publish_encoded_transition(runtime, transition: EncodedTransition) -> None:
     identity = EnvironmentIdentity(*transition.environment_identity)
     environment = runtime.environments.register(identity).value
-    experience = runtime.make_experience(
-        producer_id=transition.actor_id,
-        producer_sequence=transition.producer_sequence,
-        environment_instance_id=environment,
-        global_step=transition.global_step,
-        context_signature=transition.before_signature,
-        action_id=transition.action_id,
-        outcome_signature=transition.after_signature,
-        family_signature=stable_u64(
-            transition.observation_schema_id,
-            int(transition.before_signature != transition.after_signature),
-            person=b"v9-family",
-        ),
-        carrier_signature=stable_u64(
-            transition.observation_schema_id,
-            transition.before_signature,
-            person=b"v9-carrier",
-        ),
-        future_option_delta=float(transition.available_actions_after),
-        changed_cells=int(transition.before_signature != transition.after_signature),
-        primary_valence=transition.primary_valence,
-        trajectory_signature=stable_u64(
-            environment,
-            transition.episode_id,
-            person=b"v9-trajectory",
-        ),
-        next_context_signature=transition.after_signature,
-    )
     episode_id = EpisodeId(int(transition.episode_id))
-    runtime.submit(experience, episode_id=episode_id)
+    if not transition.symbols_only:
+        experience = runtime.make_experience(
+            producer_id=transition.actor_id,
+            producer_sequence=transition.producer_sequence,
+            environment_instance_id=environment,
+            global_step=transition.global_step,
+            context_signature=transition.before_signature,
+            action_id=transition.action_id,
+            outcome_signature=transition.after_signature,
+            family_signature=stable_u64(
+                transition.observation_schema_id,
+                int(transition.before_signature != transition.after_signature),
+                person=b"v9-family",
+            ),
+            carrier_signature=stable_u64(
+                transition.observation_schema_id,
+                transition.before_signature,
+                person=b"v9-carrier",
+            ),
+            future_option_delta=float(transition.available_actions_after),
+            changed_cells=int(transition.before_signature != transition.after_signature),
+            primary_valence=transition.primary_valence,
+            trajectory_signature=stable_u64(
+                environment,
+                transition.episode_id,
+                person=b"v9-trajectory",
+            ),
+            next_context_signature=transition.after_signature,
+        )
+        runtime.submit(experience, episode_id=episode_id)
 
     if transition.symbols:
         codec = DeterministicSymbolCodec(f"{identity.family}-raw-symbols")
