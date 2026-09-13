@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import time
 from typing import Any, Iterable
 
 from v9.memory.model import CanonicalNode, MemoryLevel, MemoryType
@@ -8,6 +9,7 @@ from v9.modalities.symbols import DeterministicSymbolCodec
 from v9.runtime.actor_policy import ActorPolicySnapshot
 from v9.runtime.memory_pipeline import DerivationResult, PreparedIngestion, PreparedSymbolIngestion
 from v9.runtime.runtime import ContinuousMemoryRuntime as BaseContinuousMemoryRuntime
+from v9.telemetry import build_primary_dashboard
 
 
 class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
@@ -15,6 +17,9 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
 
     def __init__(self, config: Any) -> None:
         self._hgt_context_action_scores: dict[int, dict[int, dict[int, float]]] = {}
+        self._metrics_cache: dict[str, Any] | None = None
+        self._metrics_cache_at = 0.0
+        self._metrics_cache_seconds = 30.0
         super().__init__(config)
 
     def set_hgt_action_scores(self, scores: dict[int, dict[int, float]], *, context_action_scores: dict[int, dict[int, dict[int, float]]] | None = None) -> None:
@@ -40,6 +45,33 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                 hgt_action_scores_by_type=self._hgt_scores_by_environment_type(),
                 model_version=self.unified_telemetry.model_version,
             )
+
+    def full_metrics(self) -> dict[str, Any]:
+        metrics = super().metrics()
+        with self._lock:
+            self._metrics_cache = metrics
+            self._metrics_cache_at = time.monotonic()
+        return metrics
+
+    def metrics(self) -> dict[str, Any]:
+        now = time.monotonic()
+        with self._lock:
+            cached = self._metrics_cache
+            cache_age = now - self._metrics_cache_at
+        if cached is None or cache_age >= self._metrics_cache_seconds:
+            return self.full_metrics()
+        with self._lock:
+            result = dict(cached)
+            diagnostic = self.unified_telemetry.diagnostic_metrics()
+            result["watermark"] = self._watermark
+            result["graph_generation"] = self.graph.generation
+            result["edges"] = len(self.graph.edges)
+            result["timeline_events_seen"] = self.timeline.events_seen
+            result["timeline_events_dropped"] = self.timeline.events_dropped
+            result["actions_committed"] = self.timeline.actions_committed
+            result["telemetry_diagnostics"] = diagnostic
+            result["primary_dashboard"] = build_primary_dashboard(result, diagnostic)
+            return result
 
     def _advance_passive_stage_interval(self, count: int = 1) -> None:
         for _ in range(max(0, int(count))):
