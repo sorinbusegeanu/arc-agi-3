@@ -14,7 +14,6 @@ from v9.memory.identity import stable_u64
 
 
 @dataclass(frozen=True, slots=True)
-@dataclass(frozen=True, slots=True)
 class EncodedTransition:
     actor_id: int
     producer_sequence: int
