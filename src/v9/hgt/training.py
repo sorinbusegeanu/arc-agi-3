@@ -85,7 +85,7 @@ def build_hgt_graph(read_view: Any, *, input_dim: int = 64):
             node = read_view.nodes[uid]
             payload = dict(read_view.payloads.get(uid, {}))
             features.append(_node_feature(node, payload, input_dim, torch))
-            labels.append(int(node.level))
+            labels.append(int(node.memory_type) // 100)
         x_dict[node_type] = torch.stack(features, dim=0)
         y_dict[node_type] = torch.tensor(labels, dtype=torch.long)
 
@@ -134,7 +134,7 @@ class _HGTWrapper:
                 for layer in self.layers:
                     updated = layer(state, edge_index_dict)
                     state = {
-                        key: updated.get(key, state[key]).relu()
+                        key: (state[key] if updated.get(key) is None else updated[key]).relu()
                         for key in state
                     }
                 return {
