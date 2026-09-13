@@ -388,7 +388,8 @@ class ContinuousMemoryRuntime:
             if result.graph_generation == previous_generation:
                 self.telemetry["canonical_reuse"] += 1
             else:
-                self.structural_index.add(node)
+                if node.level >= MemoryLevel.M2:
+                    self.structural_index.add(node)
             if self.config.enable_lifecycle and result.graph_generation != previous_generation:
                 self.lifecycle.observe(
                     node.uid,
