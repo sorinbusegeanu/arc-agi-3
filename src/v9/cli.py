@@ -41,6 +41,7 @@ class ActorResult:
     steps: int
     positive_boundaries: int
     negative_boundaries: int
+    episode_boundaries: int
     resets: int
 
 
@@ -186,7 +187,7 @@ def _actor(runtime: ContinuousMemoryRuntime, spec: EnvironmentSpec, *, actor_id:
     episode = runtime.environments.next_episode(identity)
     codec = DeterministicSymbolCodec(f"{adapter.identity().family}-raw-symbols")
     rng = Random(seed)
-    positives = negatives = resets = completed = 0
+    positives = negatives = episode_boundaries = resets = completed = 0
     next_progress = time.monotonic() + progress_interval
     try:
         for index in range(int(steps)):
@@ -210,6 +211,7 @@ def _actor(runtime: ContinuousMemoryRuntime, spec: EnvironmentSpec, *, actor_id:
             boundary = adapter.boundary_event()
             positives += int(boundary.primary_valence > 0)
             negatives += int(boundary.primary_valence < 0)
+            episode_boundaries += int(not boundary.continuation)
             if not boundary.continuation:
                 if wait:
                     time.sleep(wait)
@@ -223,7 +225,7 @@ def _actor(runtime: ContinuousMemoryRuntime, spec: EnvironmentSpec, *, actor_id:
         close = getattr(adapter, "close", None)
         if callable(close):
             close()
-    return ActorResult(actor_id, game_id, completed, positives, negatives, resets)
+    return ActorResult(actor_id, game_id, completed, positives, negatives, episode_boundaries, resets)
 
 
 def _trajectory_rows(root: Path) -> list[dict[str, Any]]:
@@ -272,6 +274,7 @@ def run_continuous(args: argparse.Namespace) -> int:
                 row.steps,
                 row.positive_boundaries,
                 row.negative_boundaries,
+                row.episode_boundaries,
                 row.resets,
             )
             for row in process_results
