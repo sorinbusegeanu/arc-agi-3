@@ -850,6 +850,7 @@ class ContinuousMemoryRuntime:
     def snapshot(self) -> SnapshotResult:
         with self._lock:
             self.wait_quiescent()
+            self.flush_deferred_memory_updates()
             self.evidence.flush()
             self._snapshot_id += 1
             self.telemetry["snapshot_writes"] += 1
@@ -1054,7 +1055,10 @@ class ContinuousMemoryRuntime:
         counts = {f"M{level}": self.graph.memory_count(MemoryLevel(level)) for level in range(8)}
         normalization = {str(radius): self.scale_statistics.state(radius).value for radius in self.config.scientific.structural_radii}
         grounding_counts = {f"G{level}": sum(int(row.maturity) == level for row in self.grounding.states.values()) for level in range(6)}
-        persistent_bytes = max(1, len(json.dumps(self.graph.state_dict(), sort_keys=True, separators=(",", ":"))))
+        persistent_bytes = max(
+            1,
+            self.graph.memory_count() * 192 + len(self.graph.edges) * 96,
+        )
         validated_transfers = sum(row.successes for row in self.transfer_trust.records.values())
         prediction_observations = self.telemetry["symbol_conditioned_prediction_observations"]
         strategy_payloads = [payload for uid, payload in view.payloads.items() if view.nodes[uid].level is MemoryLevel.M7]
