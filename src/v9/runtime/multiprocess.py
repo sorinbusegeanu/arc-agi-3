@@ -5,18 +5,15 @@ import multiprocessing as mp
 import queue
 from dataclasses import dataclass
 from typing import Any
+from random import Random
+
+from v9.cognition.action_selection import choose_action
+from v9.runtime.actor_policy import ActorPolicySnapshot
 
 from v9.memory.identity import stable_u64
 
 
 @dataclass(frozen=True, slots=True)
-class ActionRequest:
-    actor_id: int
-    request_id: int
-    environment_instance_id: int
-    actions: tuple[int, ...]
-
-
 @dataclass(frozen=True, slots=True)
 class EncodedTransition:
     actor_id: int
@@ -45,6 +42,7 @@ class ActorDone:
     negative_boundaries: int
     episode_boundaries: int
     resets: int
+    policy_refreshes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,8 +64,11 @@ def actor_process_main(
     steps: int,
     seed: int,
     env_root: str | None,
-    action_requests: Any,
-    action_responses: Any,
+    initial_policy: ActorPolicySnapshot,
+    policy_updates: Any,
+    epsilon: float,
+    policy_refresh_steps: int,
+    policy_refresh_ms: float,
     stage_queue: Any,
     result_queue: Any,
     adapter_factory_path: str,
@@ -80,6 +81,12 @@ def actor_process_main(
     environment_instance_id = int(identity.instance_id.value)
     positives = negatives = episode_boundaries = resets = completed = 0
     episode_ordinal = 1
+    policy = initial_policy
+    policy_refreshes = 0
+    rng = Random(seed)
+    refresh_steps = max(1, int(policy_refresh_steps))
+    refresh_seconds = max(0.001, float(policy_refresh_ms) / 1000.0)
+    next_refresh_time = __import__("time").monotonic() + refresh_seconds
     try:
         for index in range(int(steps)):
             actions = tuple(sorted(set(int(v) for v in adapter.available_actions())))
@@ -90,11 +97,27 @@ def actor_process_main(
                 actions = tuple(sorted(set(int(v) for v in adapter.available_actions())))
                 if not actions:
                     continue
-            request_id = index + 1
-            action_requests.put(ActionRequest(actor_id, request_id, environment_instance_id, actions))
-            response_request_id, action = action_responses.get()
-            if int(response_request_id) != request_id:
-                raise RuntimeError("actor received out-of-order action response")
+            now = __import__("time").monotonic()
+            if index % refresh_steps == 0 or now >= next_refresh_time:
+                newest = None
+                while True:
+                    try:
+                        newest = policy_updates.get_nowait()
+                    except queue.Empty:
+                        break
+                if newest is not None and int(newest.generation) > int(policy.generation):
+                    policy = newest
+                    policy_refreshes += 1
+                next_refresh_time = now + refresh_seconds
+            learned_scores = policy.learned_scores(environment_instance_id, actions)
+            action = choose_action(
+                policy,
+                actions,
+                rng=rng,
+                epsilon=float(epsilon),
+                learned_scores=learned_scores,
+                target_environment_id=environment_instance_id,
+            )
             before = adapter.observe()
             after = adapter.step(int(action))
             boundary = adapter.boundary_event()
@@ -126,7 +149,7 @@ def actor_process_main(
                 adapter.reset()
                 episode_ordinal += 1
                 resets += 1
-        result_queue.put(ActorDone(actor_id, str(getattr(spec, "display_name", identity.environment_type)), completed, positives, negatives, episode_boundaries, resets))
+        result_queue.put(ActorDone(actor_id, str(getattr(spec, "display_name", identity.environment_type)), completed, positives, negatives, episode_boundaries, resets, policy_refreshes))
     finally:
         close = getattr(adapter, "close", None)
         if callable(close):
@@ -165,11 +188,10 @@ class ProcessTopology:
         self.stage_workers = int(stage_workers)
         self.shards = int(shards)
         self.stage_queue = self.ctx.Queue(maxsize=int(queue_capacity))
-        self.action_requests = self.ctx.Queue(maxsize=max(64, int(actors) * 4))
         self.publication_queue = self.ctx.Queue(maxsize=int(queue_capacity))
         self.result_queue = self.ctx.Queue(maxsize=max(64, int(actors) * 2))
         self.shard_queues = tuple(self.ctx.Queue(maxsize=int(queue_capacity)) for _ in range(self.shards))
-        self.action_responses = tuple(self.ctx.Queue(maxsize=2) for _ in range(self.actors))
+        self.policy_updates = tuple(self.ctx.Queue(maxsize=1) for _ in range(self.actors))
         self.stage_processes: list[Any] = []
         self.shard_processes: list[Any] = []
         self.actor_processes: list[Any] = []
@@ -184,7 +206,7 @@ class ProcessTopology:
             process.start()
             self.stage_processes.append(process)
 
-    def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int) -> None:
+    def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, initial_policy: ActorPolicySnapshot, epsilon: float, policy_refresh_steps: int, policy_refresh_ms: float) -> None:
         process = self.ctx.Process(
             target=actor_process_main,
             kwargs={
@@ -193,8 +215,11 @@ class ProcessTopology:
                 "steps": steps,
                 "seed": seed,
                 "env_root": env_root,
-                "action_requests": self.action_requests,
-                "action_responses": self.action_responses[index],
+                "initial_policy": initial_policy,
+                "policy_updates": self.policy_updates[index],
+                "epsilon": float(epsilon),
+                "policy_refresh_steps": int(policy_refresh_steps),
+                "policy_refresh_ms": float(policy_refresh_ms),
                 "stage_queue": self.stage_queue,
                 "result_queue": self.result_queue,
                 "adapter_factory_path": adapter_factory_path,
@@ -205,6 +230,21 @@ class ProcessTopology:
         )
         process.start()
         self.actor_processes.append(process)
+
+    def publish_policy_snapshot(self, slots: tuple[int, ...], snapshot: ActorPolicySnapshot) -> None:
+        for slot in slots:
+            target = self.policy_updates[int(slot)]
+            try:
+                target.put_nowait(snapshot)
+            except queue.Full:
+                try:
+                    target.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    target.put_nowait(snapshot)
+                except queue.Full:
+                    pass
 
     def signal_stage_stop(self) -> None:
         for _ in self.stage_processes:
