@@ -251,7 +251,8 @@ def run_continuous(args: argparse.Namespace) -> int:
     games = tuple(spec.display_name for spec in specs)
     runtime = ContinuousMemoryRuntime(_runtime_config(args))
     curriculum_modes = sorted({spec.validation_mode for spec in specs if spec.validation_mode})
-    runtime.unified_telemetry.set_gauge("curriculum_validation_mode", ",".join(curriculum_modes))
+    effective_validation_mode = ("learning_only" if args.no_automatic_experiments else (curriculum_modes[0] if len(curriculum_modes) == 1 else args.validation_mode))
+    runtime.unified_telemetry.set_gauge("curriculum_validation_mode", effective_validation_mode)
     runtime.start()
     dashboard = None
     if not args.no_dashboard:
@@ -277,7 +278,7 @@ def run_continuous(args: argparse.Namespace) -> int:
         runtime.wait_quiescent(args.drain_timeout)
         final = runtime.close(normal=True, timeout=args.final_save_timeout)
         metrics = runtime.metrics()
-        summary = {"games": list(games), "actors": [asdict(row) for row in results], "automatic_transfer_experiments": {"mode": runtime.config.scientific.transfer_validation_mode, "budget": runtime.config.scientific.transfer_validation_trials_per_interval, "attempted": 0, "completed": 0, "passed": 0, "blocker": "no eligible target exposes exact snapshot/restore support" if runtime.config.scientific.transfer_validation_mode != "learning_only" else None}, "hypotheses": runtime.scientific_statuses(), "metrics": metrics, "final_snapshot": None if final is None else {**asdict(final), "path": str(final.path)}}
+        summary = {"games": list(games), "actors": [asdict(row) for row in results], "automatic_transfer_experiments": {"mode": effective_validation_mode, "budget": runtime.config.scientific.transfer_validation_trials_per_interval, "attempted": 0, "completed": 0, "passed": 0, "blocker": "no eligible target exposes exact snapshot/restore support" if effective_validation_mode != "learning_only" else None}, "hypotheses": runtime.scientific_statuses(), "metrics": metrics, "final_snapshot": None if final is None else {**asdict(final), "path": str(final.path)}}
         target = Path(args.root) / "v9_run_summary.json"
         target.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return 0
