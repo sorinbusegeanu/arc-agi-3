@@ -130,7 +130,13 @@ def run_parallel_memory_jobs(
         if signature in inflight:
             return
         task = runtime.build_derivation_task(signature, task_id=derive_task_id)
-        if task is None or int(task.support) <= int(last_support.get(signature, 0)):
+        if task is None:
+            return
+        previous_support = int(last_support.get(signature, 0))
+        current_support = int(task.support)
+        if current_support <= previous_support:
+            return
+        if previous_support >= 2 and current_support < previous_support * 2:
             return
         inflight.add(signature)
         memory.derivation_queue.put(task)
