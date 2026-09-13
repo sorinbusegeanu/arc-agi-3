@@ -22,6 +22,10 @@ class LifecycleRecord:
     last_observed_watermark: int = 0
     retention_score: float = 1.0
     replacement_uid: MemoryUid | None = None
+    baseline_hgt_retention: float | None = None
+    baseline_behavioral_success: float | None = None
+    baseline_transfer_quality: float | None = None
+    baseline_prediction_quality: float | None = None
 
 
 class LifecycleRegistry:
@@ -34,7 +38,8 @@ class LifecycleRegistry:
         support = current.support + int(support_delta)
         opportunities = current.relevant_opportunities + int(relevant_opportunity)
         state = current.state
-        if support_delta > 0 and state in {CognitiveState.DORMANT, CognitiveState.RETIRE_PENDING, CognitiveState.RETIRED}:
+        reactivated = support_delta > 0 and state in {CognitiveState.DORMANT, CognitiveState.RETIRE_PENDING, CognitiveState.RETIRED}
+        if reactivated:
             state = CognitiveState.REACTIVATED
         elif support > 0 and state in {CognitiveState.CANDIDATE, CognitiveState.PROBATION, CognitiveState.REACTIVATED}:
             state = CognitiveState.ACTIVE
@@ -48,20 +53,43 @@ class LifecycleRegistry:
             last_transition_watermark=int(watermark) if transitioned else current.last_transition_watermark,
             last_observed_watermark=int(watermark),
             replacement_uid=None if state in {CognitiveState.ACTIVE, CognitiveState.REACTIVATED} else current.replacement_uid,
+            baseline_hgt_retention=None if reactivated else current.baseline_hgt_retention,
+            baseline_behavioral_success=None if reactivated else current.baseline_behavioral_success,
+            baseline_transfer_quality=None if reactivated else current.baseline_transfer_quality,
+            baseline_prediction_quality=None if reactivated else current.baseline_prediction_quality,
         )
         self.records[uid] = row
         return row
 
-    def transition(self, uid: MemoryUid, state: CognitiveState, *, watermark: int, retention_score: float | None = None, replacement_uid: MemoryUid | None = None) -> LifecycleRecord:
+    def transition(
+        self,
+        uid: MemoryUid,
+        state: CognitiveState,
+        *,
+        watermark: int,
+        retention_score: float | None = None,
+        replacement_uid: MemoryUid | None = None,
+        validation_baseline: tuple[float | None, float | None, float | None, float | None] | None = None,
+    ) -> LifecycleRecord:
         current = self.records.get(uid, LifecycleRecord(uid))
         transitioned = state is not current.state
         self.transitions += int(transitioned)
+        baseline = validation_baseline or (
+            current.baseline_hgt_retention,
+            current.baseline_behavioral_success,
+            current.baseline_transfer_quality,
+            current.baseline_prediction_quality,
+        )
         row = replace(
             current,
             state=state,
             last_transition_watermark=int(watermark) if transitioned else current.last_transition_watermark,
             retention_score=current.retention_score if retention_score is None else float(retention_score),
             replacement_uid=replacement_uid,
+            baseline_hgt_retention=baseline[0],
+            baseline_behavioral_success=baseline[1],
+            baseline_transfer_quality=baseline[2],
+            baseline_prediction_quality=baseline[3],
         )
         self.records[uid] = row
         return row
@@ -85,6 +113,10 @@ class LifecycleRegistry:
             last_transition_watermark=int(watermark),
             last_observed_watermark=int(watermark),
             replacement_uid=None,
+            baseline_hgt_retention=None,
+            baseline_behavioral_success=None,
+            baseline_transfer_quality=None,
+            baseline_prediction_quality=None,
         )
         self.records[uid] = row
         return row
@@ -102,6 +134,10 @@ class LifecycleRegistry:
                     "last_observed_watermark": row.last_observed_watermark,
                     "retention_score": row.retention_score,
                     "replacement_uid": None if row.replacement_uid is None else [row.replacement_uid.hi, row.replacement_uid.lo],
+                    "baseline_hgt_retention": row.baseline_hgt_retention,
+                    "baseline_behavioral_success": row.baseline_behavioral_success,
+                    "baseline_transfer_quality": row.baseline_transfer_quality,
+                    "baseline_prediction_quality": row.baseline_prediction_quality,
                 }
                 for uid, row in sorted(self.records.items())
             ],
@@ -125,6 +161,10 @@ class LifecycleRegistry:
                 last_observed_watermark=int(raw.get("last_observed_watermark", transition_watermark)),
                 retention_score=float(raw.get("retention_score", 1.0)),
                 replacement_uid=replacement_uid,
+                baseline_hgt_retention=None if raw.get("baseline_hgt_retention") is None else float(raw["baseline_hgt_retention"]),
+                baseline_behavioral_success=None if raw.get("baseline_behavioral_success") is None else float(raw["baseline_behavioral_success"]),
+                baseline_transfer_quality=None if raw.get("baseline_transfer_quality") is None else float(raw["baseline_transfer_quality"]),
+                baseline_prediction_quality=None if raw.get("baseline_prediction_quality") is None else float(raw["baseline_prediction_quality"]),
             )
         return result
 
@@ -153,6 +193,35 @@ def retention_score(record: LifecycleRecord, payload: dict[str, Any], *, waterma
     if bool(payload.get("validated", False)):
         transfer = max(transfer, 1.0)
     return max(0.0, min(1.0, 0.35 * support + 0.25 * recency + 0.15 * surprise + 0.15 * explanatory + 0.10 * transfer))
+
+
+def _validation_metrics(runtime: Any) -> tuple[float | None, float | None, float | None, float | None]:
+    gauges = getattr(getattr(runtime, "unified_telemetry", None), "gauges", {})
+    hgt = None if "historical_retention" not in gauges else float(gauges["historical_retention"])
+    behavior = None if "behavioral_success_rate" not in gauges else float(gauges["behavioral_success_rate"])
+    transfer_records = getattr(getattr(runtime, "transfer_trust", None), "records", {})
+    transfer = None
+    if transfer_records:
+        transfer = sum(int(getattr(row, "successes", 0) > 0) for row in transfer_records.values()) / len(transfer_records)
+    prediction_count = int(getattr(runtime, "telemetry", {}).get("symbol_conditioned_prediction_observations", 0))
+    prediction = None
+    if prediction_count > 0:
+        prediction = float(getattr(runtime, "_symbol_prediction_delta_sum", 0.0)) / prediction_count
+    return hgt, behavior, transfer, prediction
+
+
+def _validation_preserved(row: LifecycleRecord, runtime: Any, *, tolerance: float = 0.05) -> bool:
+    current = _validation_metrics(runtime)
+    baseline = (
+        row.baseline_hgt_retention,
+        row.baseline_behavioral_success,
+        row.baseline_transfer_quality,
+        row.baseline_prediction_quality,
+    )
+    return all(
+        before is None or after is None or float(after) >= float(before) - float(tolerance)
+        for before, after in zip(baseline, current)
+    )
 
 
 def _sync_cognitive_visibility(graph: Any, updates: dict[MemoryUid, CognitiveState]) -> None:
@@ -188,9 +257,10 @@ def run_lifecycle_maintenance(
     reactivation_threshold: float = 0.40,
     dormancy_grace_watermarks: int = 2048,
     retirement_grace_watermarks: int = 2048,
+    validation_tolerance: float = 0.05,
 ) -> dict[str, int | float]:
     if not runtime.config.enable_lifecycle:
-        return {"scanned": 0, "dormant": 0, "pending": 0, "retired": 0, "reactivated": 0, "pressure": 0.0}
+        return {"scanned": 0, "dormant": 0, "pending": 0, "retired": 0, "reactivated": 0, "blocked": 0, "pressure": 0.0}
 
     graph = runtime.graph
     registry: LifecycleRegistry = runtime.lifecycle
@@ -200,6 +270,7 @@ def run_lifecycle_maintenance(
     effective_scan_limit = max(1, int(scan_limit)) * pressure_multiplier
     effective_retirement_limit = max(1, int(retirement_limit)) * pressure_multiplier
     replacements = graph.provenance_replacements(maximum_level=MemoryLevel.M1)
+    blocked = 0
 
     pending_plans: list[tuple[MemoryUid, MemoryUid, str]] = []
     for uid, row in registry.records.items():
@@ -213,9 +284,13 @@ def run_lifecycle_maintenance(
             continue
         if watermark - int(row.last_transition_watermark) < int(retirement_grace_watermarks):
             continue
+        if uid in runtime._replay_pool or not _validation_preserved(row, runtime, tolerance=validation_tolerance):
+            blocked += 1
+            continue
         pending_plans.append((uid, replacement_uid, "retention_compaction"))
 
     replay_before = len(runtime._replay_pool)
+    retired_records = {uid: registry.records[uid] for uid, _, _ in pending_plans if uid in registry.records}
     retired_uids = graph.retire_nodes_batch(tuple(pending_plans))
     retired_set = set(retired_uids)
     for uid in retired_uids:
@@ -244,6 +319,7 @@ def run_lifecycle_maintenance(
     pending = 0
     reactivated = 0
     visibility_updates: dict[MemoryUid, CognitiveState] = {}
+    current_validation = _validation_metrics(runtime)
     for row in candidates:
         node = graph.nodes.get(row.uid)
         if node is None:
@@ -259,9 +335,14 @@ def run_lifecycle_maintenance(
                 registry.transition(row.uid, state, watermark=watermark, retention_score=score)
                 reactivated += 1
             elif node.level <= MemoryLevel.M1 and covered and watermark - int(row.last_transition_watermark) >= int(dormancy_grace_watermarks):
-                state = CognitiveState.RETIRE_PENDING
-                registry.transition(row.uid, state, watermark=watermark, retention_score=score, replacement_uid=replacement_uid)
-                pending += 1
+                if row.uid in runtime._replay_pool or not _validation_preserved(row, runtime, tolerance=validation_tolerance):
+                    state = CognitiveState.DORMANT
+                    registry.transition(row.uid, state, watermark=watermark, retention_score=score, replacement_uid=replacement_uid)
+                    blocked += 1
+                else:
+                    state = CognitiveState.RETIRE_PENDING
+                    registry.transition(row.uid, state, watermark=watermark, retention_score=score, replacement_uid=replacement_uid)
+                    pending += 1
             else:
                 state = CognitiveState.DORMANT
                 registry.transition(row.uid, state, watermark=watermark, retention_score=score, replacement_uid=replacement_uid)
@@ -270,7 +351,14 @@ def run_lifecycle_maintenance(
         can_dormant = covered if node.level <= MemoryLevel.M1 else True
         if can_dormant and age >= int(dormancy_grace_watermarks) and score < dormant_threshold:
             state = CognitiveState.DORMANT
-            registry.transition(row.uid, state, watermark=watermark, retention_score=score, replacement_uid=replacement_uid)
+            registry.transition(
+                row.uid,
+                state,
+                watermark=watermark,
+                retention_score=score,
+                replacement_uid=replacement_uid,
+                validation_baseline=current_validation,
+            )
             dormant += 1
         else:
             state = row.state
@@ -281,7 +369,9 @@ def run_lifecycle_maintenance(
 
     replay_after = len(runtime._replay_pool)
     if retired_uids or reactivated:
-        historical_retention = float(runtime.unified_telemetry.gauges.get("historical_retention", 1.0))
+        after_hgt = _validation_metrics(runtime)[0]
+        before_hgt_values = [retired_records[uid].baseline_hgt_retention for uid in retired_uids if uid in retired_records and retired_records[uid].baseline_hgt_retention is not None]
+        before_hgt = sum(before_hgt_values) / len(before_hgt_values) if before_hgt_values else (after_hgt if after_hgt is not None else 1.0)
         runtime.record_hgt_consolidation(
             ConsolidationSample(
                 hydra_bytes_retired=len(retired_uids) * 192,
@@ -290,8 +380,8 @@ def run_lifecycle_maintenance(
                 replay_examples_before=replay_before,
                 replay_examples_after=replay_after,
                 representative_retention_ratio=1.0 if retired_uids else 0.0,
-                hgt_retention_before=historical_retention,
-                hgt_retention_after=historical_retention,
+                hgt_retention_before=float(before_hgt),
+                hgt_retention_after=float(after_hgt if after_hgt is not None else before_hgt),
                 reactivation_examples=reactivated,
             )
         )
@@ -302,5 +392,6 @@ def run_lifecycle_maintenance(
         "pending": pending,
         "retired": len(retired_uids),
         "reactivated": reactivated,
+        "blocked": blocked,
         "pressure": pressure,
     }
