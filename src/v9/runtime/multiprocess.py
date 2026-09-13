@@ -108,7 +108,11 @@ def actor_process_main(
                     policy = newest
                     policy_refreshes += 1
                 next_refresh_time = now + refresh_seconds
-            learned_scores = policy.learned_scores(environment_instance_id, actions)
+            learned_scores = policy.learned_scores(
+                environment_instance_id,
+                actions,
+                environment_type=identity.environment_type,
+            )
             action = choose_action(
                 policy,
                 actions,
