@@ -48,6 +48,9 @@ PRIMARY_KEYS = (
     "sampling_rate",
     "ingestion_rate",
     "derivation_rate",
+    "policy_snapshot_refreshes",
+    "policy_snapshot_generation",
+    "coordinator_action_requests",
 )
 
 
@@ -105,5 +108,8 @@ def build_primary_dashboard(runtime_metrics: dict[str, Any], diagnostic: dict[st
         "sampling_rate": float(diagnostic.get("sampling_rate", 0.0)),
         "ingestion_rate": float(diagnostic.get("ingestion_rate", 0.0)),
         "derivation_rate": float(diagnostic.get("derivation_rate", 0.0)),
+        "coordinator_action_requests": int(diagnostic.get("coordinator_action_requests", 0)),
+        "policy_snapshot_generation": int(diagnostic.get("policy_snapshot_generation", 0)),
+        "policy_snapshot_refreshes": int(diagnostic.get("policy_snapshot_refreshes", 0)),
     }
     return {key: dashboard[key] for key in PRIMARY_KEYS}
