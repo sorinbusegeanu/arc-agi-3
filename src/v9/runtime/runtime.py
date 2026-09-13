@@ -151,6 +151,25 @@ class ContinuousMemoryRuntime:
             source = self._hgt_action_scores.get(int(environment_id), {})
             return {int(action): float(source.get(int(action), 0.0)) for action in actions}
 
+    def _hgt_scores_by_environment_type(self) -> dict[str, dict[int, float]]:
+        grouped: dict[str, dict[int, list[float]]] = {}
+        for environment_id, actions in self._hgt_action_scores.items():
+            try:
+                environment_type = self.environments.resolve(int(environment_id)).environment_type
+            except KeyError:
+                continue
+            target = grouped.setdefault(str(environment_type), {})
+            for action, score in actions.items():
+                target.setdefault(int(action), []).append(float(score))
+        return {
+            environment_type: {
+                action: sum(scores) / len(scores)
+                for action, scores in actions.items()
+                if scores
+            }
+            for environment_type, actions in grouped.items()
+        }
+
     def actor_policy_snapshot(self) -> ActorPolicySnapshot:
         with self._lock:
             action_supports: dict[int, float] = {}
