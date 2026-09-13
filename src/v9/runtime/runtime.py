@@ -510,7 +510,12 @@ class ContinuousMemoryRuntime:
         with self._lock:
             rows = tuple(self._m1n_occurrences.get(int(signature), ()))
             support = int(self._m1n_supports.get(int(signature), len(rows)))
-            if len(rows) < 2 or support < 2:
+            distinct_evidence = {
+                evidence_uid
+                for row in rows
+                for evidence_uid in row.provenance.evidence
+            }
+            if len(rows) < 2 or support < 2 or len(distinct_evidence) < 2:
                 return None
             return DerivationTask(
                 int(task_id),
@@ -801,7 +806,7 @@ class ContinuousMemoryRuntime:
             dummy_parent_uid = node
             evidence_refs = tuple(MemoryUid(int(raw[0]), int(raw[1])) for raw in payload.get("evidence_refs", [[node.hi, node.lo]]))
             dummy = M1NormalizedRelation(node, str(payload["observable_relation"]), NormalizedChannel(str(payload["channel"])), int(signature), DerivationProvenance((dummy_parent_uid,), evidence_refs))
-            self._m1n_occurrences[int(signature)] = [dummy] * min(int(count), max(2, scientific.m1n_facts_per_channel))
+            self._m1n_occurrences[int(signature)] = [dummy] if int(count) > 0 else []
         self._m1n_supports = {int(key): int(value) for key, value in dict(state.get("m1n_supports", state.get("m1n_occurrences", {}))).items()}
         self._replay_pool = {MemoryUid(int(key[:16], 16), int(key[16:], 16)): float(value) for key, value in dict(state.get("replay_pool", {})).items()}
         self._formation_environments = {int(value) for value in state.get("formation_environments", [])}
