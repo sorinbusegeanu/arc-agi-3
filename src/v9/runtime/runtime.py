@@ -590,11 +590,14 @@ class ContinuousMemoryRuntime:
             memory_level=memory_level,
         )
 
-    def record_deliberation_metrics(self, *, reasoning_cycles: int, initial_score: float, final_score: float, best_score: float, changed: bool, behavior_improved: bool | None, reasoning_cost: float, stop_reason: str, provenance: TelemetryProvenance | None = None) -> None:
-        self.unified_telemetry.record_deliberation(reasoning_cycles=reasoning_cycles, initial_score=initial_score, final_score=final_score, best_score=best_score, changed=changed, behavior_improved=behavior_improved, reasoning_cost=reasoning_cost, stop_reason=stop_reason, provenance=provenance)
+    def record_deliberation_metrics(self, *, reasoning_cycles: int, initial_score: float, final_score: float, best_score: float, changed: bool, behavior_improved: bool | None, reasoning_cost: float, stop_reason: str, candidate_changes: int = 0, prediction_improvement: float = 0.0, strategy_changes: int = 0, provenance: TelemetryProvenance | None = None) -> None:
+        self.unified_telemetry.record_deliberation(reasoning_cycles=reasoning_cycles, initial_score=initial_score, final_score=final_score, best_score=best_score, changed=changed, behavior_improved=behavior_improved, reasoning_cost=reasoning_cost, stop_reason=stop_reason, candidate_changes=candidate_changes, prediction_improvement=prediction_improvement, strategy_changes=strategy_changes, provenance=provenance)
 
     def record_hgt_inference(self, sample: HGTInferenceSample, *, provenance: TelemetryProvenance | None = None) -> None:
         self.unified_telemetry.record_hgt_inference(sample, provenance=provenance)
+
+    def record_hgt_ablation(self, *, enabled_outcome: float, hydra_baseline_outcome: float, provenance: TelemetryProvenance | None = None) -> None:
+        self.unified_telemetry.record_hgt_ablation(enabled_outcome=enabled_outcome, hydra_baseline_outcome=hydra_baseline_outcome, provenance=provenance)
 
     def record_hgt_training(self, sample: HGTTrainingSample, *, provenance: TelemetryProvenance | None = None) -> None:
         self.unified_telemetry.record_hgt_training(sample, provenance=provenance)
