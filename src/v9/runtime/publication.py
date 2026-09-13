@@ -183,8 +183,8 @@ class CanonicalGraph:
             return tuple(self._uids_by_level[level])
 
     def _partition_state(self, partition: int):
-        nodes = [{"hi": uid.hi, "lo": uid.lo, "level": int(self.nodes[uid].level), "memory_type": int(self.nodes[uid].memory_type), "structural_key": list(self.nodes[uid].structural_key), "created_watermark": self.nodes[uid].created_watermark, "payload": self.payloads.get(uid, {})} for uid in self._node_uids_by_partition[partition]]
-        edges = [{"source_hi": self.edges[key].source.hi, "source_lo": self.edges[key].source.lo, "relation": self.edges[key].relation.value, "target_hi": self.edges[key].target.hi, "target_lo": self.edges[key].target.lo, "evidence": [[uid.hi, uid.lo] for uid in self.edges[key].evidence_uids], "authority": self.edges[key].authority.value, "object_version": self.edges[key].object_version} for key in self._edge_keys_by_partition[partition] if key in self.edges]
+        nodes = [{"hi": uid.hi, "lo": uid.lo, "level": int(self.nodes[uid].level), "memory_type": int(self.nodes[uid].memory_type), "structural_key": list(self.nodes[uid].structural_key), "created_watermark": self.nodes[uid].created_watermark, "payload": self.payloads.get(uid, {})} for uid in sorted(self._node_uids_by_partition[partition])]
+        edges = [{"source_hi": self.edges[key].source.hi, "source_lo": self.edges[key].source.lo, "relation": self.edges[key].relation.value, "target_hi": self.edges[key].target.hi, "target_lo": self.edges[key].target.lo, "evidence": [[uid.hi, uid.lo] for uid in self.edges[key].evidence_uids], "authority": self.edges[key].authority.value, "object_version": self.edges[key].object_version} for key in sorted(self._edge_keys_by_partition[partition]) if key in self.edges]
         return nodes, edges
 
     def state_dict(self) -> dict[str, object]:
