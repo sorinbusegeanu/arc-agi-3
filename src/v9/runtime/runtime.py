@@ -112,6 +112,8 @@ class ContinuousMemoryRuntime:
         self._symbol_prediction_delta_sum = 0.0
         self._prediction_error_sum = 0.0
         self._prediction_error_count = 0
+        self._stage_interval_events = 0
+        self._stage_interval_size = 256
         self.unified_telemetry = UnifiedTelemetry(model_version=scientific.hgt_model_version)
         self._hgt_action_scores: dict[int, dict[int, float]] = {}
         self.telemetry: dict[str, int] = {
