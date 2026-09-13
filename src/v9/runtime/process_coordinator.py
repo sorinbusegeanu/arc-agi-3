@@ -133,7 +133,17 @@ def run_process_jobs(
             if not progressed:
                 time.sleep(0.001)
 
-        topology.stop_stage_workers()
+        topology.signal_stage_stop()
+        while any(process.is_alive() for process in topology.stage_processes):
+            try:
+                item = topology.publication_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if isinstance(item, tuple) and item and item[0] == "transition":
+                publish_encoded_transition(runtime, item[3])
+                published += 1
+        topology.join_stage_workers()
+
         topology.stop_shard_workers()
         shard_done = 0
         while shard_done < int(shards):
