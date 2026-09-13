@@ -43,6 +43,12 @@ class MemoryWorkerTopology:
         for process in self.derivation_processes:
             process.join(timeout=30)
 
+    def terminate(self) -> None:
+        for process in self.ingest_processes + self.derivation_processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+
     @staticmethod
     def _safe_qsize(queue_obj: Any) -> int:
         try:
