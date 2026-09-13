@@ -8,7 +8,6 @@ from typing import Any
 from .memory_pipeline import DerivationResult, IngestionTask, PreparedIngestion
 from .memory_worker_topology import MemoryWorkerTopology
 from .multiprocess import ActorDone, ActorError, ProcessTopology
-from .multiprocess_ingest import publish_transition_symbols
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,28 +43,15 @@ def run_parallel_memory_jobs(
     actor_view_refresh_steps: int = 64,
     actor_view_refresh_ms: float = 250.0,
 ) -> list[ProcessActorResult]:
-    topology = ProcessTopology(
-        actors=min(int(actor_limit), len(jobs)),
-        stage_workers=int(stage_workers),
-        shards=int(shards),
-        queue_capacity=max(int(queue_capacity), int(publication_queue_capacity)),
-        start_method=start_method,
-    )
+    topology = ProcessTopology(actors=min(int(actor_limit), len(jobs)), stage_workers=int(stage_workers), shards=int(shards), queue_capacity=max(int(queue_capacity), int(publication_queue_capacity)), start_method=start_method)
     topology.start_workers()
-    memory = MemoryWorkerTopology(
-        topology.ctx,
-        ingest_workers=int(ingest_workers),
-        derivation_workers=int(derivation_workers),
-        ingest_queue_capacity=int(ingest_queue_capacity),
-        derivation_queue_capacity=int(derivation_queue_capacity),
-        result_queue_capacity=max(int(publication_queue_capacity), 1024),
-    )
+    memory = MemoryWorkerTopology(topology.ctx, ingest_workers=int(ingest_workers), derivation_workers=int(derivation_workers), ingest_queue_capacity=int(ingest_queue_capacity), derivation_queue_capacity=int(derivation_queue_capacity), result_queue_capacity=max(int(publication_queue_capacity), 1024))
     memory.start()
 
     pending = list(jobs)
-    active = {}
+    active: dict[int, tuple[int, Any]] = {}
     free_slots = list(range(topology.actors))
-    results = []
+    results: list[ProcessActorResult] = []
     initial_policy = runtime.actor_policy_snapshot()
     published_policy_generation = int(initial_policy.generation)
     next_policy_publish = time.monotonic() + max(0.01, float(actor_view_refresh_ms) / 1000.0)
@@ -78,12 +64,11 @@ def run_parallel_memory_jobs(
     sampled = ingested = derived = 0
     ingest_sequence = ingest_apply = 1
     derive_task_id = derive_apply = 1
-    ingest_watermarks = {}
-    ingest_results = {}
-    derive_results = {}
-    inflight = set()
-    last_support = {}
-    coordinator_batch_size = 32
+    ingest_results: dict[int, PreparedIngestion] = {}
+    derive_results: dict[int, DerivationResult] = {}
+    inflight: set[int] = set()
+    last_support: dict[int, int] = {}
+    coordinator_batch_size = 256
     canonical_apply_seconds = 0.0
     canonical_apply_events = 0
 
@@ -91,36 +76,18 @@ def run_parallel_memory_jobs(
         while pending and free_slots:
             actor_id, spec, steps, seed = pending.pop(0)
             slot = free_slots.pop(0)
-            topology.start_actor(
-                index=slot,
-                spec=spec,
-                actor_id=actor_id,
-                steps=steps,
-                seed=seed,
-                env_root=env_root,
-                adapter_factory_path="v9.cli:make_adapter",
-                alfred_backend_factory=alfred_backend_factory,
-                run_nonce=run_nonce,
-                initial_policy=runtime.actor_policy_snapshot(),
-                epsilon=float(epsilon),
-                policy_refresh_steps=int(actor_view_refresh_steps),
-                policy_refresh_ms=float(actor_view_refresh_ms),
-            )
+            topology.start_actor(index=slot, spec=spec, actor_id=actor_id, steps=steps, seed=seed, env_root=env_root, adapter_factory_path="v9.cli:make_adapter", alfred_backend_factory=alfred_backend_factory, run_nonce=run_nonce, initial_policy=runtime.actor_policy_snapshot(), epsilon=float(epsilon), policy_refresh_steps=int(actor_view_refresh_steps), policy_refresh_ms=float(actor_view_refresh_ms))
             active[actor_id] = (slot, topology.actor_processes[-1])
 
     def dispatch_transition(transition: Any) -> None:
         nonlocal sampled, ingest_sequence, watermark_cursor
         sampled += 1
-        canonical_sequence = runtime.reserve_producer_sequence(
-            int(transition.actor_id),
-            int(transition.producer_sequence),
-        )
+        canonical_sequence = runtime.reserve_producer_sequence(int(transition.actor_id), int(transition.producer_sequence))
         if canonical_sequence != int(transition.producer_sequence):
             transition = replace(transition, producer_sequence=canonical_sequence)
         sequence = ingest_sequence
         ingest_sequence += 1
         watermark_cursor += 1
-        ingest_watermarks[sequence] = watermark_cursor
         memory.ingest_queue.put(IngestionTask(sequence, watermark_cursor, transition))
         watermark_cursor += len(tuple(transition.symbols))
 
@@ -142,45 +109,42 @@ def run_parallel_memory_jobs(
         memory.derivation_queue.put(task)
         derive_task_id += 1
 
-    def apply_ingest(prepared: PreparedIngestion) -> None:
-        nonlocal ingested
-        sequence = int(prepared.sequence)
-        signatures = runtime.apply_prepared_ingestion(prepared)
-        base = ingest_watermarks.pop(sequence)
-        publish_transition_symbols(
-            runtime,
-            prepared.transition,
-            base_watermark=base if prepared.event is not None else base - 1,
-        )
-        runtime.record_curriculum_event(
-            step=prepared.transition.curriculum_step,
-            environment_family=prepared.identity.family,
-            game_scenario=prepared.transition.game_scenario,
-        )
-        ingested += 1
-        for signature in signatures:
-            schedule(int(signature))
-
     def apply_ready() -> bool:
-        nonlocal ingest_apply, derive_apply, derived, canonical_apply_seconds, canonical_apply_events
+        nonlocal ingest_apply, derive_apply, ingested, derived
+        nonlocal canonical_apply_seconds, canonical_apply_events
         apply_started = time.perf_counter()
-        ingest_applied = 0
-        while ingest_apply in ingest_results and ingest_applied < coordinator_batch_size:
-            apply_ingest(ingest_results.pop(ingest_apply))
+        prepared_batch: list[PreparedIngestion] = []
+        while ingest_apply in ingest_results and len(prepared_batch) < coordinator_batch_size:
+            prepared_batch.append(ingest_results.pop(ingest_apply))
             ingest_apply += 1
-            ingest_applied += 1
-        derive_applied = 0
-        while derive_apply in derive_results and derive_applied < coordinator_batch_size:
-            result = derive_results.pop(derive_apply)
-            runtime.apply_derivation_result(result)
-            signature = int(result.structural_signature)
-            last_support[signature] = max(int(last_support.get(signature, 0)), int(result.support))
-            inflight.discard(signature)
-            derived += 1
+        if prepared_batch:
+            batch_method = getattr(runtime, "apply_prepared_ingestion_batch", None)
+            signature_rows = batch_method(prepared_batch) if callable(batch_method) else tuple(runtime.apply_prepared_ingestion(row) for row in prepared_batch)
+            for prepared, signatures in zip(prepared_batch, signature_rows):
+                runtime.record_curriculum_event(step=prepared.transition.curriculum_step, environment_family=prepared.identity.family, game_scenario=prepared.transition.game_scenario)
+                ingested += 1
+                for signature in signatures:
+                    schedule(int(signature))
+
+        derivation_batch: list[DerivationResult] = []
+        while derive_apply in derive_results and len(derivation_batch) < coordinator_batch_size:
+            derivation_batch.append(derive_results.pop(derive_apply))
             derive_apply += 1
-            schedule(signature)
-            derive_applied += 1
-        applied = ingest_applied + derive_applied
+        if derivation_batch:
+            batch_method = getattr(runtime, "apply_derivation_results_batch", None)
+            if callable(batch_method):
+                batch_method(derivation_batch)
+            else:
+                for result in derivation_batch:
+                    runtime.apply_derivation_result(result)
+            for result in derivation_batch:
+                signature = int(result.structural_signature)
+                last_support[signature] = max(int(last_support.get(signature, 0)), int(result.support))
+                inflight.discard(signature)
+                derived += 1
+                schedule(signature)
+
+        applied = len(prepared_batch) + len(derivation_batch)
         if applied:
             canonical_apply_seconds += time.perf_counter() - apply_started
             canonical_apply_events += applied
@@ -189,7 +153,7 @@ def run_parallel_memory_jobs(
     def drain_results(*, block: bool = False, timeout: float = 0.0) -> bool:
         progressed = apply_ready()
         first = not progressed
-        for _ in range(coordinator_batch_size):
+        for _ in range(coordinator_batch_size * 2):
             try:
                 item = memory.result_queue.get(timeout=timeout) if block and first else memory.result_queue.get_nowait()
             except queue.Empty:
@@ -209,52 +173,35 @@ def run_parallel_memory_jobs(
         elapsed = max(1e-9, time.monotonic() - started_at)
         for key, value in memory.queue_depths().items():
             runtime.set_telemetry_gauge(key, value)
-        gauges = {
-            "active_actor_processes": len(active),
-            "coordinator_action_requests": 0,
-            "policy_snapshot_generation": int(published_policy_generation),
-            "active_ingest_workers": int(ingest_workers),
-            "active_derivation_workers": int(derivation_workers),
-            "sampled_steps": sampled,
-            "ingested_steps": ingested,
-            "derivations_applied": derived,
-            "sampling_backlog": max(0, sampled - ingested),
-            "derivation_inflight": len(inflight),
-            "sampling_rate": sampled / elapsed,
-            "ingestion_rate": ingested / elapsed,
-            "derivation_rate": derived / elapsed,
-            "canonical_apply_rate": canonical_apply_events / max(1e-9, canonical_apply_seconds),
-            "canonical_apply_latency_ms": 1000.0 * canonical_apply_seconds / max(1, canonical_apply_events),
-            "canonical_batch_size": coordinator_batch_size,
-        }
+        gauges = {"active_actor_processes": len(active), "coordinator_action_requests": 0, "policy_snapshot_generation": int(published_policy_generation), "active_ingest_workers": int(ingest_workers), "active_derivation_workers": int(derivation_workers), "sampled_steps": sampled, "ingested_steps": ingested, "derivations_applied": derived, "sampling_backlog": max(0, sampled - ingested), "derivation_inflight": len(inflight), "sampling_rate": sampled / elapsed, "ingestion_rate": ingested / elapsed, "derivation_rate": derived / elapsed, "canonical_apply_rate": canonical_apply_events / max(1e-9, canonical_apply_seconds), "canonical_apply_latency_ms": 1000.0 * canonical_apply_seconds / max(1, canonical_apply_events), "canonical_batch_size": coordinator_batch_size}
         for key, value in gauges.items():
             runtime.set_telemetry_gauge(key, value)
 
     def progress() -> None:
         telemetry()
-        metrics = runtime.metrics()
-        diag = dict(metrics.get("telemetry_diagnostics", {}))
+        diag = dict(runtime.unified_telemetry.diagnostic_metrics())
         pct = 100.0 * ingested / total_steps if total_steps else 100.0
-        print(
-            f"{time.strftime('[%H:%M]')} {pct:5.1f}% "
-            f"sampled={sampled}/{total_steps} ingested={ingested} "
-            f"rate={float(diag.get('ingestion_rate', 0.0)):.0f}/s "
-            f"backlog={max(0, sampled - ingested)}",
-            flush=True,
-        )
+        print(f"{time.strftime('[%H:%M]')} {pct:5.1f}% sampled={sampled}/{total_steps} ingested={ingested} rate={float(diag.get('ingestion_rate', 0.0)):.0f}/s backlog={max(0, sampled - ingested)}", flush=True)
+
+    def drain_publication_queue() -> bool:
+        progressed = False
+        for _ in range(coordinator_batch_size):
+            try:
+                item = topology.publication_queue.get_nowait()
+            except queue.Empty:
+                break
+            if item[0] == "transition":
+                dispatch_transition(item[3])
+                progressed = True
+            elif item[0] == "shard_done":
+                topology.publication_queue.put(item)
+                break
+        return progressed
 
     launch()
     try:
         while active:
-            progressed = False
-            for _ in range(coordinator_batch_size):
-                try:
-                    item = topology.publication_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if item[0] == "transition":
-                    dispatch_transition(item[3])
-                    progressed = True
+            progressed = drain_publication_queue()
             progressed = drain_results() or progressed
             for _ in range(coordinator_batch_size):
                 try:
@@ -262,9 +209,7 @@ def run_parallel_memory_jobs(
                 except queue.Empty:
                     break
                 if isinstance(done, ActorError):
-                    raise RuntimeError(
-                        f"actor {done.actor_id} ({done.game_id}) failed: {done.message}\n{done.traceback_text}"
-                    )
+                    raise RuntimeError(f"actor {done.actor_id} ({done.game_id}) failed: {done.message}\n{done.traceback_text}")
                 if not isinstance(done, ActorDone):
                     continue
                 slot, _ = active.pop(done.actor_id)
@@ -275,17 +220,12 @@ def run_parallel_memory_jobs(
                 progressed = True
             for actor_id, (_, process) in tuple(active.items()):
                 if not process.is_alive() and process.exitcode not in (0, None):
-                    raise RuntimeError(
-                        f"actor process {actor_id} exited before completion with code {process.exitcode}"
-                    )
+                    raise RuntimeError(f"actor process {actor_id} exited before completion with code {process.exitcode}")
             now = time.monotonic()
             if now >= next_policy_publish:
                 snapshot = runtime.actor_policy_snapshot()
                 if int(snapshot.generation) > int(published_policy_generation):
-                    topology.publish_policy_snapshot(
-                        tuple(slot for slot, _ in active.values()),
-                        snapshot,
-                    )
+                    topology.publish_policy_snapshot(tuple(slot for slot, _ in active.values()), snapshot)
                     published_policy_generation = int(snapshot.generation)
                     runtime.set_telemetry_gauge("policy_snapshot_generation", published_policy_generation)
                 next_policy_publish = now + max(0.01, float(actor_view_refresh_ms) / 1000.0)
@@ -296,15 +236,7 @@ def run_parallel_memory_jobs(
                 time.sleep(0.001)
 
         while any(process.is_alive() for process in topology.actor_processes):
-            progressed = False
-            for _ in range(coordinator_batch_size):
-                try:
-                    item = topology.publication_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if item[0] == "transition":
-                    dispatch_transition(item[3])
-                    progressed = True
+            progressed = drain_publication_queue()
             progressed = drain_results() or progressed
             if not progressed:
                 time.sleep(0.001)
@@ -336,24 +268,13 @@ def run_parallel_memory_jobs(
         while ingested < sampled:
             drain_results(block=True, timeout=30)
         memory.join_ingest()
-
         while inflight or derive_results:
             drain_results(block=bool(inflight), timeout=30)
         memory.signal_derivation_stop()
         memory.join_derivation()
         drain_results()
 
-        for key, value in {
-            "actor_processes": min(int(actor_limit), len(jobs)),
-            "stage_worker_processes": int(stage_workers),
-            "shard_worker_processes": int(shards),
-            "ingest_worker_processes": int(ingest_workers),
-            "derivation_worker_processes": int(derivation_workers),
-            "multiprocess_transitions_published": int(ingested),
-            "coordinator_action_requests": 0,
-            "policy_snapshot_generation": int(published_policy_generation),
-            "policy_snapshot_refreshes": sum(int(row.policy_refreshes) for row in results),
-        }.items():
+        for key, value in {"actor_processes": min(int(actor_limit), len(jobs)), "stage_worker_processes": int(stage_workers), "shard_worker_processes": int(shards), "ingest_worker_processes": int(ingest_workers), "derivation_worker_processes": int(derivation_workers), "multiprocess_transitions_published": int(ingested), "coordinator_action_requests": 0, "policy_snapshot_generation": int(published_policy_generation), "policy_snapshot_refreshes": sum(int(row.policy_refreshes) for row in results)}.items():
             runtime.set_telemetry_gauge(key, value)
         progress()
         return sorted(results, key=lambda row: row.actor_id)
