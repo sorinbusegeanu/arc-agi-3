@@ -151,6 +151,16 @@ class ContinuousMemoryRuntime:
             source = self._hgt_action_scores.get(int(environment_id), {})
             return {int(action): float(source.get(int(action), 0.0)) for action in actions}
 
+    def actor_policy_snapshot(self) -> ActorPolicySnapshot:
+        with self._lock:
+            view = self.graph.read_view()
+            return ActorPolicySnapshot.build(
+                generation=view.generation,
+                normalized_action_supports=view.normalized_action_supports,
+                hgt_action_scores=self._hgt_action_scores,
+                model_version=self.unified_telemetry.model_version,
+            )
+
     def start(self) -> None:
         if self._closed:
             raise RuntimeError("runtime is closed")
