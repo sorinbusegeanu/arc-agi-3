@@ -143,7 +143,7 @@ def test_parallel_sampling_defers_raw_graph_publication(tmp_path) -> None:
     from v9.runtime.multiprocess import EncodedTransition
 
     runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False, enable_snapshots=False))
-    identity = ("synthetic", "syn_move", 1, 1)
+    identity = ("synthetic", "syn_move", "default", "instance-1")
     transition = EncodedTransition(
         actor_id=1,
         producer_sequence=1,
