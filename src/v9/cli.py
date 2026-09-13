@@ -262,44 +262,9 @@ def run_continuous(args: argparse.Namespace) -> int:
         dashboard = MetricsHTTPServer(runtime.metrics, host=args.dashboard_host, port=args.dashboard_port)
         dashboard.start()
         print(f"v9 dashboard: http://{args.dashboard_host}:{args.dashboard_port}/", flush=True)
-    jobs: list[tuple[int, EnvironmentSpec, int, int]] = []
-    actor_count = max(len(specs), int(args.actors))
-    assigned_specs = [specs[index % len(specs)] for index in range(actor_count)]
-    lanes_per_spec = {
-        spec_index: sum(1 for index in range(actor_count) if index % len(specs) == spec_index)
-        for spec_index in range(len(specs))
-    }
-    lane_seen = {spec_index: 0 for spec_index in range(len(specs))}
-    for actor_index, spec in enumerate(assigned_specs):
-        spec_index = actor_index % len(specs)
-        lane_count = lanes_per_spec[spec_index]
-        lane = lane_seen[spec_index]
-        lane_seen[spec_index] += 1
-        base_steps, extra_steps = divmod(args.steps_per_game, lane_count)
-        steps = base_steps + int(lane < extra_steps)
-        if steps:
-            actor_id = actor_index + 1
-            jobs.append((actor_id, spec, steps, args.seed + actor_id * 1009))
-    print(f"v9 continuous: games={len(games)} actors={min(args.actors, len(jobs))} shards={args.shards} stage_workers={args.stage_workers} ingest_workers={args.ingest_workers} derivation_workers={args.derivation_workers} peers={'off' if args.no_peers else 'on'} lifecycle={args.lifecycle} snapshots={'off' if args.no_snapshots else 'native'} game_ids={','.join(games)}", flush=True)
+    print(f"v9 continuous: games={len(games)} actors={args.actors} epochs={args.epochs} shards={args.shards} stage_workers={args.stage_workers} ingest_workers={args.ingest_workers} derivation_workers={args.derivation_workers} peers={'off' if args.no_peers else 'on'} lifecycle={args.lifecycle} snapshots={'off' if args.no_snapshots else 'native'} game_ids={','.join(games)}", flush=True)
     try:
-        process_results = run_parallel_memory_jobs(
-            runtime,
-            jobs,
-            actor_limit=args.actors,
-            stage_workers=args.stage_workers,
-            shards=args.shards,
-            queue_capacity=max(args.stage_ring_capacity, args.shard_ring_capacity),
-            epsilon=args.epsilon,
-            env_root=args.env_root,
-            alfred_backend_factory=getattr(args, "alfred_backend_factory", None),
-            start_method=runtime.config.multiprocessing_start_method,
-            progress_interval_seconds=args.progress_interval_seconds,
-            ingest_workers=args.ingest_workers,
-            derivation_workers=args.derivation_workers,
-            ingest_queue_capacity=args.ingest_queue_capacity,
-            derivation_queue_capacity=args.derivation_queue_capacity,
-            publication_queue_capacity=args.publication_queue_capacity,
-        )
+        process_results, epoch_results = run_epochs(runtime, specs, args)
         results = [
             ActorResult(
                 row.actor_id,
@@ -314,7 +279,7 @@ def run_continuous(args: argparse.Namespace) -> int:
         runtime.wait_quiescent(args.drain_timeout)
         final = runtime.close(normal=True, timeout=args.final_save_timeout)
         metrics = runtime.metrics()
-        summary = {"games": list(games), "actors": [asdict(row) for row in results], "automatic_transfer_experiments": {"mode": effective_validation_mode, "budget": runtime.config.scientific.transfer_validation_trials_per_interval, "attempted": 0, "completed": 0, "passed": 0, "blocker": "no eligible target exposes exact snapshot/restore support" if effective_validation_mode != "learning_only" else None}, "hypotheses": runtime.scientific_statuses(), "metrics": metrics, "final_snapshot": None if final is None else {**asdict(final), "path": str(final.path)}}
+        summary = {"games": list(games), "epochs": [asdict(row) for row in epoch_results], "actors": [asdict(row) for row in results], "automatic_transfer_experiments": {"mode": effective_validation_mode, "budget": runtime.config.scientific.transfer_validation_trials_per_interval, "attempted": 0, "completed": 0, "passed": 0, "blocker": "no eligible target exposes exact snapshot/restore support" if effective_validation_mode != "learning_only" else None}, "hypotheses": runtime.scientific_statuses(), "metrics": metrics, "final_snapshot": None if final is None else {**asdict(final), "path": str(final.path)}}
         target = Path(args.root) / "v9_run_summary.json"
         target.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return 0
