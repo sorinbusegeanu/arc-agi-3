@@ -39,25 +39,32 @@ def test_predecessor_root_is_rejected(tmp_path: Path) -> None:
         ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path))
 
 
-def test_evidence_is_append_only_across_restart(tmp_path: Path) -> None:
+def test_audit_ledger_is_disabled_across_restart(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "evidence" / "ledger.jsonl"
     first = _learn(tmp_path, 2, restore=False)
-    count = len(first.evidence.records)
+    assert first.evidence.records == []
+    assert not ledger_path.exists()
     first.close()
+
     restored = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path))
-    assert len(restored.evidence.records) == count
+    assert restored.evidence.records == []
+    assert not ledger_path.exists()
 
 
-def test_restore_preserves_durable_evidence_ahead_of_snapshot(tmp_path: Path) -> None:
+def test_legacy_ledger_is_deleted_and_new_records_are_discarded(tmp_path: Path) -> None:
     path = tmp_path / "evidence" / "ledger.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"legacy":true}\n', encoding="utf-8")
+
     ledger = EvidenceLedger(path, "config")
-    first = ledger.append("INGESTION", 1, {"event": 1})
-    snapshot_state = ledger.state_dict()
-    second = ledger.append("ISF_DECISION", 2, {"score": 0.5})
+    ledger.append("INGESTION", 1, {"event": 1})
+    ledger.append("ISF_DECISION", 2, {"score": 0.5})
+    ledger.flush()
+    ledger.load_state({"schema_version": 1, "records": [{"legacy": True}]})
 
-    restored = EvidenceLedger(path, "config")
-    restored.load_state(snapshot_state)
-
-    assert restored.records == [first, second]
+    assert ledger.records == []
+    assert ledger.state_dict() == {"schema_version": 1, "disabled": True}
+    assert not path.exists()
 
 
 def test_h16_requires_matched_c0_through_c3_and_aligned_advantage() -> None:
@@ -85,6 +92,7 @@ def test_cli_smoke_uses_only_v9_named_artifacts(tmp_path: Path) -> None:
     assert "v9 smoke done" not in result.stdout
     assert (tmp_path / "snapshots").is_dir()
     assert not (tmp_path / "v8_run_summary.json").exists()
+    assert not (tmp_path / "evidence" / "ledger.jsonl").exists()
     report = json.loads((tmp_path / "reports" / "reporting_cut.json").read_text())
     assert report["scientific_config"]["design_version"] == "9.7.6"
 
