@@ -5,7 +5,7 @@
 arc-agi>=0.9.9,<1.0
 chess>=1.11,<2.0
 duckdb>=1.0
-gymnasium>=1.0,<2.0
+gymnasium[atari]>=1.0,<2.0
 networkx>=3.0
 numpy>=1.26
 pandas>=2.0
@@ -15,9 +15,11 @@ tqdm>=4.66
 PyYAML>=6.0
 
 # Curriculum environments
+ale-py>=0.10,<1.0
 minigrid>=2.3,<3.0
 
 # HGT / continual-learning stack
+nvidia-ml-py>=12.0
 torch>=2.10,<3.0
 torch-geometric>=2.6,<3.0
 
