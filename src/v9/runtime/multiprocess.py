@@ -33,6 +33,7 @@ class EncodedTransition:
     symbols: tuple[object, ...]
     curriculum_step: str | None
     game_scenario: str
+    symbols_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +114,7 @@ def actor_process_main(
                     symbols=tuple(adapter.optional_symbol_stream()),
                     curriculum_step=getattr(spec, "curriculum_step", None),
                     game_scenario=str(getattr(spec, "game_id", identity.environment_type)),
+                    symbols_only=str(getattr(spec, "condition", "") or "").upper() == "C1",
                 )
             )
             completed += 1
