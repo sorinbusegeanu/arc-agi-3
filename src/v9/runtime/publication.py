@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from threading import RLock
 from typing import Any
 
@@ -24,6 +25,17 @@ def edge_ref(edge: RelationEdge) -> ObjectRef:
     return ObjectRef("edge", stable_u64(edge.source.hi, edge.source.lo, edge.relation.value, edge.target.hi, edge.target.lo, person=b"v9-edge"))
 
 
+@dataclass(frozen=True, slots=True)
+class RetiredTombstone:
+    uid: MemoryUid
+    level: MemoryLevel
+    memory_type: MemoryType
+    structural_key: tuple[int, ...]
+    retired_generation: int
+    replacement_uid: MemoryUid
+    reason: str
+
+
 class CanonicalGraph:
     SCHEMA_VERSION = 1
 
@@ -42,6 +54,7 @@ class CanonicalGraph:
         self.nodes: dict[MemoryUid, CanonicalNode] = {}
         self.payloads: dict[MemoryUid, dict[str, Any]] = {}
         self.edges: dict[tuple[MemoryUid, str, MemoryUid], RelationEdge] = {}
+        self.retired_tombstones: dict[MemoryUid, RetiredTombstone] = {}
         self.versions = VersionTable()
         self.applied_proposals: set[int] = set()
         self._applied_order: deque[int] = deque()
@@ -87,8 +100,6 @@ class CanonicalGraph:
                     return MutationResult(proposal.proposal_uid, MutationOutcome.INVALID, self.generation)
                 owner = write.node.uid.shard(self.partition_count)
                 if current is None:
-                    if self.node_capacity_per_partition is not None and self._node_counts_by_partition[owner] + node_count_deltas[owner] >= self.node_capacity_per_partition:
-                        return MutationResult(proposal.proposal_uid, MutationOutcome.INVALID, self.generation)
                     node_count_deltas[owner] += 1
                 incoming_payload = dict(write.payload or {})
                 if current is not None and proposal.proposal_class.value == "ADDITIVE":
@@ -110,8 +121,6 @@ class CanonicalGraph:
                     edge_updates[write.edge.key] = None
                 else:
                     if current_edge is None:
-                        if self.edge_capacity_per_partition is not None and self._edge_counts_by_partition[owner] + edge_count_deltas[owner] >= self.edge_capacity_per_partition:
-                            return MutationResult(proposal.proposal_uid, MutationOutcome.INVALID, self.generation)
                         edge_count_deltas[owner] += 1
                     edge_updates[write.edge.key] = write.edge
                 refs.append(ref)
@@ -120,6 +129,7 @@ class CanonicalGraph:
                 owner = uid.shard(self.partition_count)
                 self._uids_by_level[node.level].add(uid)
                 self._node_uids_by_partition[owner].add(uid)
+                self.retired_tombstones.pop(uid, None)
             self.nodes[uid] = node
             self.payloads[uid] = payload
         for key, edge in edge_updates.items():
@@ -172,6 +182,73 @@ class CanonicalGraph:
                     results.append(self._publish_locked(proposal))
         return tuple(results)
 
+    def pressure_ratio(self) -> float:
+        with self._publication_lock:
+            ratios: list[float] = []
+            if self.node_capacity_per_partition is not None:
+                ratios.extend(count / self.node_capacity_per_partition for count in self._node_counts_by_partition)
+            if self.edge_capacity_per_partition is not None:
+                ratios.extend(count / self.edge_capacity_per_partition for count in self._edge_counts_by_partition)
+            return max(ratios, default=0.0)
+
+    def provenance_replacements(self, *, maximum_level: MemoryLevel = MemoryLevel.M1) -> dict[MemoryUid, MemoryUid]:
+        with self._publication_lock:
+            replacements: dict[MemoryUid, MemoryUid] = {}
+            for edge in self.edges.values():
+                if edge.relation is not RelationType.PROVENANCE:
+                    continue
+                source = self.nodes.get(edge.source)
+                target = self.nodes.get(edge.target)
+                if source is None or target is None or target.level > maximum_level or source.level <= target.level:
+                    continue
+                current_uid = replacements.get(target.uid)
+                current = self.nodes.get(current_uid) if current_uid is not None else None
+                if current is None or source.level > current.level or (source.level == current.level and source.uid < current.uid):
+                    replacements[target.uid] = source.uid
+            return replacements
+
+    def retire_nodes_batch(self, plans: tuple[tuple[MemoryUid, MemoryUid, str], ...]) -> tuple[MemoryUid, ...]:
+        if not plans:
+            return ()
+        all_partitions = tuple(range(self.partition_count))
+        with self._coordinator.locked(all_partitions), self._publication_lock:
+            accepted: dict[MemoryUid, tuple[CanonicalNode, MemoryUid, str]] = {}
+            for uid, replacement_uid, reason in plans:
+                node = self.nodes.get(uid)
+                replacement = self.nodes.get(replacement_uid)
+                if node is None or replacement is None:
+                    continue
+                if node.level > MemoryLevel.M1 or replacement.level <= node.level:
+                    continue
+                provenance_key = (replacement_uid, RelationType.PROVENANCE.value, uid)
+                if provenance_key not in self.edges:
+                    continue
+                accepted[uid] = (node, replacement_uid, str(reason))
+            if not accepted:
+                return ()
+            retiring = set(accepted)
+            incident = [edge for edge in self.edges.values() if edge.source in retiring or edge.target in retiring]
+            for edge in incident:
+                key = edge.key
+                owner = edge.source.shard(self.partition_count)
+                self.edges.pop(key, None)
+                self._edge_keys_by_partition[owner].discard(key)
+                self._edge_counts_by_partition[owner] -= 1
+                self.versions.bump(edge_ref(edge))
+            retired_generation = self.generation + 1
+            for uid, (node, replacement_uid, reason) in accepted.items():
+                owner = uid.shard(self.partition_count)
+                self.nodes.pop(uid, None)
+                self.payloads.pop(uid, None)
+                self._node_uids_by_partition[owner].discard(uid)
+                self._uids_by_level[node.level].discard(uid)
+                self._node_counts_by_partition[owner] -= 1
+                self.versions.bump(node_ref(uid))
+                self.retired_tombstones[uid] = RetiredTombstone(uid, node.level, node.memory_type, node.structural_key, retired_generation, replacement_uid, reason)
+            self.generation = retired_generation
+            self._cached_read_view = None
+            return tuple(sorted(accepted))
+
     def read_view(self) -> ReadView:
         with self._publication_lock:
             if self._cached_read_view is None:
@@ -201,7 +278,8 @@ class CanonicalGraph:
                     parts = list(pool.map(self._partition_state, range(self.partition_count)))
             nodes = [row for part, _ in parts for row in part]
             edges = [row for _, part in parts for row in part]
-            return {"schema_version": self.SCHEMA_VERSION, "partition_count": self.partition_count, "node_capacity_per_partition": self.node_capacity_per_partition, "edge_capacity_per_partition": self.edge_capacity_per_partition, "applied_proposal_capacity": self.applied_proposal_capacity, "generation": self.generation, "nodes": nodes, "edges": edges, "versions": self.versions.state_dict(), "applied_proposals": list(self._applied_order)}
+            tombstones = [{"hi": uid.hi, "lo": uid.lo, "level": int(row.level), "memory_type": int(row.memory_type), "structural_key": list(row.structural_key), "retired_generation": row.retired_generation, "replacement": [row.replacement_uid.hi, row.replacement_uid.lo], "reason": row.reason} for uid, row in sorted(self.retired_tombstones.items())]
+            return {"schema_version": self.SCHEMA_VERSION, "partition_count": self.partition_count, "node_capacity_per_partition": self.node_capacity_per_partition, "edge_capacity_per_partition": self.edge_capacity_per_partition, "applied_proposal_capacity": self.applied_proposal_capacity, "generation": self.generation, "nodes": nodes, "edges": edges, "retired_tombstones": tombstones, "versions": self.versions.state_dict(), "applied_proposals": list(self._applied_order)}
 
     @classmethod
     def from_state_dict(cls, state: dict[str, object]) -> "CanonicalGraph":
@@ -231,6 +309,10 @@ class CanonicalGraph:
             owner = edge.source.shard(result.partition_count)
             result._edge_counts_by_partition[owner] += 1
             result._edge_keys_by_partition[owner].add(edge.key)
+        for raw in state.get("retired_tombstones", []):
+            uid = MemoryUid(int(raw["hi"]), int(raw["lo"]))
+            replacement = raw.get("replacement", [0, 0])
+            result.retired_tombstones[uid] = RetiredTombstone(uid, MemoryLevel(int(raw["level"])), MemoryType(int(raw["memory_type"])), tuple(int(v) for v in raw.get("structural_key", [])), int(raw.get("retired_generation", result.generation)), MemoryUid(int(replacement[0]), int(replacement[1])), str(raw.get("reason", "retention_compaction")))
         result.versions = VersionTable.from_state_dict(list(state.get("versions", [])))
         applied_order = [int(value) for value in state.get("applied_proposals", [])]
         result._applied_order = deque(applied_order[-result.applied_proposal_capacity :])
