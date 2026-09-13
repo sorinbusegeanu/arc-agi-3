@@ -311,5 +311,6 @@ def run_parallel_memory_jobs(
         progress()
         return sorted(results, key=lambda row: row.actor_id)
     except BaseException:
+        memory.terminate()
         topology.terminate()
         raise
