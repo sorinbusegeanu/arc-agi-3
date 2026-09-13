@@ -318,7 +318,7 @@ class ContinuousMemoryRuntime:
                     decision_watermark=self._watermark,
                     evidence_availability_watermark=event.identity.causal_watermark,
                     stage=stage_before,
-                    next_stage=stage_snapshot.next_stage,
+                    next_stage=next_stage,
                     graph_generation=self.graph.generation,
                 )
                 self._prediction_error_sum += abs(float(experience.prediction_error))
@@ -557,20 +557,25 @@ class ContinuousMemoryRuntime:
                 },
             )
 
-            stage_snapshot = self.stage_tracker.close_interval(
-                self._stage_evidence(),
-                evidence_watermark=self._watermark,
-            )
-            self.evidence.append(
-                "DEVELOPMENTAL_STAGE",
-                self._watermark,
-                {
-                    "interval_id": stage_snapshot.interval_id,
-                    "stage": int(stage_snapshot.stage),
-                    "next_stage": int(stage_snapshot.next_stage),
-                    "evidence": asdict(stage_snapshot.evidence),
-                },
-            )
+            self._stage_interval_events += 1
+            next_stage = self.stage_tracker.stage
+            if self._stage_interval_events >= self._stage_interval_size:
+                stage_snapshot = self.stage_tracker.close_interval(
+                    self._stage_evidence(),
+                    evidence_watermark=self._watermark,
+                )
+                self._stage_interval_events = 0
+                next_stage = stage_snapshot.next_stage
+                self.evidence.append(
+                    "DEVELOPMENTAL_STAGE",
+                    self._watermark,
+                    {
+                        "interval_id": stage_snapshot.interval_id,
+                        "stage": int(stage_snapshot.stage),
+                        "next_stage": int(stage_snapshot.next_stage),
+                        "evidence": asdict(stage_snapshot.evidence),
+                    },
+                )
             experience = event.experience
             recurrence = self._m1n_supports.get(signature, 0)
             decision = self.isf.score(
