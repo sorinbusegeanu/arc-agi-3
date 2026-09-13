@@ -318,7 +318,7 @@ class ContinuousMemoryRuntime:
                     decision_watermark=self._watermark,
                     evidence_availability_watermark=event.identity.causal_watermark,
                     stage=stage_before,
-                    next_stage=next_stage,
+                    next_stage=stage_snapshot.next_stage,
                     graph_generation=self.graph.generation,
                 )
                 self._prediction_error_sum += abs(float(experience.prediction_error))
