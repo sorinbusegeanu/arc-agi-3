@@ -100,6 +100,7 @@ class ContinuousMemoryRuntime:
         self._m1n_supports: dict[int, int] = {}
         self._m1n_dirty: set[int] = set()
         self._actor_action_supports: dict[int, float] = {}
+        self._deferred_base_nodes: dict[MemoryUid, tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]]] = {}
         self._replay_pool: dict[MemoryUid, float] = {}
         self._formation_environments: set[int] = set()
         self._latest_interaction_grounding: dict[tuple[int, int], M1GroundedContingency] = {}
@@ -453,7 +454,26 @@ class ContinuousMemoryRuntime:
         else:
             self.telemetry["rejected"] += 1
 
-    def _record_normalized(self, relation: M1NormalizedRelation) -> int:
+    def _defer_base_group(
+        self,
+        rows: tuple[tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]], ...],
+    ) -> None:
+        for node, payload, evidence in rows:
+            current = self._deferred_base_nodes.get(node.uid)
+            if current is None:
+                stored = dict(payload)
+            else:
+                stored = dict(current[1])
+                stored.update(payload)
+                if "parents" in payload:
+                    stored["parents"] = sorted(
+                        {tuple(map(int, row)) for row in current[1].get("parents", [])}
+                        | {tuple(map(int, row)) for row in payload.get("parents", [])}
+                    )
+            stored.setdefault("evidence_refs", [[uid.hi, uid.lo] for uid in sorted(set(evidence))])
+            self._deferred_base_nodes[node.uid] = (node, stored, tuple(evidence))
+
+    def _record_normalized(self, relation: M1NormalizedRelation, *, defer_publication: bool = False) -> int:
         occurrences = self._m1n_occurrences.setdefault(relation.structural_signature, [])
         support = self._m1n_supports.get(relation.structural_signature, 0) + 1
         self._m1n_supports[relation.structural_signature] = support
@@ -484,24 +504,29 @@ class ContinuousMemoryRuntime:
             for uid in occurrence.provenance.evidence
         )
         if support == 1:
-            self._publish(
-                CanonicalNode(
-                    relation.uid,
-                    MemoryLevel.M1,
-                    MemoryType.NORMALIZED_RELATION,
-                    (relation.structural_signature,),
-                    self._watermark,
-                ),
-                {
-                    "observable_relation": relation.observable_relation,
-                    "channel": relation.channel.value,
-                    "structural_signature": relation.structural_signature,
-                    "support": support,
-                    "parents": [[uid.hi, uid.lo] for uid in retained_parents],
-                },
-                retained_evidence,
-                proposal_class=ProposalClass.STATEFUL,
+            normalized_node = CanonicalNode(
+                relation.uid,
+                MemoryLevel.M1,
+                MemoryType.NORMALIZED_RELATION,
+                (relation.structural_signature,),
+                self._watermark,
             )
+            normalized_payload = {
+                "observable_relation": relation.observable_relation,
+                "channel": relation.channel.value,
+                "structural_signature": relation.structural_signature,
+                "support": support,
+                "parents": [[uid.hi, uid.lo] for uid in retained_parents],
+            }
+            if defer_publication:
+                self._defer_base_group(((normalized_node, normalized_payload, retained_evidence),))
+            else:
+                self._publish(
+                    normalized_node,
+                    normalized_payload,
+                    retained_evidence,
+                    proposal_class=ProposalClass.STATEFUL,
+                )
         else:
             self._m1n_dirty.add(int(relation.structural_signature))
         return relation.structural_signature
