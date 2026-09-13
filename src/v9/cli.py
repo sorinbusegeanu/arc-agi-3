@@ -17,7 +17,7 @@ from v9.environments import ARCAdapter, ChessAdapter, GymDiscreteAdapter, GymStr
 from v9.environments.synthetic_symbolic import SyntheticSymbolicConfig
 from v9.modalities.symbols import DeterministicSymbolCodec
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig
-from v9.runtime.process_coordinator import run_process_jobs
+from v9.runtime.parallel_memory_coordinator import run_parallel_memory_jobs
 from v9.telemetry import MetricsHTTPServer
 
 MIX_GAMES = ("gp03", "tp02", "FrozenLake-v1", "Chess-v0", "Sudoku-v0")
@@ -248,6 +248,8 @@ def run_continuous(args: argparse.Namespace) -> int:
         raise ValueError("--games is required for a normal continuous run")
     if args.actors <= 0 or args.steps_per_game <= 0 or args.graph_check <= 0 or args.wait < 0 or args.progress_interval_seconds <= 0 or not 0 <= args.epsilon <= 1:
         raise ValueError("actors, steps-per-game, graph-check and progress interval must be positive; wait and epsilon must be valid")
+    if min(args.ingest_workers, args.derivation_workers, args.ingest_queue_capacity, args.derivation_queue_capacity, args.publication_queue_capacity) <= 0:
+        raise ValueError("memory worker counts and queue capacities must be positive")
     specs = resolve_game_specs(args.games, curriculum_config=args.curriculum_config)
     games = tuple(spec.display_name for spec in specs)
     runtime = ContinuousMemoryRuntime(_runtime_config(args))
@@ -273,7 +275,7 @@ def run_continuous(args: argparse.Namespace) -> int:
                 actor_id += 1
     print(f"v9 continuous: games={len(games)} actors={min(args.actors, len(jobs))} shards={args.shards} stage_workers={args.stage_workers} peers={'off' if args.no_peers else 'on'} lifecycle={args.lifecycle} snapshots={'off' if args.no_snapshots else 'native'} game_ids={','.join(games)}", flush=True)
     try:
-        process_results = run_process_jobs(
+        process_results = run_parallel_memory_jobs(
             runtime,
             jobs,
             actor_limit=args.actors,
@@ -285,6 +287,11 @@ def run_continuous(args: argparse.Namespace) -> int:
             alfred_backend_factory=getattr(args, "alfred_backend_factory", None),
             start_method=runtime.config.multiprocessing_start_method,
             progress_interval_seconds=args.progress_interval_seconds,
+            ingest_workers=args.ingest_workers,
+            derivation_workers=args.derivation_workers,
+            ingest_queue_capacity=args.ingest_queue_capacity,
+            derivation_queue_capacity=args.derivation_queue_capacity,
+            publication_queue_capacity=args.publication_queue_capacity,
         )
         results = [
             ActorResult(
