@@ -360,6 +360,223 @@ class ContinuousMemoryRuntime:
         self.evidence.append("INGESTION", self._watermark, {"m0": m0.uid.hex(), "m1g": m1g.uid.hex(), "m1n": m1n.uid.hex(), "channel": channel.value})
         return tuple(signatures)
 
+    def apply_prepared_ingestion(self, prepared: Any) -> tuple[int, ...]:
+        """Publish worker-prepared interaction memories without running M2-M4 derivation."""
+        from v9.runtime.memory_pipeline import PreparedIngestion
+
+        if not isinstance(prepared, PreparedIngestion):
+            raise TypeError("prepared ingestion has unexpected type")
+        if prepared.event is None:
+            return ()
+        with self._lock:
+            event = prepared.event
+            identity = self.environments.register(prepared.identity)
+            if int(identity.value) != int(event.identity.environment_instance_id):
+                raise RuntimeError("prepared environment identity mismatch")
+            self._watermark = max(self._watermark, int(event.identity.causal_watermark))
+            self.telemetry["events"] += 1
+            modality = int(event.identity.modality_id.value)
+            self._modality_events[modality] = self._modality_events.get(modality, 0) + 1
+            stage_before = self.stage_tracker.stage
+            self._formation_environments.add(int(event.identity.environment_instance_id))
+
+            m0 = prepared.m0
+            m1g = prepared.m1g
+            m1n = prepared.m1n
+            if m0 is None or m1g is None or m1n is None:
+                raise RuntimeError("prepared interaction is incomplete")
+
+            self._publish(
+                CanonicalNode(
+                    m0.uid,
+                    MemoryLevel.M0,
+                    MemoryType.EPISODE,
+                    (event.identity.event_id.hi, event.identity.event_id.lo),
+                    self._watermark,
+                ),
+                {
+                    "modality_id": m0.modality_id,
+                    "environment_instance_id": m0.provenance.environment_instance_id,
+                    "episode_id": m0.provenance.episode_id.value,
+                    "context_signature": m0.context_signature,
+                    "payload_digest": m0.payload_digest,
+                    "action_id": m0.action_id,
+                    "outcome_signature": m0.outcome_signature,
+                    "next_context_signature": m0.next_context_signature,
+                    "symbol_identity": m0.symbol_identity,
+                    "primary_valence": m0.primary_valence,
+                    "future_option_delta": m0.future_option_delta,
+                    "realized_cost": m0.realized_cost,
+                },
+                (m0.uid,),
+            )
+            self._publish(
+                CanonicalNode(
+                    m1g.uid,
+                    MemoryLevel.M1,
+                    MemoryType.GROUNDED_CONTINGENCY,
+                    (m1g.uid.hi, m1g.uid.lo),
+                    self._watermark,
+                ),
+                {
+                    "relation": m1g.relation.value,
+                    "environment_instance_id": m1g.environment_instance_id,
+                    "episode_id": m1g.episode_id,
+                    "grounded_context_signature": m1g.grounded_context_signature,
+                    "executable_action_token": m1g.executable_action_token,
+                    "realized_transition_signature": m1g.realized_transition_signature,
+                    "grounded_next_context_signature": m1g.grounded_next_context_signature,
+                    "parents": [[m0.uid.hi, m0.uid.lo]],
+                },
+                (m0.uid,),
+            )
+            key = (m1g.environment_instance_id, m1g.episode_id)
+            self._latest_interaction_grounding[key] = m1g
+            signature = self._record_normalized(m1n)
+            self.evidence.append(
+                "INGESTION",
+                self._watermark,
+                {
+                    "m0": m0.uid.hex(),
+                    "m1g": m1g.uid.hex(),
+                    "m1n": m1n.uid.hex(),
+                    "channel": m1n.channel.value,
+                    "worker_prepared": True,
+                },
+            )
+
+            stage_snapshot = self.stage_tracker.close_interval(
+                self._stage_evidence(),
+                evidence_watermark=self._watermark,
+            )
+            self.evidence.append(
+                "DEVELOPMENTAL_STAGE",
+                self._watermark,
+                {
+                    "interval_id": stage_snapshot.interval_id,
+                    "stage": int(stage_snapshot.stage),
+                    "next_stage": int(stage_snapshot.next_stage),
+                    "evidence": asdict(stage_snapshot.evidence),
+                },
+            )
+            experience = event.experience
+            recurrence = self._m1n_supports.get(signature, 0)
+            decision = self.isf.score(
+                ISFComponents(
+                    abs(experience.primary_valence),
+                    abs(experience.future_option_delta),
+                    experience.prediction_error,
+                    1.0 / max(1, recurrence),
+                    0.5 if experience.family_signature else 0.0,
+                    min(1.0, experience.changed_cells / 16.0),
+                ),
+                decision_watermark=self._watermark,
+                evidence_availability_watermark=event.identity.causal_watermark,
+                stage=stage_before,
+                next_stage=stage_snapshot.next_stage,
+                graph_generation=self.graph.generation,
+            )
+            self._prediction_error_sum += abs(float(experience.prediction_error))
+            self._prediction_error_count += 1
+            self.evidence.append(
+                "ISF_DECISION",
+                self._watermark,
+                {
+                    "stage": int(decision.developmental_stage),
+                    "next_stage": int(decision.next_developmental_stage),
+                    "score": decision.score,
+                    "raw": asdict(decision.raw_components),
+                    "normalized": asdict(decision.normalized_components),
+                    "graph_generation": decision.graph_generation,
+                },
+            )
+            return (signature,)
+
+    def build_derivation_task(self, signature: int, *, task_id: int) -> Any | None:
+        from v9.runtime.memory_pipeline import DerivationTask
+
+        with self._lock:
+            rows = tuple(self._m1n_occurrences.get(int(signature), ()))
+            support = int(self._m1n_supports.get(int(signature), len(rows)))
+            if len(rows) < 2 or support < 2:
+                return None
+            return DerivationTask(
+                int(task_id),
+                int(signature),
+                rows,
+                support,
+                tuple(sorted(self._formation_environments)),
+                int(self._watermark),
+            )
+
+    def apply_derivation_result(self, result: Any) -> None:
+        from v9.runtime.memory_pipeline import DerivationResult
+
+        if not isinstance(result, DerivationResult):
+            raise TypeError("derivation result has unexpected type")
+        with self._lock:
+            self._watermark = max(self._watermark, int(result.causal_watermark))
+            family = result.family
+            self._m2[family.uid] = family
+            self._publish(
+                CanonicalNode(
+                    family.uid,
+                    MemoryLevel.M2,
+                    MemoryType.FAMILY,
+                    (family.structural_signature,),
+                    self._watermark,
+                ),
+                {
+                    "structural_signature": family.structural_signature,
+                    "recurrence": family.recurrence,
+                    "compression_benefit": family.compression_benefit,
+                    "parents": [[uid.hi, uid.lo] for uid in family.provenance.parents],
+                },
+                family.provenance.evidence,
+            )
+            for role in result.roles:
+                self._m3[role.uid] = role
+                self._publish(
+                    CanonicalNode(
+                        role.uid,
+                        MemoryLevel.M3,
+                        MemoryType.ROLE,
+                        (role.relational_signature, role.consequence_signature),
+                        self._watermark,
+                    ),
+                    {
+                        "relational_signature": role.relational_signature,
+                        "consequence_signature": role.consequence_signature,
+                        "parents": [[uid.hi, uid.lo] for uid in role.provenance.parents],
+                    },
+                    role.provenance.evidence,
+                )
+            for candidate in result.concepts:
+                if candidate.uid in self._m4:
+                    continue
+                self._m4[candidate.uid] = candidate
+                self._publish(
+                    CanonicalNode(
+                        candidate.uid,
+                        MemoryLevel.M4,
+                        MemoryType.CONCEPT,
+                        candidate.invariant_descriptor,
+                        self._watermark,
+                    ),
+                    {
+                        "invariant_descriptor": list(candidate.invariant_descriptor),
+                        "compression_benefit": candidate.compression_benefit,
+                        "explanatory_reach": candidate.explanatory_reach,
+                        "transfer_prior": candidate.transfer_prior,
+                        "formation_scope": list(candidate.provenance.formation_scope),
+                        "held_out_targets": [],
+                        "validated": False,
+                        "concept_state": candidate.state.value,
+                        "parents": [[uid.hi, uid.lo] for uid in candidate.provenance.parents],
+                    },
+                    candidate.provenance.evidence,
+                )
+
     def _develop(self, signatures: tuple[int, ...] = ()) -> None:
         for signature in tuple(sorted(set(signatures)))[: self.config.scientific.replay_candidates_per_interval]:
             rows = tuple(self._m1n_occurrences[signature])
