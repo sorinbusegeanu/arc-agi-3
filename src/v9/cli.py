@@ -17,6 +17,7 @@ from v9.environments import ARCAdapter, ChessAdapter, GymDiscreteAdapter, GymStr
 from v9.environments.synthetic_symbolic import SyntheticSymbolicConfig
 from v9.modalities.symbols import DeterministicSymbolCodec
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig
+from v9.telemetry import MetricsHTTPServer
 
 MIX_GAMES = ("gp03", "tp02", "FrozenLake-v1", "Chess-v0", "Sudoku-v0")
 RESEARCH_GAMES = ("tp01", "tp02", "gp01", "gp03", "ex01", "ex02", "lo01", "mm01", "fi01", "FrozenLake-v1", "Chess-v0", "Sudoku-v0")
@@ -252,6 +253,11 @@ def run_continuous(args: argparse.Namespace) -> int:
     curriculum_modes = sorted({spec.validation_mode for spec in specs if spec.validation_mode})
     runtime.unified_telemetry.set_gauge("curriculum_validation_mode", ",".join(curriculum_modes))
     runtime.start()
+    dashboard = None
+    if not args.no_dashboard:
+        dashboard = MetricsHTTPServer(runtime.metrics, host=args.dashboard_host, port=args.dashboard_port)
+        dashboard.start()
+        print(f"v9 dashboard: http://{args.dashboard_host}:{args.dashboard_port}/", flush=True)
     jobs: list[tuple[int, EnvironmentSpec, int, int]] = []
     lanes, actor_id = max(len(specs), args.actors), 1
     base_lanes, extra_lanes = divmod(lanes, len(specs))
@@ -278,6 +284,9 @@ def run_continuous(args: argparse.Namespace) -> int:
     except BaseException:
         runtime.close(normal=False)
         raise
+    finally:
+        if dashboard is not None:
+            dashboard.close()
 
 
 def run_smoke(args: argparse.Namespace) -> int:
@@ -319,6 +328,9 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--lifecycle", choices=("on", "off"), default="on")
     continuous.add_argument("--actor-timeout", type=float, default=None)
     continuous.add_argument("--progress-interval-seconds", type=float, default=60.0)
+    continuous.add_argument("--dashboard-host", default="0.0.0.0")
+    continuous.add_argument("--dashboard-port", type=int, default=8765)
+    continuous.add_argument("--no-dashboard", action="store_true")
     continuous.add_argument("--verbose-progress", action="store_true")
     continuous.add_argument("--drain-timeout", type=float, default=300.0)
     continuous.add_argument("--final-save-timeout", type=float, default=300.0)
