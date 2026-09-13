@@ -63,17 +63,24 @@ class MemoryWorkerTopology:
         for _ in self.ingest_processes:
             self.ingest_queue.put(WorkerStop())
 
+    @staticmethod
+    def _join_checked(processes: list[Any], *, role: str, timeout: float = 30.0) -> None:
+        for process in processes:
+            process.join(timeout=float(timeout))
+            if process.is_alive():
+                raise RuntimeError(f"{role} process {process.name} did not exit within {float(timeout):.1f}s")
+            if process.exitcode != 0:
+                raise RuntimeError(f"{role} process {process.name} exited with code {process.exitcode}")
+
     def join_ingest(self) -> None:
-        for process in self.ingest_processes:
-            process.join(timeout=30)
+        self._join_checked(self.ingest_processes, role="ingest")
 
     def signal_derivation_stop(self) -> None:
         for _ in self.derivation_processes:
             self.derivation_queue.put(WorkerStop())
 
     def join_derivation(self) -> None:
-        for process in self.derivation_processes:
-            process.join(timeout=30)
+        self._join_checked(self.derivation_processes, role="derivation")
 
     def terminate(self) -> None:
         for process in self.ingest_processes + self.derivation_processes:
