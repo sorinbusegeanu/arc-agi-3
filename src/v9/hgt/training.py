@@ -46,8 +46,8 @@ def _node_feature(node: Any, payload: dict[str, Any], dim: int, torch: Any):
         float(payload.get("compression_benefit", 0.0)) / 64.0,
         float(payload.get("explanatory_reach", 0)) / 64.0,
         float(bool(payload.get("validated", False))),
-        float(payload.get("primary_valence", 0)),
-        float(payload.get("future_option_delta", 0.0)) / 16.0,
+        float(payload.get("support", 0)) / 64.0,
+        float(len(payload.get("parents", ()))) / 8.0,
     ]
     seed = hashlib.blake2b(
         json.dumps(
@@ -80,17 +80,32 @@ def build_hgt_graph(read_view: Any, *, input_dim: int = 64, max_nodes: int = 800
     index_by_uid: dict[Any, tuple[str, int]] = {}
     x_dict: dict[str, Any] = {}
     y_dict: dict[str, Any] = {}
+    action_target_dict: dict[str, Any] = {}
+    action_mask_dict: dict[str, Any] = {}
+    action_meta: dict[str, list[tuple[int, int] | None]] = {}
     for node_type, uids in nodes_by_type.items():
         features = []
         labels = []
+        action_targets = []
+        action_masks = []
+        action_rows = []
         for index, uid in enumerate(uids):
             index_by_uid[uid] = (node_type, index)
             node = read_view.nodes[uid]
             payload = dict(read_view.payloads.get(uid, {}))
             features.append(_node_feature(node, payload, input_dim, torch))
             labels.append(int(node.memory_type) // 100)
+            action_id = payload.get("action_id")
+            environment_id = payload.get("environment_instance_id")
+            usable_action = node_type == "M0" and action_id is not None and environment_id is not None
+            action_targets.append(float(payload.get("primary_valence", 0)) + 0.05 * float(payload.get("future_option_delta", 0.0)))
+            action_masks.append(bool(usable_action))
+            action_rows.append((int(environment_id), int(action_id)) if usable_action else None)
         x_dict[node_type] = torch.stack(features, dim=0)
         y_dict[node_type] = torch.tensor(labels, dtype=torch.long)
+        action_target_dict[node_type] = torch.tensor(action_targets, dtype=torch.float32)
+        action_mask_dict[node_type] = torch.tensor(action_masks, dtype=torch.bool)
+        action_meta[node_type] = action_rows
 
     edges: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
     for edge in read_view.edges.values():
@@ -106,7 +121,7 @@ def build_hgt_graph(read_view: Any, *, input_dim: int = 64, max_nodes: int = 800
         if pairs:
             edge_index_dict[key] = torch.tensor(pairs, dtype=torch.long).t().contiguous()
 
-    return x_dict, edge_index_dict, y_dict
+    return x_dict, edge_index_dict, y_dict, action_target_dict, action_mask_dict, action_meta
 
 
 class _HGTWrapper:
@@ -128,6 +143,10 @@ class _HGTWrapper:
                     node_type: nn.Linear(hidden_dim, 8)
                     for node_type in metadata[0]
                 })
+                self.value_heads = nn.ModuleDict({
+                    node_type: nn.Linear(hidden_dim, 1)
+                    for node_type in metadata[0]
+                })
 
             def forward(self, x_dict, edge_index_dict):
                 state = {
@@ -140,10 +159,10 @@ class _HGTWrapper:
                         key: (state[key] if updated.get(key) is None else updated[key]).relu()
                         for key in state
                     }
-                return {
-                    key: self.heads[key](value)
-                    for key, value in state.items()
-                }
+                return (
+                    {key: self.heads[key](value) for key, value in state.items()},
+                    {key: self.value_heads[key](value).squeeze(-1) for key, value in state.items()},
+                )
 
         self.model = Model()
 
@@ -161,7 +180,7 @@ def _split_masks(y_dict: dict[str, Any], torch: Any):
     return train_masks, val_masks
 
 
-def _loss(logits_dict, y_dict, masks, torch):
+def _loss(logits_dict, value_dict, y_dict, masks, action_targets, action_masks, torch):
     losses = []
     correct = total = 0
     for node_type, logits in logits_dict.items():
@@ -174,9 +193,17 @@ def _loss(logits_dict, y_dict, masks, torch):
         losses.append(loss)
         correct += int((selected.argmax(dim=-1) == target).sum().item())
         total += int(target.numel())
-    if not losses:
+    value_losses = []
+    for node_type, values in value_dict.items():
+        mask = action_masks[node_type].to(values.device)
+        if bool(mask.any()):
+            target = action_targets[node_type].to(values.device)[mask]
+            value_losses.append(torch.nn.functional.mse_loss(values[mask], target))
+    if not losses and not value_losses:
         return None, 0.0
-    return torch.stack(losses).mean(), correct / max(1, total)
+    classification = torch.stack(losses).mean() if losses else torch.tensor(0.0, device=next(iter(value_dict.values())).device)
+    value_loss = torch.stack(value_losses).mean() if value_losses else classification.new_tensor(0.0)
+    return classification + 0.25 * value_loss, correct / max(1, total)
 
 
 def train_hgt_epoch(
@@ -206,7 +233,7 @@ def train_hgt_epoch(
     if len(read_view.nodes) < 8:
         return HGTTrainingResult(epoch, "SKIPPED_INSUFFICIENT_DATA", runtime.unified_telemetry.model_version, None, 0.0, 0.0, len(read_view.nodes), 0, None)
 
-    x_dict, edge_index_dict, y_dict = build_hgt_graph(read_view, max_nodes=int(config.hgt_max_subgraph_nodes))
+    x_dict, edge_index_dict, y_dict, action_targets, action_masks, action_meta = build_hgt_graph(read_view, max_nodes=int(config.hgt_max_subgraph_nodes))
     metadata = (sorted(x_dict), sorted(edge_index_dict))
     if not metadata[1]:
         return HGTTrainingResult(epoch, "SKIPPED_NO_RELATIONS", runtime.unified_telemetry.model_version, None, 0.0, 0.0, len(read_view.nodes), 0, None)
@@ -250,8 +277,8 @@ def train_hgt_epoch(
     model.train()
     for _ in range(max(1, int(training_epochs))):
         optimizer.zero_grad(set_to_none=True)
-        logits = model(x_device, edges_device)
-        loss, _ = _loss(logits, y_dict, train_masks, torch)
+        logits, values = model(x_device, edges_device)
+        loss, _ = _loss(logits, values, y_dict, train_masks, action_targets, action_masks, torch)
         if loss is None:
             break
         loss.backward()
@@ -262,9 +289,9 @@ def train_hgt_epoch(
 
     model.eval()
     with torch.no_grad():
-        logits = model(x_device, edges_device)
-        val_loss_t, val_accuracy = _loss(logits, y_dict, val_masks, torch)
-        train_loss_t, train_accuracy = _loss(logits, y_dict, train_masks, torch)
+        logits, values = model(x_device, edges_device)
+        val_loss_t, val_accuracy = _loss(logits, values, y_dict, val_masks, action_targets, action_masks, torch)
+        train_loss_t, train_accuracy = _loss(logits, values, y_dict, train_masks, action_targets, action_masks, torch)
     validation_loss = float(val_loss_t.cpu().item()) if val_loss_t is not None else training_loss
     training_loss = float(train_loss_t.cpu().item()) if train_loss_t is not None else training_loss
     elapsed = max(1e-9, time.perf_counter() - start)
@@ -273,6 +300,23 @@ def train_hgt_epoch(
     candidate_version = f"hgt-{version_index:06d}"
     checkpoint_rel = f"models/{candidate_version}.pt"
     checkpoint_path = Path(root) / checkpoint_rel
+
+    action_score_sums: dict[int, dict[int, list[float]]] = {}
+    for node_type, rows in action_meta.items():
+        predicted = values[node_type].detach().cpu()
+        for index, row in enumerate(rows):
+            if row is None:
+                continue
+            environment_id, action_id = row
+            action_score_sums.setdefault(environment_id, {}).setdefault(action_id, []).append(float(predicted[index].item()))
+    action_scores = {
+        environment_id: {
+            action_id: sum(scores) / len(scores)
+            for action_id, scores in actions.items()
+            if scores
+        }
+        for environment_id, actions in action_score_sums.items()
+    }
 
     previous_val = float(manifest.get("validation_loss", float("inf")))
     promote = parent_version is None or validation_loss <= previous_val * 1.02
@@ -289,6 +333,7 @@ def train_hgt_epoch(
                 "heads": int(config.hgt_heads),
                 "validation_loss": validation_loss,
                 "training_loss": training_loss,
+                "action_scores": action_scores,
             },
             temporary_checkpoint,
         )
@@ -302,11 +347,13 @@ def train_hgt_epoch(
             "training_loss": training_loss,
             "graph_generation": int(read_view.generation),
             "examples": sum(int(v.numel()) for v in y_dict.values()),
+            "action_scores": action_scores,
         }
         temporary_manifest = manifest_path.with_suffix(".json.tmp")
         temporary_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary_manifest, manifest_path)
         model_version = candidate_version
+        runtime.set_hgt_action_scores(action_scores)
     else:
         model_version = str(parent_version)
 
@@ -327,7 +374,7 @@ def train_hgt_epoch(
         historical_retention=train_accuracy,
         current_curriculum_gain=max(0.0, val_accuracy - 0.125),
         cross_family_validation_gain=max(0.0, val_accuracy - train_accuracy),
-        loss_by_head={"memory_level": validation_loss},
+        loss_by_head={"memory_type": validation_loss, "action_value": validation_loss},
     )
     runtime.record_hgt_training(sample)
     runtime.record_model_evolution(
