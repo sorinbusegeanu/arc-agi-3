@@ -16,6 +16,8 @@ class SyntheticSymbolicConfig:
     horizon: int = 16
     aligned: bool = True
     shuffled: bool = False
+    emit_symbols: bool = True
+    scenario: str = "symbolic-causal-v1"
 
 
 class SyntheticSymbolicEnvironment(StructuralAdapter):
@@ -24,7 +26,7 @@ class SyntheticSymbolicEnvironment(StructuralAdapter):
             raise ValueError("synthetic budgets must be positive")
         self.config = config
         self._rng = Random(config.seed)
-        self._identity = EnvironmentIdentity("synthetic", "symbolic-causal-v1", repr(config), f"seed={config.seed}")
+        self._identity = EnvironmentIdentity("synthetic", str(config.scenario), repr(config), f"seed={config.seed}")
         self._observation_schema = ObservationSchema("discrete", "state=0..3")
         self._action_schema = ActionSchema("discrete", "n=2")
         self._boundary = BoundaryEvent()
@@ -55,7 +57,7 @@ class SyntheticSymbolicEnvironment(StructuralAdapter):
         return value if self.config.aligned else (value + 1) % self.config.vocabulary_size
 
     def optional_symbol_stream(self) -> tuple[object, ...]:
-        return self._symbols
+        return self._symbols if self.config.emit_symbols else ()
 
     def step(self, native_action: Any) -> int:
         before = self._state
