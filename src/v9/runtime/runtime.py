@@ -197,6 +197,38 @@ class ContinuousMemoryRuntime:
                     self._drain_timeline()
             return experience
 
+    def record_symbol_stream(self, adapter: Any, *, producer_id: int, producer_sequence: int, episode_id: EpisodeId, symbol_codec: DeterministicSymbolCodec) -> int:
+        with self._lock:
+            environment = self.environments.register(adapter.identity()).value
+            symbols = tuple(adapter.optional_symbol_stream())
+            if not symbols:
+                return 0
+            self.symbol_codecs[symbol_codec.vocabulary_id.value] = symbol_codec
+            observations = symbol_codec.encode_stream(symbols, stream_name=f"{environment}:{episode_id.value}:{producer_sequence}")
+            events = tuple(
+                PassiveSymbolEvent(
+                    TimelineIdentity(
+                        EventUid.from_producer(producer_id + 1_000_000, producer_sequence * 10_000 + index),
+                        self._watermark + index + 1,
+                        producer_id + 1_000_000,
+                        producer_sequence * 10_000 + index,
+                        environment,
+                        episode_id,
+                        SYMBOL_MODALITY,
+                    ),
+                    row.vocabulary_id,
+                    row.stream_id,
+                    row.symbol_id,
+                    row.position.value,
+                )
+                for index, row in enumerate(observations)
+            )
+            accepted = 0
+            for event in self.timeline.append_symbols(events, tuple(1 for _ in symbols)):
+                accepted += 1
+                self._drain_timeline()
+            return accepted
+
     def _drain_timeline(self) -> None:
         while (event := self.timeline.pop_next()) is not None:
             self._watermark = max(self._watermark, event.identity.causal_watermark)
