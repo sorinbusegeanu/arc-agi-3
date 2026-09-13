@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import importlib
+import logging
+import os
+import traceback
+import warnings
 import multiprocessing as mp
 import queue
 from dataclasses import dataclass
@@ -45,6 +50,14 @@ class ActorDone:
 
 
 @dataclass(frozen=True, slots=True)
+class ActorError:
+    actor_id: int
+    game_id: str
+    message: str
+    traceback_text: str
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerStop:
     reason: str = "stop"
 
@@ -74,89 +87,105 @@ def actor_process_main(
     alfred_backend_factory: str | None,
     run_nonce: int,
 ) -> None:
-    factory = _load_factory(adapter_factory_path)
-    adapter = factory(spec, seed=seed, env_root=env_root, alfred_backend_factory=alfred_backend_factory)
-    identity = adapter.identity()
-    environment_instance_id = int(identity.instance_id.value)
-    positives = negatives = episode_boundaries = resets = completed = 0
-    episode_ordinal = 1
-    policy = initial_policy
-    policy_refreshes = 0
-    rng = Random(seed)
-    refresh_steps = max(1, int(policy_refresh_steps))
-    refresh_seconds = max(0.001, float(policy_refresh_ms) / 1000.0)
-    next_refresh_time = __import__("time").monotonic() + refresh_seconds
+    game_id = str(getattr(spec, "display_name", getattr(spec, "game_id", "unknown")))
+    adapter = None
+    devnull = open(os.devnull, "w", encoding="utf-8")
     try:
-        for index in range(int(steps)):
-            actions = tuple(sorted(set(int(v) for v in adapter.available_actions())))
-            if not actions:
-                adapter.reset()
-                episode_ordinal += 1
-                resets += 1
+        logging.disable(logging.INFO)
+        warnings.filterwarnings("ignore")
+        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+            factory = _load_factory(adapter_factory_path)
+            adapter = factory(spec, seed=seed, env_root=env_root, alfred_backend_factory=alfred_backend_factory)
+            identity = adapter.identity()
+            environment_instance_id = int(identity.instance_id.value)
+            positives = negatives = episode_boundaries = resets = completed = 0
+            episode_ordinal = 1
+            policy = initial_policy
+            policy_refreshes = 0
+            rng = Random(seed)
+            refresh_steps = max(1, int(policy_refresh_steps))
+            refresh_seconds = max(0.001, float(policy_refresh_ms) / 1000.0)
+            next_refresh_time = __import__("time").monotonic() + refresh_seconds
+
+            for index in range(int(steps)):
                 actions = tuple(sorted(set(int(v) for v in adapter.available_actions())))
                 if not actions:
-                    continue
-            now = __import__("time").monotonic()
-            if index % refresh_steps == 0 or now >= next_refresh_time:
-                newest = None
-                while True:
-                    try:
-                        newest = policy_updates.get_nowait()
-                    except queue.Empty:
-                        break
-                if newest is not None and int(newest.generation) > int(policy.generation):
-                    policy = newest
-                    policy_refreshes += 1
-                next_refresh_time = now + refresh_seconds
-            learned_scores = policy.learned_scores(
-                environment_instance_id,
-                actions,
-                environment_type=identity.environment_type,
-            )
-            action = choose_action(
-                policy,
-                actions,
-                rng=rng,
-                epsilon=float(epsilon),
-                learned_scores=learned_scores,
-                target_environment_id=environment_instance_id,
-            )
-            before = adapter.observe()
-            after = adapter.step(int(action))
-            boundary = adapter.boundary_event()
-            observation_schema_id = int(adapter.observation_schema().schema_id)
-            stage_queue.put(
-                EncodedTransition(
-                    actor_id=actor_id,
-                    producer_sequence=index + 1,
-                    global_step=index,
-                    environment_identity=(identity.family, identity.environment_type, identity.config, identity.instance),
-                    episode_id=int(stable_u64(environment_instance_id, run_nonce, actor_id, episode_ordinal, person=b"v9-mp-episode")),
-                    observation_schema_id=observation_schema_id,
-                    before_signature=int(adapter.encode_observation(before)),
-                    action_id=int(adapter.encode_action(action)),
-                    after_signature=int(adapter.encode_observation(after)),
-                    available_actions_after=len(tuple(adapter.available_actions())),
-                    primary_valence=int(boundary.primary_valence),
-                    symbols=tuple(adapter.optional_symbol_stream()),
-                    curriculum_step=getattr(spec, "curriculum_step", None),
-                    game_scenario=str(getattr(spec, "game_id", identity.environment_type)),
-                    symbols_only=str(getattr(spec, "condition", "") or "").upper() == "C1",
+                    adapter.reset()
+                    episode_ordinal += 1
+                    resets += 1
+                    actions = tuple(sorted(set(int(v) for v in adapter.available_actions())))
+                    if not actions:
+                        continue
+                now = __import__("time").monotonic()
+                if index % refresh_steps == 0 or now >= next_refresh_time:
+                    newest = None
+                    while True:
+                        try:
+                            newest = policy_updates.get_nowait()
+                        except queue.Empty:
+                            break
+                    if newest is not None and int(newest.generation) > int(policy.generation):
+                        policy = newest
+                        policy_refreshes += 1
+                    next_refresh_time = now + refresh_seconds
+                learned_scores = policy.learned_scores(
+                    environment_instance_id,
+                    actions,
+                    environment_type=identity.environment_type,
                 )
-            )
-            completed += 1
-            positives += int(boundary.primary_valence > 0)
-            negatives += int(boundary.primary_valence < 0)
-            episode_boundaries += int(not boundary.continuation)
-            if not boundary.continuation:
-                adapter.reset()
-                episode_ordinal += 1
-                resets += 1
-        result_queue.put(ActorDone(actor_id, str(getattr(spec, "display_name", identity.environment_type)), completed, positives, negatives, episode_boundaries, resets, policy_refreshes))
+                action = choose_action(
+                    policy,
+                    actions,
+                    rng=rng,
+                    epsilon=float(epsilon),
+                    learned_scores=learned_scores,
+                    target_environment_id=environment_instance_id,
+                )
+                before = adapter.observe()
+                after = adapter.step(int(action))
+                boundary = adapter.boundary_event()
+                observation_schema_id = int(adapter.observation_schema().schema_id)
+                stage_queue.put(
+                    EncodedTransition(
+                        actor_id=actor_id,
+                        producer_sequence=index + 1,
+                        global_step=index,
+                        environment_identity=(identity.family, identity.environment_type, identity.config, identity.instance),
+                        episode_id=int(stable_u64(environment_instance_id, run_nonce, actor_id, episode_ordinal, person=b"v9-mp-episode")),
+                        observation_schema_id=observation_schema_id,
+                        before_signature=int(adapter.encode_observation(before)),
+                        action_id=int(adapter.encode_action(action)),
+                        after_signature=int(adapter.encode_observation(after)),
+                        available_actions_after=len(tuple(adapter.available_actions())),
+                        primary_valence=int(boundary.primary_valence),
+                        symbols=tuple(adapter.optional_symbol_stream()),
+                        curriculum_step=getattr(spec, "curriculum_step", None),
+                        game_scenario=str(getattr(spec, "game_id", identity.environment_type)),
+                        symbols_only=str(getattr(spec, "condition", "") or "").upper() == "C1",
+                    )
+                )
+                completed += 1
+                positives += int(boundary.primary_valence > 0)
+                negatives += int(boundary.primary_valence < 0)
+                episode_boundaries += int(not boundary.continuation)
+                if not boundary.continuation:
+                    adapter.reset()
+                    episode_ordinal += 1
+                    resets += 1
+            result_queue.put(ActorDone(actor_id, game_id, completed, positives, negatives, episode_boundaries, resets, policy_refreshes))
+    except BaseException as exc:
+        result_queue.put(ActorError(actor_id, game_id, repr(exc), traceback.format_exc()))
+        raise SystemExit(1)
     finally:
-        close = getattr(adapter, "close", None)
-        if callable(close):
-            close()
+        if adapter is not None:
+            close = getattr(adapter, "close", None)
+            if callable(close):
+                try:
+                    with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                        close()
+                except BaseException:
+                    pass
+        devnull.close()
 
 
 def stage_worker_main(stage_queue: Any, shard_queues: tuple[Any, ...]) -> None:
