@@ -186,7 +186,20 @@ def train_hgt_epoch(
     learning_rate: float,
     root: str | Path,
 ) -> HGTTrainingResult:
-    torch, _, _ = _require_torch()
+    try:
+        torch, _, _ = _require_torch()
+    except RuntimeError:
+        return HGTTrainingResult(
+            epoch,
+            "SKIPPED_DEPENDENCY",
+            runtime.unified_telemetry.model_version,
+            None,
+            0.0,
+            0.0,
+            len(runtime.read_view.nodes),
+            0,
+            None,
+        )
     config = runtime.config.scientific
     read_view = runtime.read_view
     if len(read_view.nodes) < 8:
