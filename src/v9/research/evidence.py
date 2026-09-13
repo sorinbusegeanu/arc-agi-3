@@ -22,7 +22,7 @@ class EvidenceRecord:
 class EvidenceLedger:
     SCHEMA_VERSION = 1
 
-    def __init__(self, path: Path | None, scientific_config_id: str, *, flush_records: int = 256, flush_interval_seconds: float = 0.5) -> None:
+    def __init__(self, path: Path | None, scientific_config_id: str, *, flush_records: int = 1, flush_interval_seconds: float = 0.5) -> None:
         self.path = path
         self.scientific_config_id = scientific_config_id
         self.records: list[EvidenceRecord] = []
