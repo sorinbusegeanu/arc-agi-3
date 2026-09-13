@@ -273,7 +273,7 @@ def run_continuous(args: argparse.Namespace) -> int:
             if steps:
                 jobs.append((actor_id, spec, steps, args.seed + actor_id * 1009))
                 actor_id += 1
-    print(f"v9 continuous: games={len(games)} actors={min(args.actors, len(jobs))} shards={args.shards} stage_workers={args.stage_workers} peers={'off' if args.no_peers else 'on'} lifecycle={args.lifecycle} snapshots={'off' if args.no_snapshots else 'native'} game_ids={','.join(games)}", flush=True)
+    print(f"v9 continuous: games={len(games)} actors={min(args.actors, len(jobs))} shards={args.shards} stage_workers={args.stage_workers} ingest_workers={args.ingest_workers} derivation_workers={args.derivation_workers} peers={'off' if args.no_peers else 'on'} lifecycle={args.lifecycle} snapshots={'off' if args.no_snapshots else 'native'} game_ids={','.join(games)}", flush=True)
     try:
         process_results = run_parallel_memory_jobs(
             runtime,
