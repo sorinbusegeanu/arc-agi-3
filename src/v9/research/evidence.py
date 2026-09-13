@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from time import monotonic
@@ -41,11 +41,25 @@ class EvidenceLedger:
     def append(self, kind: str, causal_watermark: int, payload: dict[str, Any]) -> EvidenceRecord:
         with self._lock:
             sequence = len(self.records)
-            uid = stable_u64(kind, causal_watermark, sequence, json.dumps(payload, sort_keys=True), person=b"v9-evidence")
-            record = EvidenceRecord(uid, str(kind), int(causal_watermark), self.scientific_config_id, dict(payload))
+            payload_copy = dict(payload)
+            payload_json = json.dumps(payload_copy, sort_keys=True)
+            uid = stable_u64(kind, causal_watermark, sequence, payload_json, person=b"v9-evidence")
+            kind_text = str(kind)
+            watermark = int(causal_watermark)
+            record = EvidenceRecord(uid, kind_text, watermark, self.scientific_config_id, payload_copy)
             self.records.append(record)
             if self.path is not None:
-                self._pending_lines.append(json.dumps(asdict(record), sort_keys=True, separators=(",", ":")) + "\n")
+                # Reuse the canonical payload serialization used for the evidence
+                # identity instead of serializing the same nested payload twice.
+                self._pending_lines.append(
+                    "{" +
+                    f'"uid":{uid},' +
+                    f'"kind":{json.dumps(kind_text)},' +
+                    f'"causal_watermark":{watermark},' +
+                    f'"scientific_config_id":{json.dumps(self.scientific_config_id)},' +
+                    f'"payload":{payload_json}' +
+                    "}\n"
+                )
                 now = monotonic()
                 if len(self._pending_lines) >= self._flush_records or now - self._last_flush >= self._flush_interval_seconds:
                     self._flush_locked(now=now)
