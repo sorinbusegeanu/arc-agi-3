@@ -9,6 +9,8 @@ from v9.memory.identity import MemoryUid
 from v9.memory.model import CognitiveState, MemoryLevel
 from v9.telemetry import ConsolidationSample
 
+from .publication import node_ref
+
 
 @dataclass(frozen=True, slots=True)
 class LifecycleRecord:
@@ -153,6 +155,30 @@ def retention_score(record: LifecycleRecord, payload: dict[str, Any], *, waterma
     return max(0.0, min(1.0, 0.35 * support + 0.25 * recency + 0.15 * surprise + 0.15 * explanatory + 0.10 * transfer))
 
 
+def _sync_cognitive_visibility(graph: Any, updates: dict[MemoryUid, CognitiveState]) -> None:
+    if not updates:
+        return
+    changed: list[MemoryUid] = []
+    with graph._publication_lock:
+        for uid, state in updates.items():
+            payload = graph.payloads.get(uid)
+            if payload is None:
+                continue
+            before = payload.get("cognitive_state")
+            if state in {CognitiveState.ACTIVE, CognitiveState.REACTIVATED, CognitiveState.VALIDATED}:
+                payload.pop("cognitive_state", None)
+            else:
+                payload["cognitive_state"] = state.name
+            after = payload.get("cognitive_state")
+            if before != after:
+                changed.append(uid)
+        if changed:
+            for uid in changed:
+                graph.versions.bump(node_ref(uid))
+            graph.generation += 1
+            graph._cached_read_view = None
+
+
 def run_lifecycle_maintenance(
     runtime: Any,
     *,
@@ -217,6 +243,7 @@ def run_lifecycle_maintenance(
     dormant = 0
     pending = 0
     reactivated = 0
+    visibility_updates: dict[MemoryUid, CognitiveState] = {}
     for row in candidates:
         node = graph.nodes.get(row.uid)
         if node is None:
@@ -228,20 +255,29 @@ def run_lifecycle_maintenance(
         covered = replacement_uid is not None
         if row.state is CognitiveState.DORMANT:
             if score >= reactivation_threshold:
-                registry.transition(row.uid, CognitiveState.REACTIVATED, watermark=watermark, retention_score=score)
+                state = CognitiveState.REACTIVATED
+                registry.transition(row.uid, state, watermark=watermark, retention_score=score)
                 reactivated += 1
             elif node.level <= MemoryLevel.M1 and covered and watermark - int(row.last_transition_watermark) >= int(dormancy_grace_watermarks):
-                registry.transition(row.uid, CognitiveState.RETIRE_PENDING, watermark=watermark, retention_score=score, replacement_uid=replacement_uid)
+                state = CognitiveState.RETIRE_PENDING
+                registry.transition(row.uid, state, watermark=watermark, retention_score=score, replacement_uid=replacement_uid)
                 pending += 1
             else:
-                registry.transition(row.uid, CognitiveState.DORMANT, watermark=watermark, retention_score=score, replacement_uid=replacement_uid)
+                state = CognitiveState.DORMANT
+                registry.transition(row.uid, state, watermark=watermark, retention_score=score, replacement_uid=replacement_uid)
+            visibility_updates[row.uid] = state
             continue
         can_dormant = covered if node.level <= MemoryLevel.M1 else True
         if can_dormant and age >= int(dormancy_grace_watermarks) and score < dormant_threshold:
-            registry.transition(row.uid, CognitiveState.DORMANT, watermark=watermark, retention_score=score, replacement_uid=replacement_uid)
+            state = CognitiveState.DORMANT
+            registry.transition(row.uid, state, watermark=watermark, retention_score=score, replacement_uid=replacement_uid)
             dormant += 1
         else:
-            registry.transition(row.uid, row.state, watermark=watermark, retention_score=score)
+            state = row.state
+            registry.transition(row.uid, state, watermark=watermark, retention_score=score)
+        visibility_updates[row.uid] = state
+
+    _sync_cognitive_visibility(graph, visibility_updates)
 
     replay_after = len(runtime._replay_pool)
     if retired_uids or reactivated:
