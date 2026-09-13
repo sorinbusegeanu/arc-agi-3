@@ -22,6 +22,13 @@ def _freeze(value: Any) -> Any:
     return value
 
 
+def _cognitively_visible(payload: dict[str, Any]) -> bool:
+    if int(payload.get("cognitive_state_version", 0) or 0) < 2:
+        return True
+    state = str(payload.get("cognitive_state", "ACTIVE")).upper()
+    return state not in {"DORMANT", "RETIRE_PENDING", "QUARANTINED", "RETIRED"}
+
+
 @dataclass(frozen=True, slots=True)
 class ReadView:
     generation: int
@@ -33,11 +40,10 @@ class ReadView:
 
     @classmethod
     def build(cls, generation: int, nodes: dict[MemoryUid, CanonicalNode], payloads: dict[MemoryUid, dict[str, Any]], edges: dict[tuple[MemoryUid, str, MemoryUid], RelationEdge], versions: dict[ObjectRef, int]) -> "ReadView":
-        hidden_states = {"DORMANT", "RETIRE_PENDING", "QUARANTINED", "RETIRED"}
         visible_nodes = {
             uid: node
             for uid, node in nodes.items()
-            if str(payloads.get(uid, {}).get("cognitive_state", "ACTIVE")).upper() not in hidden_states
+            if _cognitively_visible(payloads.get(uid, {}))
         }
         visible_uids = set(visible_nodes)
         visible_payloads = {uid: payloads.get(uid, {}) for uid in visible_uids}
