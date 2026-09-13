@@ -12,7 +12,7 @@ from typing import Any
 
 from v9.cognition.action_selection import choose_action
 from v9.curriculum import CurriculumSelection, EnvironmentSpec, resolve_curriculum_selector
-from v9.environments import ARCAdapter, ChessAdapter, GymDiscreteAdapter, GymStructuredAdapter, SudokuAdapter, SyntheticSymbolicEnvironment, make_babyai_adapter
+from v9.environments import ARCAdapter, ChessAdapter, GymDiscreteAdapter, GymStructuredAdapter, SokobanAdapter, SudokuAdapter, SyntheticSymbolicEnvironment, make_babyai_adapter
 from v9.environments.synthetic_symbolic import SyntheticSymbolicConfig
 from v9.modalities.symbols import DeterministicSymbolCodec
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig
@@ -97,9 +97,11 @@ def make_adapter(spec: EnvironmentSpec | str, *, seed: int, env_root: str | None
 
     if adapter == "gym_discrete":
         return GymDiscreteAdapter(game_id, seed=seed, make_kwargs=kwargs)
-    if adapter in {"gym_structured", "gym_image", "sokoban"}:
-        family = "image" if adapter == "gym_image" else ("grid" if adapter == "sokoban" else "structured")
+    if adapter in {"gym_structured", "gym_image"}:
+        family = "image" if adapter == "gym_image" else "structured"
         return GymStructuredAdapter(game_id, seed=seed, make_kwargs=kwargs, observation_family=family)
+    if adapter == "sokoban":
+        return SokobanAdapter(environment_name=game_id, seed=seed)
     if adapter in {"minigrid", "babyai"}:
         return make_babyai_adapter(
             game_id,
