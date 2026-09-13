@@ -71,4 +71,4 @@ def test_cli_smoke_uses_only_v9_named_artifacts(tmp_path: Path) -> None:
     assert (tmp_path / "snapshots").is_dir()
     assert not (tmp_path / "v8_run_summary.json").exists()
     report = json.loads((tmp_path / "reports" / "reporting_cut.json").read_text())
-    assert report["scientific_config"]["design_version"] == "9.5"
+    assert report["scientific_config"]["design_version"] == "9.7.6"
