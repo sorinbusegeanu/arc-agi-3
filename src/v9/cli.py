@@ -191,7 +191,10 @@ def _actor(runtime: ContinuousMemoryRuntime, spec: EnvironmentSpec, *, actor_id:
             before = adapter.observe()
             action = choose_action(runtime.read_view, actions, rng=rng, epsilon=epsilon, target_environment_id=identity.value)
             after = adapter.step(action)
-            runtime.record_interaction(adapter, producer_id=actor_id, producer_sequence=index + 1, global_step=index, native_action=action, before_observation=before, after_observation=after, episode_id=episode, symbol_codec=codec)
+            if (spec.condition or "").upper() == "C1":
+                runtime.record_symbol_stream(adapter, producer_id=actor_id, producer_sequence=index + 1, episode_id=episode, symbol_codec=codec)
+            else:
+                runtime.record_interaction(adapter, producer_id=actor_id, producer_sequence=index + 1, global_step=index, native_action=action, before_observation=before, after_observation=after, episode_id=episode, symbol_codec=codec)
             runtime.unified_telemetry.record_curriculum_event(step=spec.curriculum_step, environment_family=adapter.identity().family, game_scenario=spec.game_id)
             completed += 1
             boundary = adapter.boundary_event()
