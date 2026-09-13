@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from v9.cli import make_adapter, resolve_game_specs, resolve_games
+from v9.cli import build_parser, make_adapter, resolve_game_specs, resolve_games, run_continuous
 from v9.curriculum import load_curriculum, resolve_curriculum_selector
 from v9.environments import GymDiscreteAdapter, SokobanAdapter, SyntheticSymbolicEnvironment
 
@@ -70,3 +70,26 @@ def test_legacy_game_selectors_remain_supported() -> None:
     mix = resolve_game_specs("mix")
     assert {spec.adapter for spec in mix} == {"auto"}
     assert len(mix) == 5
+
+
+def test_step1_continuous_run_executes_curriculum(tmp_path) -> None:
+    root = tmp_path / "step1"
+    args = build_parser().parse_args([
+        "continuous-run",
+        "--root", str(root),
+        "--games", "step1",
+        "--steps-per-game", "1",
+        "--actors", "2",
+        "--shards", "2",
+        "--stage-workers", "1",
+        "--no-peers",
+    ])
+    assert run_continuous(args) == 0
+
+    import json
+    summary = json.loads((root / "v9_run_summary.json").read_text(encoding="utf-8"))
+    assert len(summary["games"]) == 12
+    assert summary["automatic_transfer_experiments"]["mode"] == "learning_only"
+    counts = summary["metrics"]["telemetry_diagnostics"]["curriculum_counts"]
+    assert sum(counts.values()) == 12
+    assert all(key.startswith("step1|synthetic|") for key in counts)
