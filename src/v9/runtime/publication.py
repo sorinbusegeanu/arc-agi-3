@@ -27,13 +27,17 @@ def edge_ref(edge: RelationEdge) -> ObjectRef:
 class CanonicalGraph:
     SCHEMA_VERSION = 1
 
-    def __init__(self, partition_count: int, *, node_capacity_per_partition: int = 250_000, edge_capacity_per_partition: int = 500_000, applied_proposal_capacity: int = 65_536) -> None:
+    def __init__(self, partition_count: int, *, node_capacity_per_partition: int | None = 250_000, edge_capacity_per_partition: int | None = 500_000, applied_proposal_capacity: int = 65_536) -> None:
         self.partition_count = int(partition_count)
-        self.node_capacity_per_partition = int(node_capacity_per_partition)
-        self.edge_capacity_per_partition = int(edge_capacity_per_partition)
+        self.node_capacity_per_partition = None if node_capacity_per_partition is None else int(node_capacity_per_partition)
+        self.edge_capacity_per_partition = None if edge_capacity_per_partition is None else int(edge_capacity_per_partition)
         self.applied_proposal_capacity = int(applied_proposal_capacity)
-        if min(self.partition_count, self.node_capacity_per_partition, self.edge_capacity_per_partition, self.applied_proposal_capacity) <= 0:
-            raise ValueError("canonical graph capacities must be positive")
+        if self.partition_count <= 0 or self.applied_proposal_capacity <= 0:
+            raise ValueError("canonical graph counts must be positive")
+        if self.node_capacity_per_partition is not None and self.node_capacity_per_partition <= 0:
+            raise ValueError("canonical graph node capacity must be positive or None")
+        if self.edge_capacity_per_partition is not None and self.edge_capacity_per_partition <= 0:
+            raise ValueError("canonical graph edge capacity must be positive or None")
         self.generation = 0
         self.nodes: dict[MemoryUid, CanonicalNode] = {}
         self.payloads: dict[MemoryUid, dict[str, Any]] = {}
@@ -83,7 +87,7 @@ class CanonicalGraph:
                     return MutationResult(proposal.proposal_uid, MutationOutcome.INVALID, self.generation)
                 owner = write.node.uid.shard(self.partition_count)
                 if current is None:
-                    if self._node_counts_by_partition[owner] + node_count_deltas[owner] >= self.node_capacity_per_partition:
+                    if self.node_capacity_per_partition is not None and self._node_counts_by_partition[owner] + node_count_deltas[owner] >= self.node_capacity_per_partition:
                         return MutationResult(proposal.proposal_uid, MutationOutcome.INVALID, self.generation)
                     node_count_deltas[owner] += 1
                 incoming_payload = dict(write.payload or {})
@@ -106,7 +110,7 @@ class CanonicalGraph:
                     edge_updates[write.edge.key] = None
                 else:
                     if current_edge is None:
-                        if self._edge_counts_by_partition[owner] + edge_count_deltas[owner] >= self.edge_capacity_per_partition:
+                        if self.edge_capacity_per_partition is not None and self._edge_counts_by_partition[owner] + edge_count_deltas[owner] >= self.edge_capacity_per_partition:
                             return MutationResult(proposal.proposal_uid, MutationOutcome.INVALID, self.generation)
                         edge_count_deltas[owner] += 1
                     edge_updates[write.edge.key] = write.edge
@@ -203,7 +207,14 @@ class CanonicalGraph:
     def from_state_dict(cls, state: dict[str, object]) -> "CanonicalGraph":
         if int(state.get("schema_version", 0)) != cls.SCHEMA_VERSION:
             raise ValueError("unsupported native v9 graph schema")
-        result = cls(int(state["partition_count"]), node_capacity_per_partition=int(state.get("node_capacity_per_partition", 250_000)), edge_capacity_per_partition=int(state.get("edge_capacity_per_partition", 500_000)), applied_proposal_capacity=int(state.get("applied_proposal_capacity", 65_536)))
+        raw_node_capacity = state.get("node_capacity_per_partition", 250_000)
+        raw_edge_capacity = state.get("edge_capacity_per_partition", 500_000)
+        result = cls(
+            int(state["partition_count"]),
+            node_capacity_per_partition=None if raw_node_capacity is None else int(raw_node_capacity),
+            edge_capacity_per_partition=None if raw_edge_capacity is None else int(raw_edge_capacity),
+            applied_proposal_capacity=int(state.get("applied_proposal_capacity", 65_536)),
+        )
         result.generation = int(state.get("generation", 0))
         for raw in state.get("nodes", []):
             uid = MemoryUid(int(raw["hi"]), int(raw["lo"]))
