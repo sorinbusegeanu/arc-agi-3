@@ -73,13 +73,7 @@ def resolve_start_method(start_method: str | None = None) -> str:
 
 
 def ensure_process_server_ready(start_method: str | None = None) -> str:
-    """Start the multiprocessing server while the parent is still small.
-
-    Forkserver is useful only if the server exists before the parent restores the
-    multi-gigabyte memory graph. Starting it after restore still makes the large,
-    threaded parent participate in process bootstrap. Production continuous runs
-    call this before importing the full CLI/runtime path.
-    """
+    """Start the multiprocessing server while the parent is still small."""
     global _FORKSERVER_READY
     method = resolve_start_method(start_method)
     if method != "forkserver" or _FORKSERVER_READY:
@@ -98,6 +92,25 @@ def ensure_process_server_ready(start_method: str | None = None) -> str:
         raise RuntimeError(f"v9 forkserver bootstrap failed with code {process.exitcode}")
     _FORKSERVER_READY = True
     return method
+
+
+def _close_queue(queue_obj: Any, *, drain: bool) -> None:
+    if queue_obj is None:
+        return
+    if not drain:
+        try:
+            queue_obj.cancel_join_thread()
+        except (AttributeError, OSError, ValueError):
+            pass
+    try:
+        queue_obj.close()
+    except (AttributeError, OSError, ValueError):
+        pass
+    if drain:
+        try:
+            queue_obj.join_thread()
+        except (AttributeError, AssertionError, OSError, ValueError):
+            pass
 
 
 def _load_factory(path: str):
@@ -234,11 +247,6 @@ class ProcessTopology:
         self.actors = int(actors)
         self.stage_workers = int(stage_workers)
         self.shards = int(shards)
-        # Keep the whole process graph in one context. The previous mixed
-        # spawn/forkserver topology still started actors directly from the huge
-        # restored parent and crossed semaphore contexts. Forkserver is prewarmed
-        # before restore instead, so later actor starts are served by the small
-        # server process.
         self.stage_queue = self.ctx.Queue(maxsize=int(queue_capacity))
         self.publication_queue = self.ctx.Queue(maxsize=int(queue_capacity))
         self.result_queue = self.ctx.Queue(maxsize=max(64, int(actors) * 2))
@@ -247,6 +255,7 @@ class ProcessTopology:
         self.stage_processes: list[Any] = []
         self.shard_processes: list[Any] = []
         self.actor_processes: list[Any] = []
+        self._closed = False
 
     def start_workers(self) -> None:
         for shard_id, shard_queue in enumerate(self.shard_queues):
@@ -307,6 +316,20 @@ class ProcessTopology:
             if process.is_alive():
                 process.terminate()
             process.join(timeout=5)
+
+    def close(self, *, drain: bool = True) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        queues = (
+            self.stage_queue,
+            self.publication_queue,
+            self.result_queue,
+            *self.shard_queues,
+            *self.policy_updates,
+        )
+        for queue_obj in queues:
+            _close_queue(queue_obj, drain=drain)
 
     @property
     def process_count(self) -> int:
