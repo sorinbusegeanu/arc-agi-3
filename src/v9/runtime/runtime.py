@@ -153,10 +153,24 @@ class ContinuousMemoryRuntime:
 
     def actor_policy_snapshot(self) -> ActorPolicySnapshot:
         with self._lock:
-            view = self.graph.read_view()
+            action_supports: dict[int, float] = {}
+            for signature, support in self._m1n_supports.items():
+                rows = self._m1n_occurrences.get(int(signature), ())
+                if not rows:
+                    continue
+                observable = str(rows[0].observable_relation)
+                prefix, separator, remainder = observable.partition(":")
+                action_text, action_separator, _ = remainder.partition(":")
+                if prefix != "ACTION" or not separator or not action_separator:
+                    continue
+                try:
+                    action = int(action_text)
+                except ValueError:
+                    continue
+                action_supports[action] = action_supports.get(action, 0.0) + float(support)
             return ActorPolicySnapshot.build(
-                generation=view.generation,
-                normalized_action_supports=view.normalized_action_supports,
+                generation=self.graph.generation,
+                normalized_action_supports=action_supports,
                 hgt_action_scores=self._hgt_action_scores,
                 model_version=self.unified_telemetry.model_version,
             )
