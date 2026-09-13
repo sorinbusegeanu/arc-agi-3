@@ -21,6 +21,7 @@ class ProcessActorResult:
     steps: int
     positive_boundaries: int
     negative_boundaries: int
+    episode_boundaries: int
     resets: int
 
 
@@ -261,7 +262,7 @@ def run_parallel_memory_jobs(
                     raise RuntimeError(f"actor process {done.actor_id} exited with code {process.exitcode}")
                 free_slots.append(slot)
                 free_slots.sort()
-                results.append(ProcessActorResult(done.actor_id, done.game_id, done.steps, done.positive_boundaries, done.negative_boundaries, done.resets))
+                results.append(ProcessActorResult(done.actor_id, done.game_id, done.steps, done.positive_boundaries, done.negative_boundaries, done.episode_boundaries, done.resets))
                 launch()
                 progressed = True
             if time.monotonic() >= next_progress:
