@@ -39,9 +39,26 @@ def build_epoch_jobs(specs: tuple[Any, ...], args: Any, *, epoch: int) -> list[t
     return jobs
 
 
+def _scenario_success(rows: list[Any]) -> tuple[dict[str, float], float]:
+    totals: dict[str, tuple[int, int]] = {}
+    for row in rows:
+        success, episodes = totals.get(row.game_id, (0, 0))
+        totals[row.game_id] = (
+            success + int(row.positive_boundaries),
+            episodes + int(row.episode_boundaries),
+        )
+    rates = {
+        game_id: (success / episodes if episodes else 0.0)
+        for game_id, (success, episodes) in totals.items()
+    }
+    macro = sum(rates.values()) / len(rates) if rates else 0.0
+    return rates, macro
+
+
 def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
     actor_results = []
     epoch_results = []
+    baseline_success: float | None = None
     for epoch in range(1, int(args.epochs) + 1):
         jobs = build_epoch_jobs(specs, args, epoch=epoch)
         print(f"v9 epoch {epoch}/{args.epochs} sampling start actors={len(jobs)}", flush=True)
@@ -65,6 +82,13 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
         )
         actor_results.extend(process_results)
         runtime.wait_quiescent(args.drain_timeout)
+        scenario_success, behavioral_success = _scenario_success(process_results)
+        if baseline_success is None:
+            baseline_success = behavioral_success
+        behavioral_gain = behavioral_success - baseline_success
+        runtime.set_telemetry_gauge("behavioral_success_rate", behavioral_success)
+        runtime.set_telemetry_gauge("behavioral_success_gain", behavioral_gain)
+        runtime.set_telemetry_gauge("successful_scenarios", sum(rate > 0.0 for rate in scenario_success.values()))
 
         print(f"v9 epoch {epoch}/{args.epochs} training start", flush=True)
         training = train_hgt_epoch(
@@ -86,7 +110,12 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
             EpochRunResult(
                 epoch=epoch,
                 actors=tuple(asdict(row) for row in process_results),
-                training=asdict(training),
+                training={
+                    **asdict(training),
+                    "behavioral_success_rate": behavioral_success,
+                    "behavioral_success_gain": behavioral_gain,
+                    "scenario_success_rate": scenario_success,
+                },
                 metrics=runtime.metrics(),
             )
         )
