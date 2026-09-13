@@ -14,6 +14,7 @@ class EpochRunResult:
     epoch: int
     actors: tuple[dict[str, Any], ...]
     training: dict[str, Any]
+    performance: dict[str, Any]
     metrics: dict[str, Any]
 
 
@@ -54,6 +55,32 @@ def _scenario_success(rows: list[Any]) -> tuple[dict[str, float], float]:
     }
     macro = sum(rates.values()) / len(rates) if rates else 0.0
     return rates, macro
+
+
+def _performance_summary(runtime: Any) -> dict[str, Any]:
+    metrics = runtime.metrics()
+    diagnostic = dict(metrics.get("telemetry_diagnostics", {}))
+    sampled = int(diagnostic.get("sampled_steps", 0))
+    ingested = int(diagnostic.get("ingested_steps", 0))
+    backlog = int(diagnostic.get("sampling_backlog", max(0, sampled - ingested)))
+    coordinator_actions = int(diagnostic.get("coordinator_action_requests", 0))
+    return {
+        "sampled_steps": sampled,
+        "ingested_steps": ingested,
+        "sampling_rate": float(diagnostic.get("sampling_rate", 0.0)),
+        "ingestion_rate": float(diagnostic.get("ingestion_rate", 0.0)),
+        "sampling_backlog": backlog,
+        "ingest_queue_depth": int(diagnostic.get("ingest_queue_depth", 0)),
+        "derivation_queue_depth": int(diagnostic.get("derivation_queue_depth", 0)),
+        "coordinator_action_requests": coordinator_actions,
+        "policy_snapshot_generation": int(diagnostic.get("policy_snapshot_generation", 0)),
+        "policy_snapshot_refreshes": int(diagnostic.get("policy_snapshot_refreshes", 0)),
+        "optimized_sampling_path": bool(
+            coordinator_actions == 0
+            and sampled == ingested
+            and backlog == 0
+        ),
+    }
 
 
 def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
@@ -109,6 +136,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
         )
         if runtime.config.enable_snapshots:
             runtime.snapshot()
+        performance = _performance_summary(runtime)
         epoch_results.append(
             EpochRunResult(
                 epoch=epoch,
@@ -119,6 +147,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
                     "behavioral_success_gain": behavioral_gain,
                     "scenario_success_rate": scenario_success,
                 },
+                performance=performance,
                 metrics=runtime.metrics(),
             )
         )
