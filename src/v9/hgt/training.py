@@ -187,6 +187,7 @@ def train_hgt_epoch(
     root: str | Path,
 ) -> HGTTrainingResult:
     torch, _, _ = _require_torch()
+    config = runtime.config.scientific
     read_view = runtime.read_view
     if len(read_view.nodes) < 8:
         return HGTTrainingResult(epoch, "SKIPPED_INSUFFICIENT_DATA", runtime.unified_telemetry.model_version, None, 0.0, 0.0, len(read_view.nodes), 0, None)
@@ -196,7 +197,6 @@ def train_hgt_epoch(
     if not metadata[1]:
         return HGTTrainingResult(epoch, "SKIPPED_NO_RELATIONS", runtime.unified_telemetry.model_version, None, 0.0, 0.0, len(read_view.nodes), 0, None)
 
-    config = runtime.config.scientific
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     wrapper = _HGTWrapper(
         metadata,
