@@ -112,6 +112,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
         )
         actor_results.extend(process_results)
         runtime.wait_quiescent(args.drain_timeout)
+        runtime.flush_deferred_memory_updates()
         scenario_success, behavioral_success = _scenario_success(process_results)
         if baseline_success is None:
             baseline_success = behavioral_success
