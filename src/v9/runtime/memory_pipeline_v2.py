@@ -71,7 +71,7 @@ class PreparedCommitBatch:
     rows: tuple[CommitPlan, ...]
 
 
-def _m0_write(m0: Any, event: Any) -> CanonicalWrite:
+def _m0_write(m0: Any, event: Any, transition: Any = None) -> CanonicalWrite:
     return CanonicalWrite(
         CanonicalNode(
             m0.uid,
