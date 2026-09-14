@@ -134,7 +134,7 @@ def _classification(row: dict[str, Any], prepared: Any) -> dict[str, dict[str, s
     has_action = bool(transition.semantic_action)
     has_options = bool(transition.semantic_options)
     has_delta = bool(transition.semantic_delta)
-    has_spatial = any(int(fact[0]) == 5 for fact in transition.semantic_before + transition.semantic_after)
+    has_spatial = any(int(fact[0]) == 5 or int(fact[2]) in {2, 3, 4, 21} for fact in transition.semantic_before + transition.semantic_after)
     has_text_fact = any(int(fact[0]) == 7 for fact in transition.semantic_before + transition.semantic_after)
     return {
         "raw_observation": {
