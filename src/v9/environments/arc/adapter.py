@@ -10,6 +10,7 @@ import numpy as np
 from v9.environments.base import StructuralAdapter, _fact, _semantic_id
 from v9.environments.contract import BoundaryEvent, BoundaryScope, TaskProgress, WithinActionFrame, WithinActionTrace
 from v9.environments.schemas import ActionSchema, EnvironmentIdentity, ObservationSchema
+from v9.memory.identity import stable_u64
 
 
 def _has_environment(root: Path, game_id: str) -> bool:
