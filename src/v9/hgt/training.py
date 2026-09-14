@@ -77,6 +77,12 @@ def _node_feature(node: Any, payload: dict[str, Any], dim: int, torch: Any):
         float(bool(payload.get("validated", False))),
         float(payload.get("support", 0)) / 64.0,
         float(len(payload.get("parents", ()))) / 8.0,
+        float(bool(payload.get("task_success", False))),
+        float(bool(payload.get("task_failure", False))),
+        float(bool(payload.get("task_truncated", False))),
+        min(1.0, float(payload.get("level_index", 0)) / 32.0),
+        min(1.0, float(payload.get("levels_completed", 0)) / 32.0),
+        max(-1.0, min(1.0, float(payload.get("primary_valence", 0)))),
     ]
     while len(values) < dim:
         values.append(0.0)
