@@ -25,6 +25,23 @@ class BoundaryEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskProgress:
+    game_id: str = ""
+    level_id: str | None = None
+    level_index: int = 0
+    levels_completed: int = 0
+    terminal: bool = False
+    success: bool = False
+    failure: bool = False
+    truncated: bool = False
+    score: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.success and self.failure:
+            raise ValueError("task progress cannot be both success and failure")
+
+
+@dataclass(frozen=True, slots=True)
 class WithinActionFrame:
     observation: Any
     ordinal: int
@@ -69,6 +86,7 @@ class EnvironmentCognitionAdapter(Protocol):
     def encode_action(self, action: Any) -> int: ...
     def transition(self, before: Any, after: Any, action: Any) -> EnvironmentTransition: ...
     def boundary_event(self) -> BoundaryEvent: ...
+    def task_progress(self) -> TaskProgress: ...
     def optional_micro_trace(self) -> WithinActionTrace | None: ...
     def optional_symbol_stream(self) -> tuple[object, ...]: ...
 
