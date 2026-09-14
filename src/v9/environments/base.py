@@ -68,6 +68,52 @@ class StructuralAdapter:
     def encode_action(self, action: Any) -> int:
         return int(action)
 
+    def semantic_observation(self, observation: Any) -> tuple[SemanticFact, ...]:
+        facts: list[SemanticFact] = []
+        family = str(self._identity.family).lower()
+        environment = str(self._identity.environment_type).lower()
+        if isinstance(observation, dict):
+            for key, value in sorted(observation.items()):
+                if isinstance(value, (int, float)):
+                    facts.append(_fact(6, str(key), 1, str(key), float(value)))
+                elif isinstance(value, str):
+                    facts.append(_fact(7, str(key), 1, value, 1.0))
+            return tuple(facts[:512])
+        if isinstance(observation, (int, float)):
+            return (_fact(6, "state", 1, int(observation), float(observation)),)
+        try:
+            values = list(observation)
+        except Exception:
+            return ()
+        if values and isinstance(values[0], (list, tuple)):
+            for r, row in enumerate(values[:64]):
+                for col, value in enumerate(list(row)[:64]):
+                    try:
+                        numeric = int(value)
+                    except Exception:
+                        continue
+                    if numeric == 0 and family not in {"puzzle", "sudoku"}:
+                        continue
+                    entity = _semantic_id(f"{family}:{r}:{col}")
+                    facts.append(_fact(2, entity, 6, numeric, float(numeric)))
+                    facts.append(_fact(5, entity, 2, r * 4096 + col, 1.0))
+                    if len(facts) >= 1024:
+                        return tuple(facts)
+            return tuple(facts)
+        names = ()
+        if family == "gymnasium" and "cartpole" in environment:
+            names = ("cart_position", "cart_velocity", "pole_angle", "pole_velocity")
+        elif family == "gymnasium" and "mountaincar" in environment:
+            names = ("position", "velocity")
+        for index, value in enumerate(values[:128]):
+            try:
+                numeric = float(value)
+            except Exception:
+                continue
+            name = names[index] if index < len(names) else f"feature_{index}"
+            facts.append(_fact(6, name, 1, index, numeric))
+        return tuple(facts)
+
     def semantic_action(self, action: Any) -> tuple[SemanticFact, ...]:
         return (_fact(8, f"action:{int(action)}", 23, int(action), 1.0),)
 
