@@ -232,7 +232,11 @@ class UnifiedTelemetry:
             status = "GRADIENT_INSTABILITY"
         elif validation_loss > train_loss * 1.5 and train_loss > 0:
             status = "OVERFITTING"
-        elif current_gain > 0 and retention < 0.8:
+        elif (
+            current_gain > 0
+            and bool(str(self.gauges.get("parent_model_version", "")))
+            and float(self.gauges.get("historical_retention_delta", 0.0)) < -0.05
+        ):
             status = "CATASTROPHIC_FORGETTING"
         elif current_gain > 0 and cross_gain <= 0:
             status = "POOR_CROSS_FAMILY_GENERALIZATION"
