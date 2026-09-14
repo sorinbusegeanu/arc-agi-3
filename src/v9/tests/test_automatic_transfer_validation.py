@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from v9.environments.contract import BoundaryEvent, BoundaryScope
 from v9.environments.schemas import ActionSchema, EnvironmentIdentity, ObservationSchema
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig
-from v9.runtime.transfer_validation import run_transfer_validation_interval
+from v9.runtime.transfer_validation import _balance_transfer_candidates, run_transfer_validation_interval
 
 
 def _runtime_with_concept(root: Path) -> ContinuousMemoryRuntime:
@@ -172,3 +172,16 @@ def test_repeated_success_after_validation_does_not_rematerialize_higher_memory(
     assert after["M5"] == before["M5"]
     assert after["M6"] == before["M6"]
     assert after["M7"] == before["M7"]
+
+
+def test_transfer_candidates_are_round_robin_balanced_by_environment_type() -> None:
+    rows = (
+        {"id": "a1", "source_environment_types": ("blackjack",)},
+        {"id": "a2", "source_environment_types": ("blackjack",)},
+        {"id": "a3", "source_environment_types": ("blackjack",)},
+        {"id": "b1", "source_environment_types": ("frozenlake",)},
+        {"id": "b2", "source_environment_types": ("frozenlake",)},
+        {"id": "c1", "source_environment_types": ("cartpole",)},
+    )
+    balanced = _balance_transfer_candidates(rows)
+    assert [row["id"] for row in balanced] == ["a1", "c1", "b1", "a2", "b2", "a3"]
