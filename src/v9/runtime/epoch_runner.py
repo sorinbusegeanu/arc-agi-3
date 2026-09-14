@@ -360,7 +360,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         # HGT metrics. Newly dormant memories affect the next epoch, not the model
         # evaluation used to decide whether forgetting is safe this epoch.
         lifecycle_started = time.perf_counter()
-        lifecycle_result = run_lifecycle_maintenance(runtime)
+        lifecycle_result = run_lifecycle_maintenance(runtime, dormancy_grace_cycles=1, retirement_grace_cycles=1)
         lifecycle_done = time.perf_counter()
         runtime.set_telemetry_gauge("post_sampling_lifecycle_seconds", lifecycle_done - lifecycle_started)
         runtime.set_telemetry_gauge("post_sampling_total_seconds", lifecycle_done - post_sampling_started)
