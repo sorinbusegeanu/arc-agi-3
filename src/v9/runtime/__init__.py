@@ -8,6 +8,7 @@ from v9.memory.m7_strategy import M7Strategy
 from v9.memory.model import MemoryLevel
 from v9.memory.provenance import DerivationProvenance
 from v9.mutation.proposals import MutationKind, ProposalClass
+from v9.mutation.lineage import LineageAwareDependencyEdge, LineageContextOverlay, RegimeState
 
 from .config import RuntimeConfig, ScientificConfig, ScientificConfigId
 from .publication import CanonicalGraph
