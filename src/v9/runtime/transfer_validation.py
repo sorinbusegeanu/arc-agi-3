@@ -326,9 +326,11 @@ def run_transfer_validation_interval(
     attempted = len(tasks)
     completed = 0
     passed = 0
-    validated = 0
     results_by_concept: dict[Any, list[_TransferTrialExecution]] = {}
-    before_validated: dict[Any, bool] = {candidate["concept_uid"]: bool(candidate["validated"]) for candidate in candidates}
+    with runtime._lock:
+        validated_before_uids = {
+            uid for uid, concept in runtime._m4.items() if bool(concept.validated)
+        }
 
     factory_qualname = str(getattr(adapter_factory, "__qualname__", ""))
     process_safe = bool(getattr(adapter_factory, "__module__", "")) and "<locals>" not in factory_qualname
@@ -410,8 +412,6 @@ def run_transfer_validation_interval(
         rows = results_by_concept.get(concept_uid, [])
         blockers = blocked_concepts.get(concept_uid, [])
         now_validated = bool(runtime.is_concept_validated(concept_uid))
-        if not before_validated.get(concept_uid, False) and now_validated:
-            validated += 1
         concept_passed = sum(int(row.blocker is None and row.matched and row.effect > threshold) for row in rows)
         _append_transfer_log(
             log_root,
@@ -421,11 +421,21 @@ def run_transfer_validation_interval(
                 "concept_uid": str(concept_uid),
                 "trials": sum(int(row.blocker is None) for row in rows),
                 "passed": int(concept_passed),
-                "validated_before": bool(before_validated.get(concept_uid, False)),
+                "validated_before": concept_uid in validated_before_uids,
                 "validated_after": now_validated,
                 "blockers": blockers,
             },
         )
+
+    with runtime._lock:
+        validated_after_uids = {
+            uid for uid, concept in runtime._m4.items() if bool(concept.validated)
+        }
+    newly_validated_uids = validated_after_uids - validated_before_uids
+    validated = len(newly_validated_uids)
+    runtime.set_telemetry_gauge("transfer_validated_before", len(validated_before_uids))
+    runtime.set_telemetry_gauge("transfer_validated_after", len(validated_after_uids))
+    runtime.set_telemetry_gauge("transfer_newly_validated", validated)
 
     last_blocker = None if completed else "all scheduled transfer trials were blocked"
     _append_transfer_log(
