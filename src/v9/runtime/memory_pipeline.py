@@ -70,6 +70,15 @@ class DerivationResult:
     causal_watermark: int
 
 
+def _semantic_signature(rows: tuple[tuple[int, int, int, int, float], ...], fallback: tuple[int, ...], *, person: bytes) -> int:
+    if not rows:
+        return stable_u64(*fallback, person=person)
+    parts: list[object] = []
+    for kind, subject, relation, obj, value in rows:
+        parts.extend((int(kind), int(subject), int(relation), int(obj), repr(float(value))))
+    return stable_u64(*parts, person=person)
+
+
 def _prepare_symbols(task: IngestionTask, transition: EncodedTransition, identity: EnvironmentIdentity, interaction_grounding: M1GroundedContingency | None) -> tuple[tuple[PreparedSymbolIngestion, ...], dict[str, Any] | None]:
     if not transition.symbols:
         return (), None
@@ -129,8 +138,8 @@ def prepare_ingestion(task: IngestionTask) -> PreparedIngestion:
             int(transition.before_signature),
             int(transition.action_id),
             int(transition.after_signature),
-            stable_u64(transition.semantic_delta if transition.semantic_delta else (int(transition.observation_schema_id), int(transition.before_signature != transition.after_signature)), person=b"v9-family"),
-            stable_u64(transition.semantic_before if transition.semantic_before else (int(transition.observation_schema_id), int(transition.before_signature)), person=b"v9-carrier"),
+            _semantic_signature(transition.semantic_delta, (int(transition.observation_schema_id), int(transition.before_signature != transition.after_signature)), person=b"v9-family"),
+            _semantic_signature(transition.semantic_before, (int(transition.observation_schema_id), int(transition.before_signature)), person=b"v9-carrier"),
             float(transition.available_actions_after),
             max(int(transition.before_signature != transition.after_signature), len(transition.semantic_delta)),
             int(transition.primary_valence),
@@ -142,8 +151,8 @@ def prepare_ingestion(task: IngestionTask) -> PreparedIngestion:
         payload_digest = stable_u64(experience.context_signature, experience.action_id, experience.outcome_signature, person=b"v9-interaction-payload")
         m0 = M0Episode.from_event(event, context_signature=experience.context_signature, payload_digest=payload_digest)
         m1g = M1GroundedContingency.build(GroundedRelation.ACTION_CONDITIONED, (m0,))
-        semantic_action_signature = stable_u64(transition.semantic_action if transition.semantic_action else (transition.action_id,), person=b"v9-sem-action")
-        semantic_delta_signature = stable_u64(transition.semantic_delta if transition.semantic_delta else (transition.before_signature, transition.after_signature), person=b"v9-sem-delta")
+        semantic_action_signature = _semantic_signature(transition.semantic_action, (transition.action_id,), person=b"v9-sem-action")
+        semantic_delta_signature = _semantic_signature(transition.semantic_delta, (transition.before_signature, transition.after_signature), person=b"v9-sem-delta")
         observable = (f"ACTION:{transition.action_schema_id}:{identity.environment_type}:{experience.action_id}" f":SEM_ACTION:{semantic_action_signature}:SEM_DELTA:{semantic_delta_signature}" f":FAMILY:{experience.family_signature}:OUTCOME:{experience.outcome_signature}" f":OPTIONS:{transition.available_action_set_signature}:BOUNDARY:{transition.boundary_scope}" f":SUCCESS:{int(transition.task_success)}:FAILURE:{int(transition.task_failure)}" f":TRUNCATED:{int(transition.task_truncated)}:LEVEL:{transition.level_index}" f":LEVELS_COMPLETED:{transition.levels_completed}")
         m1n = M1NormalizedRelation.build(observable, NormalizedChannel.WORLD, (m1g,))
 
