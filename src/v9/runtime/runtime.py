@@ -9,7 +9,7 @@ from typing import Any
 from v9.cognition.compression import form_families
 from v9.cognition.action_selection import scoped_action_key
 from v9.cognition.developmental_stage import DevelopmentalStageTracker, StageEvidence
-from v9.cognition.grounding import GroundingRegistry
+from v9.cognition.grounding import GroundingEvidence, GroundingRegistry
 from v9.cognition.isf import ISFComponents, InteractionSignificanceFunction
 from v9.cognition.replay import ReplayCandidate, ReplayResult, ReplayScheduler
 from v9.cognition.roles import form_roles
@@ -754,6 +754,31 @@ class ContinuousMemoryRuntime:
             )
             key = (m1g.environment_instance_id, m1g.episode_id)
             self._latest_interaction_grounding[key] = m1g
+            for symbol_row in prepared.symbols:
+                if symbol_row.aligned_m1n is None:
+                    continue
+                grounding_key = (
+                    int(symbol_row.m1g.uid.lo),
+                    int(m1g.uid.lo),
+                    int(m1g.environment_instance_id),
+                    0,
+                    0,
+                )
+                before_grounding = self.grounding.states.get(grounding_key)
+                after_grounding = self.grounding.observe(
+                    GroundingEvidence(
+                        int(symbol_row.m1g.uid.lo),
+                        int(m1g.uid.lo),
+                        int(m1g.environment_instance_id),
+                        0,
+                        0,
+                        int(self._watermark),
+                        recurrent_symbol=True,
+                        cross_modal_association=True,
+                    )
+                )
+                if before_grounding is None or int(after_grounding.maturity) > int(before_grounding.maturity):
+                    self.telemetry["grounding_promotions"] += 1
             prior_support = int(self._m1n_supports.get(int(m1n.structural_signature), 0))
             signature = self._record_normalized(m1n, defer_publication=True)
             self.evidence.append(
