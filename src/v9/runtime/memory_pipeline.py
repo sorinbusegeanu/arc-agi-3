@@ -192,7 +192,7 @@ def derive_memory(task: DerivationTask) -> DerivationResult:
             formation_scope=task.formation_scope,
         )
         for role in roles
-        if int(task.support) >= 4 and len(task.formation_scope) >= 2
+        if int(task.support) >= 4
     )
     return DerivationResult(task.task_id, task.structural_signature, task.support, family, roles, concepts, task.causal_watermark)
 
