@@ -101,7 +101,7 @@ def _m0_write(m0: Any, event: Any, transition: Any = None) -> CanonicalWrite:
     )
 
 
-def _m1g_write(m1g: Any, m0: Any, event: Any) -> CanonicalWrite:
+def _m1g_write(m1g: Any, m0: Any, event: Any, transition: Any = None) -> CanonicalWrite:
     return CanonicalWrite(
         CanonicalNode(
             m1g.uid,
