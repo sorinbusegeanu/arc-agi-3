@@ -489,10 +489,12 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, parent_version, 0.0, parent_validation_loss if math.isfinite(parent_validation_loss) else 0.0, action_examples, 0, parent_checkpoint)
 
     model.eval()
+    inference_started = time.perf_counter()
     with torch.no_grad():
         logits, values = model(x_device, edges_device)
         val_loss_t, val_accuracy = _loss(logits, values, y_dict, val_masks, action_targets, action_masks, torch)
         train_loss_t, train_accuracy = _loss(logits, values, y_dict, train_masks, action_targets, action_masks, torch)
+    inference_latency_ms = 1000.0 * (time.perf_counter() - inference_started)
     if val_loss_t is None:
         return HGTTrainingResult(epoch, "SKIPPED_NO_VALIDATION_EVIDENCE", runtime.unified_telemetry.model_version, parent_version, training_loss, 0.0, action_examples, training_steps, parent_checkpoint)
     validation_loss = float(val_loss_t.cpu().item())
@@ -625,4 +627,9 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         examples=action_examples,
         training_steps=training_steps,
         checkpoint=checkpoint_rel if promote else parent_checkpoint,
+        validation_accuracy=float(val_accuracy),
+        inference_latency_ms=float(inference_latency_ms),
+        subgraph_nodes=sum(int(value.shape[0]) for value in x_dict.values()),
+        subgraph_edges=sum(int(value.shape[1]) for value in edge_index_dict.values()),
+        relevance_precision=action_examples / max(1, selected_examples),
     )
