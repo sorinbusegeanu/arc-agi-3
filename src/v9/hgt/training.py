@@ -58,7 +58,7 @@ def _stable_metadata() -> tuple[list[str], list[tuple[str, str, str]]]:
 
 def _semantic_rows(payload: dict[str, Any]) -> tuple[tuple[int, int, int, int, float], ...]:
     rows: list[tuple[int, int, int, int, float]] = []
-    for key in ("semantic_before", "semantic_action", "semantic_effects"):
+    for key in ("semantic_before", "semantic_action", "semantic_options", "semantic_effects"):
         for row in payload.get(key, ()) or ():
             if isinstance(row, (list, tuple)) and len(row) == 5:
                 rows.append((int(row[0]), int(row[1]), int(row[2]), int(row[3]), float(row[4])))
