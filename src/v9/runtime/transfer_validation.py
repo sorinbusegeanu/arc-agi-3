@@ -180,9 +180,11 @@ def run_transfer_validation_interval(
             now = time.monotonic()
             if mode == "validation_budgeted" and now >= candidate_deadline:
                 last_blocker = "candidate transfer validation time budget exhausted"
+                concept_blockers.append(last_blocker)
                 break
             if scans >= maximum_scans:
                 last_blocker = last_blocker or "no eligible held-out target instance"
+                concept_blockers.append(last_blocker)
                 break
             spec = target_specs[target_cursor % len(target_specs)]
             target_cursor += 1
@@ -199,14 +201,17 @@ def run_transfer_validation_interval(
                 )
                 if not callable(getattr(adapter, "capture_state", None)) or not callable(getattr(adapter, "restore_state", None)):
                     last_blocker = f"{adapter.identity().family} adapter lacks exact snapshot/restore"
+                    concept_blockers.append(last_blocker)
                     continue
                 identity = adapter.identity()
                 if source_types and str(identity.environment_type) not in source_types:
                     last_blocker = "target metadata/adapter environment type mismatch"
+                    concept_blockers.append(last_blocker)
                     continue
                 target_environment_id = int(identity.instance_id.value)
                 if target_environment_id in formation_scope:
                     last_blocker = "target environment is part of concept formation provenance"
+                    concept_blockers.append(last_blocker)
                     continue
                 snapshot = runtime.actor_policy_snapshot()
                 baseline = _baseline_policy(
@@ -240,6 +245,7 @@ def run_transfer_validation_interval(
                 target_action = next((action for action in action_candidates if action in initial_actions), None)
                 if target_action is None:
                     last_blocker = "concept has no target-local grounded action"
+                    concept_blockers.append(last_blocker)
                     continue
                 attempted += 1
 
