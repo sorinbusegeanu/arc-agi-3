@@ -245,8 +245,10 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             if requested_training_steps > 1
             else int(runtime.config.scientific.hgt_gradient_accumulation)
         )
+        symbol_prediction_started = time.perf_counter()
         symbol_prediction_samples = _record_symbol_prediction_evidence(runtime)
         runtime.set_telemetry_gauge("symbol_prediction_samples_epoch", symbol_prediction_samples)
+        runtime.set_telemetry_gauge("post_sampling_symbol_prediction_seconds", time.perf_counter() - symbol_prediction_started)
 
         if behavioral_gain < -0.005:
             rolled_back = rollback_hgt_model(runtime, root=args.root)
