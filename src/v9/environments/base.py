@@ -68,6 +68,9 @@ class StructuralAdapter:
     def encode_action(self, action: Any) -> int:
         return int(action)
 
+    def semantic_action(self, action: Any) -> tuple[SemanticFact, ...]:
+        return (_fact(8, f"action:{int(action)}", 23, int(action), 1.0),)
+
     def transition(self, before: Any, after: Any, action: Any) -> EnvironmentTransition:
         before_actions = tuple(self.available_actions())
         before_signature = self.encode_observation(before)
