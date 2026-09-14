@@ -11,7 +11,7 @@ from .memory_pipeline_v2 import CanonicalWrite
 def ensure_fast_state(runtime: Any) -> None:
     if not hasattr(runtime, "_fast_stable_contingencies"):
         runtime._fast_stable_contingencies = sum(
-            int(int(support) >= 2) for support in runtime._m1n_supports.values()
+            int(len(rows) >= 2) for rows in runtime._m1n_occurrences.values()
         )
 
 
@@ -52,11 +52,9 @@ def record_normalized_fast(runtime: Any, relation: Any, initial_write: Canonical
     ensure_fast_state(runtime)
     signature = int(relation.structural_signature)
     occurrences = runtime._m1n_occurrences.setdefault(signature, [])
-    old_support = int(runtime._m1n_supports.get(signature, 0))
-    support = old_support + 1
+    was_stable = len(occurrences) >= 2
+    support = int(runtime._m1n_supports.get(signature, 0)) + 1
     runtime._m1n_supports[signature] = support
-    if old_support < 2 <= support:
-        runtime._fast_stable_contingencies += 1
 
     cache = runtime._normalized_action_cache
     if signature not in cache:
@@ -77,6 +75,9 @@ def record_normalized_fast(runtime: Any, relation: Any, initial_write: Canonical
 
     if len(occurrences) < max(2, runtime.config.scientific.m1n_facts_per_channel):
         occurrences.append(relation)
+    if not was_stable and len(occurrences) >= 2:
+        runtime._fast_stable_contingencies += 1
+
     runtime._replay_pool[relation.uid] = float(support)
     if support == 1:
         deferred_rows.append(initial_write.runtime_row())
