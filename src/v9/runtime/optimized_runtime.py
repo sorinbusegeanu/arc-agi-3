@@ -17,7 +17,7 @@ from v9.runtime.actor_policy import ActorPolicySnapshot
 from v9.runtime.memory_pipeline import DerivationResult, PreparedIngestion, PreparedSymbolIngestion
 from v9.runtime.runtime import ContinuousMemoryRuntime as BaseContinuousMemoryRuntime
 from v9.runtime.snapshot_backend import latest_snapshot
-from v9.telemetry import build_primary_dashboard
+from v9.telemetry import build_primary_dashboard, read_gpu_snapshot
 
 
 class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
@@ -115,6 +115,10 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
             result["timeline_events_dropped"] = self.timeline.events_dropped
             result["actions_committed"] = self.timeline.actions_committed
             diagnostic = self.unified_telemetry.diagnostic_metrics()
+            gpu = read_gpu_snapshot()
+            diagnostic = dict(diagnostic)
+            diagnostic["gpu_memory_current_bytes"] = int(gpu.memory_used_bytes)
+            diagnostic["gpu_utilization_current"] = float(gpu.utilization_percent)
             result["telemetry_diagnostics"] = diagnostic
             total_memories = sum(int(v) for v in result["memory_levels"].values())
             result["success_rate"] = float(diagnostic.get("behavioral_success_rate", 0.0))
