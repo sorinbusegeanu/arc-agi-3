@@ -938,7 +938,7 @@ class ContinuousMemoryRuntime:
                     role.provenance.evidence,
                 )
             for candidate in result.concepts:
-                if candidate.uid in self._m4:
+                if candidate.uid in self._m4 and candidate.uid in self.graph.nodes:
                     continue
                 self._m4[candidate.uid] = candidate
                 self._publish(
