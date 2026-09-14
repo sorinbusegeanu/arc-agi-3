@@ -688,7 +688,31 @@ def rollback_hgt_model(runtime: Any, *, root: str | Path) -> str | None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     parent_version = manifest.get("parent_model_version")
     current_version = manifest.get("current_model_version")
-    if not parent_version or not current_version or parent_version == current_version:
+    if not current_version:
+        return None
+    if not parent_version:
+        manifest.update(
+            {
+                "current_model_version": None,
+                "current_checkpoint": None,
+                "parent_model_version": None,
+                "rollback_from_model_version": str(current_version),
+                "rollback_to_model_version": "untrained",
+            }
+        )
+        temporary_manifest = manifest_path.with_suffix(".json.tmp")
+        temporary_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary_manifest, manifest_path)
+        try:
+            runtime.set_hgt_action_scores({}, context_action_scores={})
+        except TypeError:
+            runtime.set_hgt_action_scores({})
+        runtime.unified_telemetry.model_version = "untrained"
+        runtime.set_telemetry_gauge("hgt_behavior_rollback", 1)
+        runtime.set_telemetry_gauge("hgt_rollback_from_model", str(current_version))
+        runtime.set_telemetry_gauge("hgt_rollback_to_model", "untrained")
+        return "untrained"
+    if parent_version == current_version:
         return None
     checkpoint_rel = f"models/{parent_version}.pt"
     checkpoint_path = Path(root) / checkpoint_rel
