@@ -638,7 +638,7 @@ def _is_cuda_oom(exc: BaseException) -> bool:
     return "out of memory" in text and ("cuda" in text or "gpu" in text)
 
 
-def _retry_after_oom(runtime: Any, *, epoch: int, training_epochs: int, learning_rate: float, root: str | Path, budget_scale: float, oom_retry: int, exc: RuntimeError):
+def _retry_after_oom(runtime: Any, *, epoch: int, training_epochs: int, learning_rate: float, root: str | Path, allow_promotion: bool, budget_scale: float, oom_retry: int, exc: RuntimeError):
     config = runtime.config.scientific
     if not _is_cuda_oom(exc) or int(oom_retry) >= int(config.hgt_oom_retry_limit):
         raise exc
@@ -865,6 +865,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             training_epochs=training_epochs,
             learning_rate=learning_rate,
             root=root,
+            allow_promotion=allow_promotion,
             budget_scale=_budget_scale,
             oom_retry=_oom_retry,
             exc=exc,
