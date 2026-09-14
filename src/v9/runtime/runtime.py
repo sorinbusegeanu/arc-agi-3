@@ -1037,6 +1037,7 @@ class ContinuousMemoryRuntime:
     def record_transfer_validation(self, concept_uid: MemoryUid, *, target_environment_id: int, target_native_action: int, enabled_metric: float, ablated_metric: float, matched: bool = True, held_out: bool = True, context_scope_id: int = 0) -> None:
         if concept_uid not in self._m4:
             raise KeyError("transfer validation requires an existing M4 concept candidate")
+        was_validated = bool(self._m4[concept_uid].validated)
         row = {"target_environment_id": int(target_environment_id), "target_native_action": int(target_native_action), "enabled_metric": float(enabled_metric), "ablated_metric": float(ablated_metric), "matched": bool(matched), "held_out": bool(held_out), "context_scope_id": int(context_scope_id)}
         trial_rows = self._transfer_trials.setdefault(concept_uid, [])
         trial_rows.append(row)
@@ -1051,6 +1052,8 @@ class ContinuousMemoryRuntime:
         if ValidationMode(self.config.scientific.transfer_validation_mode) is ValidationMode.LEARNING_ONLY:
             return
         if len(admissible) < self.config.scientific.transfer_minimum_trials:
+            return
+        if was_validated:
             return
         concept = self._m4[concept_uid].with_validation(tuple(int(trial["target_environment_id"]) for trial in admissible))
         self._m4[concept.uid] = concept
