@@ -94,6 +94,13 @@ class ScientificConfig:
     hgt_target_subgraph_nodes: int = 400
     hgt_max_subgraph_nodes: int = 800
     hgt_max_subgraph_edges: int = 4000
+    hgt_max_total_nodes: int = 6000
+    hgt_max_total_edges: int = 40000
+    hgt_max_semantic_facts_per_memory: int = 16
+    hgt_oom_retry_limit: int = 2
+    hgt_min_free_vram_bytes: int = 6 * 1024 * 1024 * 1024
+    hgt_dynamic_loss_weighting: bool = True
+    hgt_loss_weights: tuple[float, ...] = (1.0, 1.0, 0.5, 0.5, 0.5, 1.0, 0.5, 0.5, 0.5)
     hgt_model_version: str = "untrained"
     hgt_training_microbatch: int = 4
     hgt_gradient_accumulation: int = 8
@@ -127,7 +134,8 @@ class ScientificConfig:
             self.deliberation_stability_cycles, self.deliberation_compute_budget,
             self.hgt_hidden_dim, self.hgt_layers, self.hgt_heads, self.hgt_ffn_dim,
             self.hgt_target_subgraph_nodes, self.hgt_max_subgraph_nodes,
-            self.hgt_max_subgraph_edges, self.hgt_training_microbatch,
+            self.hgt_max_subgraph_edges, self.hgt_max_total_nodes, self.hgt_max_total_edges,
+            self.hgt_max_semantic_facts_per_memory, self.hgt_oom_retry_limit, self.hgt_training_microbatch,
             self.hgt_gradient_accumulation, self.hgt_examples_per_train_trigger,
         )
         if min(int(value) for value in positive) <= 0:
@@ -161,6 +169,14 @@ class ScientificConfig:
             raise ValueError("HGT target subgraph size cannot exceed maximum")
         if self.hgt_target_inference_latency_ms <= 0:
             raise ValueError("HGT inference latency target must be positive")
+        if self.hgt_max_total_nodes < self.hgt_max_subgraph_nodes:
+            raise ValueError("HGT total node budget cannot be smaller than memory-node budget")
+        if self.hgt_max_total_edges < self.hgt_max_subgraph_edges:
+            raise ValueError("HGT total edge budget cannot be smaller than canonical-edge budget")
+        if self.hgt_min_free_vram_bytes < 0:
+            raise ValueError("HGT free VRAM reserve must be non-negative")
+        if len(self.hgt_loss_weights) != 9 or any(float(value) <= 0.0 for value in self.hgt_loss_weights):
+            raise ValueError("HGT requires nine positive objective weights")
 
     def as_dict(self, *, include_id: bool = True) -> dict[str, Any]:
         payload = asdict(self)
@@ -168,6 +184,7 @@ class ScientificConfig:
             payload[name] = list(payload[name])
         payload["beta_by_radius"] = [list(row) for row in self.beta_by_radius]
         payload["isf_weights_by_stage"] = [list(row) for row in self.isf_weights_by_stage]
+        payload["hgt_loss_weights"] = list(self.hgt_loss_weights)
         if include_id:
             payload["scientific_config_id"] = self.config_id.value
         return payload
