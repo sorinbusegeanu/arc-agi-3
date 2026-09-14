@@ -100,6 +100,7 @@ class ContinuousMemoryRuntime:
         self._m1n_occurrences: dict[int, list[M1NormalizedRelation]] = {}
         self._m1n_supports: dict[int, int] = {}
         self._m1n_dirty: set[int] = set()
+        self._cross_modal_signatures: dict[int, None] = {}
         self._actor_action_supports: dict[int, float] = {}
         self._actor_policy_generation = 0
         self._deferred_base_nodes: dict[MemoryUid, tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]]] = {}
@@ -502,6 +503,12 @@ class ContinuousMemoryRuntime:
 
     def _record_normalized(self, relation: M1NormalizedRelation, *, defer_publication: bool = False, payload_extra: dict[str, Any] | None = None) -> int:
         occurrences = self._m1n_occurrences.setdefault(relation.structural_signature, [])
+        if relation.channel is NormalizedChannel.CROSS_MODAL:
+            signature_key = int(relation.structural_signature)
+            self._cross_modal_signatures.pop(signature_key, None)
+            self._cross_modal_signatures[signature_key] = None
+            while len(self._cross_modal_signatures) > 8192:
+                self._cross_modal_signatures.pop(next(iter(self._cross_modal_signatures)))
         support = self._m1n_supports.get(relation.structural_signature, 0) + 1
         self._m1n_supports[relation.structural_signature] = support
         observable = str(relation.observable_relation)
@@ -1110,6 +1117,7 @@ class ContinuousMemoryRuntime:
             "in_flight_proposals": [],
             "m1n_occurrences": {str(key): len(value) for key, value in self._m1n_occurrences.items()},
             "m1n_supports": {str(key): value for key, value in self._m1n_supports.items()},
+            "cross_modal_signatures": list(self._cross_modal_signatures),
             "replay_pool": {uid.hex(): value for uid, value in self._replay_pool.items()},
             "formation_environments": sorted(self._formation_environments),
             "latest_interaction_grounding": [
