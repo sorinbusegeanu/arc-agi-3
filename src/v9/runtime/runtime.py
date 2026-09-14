@@ -420,7 +420,7 @@ class ContinuousMemoryRuntime:
     def _publish_group(
         self,
         rows: tuple[tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]], ...],
-    ) -> None:
+    ) -> bool:
         writes: list[MutationWrite] = []
         target_partitions: set[int] = set()
         dependencies: list[ReadDependency] = []
@@ -479,6 +479,7 @@ class ContinuousMemoryRuntime:
             self.telemetry["read_set_conflicts"] += 1
         else:
             self.telemetry["rejected"] += 1
+        return result.outcome.value == "ACCEPTED"
 
     def _defer_base_group(
         self,
