@@ -592,7 +592,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         gpu_utilization=float(gpu.utilization_percent),
         historical_retention=val_accuracy,
         current_curriculum_gain=max(0.0, val_accuracy - (1.0 / 3.0)),
-        cross_family_validation_gain=max(0.0, val_accuracy - train_accuracy),
+        cross_family_validation_gain=val_accuracy,
         loss_by_head={"primary_valence": validation_loss, "discounted_action_value": validation_loss},
     )
     runtime.record_hgt_training(sample)
