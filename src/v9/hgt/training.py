@@ -203,6 +203,7 @@ def build_hgt_graph(
     max_total_edges: int = 40000,
     max_semantic_facts_per_memory: int = 16,
     return_discount: float = 0.97,
+    include_objectives: bool = False,
 ):
     torch, _, _ = _require_torch()
     selected_uids = _select_connected_nodes(read_view, max_nodes)
@@ -363,7 +364,9 @@ def build_hgt_graph(
         for key, pairs in edges.items()
         if pairs
     }
-    return x_dict, edge_index_dict, y_dict, action_target_dict, action_mask_dict, action_meta, task_target_dict, task_mask_dict
+    if include_objectives:
+        return x_dict, edge_index_dict, y_dict, action_target_dict, action_mask_dict, action_meta, task_target_dict, task_mask_dict
+    return x_dict, edge_index_dict, y_dict, action_target_dict, action_mask_dict, action_meta
 
 
 class _HGTWrapper:
@@ -657,6 +660,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         max_total_nodes=total_node_budget,
         max_total_edges=total_edge_budget,
         max_semantic_facts_per_memory=int(config.hgt_max_semantic_facts_per_memory),
+        include_objectives=True,
     )
     realized_nodes = sum(int(value.shape[0]) for value in x_dict.values())
     realized_edges = sum(int(value.shape[1]) for value in edge_index_dict.values())
