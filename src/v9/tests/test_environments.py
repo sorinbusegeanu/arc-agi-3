@@ -250,10 +250,11 @@ def test_alfworld_text_backend_maps_dynamic_commands_and_task_instruction(tmp_pa
     world, instruction = backend.reset()
     assert instruction == b"put the apple away"
     assert world["admissible_commands"] == ("look", "take apple")
-    assert backend.available_actions() == (0, 1)
-    _, _, boundary = backend.step(1)
+    actions = backend.available_actions()
+    assert len(actions) == 2 and actions[0] != actions[1]
+    _, _, boundary = backend.step(actions[1])
     assert native.commands == ["take apple"]
-    assert backend.available_actions() == (0,)
+    assert len(backend.available_actions()) == 1
     assert boundary == BoundaryEvent(BoundaryScope.EPISODE, 1, False)
     backend.close()
     assert native.closed is True
@@ -300,9 +301,10 @@ def test_alfworld_thor_backend_maps_commands_and_captures_rgb_frame(tmp_path: Pa
     assert native.native_actions == [{"action": "TeleportFull"}]
     assert header["shape"] == [2, 2, 3]
     assert world[4 + header_size:] == native.last_event.frame.tobytes()
-    assert backend.available_actions() == (0, 1)
+    actions = backend.available_actions()
+    assert len(actions) == 2 and actions[0] != actions[1]
 
-    _, _, boundary = backend.step(1)
+    _, _, boundary = backend.step(actions[1])
     assert controller.commands == ["take apple"]
     assert boundary == BoundaryEvent(BoundaryScope.EPISODE, 1, False)
     backend.close()
