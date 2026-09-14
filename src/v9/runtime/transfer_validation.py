@@ -304,7 +304,8 @@ def run_transfer_validation_interval(
         if not target_specs:
             blocked_concepts.setdefault(concept_uid, []).append("no compatible held-out target specification")
             continue
-        for trial_index in range(minimum_trials):
+        trials_per_candidate = max(minimum_trials, min(8, minimum_trials * 4))
+        for trial_index in range(trials_per_candidate):
             if len(tasks) >= budget:
                 break
             spec = target_specs[trial_index % len(target_specs)]
