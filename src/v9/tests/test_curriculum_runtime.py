@@ -115,6 +115,7 @@ def test_broad_preset_spans_all_runnable_language_and_symbolic_families() -> Non
         "arc",
     }
     assert all(spec.curriculum_step == "broad" for spec in selection.specs)
+    assert {spec.validation_mode for spec in selection.specs} == {"validation_budgeted"}
 
     symbolic = tuple(spec for spec in selection.specs if spec.adapter == "synthetic_symbolic")
     assert len(symbolic) == 16
