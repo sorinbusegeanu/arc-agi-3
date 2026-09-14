@@ -51,6 +51,50 @@ def _scenario_success(rows: list[Any]) -> tuple[dict[str, float], float]:
     return rates, macro
 
 
+def _game_level_metrics(rows: list[Any]) -> dict[str, Any]:
+    by_game: dict[str, dict[str, int | float]] = {}
+    for row in rows:
+        target = by_game.setdefault(
+            str(row.game_id),
+            {
+                "wins": 0,
+                "failures": 0,
+                "truncations": 0,
+                "episodes": 0,
+                "levels_completed": 0,
+                "best_level": 0,
+                "steps": 0,
+            },
+        )
+        wins = int(getattr(row, "task_successes", 0))
+        failures = int(getattr(row, "task_failures", 0))
+        truncations = int(getattr(row, "task_truncations", 0))
+        levels = int(getattr(row, "levels_completed", 0))
+        target["wins"] += wins
+        target["failures"] += failures
+        target["truncations"] += truncations
+        target["episodes"] += wins + failures + truncations
+        target["levels_completed"] += levels
+        target["best_level"] = max(int(target["best_level"]), levels)
+        target["steps"] += int(getattr(row, "steps", 0))
+
+    solved_games = sum(int(values["wins"]) > 0 for values in by_game.values())
+    total_games = len(by_game)
+    total_episodes = sum(int(values["episodes"]) for values in by_game.values())
+    total_wins = sum(int(values["wins"]) for values in by_game.values())
+    total_levels = sum(int(values["levels_completed"]) for values in by_game.values())
+    return {
+        "current_run_wins": total_wins / max(1, total_episodes),
+        "current_run_solved_games": solved_games,
+        "current_run_total_games": total_games,
+        "current_run_levels_completed": total_levels,
+        "current_run_best_level_by_game": {
+            game_id: int(values["best_level"]) for game_id, values in sorted(by_game.items())
+        },
+        "current_run_game_results": by_game,
+    }
+
+
 def _performance_summary(metrics: dict[str, Any]) -> dict[str, Any]:
     diagnostic = dict(metrics.get("telemetry_diagnostics", {}))
     sampled = int(diagnostic.get("sampled_steps", 0))
@@ -118,6 +162,15 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         runtime.set_telemetry_gauge("behavioral_success_rate", behavioral_success)
         runtime.set_telemetry_gauge("behavioral_success_gain", behavioral_gain)
         runtime.set_telemetry_gauge("successful_scenarios", sum(rate > 0.0 for rate in scenario_success.values()))
+        game_level = _game_level_metrics(process_results)
+        runtime.set_telemetry_gauge("current_run_wins", float(game_level["current_run_wins"]))
+        runtime.set_telemetry_gauge("current_run_solved_games", int(game_level["current_run_solved_games"]))
+        runtime.set_telemetry_gauge("current_run_total_games", int(game_level["current_run_total_games"]))
+        runtime.set_telemetry_gauge("current_run_levels_completed", int(game_level["current_run_levels_completed"]))
+        runtime.set_telemetry_gauge(
+            "current_run_best_level_by_game",
+            game_level["current_run_best_level_by_game"],
+        )
 
         # M4 -> M5 is a causal gate. Drive only matched held-out trials from an
         # exactly restorable target state; failed trials remain failed evidence.
@@ -180,6 +233,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                     "behavioral_success_rate": behavioral_success,
                     "behavioral_success_gain": behavioral_gain,
                     "scenario_success_rate": scenario_success,
+                    "game_level_metrics": game_level,
                     "transfer_validation": asdict(transfer),
                 },
                 performance=performance,
