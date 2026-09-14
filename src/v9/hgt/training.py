@@ -794,6 +794,13 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     if validation_examples <= 0:
         return HGTTrainingResult(epoch, "SKIPPED_NO_VALIDATION_EVIDENCE", runtime.unified_telemetry.model_version, None, 0.0, 0.0, action_examples, 0, None)
 
+    dynamic_training_steps = max(
+        int(training_epochs),
+        min(64, max(1, int(math.ceil(training_examples / 512.0)))),
+    )
+    runtime.set_telemetry_gauge("hgt_dynamic_training_steps", int(dynamic_training_steps))
+    runtime.set_telemetry_gauge("hgt_training_examples_current", int(training_examples))
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -876,7 +883,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     last_grad_norm = 0.0
     model.train()
     try:
-        for _ in range(max(1, int(training_epochs))):
+        for _ in range(max(1, int(dynamic_training_steps))):
             optimizer.zero_grad(set_to_none=True)
             logits, values, auxiliary = model(x_device, edges_device)
             loss, _, _ = _loss(
