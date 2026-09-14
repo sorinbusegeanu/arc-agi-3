@@ -210,8 +210,16 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                 before = adapter.observe()
                 before_signature = int(adapter.encode_observation(before))
                 learned_scores = policy.learned_scores(environment_instance_id, actions, environment_type=identity.environment_type, context_signature=before_signature)
+                grounded_scores = policy.grounded_scores(actions, environment_type=identity.environment_type)
                 action_schema_id = int(adapter.action_schema().schema_id)
-                action = choose_action(policy, actions, rng=rng, epsilon=float(epsilon), learned_scores=learned_scores, target_environment_id=environment_instance_id, action_schema_id=action_schema_id, environment_type=identity.environment_type)
+                base_preference = min(actions, key=lambda value: (-float(learned_scores.get(int(value), 0.0)), int(value)))
+                enriched_scores = {
+                    int(value): float(learned_scores.get(int(value), 0.0)) + float(grounded_scores.get(int(value), 0.0))
+                    for value in actions
+                }
+                grounded_preference = min(actions, key=lambda value: (-float(enriched_scores.get(int(value), 0.0)), int(value)))
+                grounded_action_influence += int(base_preference != grounded_preference)
+                action = choose_action(policy, actions, rng=rng, epsilon=float(epsilon), learned_scores=enriched_scores, target_environment_id=environment_instance_id, action_schema_id=action_schema_id, environment_type=identity.environment_type)
                 after = adapter.step(int(action))
                 boundary = adapter.boundary_event()
                 progress = adapter.task_progress()
