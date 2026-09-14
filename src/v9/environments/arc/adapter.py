@@ -8,7 +8,7 @@ from typing import Any, Callable
 import numpy as np
 
 from v9.environments.base import StructuralAdapter
-from v9.environments.contract import BoundaryEvent, BoundaryScope, WithinActionFrame, WithinActionTrace
+from v9.environments.contract import BoundaryEvent, BoundaryScope, TaskProgress, WithinActionFrame, WithinActionTrace
 from v9.environments.schemas import ActionSchema, EnvironmentIdentity, ObservationSchema
 
 
@@ -73,6 +73,7 @@ class ARCAdapter(StructuralAdapter):
         self._boundary = BoundaryEvent()
         self._last_trace = None
         self._levels = 0
+        self._last_state = "NOT_FINISHED"
         self._action_history: list[int] = []
         self.reset()
 
@@ -80,6 +81,7 @@ class ARCAdapter(StructuralAdapter):
         self._raw = self.env.reset()
         self._observation = _grid(self._raw)
         self._levels = int(getattr(self._raw, "levels_completed", 0) or 0)
+        self._last_state = _state(self._raw)
         self._boundary = BoundaryEvent()
         self._last_trace = None
         self._action_history = []
@@ -106,6 +108,7 @@ class ARCAdapter(StructuralAdapter):
         raw = self.env.step(action)
         self._action_history.append(encoded_action)
         state = _state(raw)
+        self._last_state = state
         levels = int(getattr(raw, "levels_completed", self._levels) or 0)
         advanced = levels > self._levels
         self._levels = levels
@@ -124,6 +127,20 @@ class ARCAdapter(StructuralAdapter):
             self._boundary = BoundaryEvent()
         self._last_trace = WithinActionTrace(before, (WithinActionFrame(after.copy(), 0),), after.copy())
         return self.observe()
+
+    def task_progress(self) -> TaskProgress:
+        terminal = self._last_state in {"WIN", "GAME_OVER"}
+        return TaskProgress(
+            game_id=self.game_id,
+            level_id=f"level-{self._levels + (0 if terminal else 1)}",
+            level_index=int(self._levels + (0 if terminal else 1)),
+            levels_completed=int(self._levels),
+            terminal=terminal,
+            success=self._last_state == "WIN",
+            failure=self._last_state == "GAME_OVER",
+            truncated=False,
+            score=float(self._levels),
+        )
 
     def capture_state(self) -> dict[str, object]:
         """Capture a reproducible ARC state as seed plus exact action replay."""
