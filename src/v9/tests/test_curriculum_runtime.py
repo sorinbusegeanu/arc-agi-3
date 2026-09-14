@@ -100,7 +100,7 @@ def test_step1_continuous_run_executes_curriculum(tmp_path) -> None:
 def test_broad_preset_spans_all_runnable_language_and_symbolic_families() -> None:
     selection = resolve_curriculum_selector("broad")
     assert selection is not None
-    assert len(selection.specs) == 76
+    assert len(selection.specs) == 110
     assert {spec.adapter for spec in selection.specs} == {
         "synthetic_causal",
         "synthetic_symbolic",
@@ -151,11 +151,7 @@ def test_broad_preset_spans_all_runnable_language_and_symbolic_families() -> Non
         "sudoku_clues_36",
         "sudoku_clues_30",
     )
-    assert tuple(spec.game_id for spec in selection.specs if spec.adapter == "arc") == (
-        "g50t",
-        "ls20",
-        "re86",
-        "tr87",
-        "tu93",
-        "wa30",
-    )
+    arc_games = tuple(spec.game_id for spec in selection.specs if spec.adapter == "arc")
+    assert len(arc_games) == 40
+    assert arc_games[:4] == ("ez01", "ez02", "ez03", "ez04")
+    assert arc_games[-4:] == ("wk01", "rf01", "mo01", "zq01")
