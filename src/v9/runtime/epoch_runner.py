@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from v9.hgt import train_hgt_epoch
+from v9.memory.m1_normalized import NormalizedChannel
 from v9.telemetry import HGTInferenceSample, OptimizationSample
 from .lifecycle import run_lifecycle_maintenance
 from .parallel_memory_coordinator_v2 import run_parallel_memory_jobs
@@ -95,6 +96,40 @@ def _game_level_metrics(rows: list[Any]) -> dict[str, Any]:
         },
         "current_run_game_results": by_game,
     }
+
+
+def _record_symbol_prediction_evidence(runtime: Any, *, limit: int = 128) -> int:
+    world_by_parent: dict[Any, int] = {}
+    cross_rows: list[tuple[Any, int]] = []
+    for signature, rows in runtime._m1n_occurrences.items():
+        support = int(runtime._m1n_supports.get(int(signature), len(rows)))
+        for relation in rows:
+            if relation.channel is NormalizedChannel.WORLD:
+                for parent in relation.provenance.parents:
+                    world_by_parent[parent] = max(world_by_parent.get(parent, 0), support)
+            elif relation.channel is NormalizedChannel.CROSS_MODAL:
+                cross_rows.append((relation, support))
+
+    recorded = 0
+    for relation, cross_support in cross_rows:
+        interaction_parent = next(
+            (parent for parent in relation.provenance.parents if parent in world_by_parent),
+            None,
+        )
+        if interaction_parent is None:
+            continue
+        world_support = int(world_by_parent[interaction_parent])
+        baseline = world_support / max(1.0, float(world_support + 1))
+        conditioned = cross_support / max(1.0, float(cross_support + 1))
+        runtime.record_symbol_conditioned_prediction(
+            baseline=baseline,
+            conditioned=conditioned,
+            actual=1.0,
+        )
+        recorded += 1
+        if recorded >= int(limit):
+            break
+    return recorded
 
 
 def _performance_summary(metrics: dict[str, Any]) -> dict[str, Any]:
@@ -201,6 +236,9 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             if requested_training_steps > 1
             else int(runtime.config.scientific.hgt_gradient_accumulation)
         )
+        symbol_prediction_samples = _record_symbol_prediction_evidence(runtime)
+        runtime.set_telemetry_gauge("symbol_prediction_samples_epoch", symbol_prediction_samples)
+
         replay_result = runtime.replay_once()
         runtime.set_telemetry_gauge("replay_selected_epoch", int(replay_result.selected))
         runtime.set_telemetry_gauge("replay_processed_epoch", int(replay_result.processed))
