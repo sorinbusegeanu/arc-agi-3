@@ -9,6 +9,7 @@ from v9.hgt import training
 from v9.memory import CanonicalNode, MemoryLevel, MemoryType
 from v9.memory.relations import RelationEdge, RelationType
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
+from v9.runtime.actor_policy import ActorPolicySnapshot
 from v9.runtime.read_view import ReadView
 
 
@@ -169,3 +170,40 @@ def test_hgt_behavior_rollback_restores_parent_policy(tmp_path) -> None:
     assert runtime.hgt_action_scores(7, (1, 2)) == {1: 0.9, 2: 0.1}
     manifest = json.loads((models / "hgt_manifest.json").read_text(encoding="utf-8"))
     assert manifest["current_model_version"] == parent
+
+
+def test_grounded_m7_scores_are_context_specific() -> None:
+    snapshot = ActorPolicySnapshot.build(
+        generation=1,
+        normalized_action_supports={},
+        hgt_action_scores={},
+        hgt_context_action_scores={},
+        hgt_action_scores_by_type={},
+        grounded_action_scores_by_type={"target": {1: 0.2, 2: 0.8}},
+        grounded_context_action_scores_by_type={"target": {99: {1: 0.9, 2: 0.1}}},
+        model_version="test",
+    )
+    assert snapshot.grounded_scores((1, 2), environment_type="target", context_signature=99) == {1: 0.9, 2: 0.1}
+    assert snapshot.grounded_scores((1, 2), environment_type="target", context_signature=100) == {1: 0.0, 2: 0.0}
+
+
+def test_unseen_actions_respect_epsilon_instead_of_forcing_exploration() -> None:
+    snapshot = ActorPolicySnapshot.build(
+        generation=1,
+        normalized_action_supports={},
+        hgt_action_scores={},
+        model_version="test",
+    )
+    action = choose_action(
+        snapshot,
+        (1, 2),
+        rng=Random(0),
+        epsilon=0.0,
+        learned_scores={1: 0.1, 2: 0.9},
+        target_environment_id=7,
+    )
+    assert action == 2
+
+
+def test_behavior_gate_blocks_candidate_promotion() -> None:
+    assert training._should_promote("hgt-000001", 0.8, 0.7, 0.6, 0.7)
