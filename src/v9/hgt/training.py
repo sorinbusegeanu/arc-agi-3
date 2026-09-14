@@ -451,18 +451,34 @@ def _should_promote(
     return bool(loss_ok and accuracy_ok)
 
 
-def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_rate: float, root: str | Path) -> HGTTrainingResult:
+def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_rate: float, root: str | Path, _budget_scale: float = 1.0, _oom_retry: int = 0) -> HGTTrainingResult:
     try:
         torch, _, _ = _require_torch()
     except RuntimeError:
         examples = int(getattr(getattr(runtime, "graph", None), "memory_count", lambda: 0)())
         return HGTTrainingResult(epoch, "SKIPPED_DEPENDENCY", runtime.unified_telemetry.model_version, None, 0.0, 0.0, examples, 0, None)
     config = runtime.config.scientific
+    memory_node_budget = max(64, int(config.hgt_max_subgraph_nodes * float(_budget_scale)))
+    canonical_edge_budget = max(256, int(config.hgt_max_subgraph_edges * float(_budget_scale)))
+    total_node_budget = max(memory_node_budget, int(config.hgt_max_total_nodes * float(_budget_scale)))
+    total_edge_budget = max(canonical_edge_budget, int(config.hgt_max_total_edges * float(_budget_scale)))
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        runtime.set_telemetry_gauge("hgt_vram_free_before_training_bytes", int(free_bytes))
+        runtime.set_telemetry_gauge("hgt_vram_total_bytes", int(total_bytes))
+        if int(free_bytes) < int(config.hgt_min_free_vram_bytes):
+            pressure = max(0.25, float(free_bytes) / max(1.0, float(config.hgt_min_free_vram_bytes)))
+            memory_node_budget = max(64, int(memory_node_budget * pressure))
+            canonical_edge_budget = max(256, int(canonical_edge_budget * pressure))
+            total_node_budget = max(memory_node_budget, int(total_node_budget * pressure))
+            total_edge_budget = max(canonical_edge_budget, int(total_edge_budget * pressure))
+            runtime.set_telemetry_gauge("hgt_vram_preflight_shedding_factor", float(pressure))
     training_view_builder = getattr(runtime.graph, "training_view", None)
     read_view = (
         training_view_builder(
-            max_nodes=int(config.hgt_max_subgraph_nodes),
-            max_edges=int(config.hgt_max_subgraph_edges),
+            max_nodes=memory_node_budget,
+            max_edges=canonical_edge_budget,
         )
         if callable(training_view_builder)
         else runtime.read_view
@@ -471,9 +487,22 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         return HGTTrainingResult(epoch, "SKIPPED_INSUFFICIENT_DATA", runtime.unified_telemetry.model_version, None, 0.0, 0.0, len(read_view.nodes), 0, None)
     x_dict, edge_index_dict, y_dict, action_targets, action_masks, action_meta = build_hgt_graph(
         read_view,
-        max_nodes=int(config.hgt_max_subgraph_nodes),
-        max_edges=int(config.hgt_max_subgraph_edges),
+        max_nodes=memory_node_budget,
+        max_edges=canonical_edge_budget,
+        max_total_nodes=total_node_budget,
+        max_total_edges=total_edge_budget,
+        max_semantic_facts_per_memory=int(config.hgt_max_semantic_facts_per_memory),
     )
+    realized_nodes = sum(int(value.shape[0]) for value in x_dict.values())
+    realized_edges = sum(int(value.shape[1]) for value in edge_index_dict.values())
+    runtime.set_telemetry_gauge("hgt_requested_memory_nodes", int(memory_node_budget))
+    runtime.set_telemetry_gauge("hgt_requested_canonical_edges", int(canonical_edge_budget))
+    runtime.set_telemetry_gauge("hgt_total_node_budget", int(total_node_budget))
+    runtime.set_telemetry_gauge("hgt_total_edge_budget", int(total_edge_budget))
+    runtime.set_telemetry_gauge("hgt_realized_total_nodes", int(realized_nodes))
+    runtime.set_telemetry_gauge("hgt_realized_total_edges", int(realized_edges))
+    runtime.set_telemetry_gauge("hgt_semantic_nodes", int(realized_nodes - len(x_dict[NODE_TYPE])))
+    runtime.set_telemetry_gauge("hgt_oom_retry_count", int(_oom_retry))
     selected_examples = sum(int(v.numel()) for v in y_dict.values())
     action_examples = sum(int(mask.sum().item()) for mask in action_masks.values())
     metadata = _stable_metadata()
