@@ -173,9 +173,10 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
                     mutation_kind=MutationKind.UPDATE_VALIDATION,
                 )
 
+            was_validated = bool(concept.validated)
             super().record_transfer_validation(concept_uid, **kwargs)
             concept = self._m4[concept_uid]
-            if not concept.validated:
+            if was_validated or not concept.validated:
                 return
 
             role = self._m3[concept.provenance.parents[0]]
