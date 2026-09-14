@@ -176,14 +176,6 @@ def run_transfer_validation_interval(
                 if target_environment_id in formation_scope:
                     last_blocker = "target environment is part of concept formation provenance"
                     continue
-                initial_actions = tuple(sorted(set(int(value) for value in adapter.available_actions())))
-                target_action = next((action for action in action_candidates if action in initial_actions), None)
-                if target_action is None:
-                    last_blocker = "concept has no target-local grounded action"
-                    continue
-                attempted += 1
-
-                environment = _BoundaryScoredEnvironment(adapter)
                 snapshot = runtime.actor_policy_snapshot()
                 baseline = _baseline_policy(
                     adapter,
@@ -192,6 +184,32 @@ def run_transfer_validation_interval(
                     environment_type=str(identity.environment_type),
                     seed=seed,
                 )
+                if context_candidates:
+                    matched_context = int(adapter.encode_observation(adapter.observe())) in context_candidates
+                    seek_limit = max(4, min(128, horizon * 4))
+                    seek_step = 0
+                    while not matched_context and seek_step < seek_limit:
+                        actions = tuple(int(value) for value in adapter.available_actions())
+                        if not actions:
+                            break
+                        seek_action = baseline(adapter.observe(), actions, seek_step)
+                        adapter.step(seek_action)
+                        seek_step += 1
+                        matched_context = int(adapter.encode_observation(adapter.observe())) in context_candidates
+                        if not adapter.boundary_event().continuation:
+                            adapter.reset()
+                    if not matched_context:
+                        last_blocker = "no corresponding target context found"
+                        continue
+
+                initial_actions = tuple(sorted(set(int(value) for value in adapter.available_actions())))
+                target_action = next((action for action in action_candidates if action in initial_actions), None)
+                if target_action is None:
+                    last_blocker = "concept has no target-local grounded action"
+                    continue
+                attempted += 1
+
+                environment = _BoundaryScoredEnvironment(adapter)
 
                 def enabled(observation: Any, actions: tuple[int, ...], step: int) -> int:
                     if step == 0 and target_action in actions:
