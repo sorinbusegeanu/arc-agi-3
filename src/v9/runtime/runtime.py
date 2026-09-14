@@ -715,6 +715,7 @@ class ContinuousMemoryRuntime:
                 (event.identity.event_id.hi, event.identity.event_id.lo),
                 self._watermark,
             )
+            transition = prepared.transition
             m0_payload = {
                 "modality_id": m0.modality_id,
                 "environment_instance_id": m0.provenance.environment_instance_id,
@@ -728,6 +729,16 @@ class ContinuousMemoryRuntime:
                 "primary_valence": m0.primary_valence,
                 "future_option_delta": m0.future_option_delta,
                 "realized_cost": m0.realized_cost,
+                "task_success": bool(transition.task_success),
+                "task_failure": bool(transition.task_failure),
+                "task_truncated": bool(transition.task_truncated),
+                "level_index": int(transition.level_index),
+                "levels_completed": int(transition.levels_completed),
+                **({"semantic_before": [list(row) for row in transition.semantic_before]} if transition.semantic_before else {}),
+                **({"semantic_action": [list(row) for row in transition.semantic_action]} if transition.semantic_action else {}),
+                **({"semantic_options": [list(row) for row in transition.semantic_options]} if transition.semantic_options else {}),
+                **({"semantic_after": [list(row) for row in transition.semantic_after]} if transition.semantic_after else {}),
+                **({"semantic_effects": [list(row) for row in transition.semantic_delta]} if transition.semantic_delta else {}),
             }
             m1g_node = CanonicalNode(
                 m1g.uid,
@@ -744,6 +755,8 @@ class ContinuousMemoryRuntime:
                 "executable_action_token": m1g.executable_action_token,
                 "realized_transition_signature": m1g.realized_transition_signature,
                 "grounded_next_context_signature": m1g.grounded_next_context_signature,
+                **({"semantic_action": [list(row) for row in transition.semantic_action]} if transition.semantic_action else {}),
+                **({"semantic_effects": [list(row) for row in transition.semantic_delta]} if transition.semantic_delta else {}),
                 "parents": [[m0.uid.hi, m0.uid.lo]],
             }
             self._defer_base_group(
