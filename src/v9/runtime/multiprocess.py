@@ -230,6 +230,11 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                 semantic_action_fn = getattr(adapter, "semantic_action", None)
                 semantic_delta_fn = getattr(adapter, "semantic_delta", None)
                 semantic_action = tuple(semantic_action_fn(action)) if callable(semantic_action_fn) else ()
+                semantic_options = tuple(
+                    fact
+                    for candidate in actions[:64]
+                    for fact in (tuple(semantic_action_fn(candidate)) if callable(semantic_action_fn) else ())
+                )
                 after = adapter.step(int(action))
                 semantic_after = tuple(semantic_observer(after)) if callable(semantic_observer) else ()
                 semantic_delta = tuple(semantic_delta_fn(semantic_before, semantic_after)) if callable(semantic_delta_fn) else ()
