@@ -187,6 +187,19 @@ def test_environment_registry_detects_tampering_and_restores_episode_identity() 
         EnvironmentRegistry.from_state_dict(state)
 
 
+def test_babyai_reset_suppresses_native_sampling_noise(capsys) -> None:
+    class NoisyBabyAI(FakeBabyAI):
+        def reset(self):
+            print("Sampling rejected: unreachable object at (1, 1)")
+            return super().reset()
+
+    adapter = BabyAIAdapter(NoisyBabyAI())
+    adapter.reset()
+    captured = capsys.readouterr()
+    assert "Sampling rejected:" not in captured.out
+    assert "Sampling rejected:" not in captured.err
+
+
 def test_babyai_and_alfred_optional_backend_contracts() -> None:
     baby = BabyAIAdapter(FakeBabyAI())
     baby.reset()
