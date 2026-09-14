@@ -269,6 +269,7 @@ def build_hgt_graph(
         )
     for memory_index, node_type, semantic_index in semantic_links:
         edges.setdefault((NODE_TYPE, "SEMANTIC", node_type), []).append((memory_index, semantic_index))
+        edges.setdefault((node_type, "SEMANTIC_OF", NODE_TYPE), []).append((semantic_index, memory_index))
     edge_index_dict = {
         key: torch.tensor(pairs, dtype=torch.long).t().contiguous()
         for key, pairs in edges.items()
