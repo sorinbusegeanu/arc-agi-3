@@ -57,3 +57,17 @@ def test_hgt_semantic_row_reader_includes_after_state() -> None:
     rows = _semantic_rows(payload)
     assert len(rows) == 4
     assert (2, 1, 6, 4, 4.0) in rows
+
+
+def test_arc_semantic_component_hashing_handles_multicell_shapes() -> None:
+    import numpy as np
+    from v9.environments.arc.adapter import ARCAdapter
+    adapter = object.__new__(ARCAdapter)
+    grid = np.array([
+        [1, 1, 0],
+        [1, 0, 2],
+        [0, 0, 2],
+    ], dtype=np.int64)
+    facts = ARCAdapter.semantic_observation(adapter, grid)
+    assert facts
+    assert any(int(row[0]) == 5 for row in facts)
