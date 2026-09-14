@@ -280,7 +280,35 @@ def run_transfer_validation_interval(
                 )
                 completed += 1
                 trials_for_concept += 1
-                passed += int(result.effect > float(runtime.config.scientific.transfer_effect_threshold))
+                trial_passed = bool(result.effect > threshold)
+                concept_passed += int(trial_passed)
+                passed += int(trial_passed)
+                _append_transfer_log(
+                    log_root,
+                    {
+                        "epoch": int(epoch),
+                        "event": "trial",
+                        "concept_uid": str(concept_uid),
+                        "source_types": sorted(source_types),
+                        "formation_scope": sorted(formation_scope),
+                        "target_environment_type": str(identity.environment_type),
+                        "target_environment_id": int(target_environment_id),
+                        "target_action": int(target_action),
+                        "enabled_metric": float(result.enabled_metric),
+                        "ablated_metric": float(result.ablated_metric),
+                        "effect": float(result.effect),
+                        "threshold": threshold,
+                        "passed": trial_passed,
+                        "matched": bool(result.matched),
+                        "held_out": True,
+                        "trial_index_for_concept": int(trials_for_concept),
+                        "minimum_trials": int(minimum_trials),
+                        "horizon": int(horizon),
+                        "positive_evidence": int(candidate.get("positive_evidence", 0)),
+                        "negative_evidence": int(candidate.get("negative_evidence", 0)),
+                        "support": int(candidate.get("support", 0)),
+                    },
+                )
             finally:
                 if adapter is not None:
                     close = getattr(adapter, "close", None)
