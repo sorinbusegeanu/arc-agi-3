@@ -116,21 +116,25 @@ def run_transfer_validation_interval(
         before_validated = bool(candidate["validated"])
         trials_for_concept = 0
 
-        preferred = tuple(spec for spec in specs if str(getattr(spec, "game_id", "")) not in source_types)
-        target_specs = preferred or tuple(specs)
+        target_specs = tuple(specs)
         if not target_specs:
             last_blocker = "no held-out target specification"
             continue
 
+        eligibility_scans = 0
+        maximum_scans = max(len(target_specs) * 3, budget * 2)
         while attempted < budget and trials_for_concept < minimum_trials:
             if mode == "validation_budgeted" and time.monotonic() >= deadline:
                 last_blocker = "transfer validation time budget exhausted"
                 break
+            if eligibility_scans >= maximum_scans:
+                last_blocker = last_blocker or "no eligible held-out target with exact snapshot/restore"
+                break
             spec = target_specs[target_cursor % len(target_specs)]
             target_cursor += 1
-            seed = int(getattr(args, "seed", 0)) + int(epoch) * 10_000_019 + attempted * 1009 + 7_000_001
+            eligibility_scans += 1
+            seed = int(getattr(args, "seed", 0)) + int(epoch) * 10_000_019 + (attempted + eligibility_scans) * 1009 + 7_000_001
             adapter = None
-            attempted += 1
             try:
                 adapter = adapter_factory(
                     spec,
@@ -142,6 +146,9 @@ def run_transfer_validation_interval(
                     last_blocker = f"{adapter.identity().family} adapter lacks exact snapshot/restore"
                     continue
                 identity = adapter.identity()
+                if source_types and str(identity.environment_type) in source_types:
+                    last_blocker = "target environment type is part of concept formation provenance"
+                    continue
                 target_environment_id = int(identity.instance_id.value)
                 if target_environment_id in formation_scope:
                     last_blocker = "target environment is part of concept formation provenance"
@@ -151,6 +158,7 @@ def run_transfer_validation_interval(
                 if target_action is None:
                     last_blocker = "concept has no target-local grounded action"
                     continue
+                attempted += 1
 
                 environment = _BoundaryScoredEnvironment(adapter)
                 snapshot = runtime.actor_policy_snapshot()
