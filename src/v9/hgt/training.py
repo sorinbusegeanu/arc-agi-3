@@ -29,6 +29,11 @@ class HGTTrainingResult:
     examples: int
     training_steps: int
     checkpoint: str | None
+    validation_accuracy: float = 0.0
+    inference_latency_ms: float = 0.0
+    subgraph_nodes: int = 0
+    subgraph_edges: int = 0
+    relevance_precision: float = 0.0
 
 
 def _require_torch():
