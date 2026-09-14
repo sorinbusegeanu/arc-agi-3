@@ -211,6 +211,8 @@ def run_trace_bundle(
 
                 after = adapter.step(action)
                 after_trace = _trace_observation(adapter, after)
+                semantic_after = tuple(adapter.semantic_observation(after))
+                semantic_delta = tuple(adapter.semantic_delta(semantic_before, semantic_after))
                 boundary = adapter.boundary_event()
                 progress = adapter.task_progress()
                 after_actions = tuple(sorted(set(int(value) for value in adapter.available_actions())))
@@ -237,6 +239,11 @@ def run_trace_bundle(
                         for value in actions
                     ],
                     "chosen_action": {"token": action, "semantic": action_label},
+                    "semantic_before": [list(x) for x in semantic_before],
+                    "semantic_action": [list(x) for x in semantic_action],
+                    "semantic_options": [list(x) for x in semantic_options],
+                    "semantic_after": [list(x) for x in semantic_after],
+                    "semantic_delta": [list(x) for x in semantic_delta],
                     "after_observation": after_trace,
                     "after_signature": int(adapter.encode_observation(after)),
                     "symbols_after": _symbol_text(after_symbols),
