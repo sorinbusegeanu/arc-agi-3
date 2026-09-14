@@ -199,6 +199,7 @@ def run_trace_bundle(
                         continue
 
                 before = adapter.observe()
+                before_trace = _trace_observation(adapter, before)
                 before_signature = int(adapter.encode_observation(before))
                 before_symbols = tuple(adapter.optional_symbol_stream())
                 labels_before = _action_labels(adapter, actions)
@@ -206,6 +207,7 @@ def run_trace_bundle(
                 action_label = labels_before.get(action, str(action))
 
                 after = adapter.step(action)
+                after_trace = _trace_observation(adapter, after)
                 boundary = adapter.boundary_event()
                 progress = adapter.task_progress()
                 after_actions = tuple(sorted(set(int(value) for value in adapter.available_actions())))
@@ -222,7 +224,7 @@ def run_trace_bundle(
                     },
                     "episode": episode,
                     "step": step,
-                    "before_observation": _trace_observation(adapter, before),
+                    "before_observation": before_trace,
                     "before_signature": before_signature,
                     "symbols_before": _symbol_text(before_symbols),
                     "available_actions_before": [
@@ -230,7 +232,7 @@ def run_trace_bundle(
                         for value in actions
                     ],
                     "chosen_action": {"token": action, "semantic": action_label},
-                    "after_observation": _trace_observation(adapter, after),
+                    "after_observation": after_trace,
                     "after_signature": int(adapter.encode_observation(after)),
                     "symbols_after": _symbol_text(after_symbols),
                     "available_actions_after": [
