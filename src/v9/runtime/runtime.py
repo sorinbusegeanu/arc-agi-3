@@ -305,8 +305,9 @@ class ContinuousMemoryRuntime:
             if isinstance(event, InteractionEvent):
                 experience = event.experience
                 recurrence = self._m1n_supports.get(stable_u64(f"ACTION:{experience.action_id}:FAMILY:{experience.family_signature}:OUTCOME:{experience.outcome_signature}", NormalizedChannel.WORLD.value, person=b"v9-m1-normalized"), 0)
+                recurrence_surprise = 1.0 / max(1.0, float(recurrence))
                 decision = self.isf.score(
-                    ISFComponents(abs(experience.primary_valence), abs(experience.future_option_delta), experience.prediction_error, 1.0 / max(1, recurrence), 0.5 if experience.family_signature else 0.0, min(1.0, experience.changed_cells / 16.0)),
+                    ISFComponents(abs(experience.primary_valence), abs(experience.future_option_delta), recurrence_surprise, 1.0 / max(1, recurrence), 0.5 if experience.family_signature else 0.0, min(1.0, experience.changed_cells / 16.0)),
                     decision_watermark=self._watermark,
                     evidence_availability_watermark=event.identity.causal_watermark,
                     stage=stage_before,
