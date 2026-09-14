@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from v9.environments import (
-    ARCAdapter, AlfredAdapter, BabyAIAdapter, BoundaryEvent, BoundaryScope,
+    ARCAdapter, AlfredAdapter, AlfworldTextBackend, BabyAIAdapter, BoundaryEvent, BoundaryScope,
     EnvironmentCognitionAdapter, GymDiscreteAdapter, SudokuAdapter,
     SyntheticSymbolicEnvironment,
 )
@@ -37,6 +37,9 @@ class FakeBabyAI:
 class FakeAlfred:
     environment_name = "fake-alfred"
 
+    def __init__(self):
+        self.closed = False
+
     def reset(self):
         return b"world", "move"
 
@@ -45,6 +48,25 @@ class FakeAlfred:
 
     def step(self, action: int):
         return f"world-{action}".encode(), "move", BoundaryEvent(BoundaryScope.EPISODE, 1, False)
+
+    def close(self):
+        self.closed = True
+
+
+class FakeAlfworldTextEnvironment:
+    def __init__(self):
+        self.commands = []
+        self.closed = False
+
+    def reset(self):
+        return "room", {"admissible_commands": ["take apple", "look"], "won": False}
+
+    def step(self, command: str):
+        self.commands.append(command)
+        return "done", 1, True, {"admissible_commands": ["inventory"], "won": True}
+
+    def close(self):
+        self.closed = True
 
 
 @dataclass
@@ -134,6 +156,58 @@ def test_babyai_and_alfred_optional_backend_contracts() -> None:
     alfred.step(4)
     assert alfred.boundary_event().primary_valence == 1
     assert alfred.payload_store.hot_bytes > 0
+    alfred.close()
+    assert alfred.backend.closed is True
+
+
+def test_alfworld_text_backend_maps_dynamic_commands_and_task_instruction(tmp_path: Path) -> None:
+    task = tmp_path / "json_2.1.1" / "train" / "pick_and_place_simple-Apple-None-Table-1" / "trial_1"
+    task.mkdir(parents=True)
+    (task / "game.tw-pddl").write_text("{}", encoding="utf-8")
+    (task / "traj_data.json").write_text(
+        '{"task_type":"pick_and_place_simple","turk_annotations":{"anns":[{"task_desc":"put the apple away"}]}}',
+        encoding="utf-8",
+    )
+    native = FakeAlfworldTextEnvironment()
+    backend = AlfworldTextBackend(
+        "pick_and_place_simple",
+        seed=3,
+        data_root=tmp_path,
+        environment_factory=lambda path: native,
+    )
+
+    world, instruction = backend.reset()
+    assert instruction == b"put the apple away"
+    assert world["admissible_commands"] == ("look", "take apple")
+    assert backend.available_actions() == (0, 1)
+    _, _, boundary = backend.step(1)
+    assert native.commands == ["take apple"]
+    assert backend.available_actions() == (0,)
+    assert boundary == BoundaryEvent(BoundaryScope.EPISODE, 1, False)
+    backend.close()
+    assert native.closed is True
+
+
+def test_alfworld_text_backend_reports_missing_downloaded_tasks(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="alfworld-download"):
+        AlfworldTextBackend("pick_and_place_simple", data_root=tmp_path)
+
+
+def test_cli_alfred_adapter_uses_builtin_backend_and_is_ready_after_construction(monkeypatch) -> None:
+    from v9 import cli
+    from v9.curriculum import EnvironmentSpec
+    import v9.environments
+
+    backend = FakeAlfred()
+    monkeypatch.setattr(v9.environments, "make_alfworld_backend", lambda **kwargs: backend)
+    adapter = cli.make_adapter(
+        EnvironmentSpec("alfred", "pick_and_place_simple"),
+        seed=7,
+        env_root=None,
+    )
+
+    assert adapter.observe().instruction_bytes == b"move"
+    assert adapter.available_actions() == (4, 5)
 
 
 def test_babyai_factory_registers_environments_in_a_clean_process() -> None:

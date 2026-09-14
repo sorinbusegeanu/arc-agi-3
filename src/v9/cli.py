@@ -136,15 +136,19 @@ def make_adapter(spec: EnvironmentSpec | str, *, seed: int, env_root: str | None
             )
         )
     if adapter == "alfred":
-        if not alfred_backend_factory:
-            raise RuntimeError("ALFRED curriculum execution requires --alfred-backend-factory module:function")
-        module_name, separator, attribute = alfred_backend_factory.partition(":")
-        if not separator:
-            raise ValueError("--alfred-backend-factory must use module:function")
-        factory = getattr(importlib.import_module(module_name), attribute)
+        if alfred_backend_factory:
+            module_name, separator, attribute = alfred_backend_factory.partition(":")
+            if not separator:
+                raise ValueError("--alfred-backend-factory must use module:function")
+            factory = getattr(importlib.import_module(module_name), attribute)
+        else:
+            from v9.environments import make_alfworld_backend
+            factory = make_alfworld_backend
         from v9.environments import AlfredAdapter
         backend = factory(game_id=game_id, seed=seed, **kwargs)
-        return AlfredAdapter(backend)
+        result = AlfredAdapter(backend)
+        result.reset()
+        return result
     if adapter == "arc":
         return ARCAdapter(game_id, seed=seed, env_root=env_root)
     raise ValueError(f"unsupported curriculum adapter: {spec.adapter}")
@@ -324,6 +328,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_runtime_arguments(continuous)
     continuous.add_argument("--games", default=None)
     continuous.add_argument("--curriculum-config", default=None)
+    continuous.add_argument("--alfred-backend-factory", default=None, metavar="MODULE:FUNCTION")
     trajectory = continuous.add_mutually_exclusive_group()
     trajectory.add_argument("--show-best-trajectory", metavar="GAME_ID", default=None)
     trajectory.add_argument("--save-best-trajectory", metavar="FILE", default=None)
