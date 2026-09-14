@@ -130,6 +130,7 @@ def run_transfer_validation_interval(
         formation_scope = set(int(value) for value in candidate["formation_scope"])
         source_types = set(str(value) for value in candidate["source_environment_types"])
         action_candidates = tuple(int(value) for value in candidate["actions"])
+        context_candidates = {int(value) for value in candidate.get("contexts", ())}
         before_validated = bool(candidate["validated"])
         trials_for_concept = 0
 
