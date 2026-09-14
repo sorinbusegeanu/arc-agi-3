@@ -7,6 +7,7 @@ from typing import Any
 from v9.hgt import train_hgt_epoch
 from .lifecycle import run_lifecycle_maintenance
 from .parallel_memory_coordinator import run_parallel_memory_jobs
+from .transfer_validation import run_transfer_validation_interval
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,10 +71,15 @@ def _performance_summary(metrics: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
+def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_factory: Any | None = None):
     actor_results = []
     epoch_results = []
     baseline_success: float | None = None
+    transfer_attempted = transfer_completed = transfer_passed = transfer_validated = 0
+    if adapter_factory is None:
+        # Imported lazily to avoid the cli -> epoch_runner module cycle.
+        from v9.cli import make_adapter as adapter_factory
+
     for epoch in range(1, int(args.epochs) + 1):
         jobs = build_epoch_jobs(specs, args, epoch=epoch)
         print(f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} sampling start actors={len(jobs)}", flush=True)
@@ -110,6 +116,25 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
         runtime.set_telemetry_gauge("behavioral_success_rate", behavioral_success)
         runtime.set_telemetry_gauge("behavioral_success_gain", behavioral_gain)
         runtime.set_telemetry_gauge("successful_scenarios", sum(rate > 0.0 for rate in scenario_success.values()))
+
+        # M4 -> M5 is a causal gate. Drive only matched held-out trials from an
+        # exactly restorable target state; failed trials remain failed evidence.
+        transfer = run_transfer_validation_interval(
+            runtime,
+            specs,
+            args,
+            epoch=epoch,
+            adapter_factory=adapter_factory,
+        )
+        transfer_attempted += int(transfer.attempted)
+        transfer_completed += int(transfer.completed)
+        transfer_passed += int(transfer.passed)
+        transfer_validated += int(transfer.validated_concepts)
+        runtime.set_telemetry_gauge("transfer_experiments_attempted", transfer_attempted)
+        runtime.set_telemetry_gauge("transfer_experiments_completed", transfer_completed)
+        runtime.set_telemetry_gauge("transfer_experiments_passed", transfer_passed)
+        runtime.set_telemetry_gauge("transfer_concepts_validated", transfer_validated)
+        runtime.set_telemetry_gauge("transfer_experiment_blocker", transfer.blocker or "")
 
         requested_training_steps = int(args.hgt_training_epochs)
         effective_training_steps = (
@@ -153,6 +178,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any):
                     "behavioral_success_rate": behavioral_success,
                     "behavioral_success_gain": behavioral_gain,
                     "scenario_success_rate": scenario_success,
+                    "transfer_validation": asdict(transfer),
                 },
                 performance=performance,
                 metrics=metrics,
