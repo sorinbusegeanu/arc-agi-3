@@ -37,6 +37,10 @@ class ProcessActorResult:
     episode_boundaries: int
     resets: int
     policy_refreshes: int = 0
+    task_successes: int = 0
+    task_failures: int = 0
+    task_truncations: int = 0
+    levels_completed: int = 0
 
 
 def _reconcile_actor_liveness(
