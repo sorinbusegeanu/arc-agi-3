@@ -9,7 +9,7 @@ from typing import Any
 
 from .canonical_commit import apply_canonical_commit_batch
 from .memory_pipeline import DerivationResult, IngestionTask
-from .memory_pipeline_v2 import IngestionBatchTask, PreparedCommitBatch
+from .memory_pipeline_v2 import DerivationBatchTask, IngestionBatchTask, PreparedCommitBatch
 from .parallel_memory_coordinator import _adaptive_canonical_batch_size
 from .shared_batch_transport import consume_shared_batch
 
@@ -91,17 +91,22 @@ class MemoryPipelineServiceV2:
         self.pending_derivation.append(task)
 
     def pump_derivation_tasks(self) -> bool:
-        progressed = False
-        for _ in range(256):
-            if not self.pending_derivation:
-                break
-            try:
-                self.memory.derivation_queue.put_nowait(self.pending_derivation[0])
-            except queue.Full:
-                break
+        if not self.pending_derivation:
+            return False
+        count = min(64, len(self.pending_derivation))
+        tasks = tuple(islice(self.pending_derivation, 0, count))
+        batch = DerivationBatchTask(
+            int(tasks[0].task_id),
+            int(tasks[-1].task_id),
+            tasks,
+        )
+        try:
+            self.memory.derivation_queue.put_nowait(batch)
+        except queue.Full:
+            return False
+        for _ in range(count):
             self.pending_derivation.popleft()
-            progressed = True
-        return progressed
+        return True
 
     def drain_ingest_results(self, *, block: bool = False, timeout: float = 0.0) -> bool:
         progressed = False
@@ -183,6 +188,12 @@ class MemoryPipelineServiceV2:
             first = False
             if item[0] == "worker_error":
                 raise RuntimeError(f"{item[1]} worker task {item[2]} failed: {item[3]}")
+            if item[0] == "derivation_batch_shm":
+                results, _decode_ms = consume_shared_batch(item[3])
+                for result in results:
+                    self.derive_results[int(result.task_id)] = result
+                progressed = True
+                continue
             if item[0] == "derivation":
                 self.derive_results[int(item[1])] = item[2]
                 progressed = True
