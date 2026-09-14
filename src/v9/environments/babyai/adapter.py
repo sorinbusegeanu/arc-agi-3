@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+import os
 from typing import Any
 
 from v9.environments.base import StructuralAdapter
@@ -13,6 +15,12 @@ from v9.modalities.symbols import DeterministicSymbolCodec, SymbolObservation
 class BabyAIObservation:
     world: Any
     instruction_bytes: bytes
+
+
+def _quiet_native_call(callable_obj, *args, **kwargs):
+    with open(os.devnull, "w", encoding="utf-8") as sink:
+        with redirect_stdout(sink), redirect_stderr(sink):
+            return callable_obj(*args, **kwargs)
 
 
 class BabyAIAdapter(StructuralAdapter):
@@ -40,7 +48,7 @@ class BabyAIAdapter(StructuralAdapter):
         return BabyAIObservation(world, mission.encode("utf-8") if isinstance(mission, str) else bytes(mission))
 
     def reset(self) -> BabyAIObservation:
-        raw = self.native_env.reset()
+        raw = _quiet_native_call(self.native_env.reset)
         observation = raw[0] if isinstance(raw, tuple) and len(raw) == 2 else raw
         self._last = self._split(observation)
         self._boundary = BoundaryEvent()
@@ -82,9 +90,9 @@ def make_babyai_adapter(environment_id: str, *, seed: int = 0, suppress_symbols:
         import minigrid  # noqa: F401  # registers MiniGrid and BabyAI environments
     except ImportError as exc:
         raise RuntimeError("BabyAI live support requires the optional minigrid dependency") from exc
-    env = gym.make(environment_id, **kwargs)
+    env = _quiet_native_call(gym.make, environment_id, **kwargs)
     try:
-        env.reset(seed=int(seed))
+        _quiet_native_call(env.reset, seed=int(seed))
     except TypeError:
         pass
     return BabyAIAdapter(env, environment_name=environment_id, suppress_symbols=suppress_symbols)
