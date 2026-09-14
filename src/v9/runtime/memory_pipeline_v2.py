@@ -118,6 +118,8 @@ def _m1g_write(m1g: Any, m0: Any, event: Any, transition: Any = None) -> Canonic
             "executable_action_token": m1g.executable_action_token,
             "realized_transition_signature": m1g.realized_transition_signature,
             "grounded_next_context_signature": m1g.grounded_next_context_signature,
+            "semantic_action": [] if transition is None else [list(row) for row in transition.semantic_action],
+            "semantic_effects": [] if transition is None else [list(row) for row in transition.semantic_delta],
             "parents": [[m0.uid.hi, m0.uid.lo]],
         },
         (m0.uid,),
