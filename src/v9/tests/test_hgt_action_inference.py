@@ -93,9 +93,37 @@ def test_hgt_graph_sampling_keeps_relation_endpoints(monkeypatch) -> None:
     assert ("MEMORY", "PROVENANCE", "MEMORY") in edge_indexes
 
 
-def test_hgt_promotion_compares_candidate_to_parent_on_same_current_graph() -> None:
+def test_hgt_promotion_requires_retention_and_loss_preservation() -> None:
     assert training._should_promote("hgt-000001", 0.80, 0.76, 0.60, 0.61)
-    assert training._should_promote("hgt-000001", 0.80, 0.805, 0.60, 0.59)
-    assert not training._should_promote("hgt-000001", 0.80, 0.82, 0.60, 0.61)
-    assert not training._should_promote("hgt-000001", 0.80, 0.76, 0.60, 0.50)
+    assert training._should_promote("hgt-000001", 0.80, 0.80, 0.60, 0.60)
+    assert not training._should_promote("hgt-000001", 0.80, 0.805, 0.60, 0.61)
+    assert not training._should_promote("hgt-000001", 0.80, 0.76, 0.60, 0.59)
     assert training._should_promote(None, float("inf"), 1.20, float("nan"), 0.20)
+
+
+def test_optimized_runtime_policy_snapshot_keeps_grounded_strategy_scores(tmp_path) -> None:
+    from v9.environments.schemas import EnvironmentIdentity
+    from v9.memory.identity import MemoryUid
+    from v9.memory.m7_strategy import M7Strategy
+    from v9.memory.provenance import DerivationProvenance
+
+    runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False))
+    environment_id = runtime.environments.register(
+        EnvironmentIdentity("gymnasium", "FrozenLake-v1", "default", "seed=1")
+    ).value
+    outcome_uid = MemoryUid.derive("outcome", 1)
+    strategy_uid = MemoryUid.derive("strategy", 1)
+    runtime._m7[strategy_uid] = M7Strategy(
+        strategy_uid,
+        outcome_uid,
+        environment_id,
+        (2,),
+        3,
+        4,
+        2,
+        9,
+        DerivationProvenance((outcome_uid,), (outcome_uid,)),
+    )
+
+    snapshot = runtime.actor_policy_snapshot()
+    assert snapshot.grounded_scores((1, 2), environment_type="FrozenLake-v1")[2] == 0.75
