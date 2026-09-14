@@ -78,6 +78,8 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
                 ),
             )
             for concept in concepts:
+                if concept.validated:
+                    continue
                 scope = self._concept_evidence_scope(concept)
                 source_types: set[str] = set()
                 for environment_id in scope:
