@@ -333,8 +333,10 @@ class AlfredAdapter(StructuralAdapter):
         self._last_trace = None
         self._last: AlfredObservation | None = None
         self._counter = 0
+        self._trace_world: Any = None
 
     def _capture(self, world: Any, instruction: str | bytes) -> AlfredObservation:
+        self._trace_world = world
         payload = bytes(world) if isinstance(world, (bytes, bytearray, memoryview)) else repr(world).encode("utf-8")
         self._counter += 1
         source = MemoryUid.derive("alfred-observation", self._identity.instance_id.value, self._counter)
@@ -356,6 +358,22 @@ class AlfredAdapter(StructuralAdapter):
 
     def available_actions(self) -> tuple[int, ...]:
         return () if not self._boundary.continuation else tuple(int(value) for value in self.backend.available_actions())
+
+    def trace_observation(self) -> object:
+        return {
+            "world": self._trace_world,
+            "instruction": self.observe().instruction_bytes,
+            "world_signature": int(self.observe().world_signature),
+            "payload_uid": int(self.observe().payload_uid),
+        }
+
+    def trace_action_labels(self, actions: tuple[int, ...]) -> dict[int, str]:
+        commands = tuple(str(value) for value in getattr(self.backend, "_actions", ()))
+        return {
+            int(token): command
+            for token, command in zip(self.backend.available_actions(), commands)
+            if int(token) in set(int(value) for value in actions)
+        }
 
     def optional_symbol_stream(self) -> tuple[object, ...]:
         return tuple(self.observe().instruction_bytes)
