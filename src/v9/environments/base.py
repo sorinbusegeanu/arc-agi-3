@@ -198,6 +198,20 @@ class StructuralAdapter:
                 )
             except Exception:
                 pass
+        elif family in {"puzzle", "sudoku"} or "sudoku" in str(self._identity.environment_type).lower():
+            try:
+                from v9.environments.sudoku.adapter import decode_action
+                row, col, digit = decode_action(token)
+                action_type = "place"
+                subject = _semantic_id("action:place")
+                return (
+                    _fact(8, subject, 23, "place", 1.0),
+                    _fact(8, subject, 16, "row", float(row)),
+                    _fact(8, subject, 16, "column", float(col)),
+                    _fact(8, subject, 16, "digit", float(digit)),
+                )
+            except Exception:
+                pass
         subject = _semantic_id(f"action:{action_type}")
         return (_fact(8, subject, 23, action_type, 1.0),)
 
