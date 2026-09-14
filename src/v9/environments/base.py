@@ -72,6 +72,17 @@ class StructuralAdapter:
         facts: list[SemanticFact] = []
         family = str(self._identity.family).lower()
         environment = str(self._identity.environment_type).lower()
+        instruction = getattr(observation, "instruction_bytes", None)
+        world = getattr(observation, "world", None)
+        if instruction is not None:
+            try:
+                text = bytes(instruction).decode("utf-8")
+            except Exception:
+                text = repr(instruction)
+            if text:
+                facts.append(_fact(7, "instruction", 1, text, 1.0))
+            if world is not None:
+                observation = world
         if isinstance(observation, dict):
             for key, value in sorted(observation.items()):
                 if isinstance(value, (int, float)):
