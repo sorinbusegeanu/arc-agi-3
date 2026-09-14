@@ -51,8 +51,9 @@ class ScientificConfig:
     transfer_minimum_trials: int = 2
     transfer_effect_threshold: float = 0.0
     transfer_validation_mode: str = "validation_budgeted"
-    transfer_validation_trials_per_interval: int = 8
-    transfer_validation_time_budget_seconds: float = 30.0
+    transfer_validation_trials_per_interval: int = 900
+    transfer_validation_workers: int = 30
+    transfer_validation_time_budget_seconds: float = 300.0
     transfer_trust_scope_limit: int = 8192
     replay_candidates_per_interval: int = 128
     structural_index_bucket_scan_limit: int = 8
@@ -91,11 +92,11 @@ class ScientificConfig:
     hgt_layers: int = 3
     hgt_heads: int = 5
     hgt_ffn_dim: int = 1024
-    hgt_target_subgraph_nodes: int = 400
-    hgt_max_subgraph_nodes: int = 800
-    hgt_max_subgraph_edges: int = 4000
-    hgt_max_total_nodes: int = 6000
-    hgt_max_total_edges: int = 40000
+    hgt_target_subgraph_nodes: int = 8000
+    hgt_max_subgraph_nodes: int = 12000
+    hgt_max_subgraph_edges: int = 60000
+    hgt_max_total_nodes: int = 60000
+    hgt_max_total_edges: int = 400000
     hgt_max_semantic_facts_per_memory: int = 16
     hgt_oom_retry_limit: int = 2
     hgt_min_free_vram_bytes: int = 6 * 1024 * 1024 * 1024
@@ -121,7 +122,7 @@ class ScientificConfig:
             self.replay_candidates, self.normalization_bootstrap_samples,
             self.normalization_reservoir_limit, self.normalization_minimum_generation_span, self.probation_evidence_opportunities,
             self.transfer_minimum_trials,
-            self.provisional_sample_bound, self.transfer_validation_trials_per_interval,
+            self.provisional_sample_bound, self.transfer_validation_trials_per_interval, self.transfer_validation_workers,
             self.transfer_trust_scope_limit,
             self.replay_candidates_per_interval, self.structural_index_bucket_scan_limit,
             self.descriptor_component_limit, self.context_scope_limit,
