@@ -271,7 +271,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
             # ActorDone is an end-of-stream marker. Ensure every transition this
             # actor produced has left its feeder before publishing completion.
             _flush_child_queue(stage_queue)
-            result_queue.put(ActorDone(actor_id, game_id, completed, positives, negatives, episode_boundaries, resets, policy_refreshes, task_successes, task_failures, task_truncations, levels_completed))
+            result_queue.put(ActorDone(actor_id, game_id, completed, positives, negatives, episode_boundaries, resets, policy_refreshes, task_successes, task_failures, task_truncations, levels_completed, grounded_action_influence))
             completion_sent = True
     except BaseException as exc:
         try:
