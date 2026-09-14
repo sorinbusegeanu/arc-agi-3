@@ -284,9 +284,14 @@ def run_continuous(args: argparse.Namespace) -> int:
         x_display=getattr(args, "alfred_x_display", None),
     )
     games = tuple(spec.display_name for spec in specs)
-    runtime = ContinuousMemoryRuntime(_runtime_config(args))
     curriculum_modes = sorted({spec.validation_mode for spec in specs if spec.validation_mode})
-    effective_validation_mode = ("learning_only" if args.no_automatic_experiments else (curriculum_modes[0] if len(curriculum_modes) == 1 else args.validation_mode))
+    effective_validation_mode = (
+        "learning_only"
+        if args.no_automatic_experiments
+        else (curriculum_modes[0] if len(curriculum_modes) == 1 else args.validation_mode)
+    )
+    args.validation_mode = effective_validation_mode
+    runtime = ContinuousMemoryRuntime(_runtime_config(args))
     runtime.set_telemetry_gauge("curriculum_validation_mode", effective_validation_mode)
     runtime.start()
     dashboard = None
