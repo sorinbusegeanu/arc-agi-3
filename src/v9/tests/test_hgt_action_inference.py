@@ -207,3 +207,30 @@ def test_unseen_actions_respect_epsilon_instead_of_forcing_exploration() -> None
 
 def test_behavior_gate_blocks_candidate_promotion() -> None:
     assert training._should_promote("hgt-000001", 0.8, 0.7, 0.6, 0.7)
+
+
+def test_first_hgt_model_can_rollback_to_untrained(tmp_path) -> None:
+    import json
+    pytest.importorskip("torch")
+
+    runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False))
+    runtime.set_hgt_action_scores({7: {1: 0.9}}, context_action_scores={7: {11: {1: 0.8}}})
+    models = tmp_path / "models"
+    models.mkdir(exist_ok=True)
+    (models / "hgt_manifest.json").write_text(
+        json.dumps(
+            {
+                "model_schema_version": training.MODEL_SCHEMA_VERSION,
+                "version_index": 1,
+                "current_model_version": "hgt-000001",
+                "current_checkpoint": "models/hgt-000001.pt",
+                "parent_model_version": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restored = training.rollback_hgt_model(runtime, root=tmp_path)
+    assert restored == "untrained"
+    assert runtime.hgt_action_scores(7, (1,)) == {1: 0.0}
+    assert runtime.actor_policy_snapshot().learned_scores(7, (1,), context_signature=11) == {1: 0.0}
