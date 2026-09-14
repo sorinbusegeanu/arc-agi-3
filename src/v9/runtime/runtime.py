@@ -326,15 +326,16 @@ class ContinuousMemoryRuntime:
                 experience = event.experience
                 recurrence = self._m1n_supports.get(stable_u64(f"ACTION:{experience.action_id}:FAMILY:{experience.family_signature}:OUTCOME:{experience.outcome_signature}", NormalizedChannel.WORLD.value, person=b"v9-m1-normalized"), 0)
                 recurrence_surprise = 1.0 / max(1.0, float(recurrence))
+                prediction_error = abs(float(experience.prediction_error)) if float(experience.prediction_error) != 0.0 else recurrence_surprise
                 decision = self.isf.score(
-                    ISFComponents(abs(experience.primary_valence), abs(experience.future_option_delta), recurrence_surprise, 1.0 / max(1, recurrence), 0.5 if experience.family_signature else 0.0, min(1.0, experience.changed_cells / 16.0)),
+                    ISFComponents(abs(experience.primary_valence), abs(experience.future_option_delta), prediction_error, 1.0 / max(1, recurrence), 0.5 if experience.family_signature else 0.0, min(1.0, experience.changed_cells / 16.0)),
                     decision_watermark=self._watermark,
                     evidence_availability_watermark=event.identity.causal_watermark,
                     stage=stage_before,
                     next_stage=stage_snapshot.next_stage,
                     graph_generation=self.graph.generation,
                 )
-                self._prediction_error_sum += float(recurrence_surprise)
+                self._prediction_error_sum += float(prediction_error)
                 self._prediction_error_count += 1
                 self.evidence.append("ISF_DECISION", self._watermark, {"stage": int(decision.developmental_stage), "next_stage": int(decision.next_developmental_stage), "score": decision.score, "raw": asdict(decision.raw_components), "normalized": asdict(decision.normalized_components), "graph_generation": decision.graph_generation})
 
