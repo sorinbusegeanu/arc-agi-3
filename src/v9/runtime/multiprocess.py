@@ -46,7 +46,6 @@ class EncodedTransition:
     task_truncated: bool = False
     level_index: int = 0
     levels_completed: int = 0
-    grounded_action_influence: int = 0
 
 
 @dataclass(frozen=True, slots=True)
