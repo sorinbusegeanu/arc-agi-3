@@ -315,11 +315,37 @@ def run_transfer_validation_interval(
                     if callable(close):
                         close()
 
-        if not before_validated and runtime.is_concept_validated(concept_uid):
+        now_validated = bool(runtime.is_concept_validated(concept_uid))
+        if not before_validated and now_validated:
             validated += 1
+        _append_transfer_log(
+            log_root,
+            {
+                "epoch": int(epoch),
+                "event": "concept_summary",
+                "concept_uid": str(concept_uid),
+                "trials": int(trials_for_concept),
+                "passed": int(concept_passed),
+                "validated_before": bool(before_validated),
+                "validated_after": now_validated,
+                "blockers": concept_blockers,
+            },
+        )
         if mode == "validation_budgeted" and time.monotonic() >= deadline:
             break
 
     if completed:
         last_blocker = None
+    _append_transfer_log(
+        log_root,
+        {
+            "epoch": int(epoch),
+            "event": "interval_summary",
+            "attempted": int(attempted),
+            "completed": int(completed),
+            "passed": int(passed),
+            "validated": int(validated),
+            "blocker": last_blocker,
+        },
+    )
     return TransferValidationStats(attempted, completed, passed, validated, last_blocker)
