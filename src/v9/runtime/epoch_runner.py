@@ -189,8 +189,13 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             actor_view_refresh_ms=args.actor_view_refresh_ms,
         )
         actor_results.extend(process_results)
+        post_sampling_started = time.perf_counter()
         runtime.wait_quiescent(args.drain_timeout)
+        quiescent_done = time.perf_counter()
         runtime.flush_deferred_memory_updates()
+        flush_done = time.perf_counter()
+        runtime.set_telemetry_gauge("post_sampling_wait_quiescent_seconds", quiescent_done - post_sampling_started)
+        runtime.set_telemetry_gauge("post_sampling_flush_seconds", flush_done - quiescent_done)
 
         # Current-epoch behavioral evidence must be visible before model validation
         # and before any memory is hidden or physically compacted.
@@ -213,6 +218,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
 
         # M4 -> M5 is a causal gate. Drive only matched held-out trials from an
         # exactly restorable target state; failed trials remain failed evidence.
+        transfer_started = time.perf_counter()
         transfer = run_transfer_validation_interval(
             runtime,
             specs,
@@ -220,6 +226,8 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             epoch=epoch,
             adapter_factory=adapter_factory,
         )
+        transfer_done = time.perf_counter()
+        runtime.set_telemetry_gauge("post_sampling_transfer_seconds", transfer_done - transfer_started)
         transfer_attempted += int(transfer.attempted)
         transfer_completed += int(transfer.completed)
         transfer_passed += int(transfer.passed)
@@ -239,12 +247,16 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         symbol_prediction_samples = _record_symbol_prediction_evidence(runtime)
         runtime.set_telemetry_gauge("symbol_prediction_samples_epoch", symbol_prediction_samples)
 
+        replay_started = time.perf_counter()
         replay_result = runtime.replay_once()
+        replay_done = time.perf_counter()
+        runtime.set_telemetry_gauge("post_sampling_replay_seconds", replay_done - replay_started)
         runtime.set_telemetry_gauge("replay_selected_epoch", int(replay_result.selected))
         runtime.set_telemetry_gauge("replay_processed_epoch", int(replay_result.processed))
         runtime.set_telemetry_gauge("replay_new_memories_epoch", int(replay_result.new_memories))
         runtime.set_telemetry_gauge("replay_revisions_epoch", int(replay_result.revisions))
 
+        training_started = time.perf_counter()
         training = train_hgt_epoch(
             runtime,
             epoch=epoch,
@@ -252,6 +264,8 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             learning_rate=args.hgt_learning_rate,
             root=args.root,
         )
+        training_done = time.perf_counter()
+        runtime.set_telemetry_gauge("post_sampling_training_seconds", training_done - training_started)
 
         diagnostics = runtime.unified_telemetry.diagnostic_metrics()
         validation_accuracy = float(training.validation_accuracy)
@@ -344,7 +358,11 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         # Compaction is evidence-gated by the just-computed behavioral and held-out
         # HGT metrics. Newly dormant memories affect the next epoch, not the model
         # evaluation used to decide whether forgetting is safe this epoch.
+        lifecycle_started = time.perf_counter()
         lifecycle_result = run_lifecycle_maintenance(runtime)
+        lifecycle_done = time.perf_counter()
+        runtime.set_telemetry_gauge("post_sampling_lifecycle_seconds", lifecycle_done - lifecycle_started)
+        runtime.set_telemetry_gauge("post_sampling_total_seconds", lifecycle_done - post_sampling_started)
         for key, value in lifecycle_result.items():
             runtime.set_telemetry_gauge(f"lifecycle_{key}", value)
 
