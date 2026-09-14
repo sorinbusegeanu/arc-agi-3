@@ -75,7 +75,7 @@ def _game_level_metrics(rows: list[Any]) -> dict[str, Any]:
         target["failures"] += failures
         target["truncations"] += truncations
         target["episodes"] += wins + failures + truncations
-        target["levels_completed"] += levels
+        target["levels_completed"] = max(int(target["levels_completed"]), levels)
         target["best_level"] = max(int(target["best_level"]), levels)
         target["steps"] += int(getattr(row, "steps", 0))
 
