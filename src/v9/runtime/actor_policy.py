@@ -30,7 +30,7 @@ class ActorPolicySnapshot:
     ) -> "ActorPolicySnapshot":
         learned = {
             int(environment): {
-                int(action): float(score)
+                int(action): max(-1.0, min(1.0, float(score)))
                 for action, score in actions.items()
             }
             for environment, actions in hgt_action_scores.items()
@@ -38,7 +38,7 @@ class ActorPolicySnapshot:
         contextual = {
             int(environment): {
                 int(context): {
-                    int(action): float(score)
+                    int(action): max(-1.0, min(1.0, float(score)))
                     for action, score in actions.items()
                 }
                 for context, actions in contexts.items()
@@ -47,7 +47,7 @@ class ActorPolicySnapshot:
         }
         by_type = {
             str(environment_type): {
-                int(action): float(score)
+                int(action): max(-1.0, min(1.0, float(score)))
                 for action, score in actions.items()
             }
             for environment_type, actions in (hgt_action_scores_by_type or {}).items()
