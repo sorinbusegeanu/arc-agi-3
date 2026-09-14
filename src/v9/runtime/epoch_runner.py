@@ -101,7 +101,7 @@ def _game_level_metrics(rows: list[Any]) -> dict[str, Any]:
 def _record_symbol_prediction_evidence(runtime: Any, *, limit: int = 128, scan_budget: int = 8192) -> int:
     recorded = 0
     scanned = 0
-    signatures = reversed(tuple(runtime._m1n_occurrences.keys()))
+    signatures = reversed(tuple(getattr(runtime, "_cross_modal_signatures", {}).keys()))
     for signature in signatures:
         if recorded >= int(limit) or scanned >= int(scan_budget):
             break
