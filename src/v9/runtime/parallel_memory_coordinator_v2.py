@@ -63,6 +63,7 @@ def run_parallel_memory_jobs(
     free_slots = list(range(topology.actors))
     results: list[ProcessActorResult] = []
     clean_exit_without_done: dict[int, float] = {}
+    grounded_influence_total = 0
     initial_policy = runtime.actor_policy_snapshot()
     published_policy_generation = int(initial_policy.generation)
     next_policy_publish = time.monotonic() + max(0.01, float(actor_view_refresh_ms) / 1000.0)
@@ -122,6 +123,7 @@ def run_parallel_memory_jobs(
         return progressed
 
     def drain_actor_results() -> bool:
+        nonlocal grounded_influence_total
         progressed = False
         for _ in range(256):
             try:
@@ -141,6 +143,8 @@ def run_parallel_memory_jobs(
             clean_exit_without_done.pop(done.actor_id, None)
             free_slots.append(slot)
             free_slots.sort()
+            grounded_influence_total += int(getattr(done, "grounded_action_influence", 0))
+            runtime.set_telemetry_gauge("grounded_action_influence", grounded_influence_total)
             results.append(
                 ProcessActorResult(
                     done.actor_id,
