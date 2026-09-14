@@ -5,6 +5,7 @@ import time
 from typing import Any, Iterable
 
 from v9.cognition.isf import ISFComponents
+from v9.cognition.grounding import GroundingEvidence
 from v9.cognition.action_selection import scoped_action_key
 from v9.cognition.similarity import StructuralDescriptor
 from v9.memory.identity import MemoryUid
@@ -377,6 +378,29 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                     signatures.append(self._record_normalized_deferred_batch(m1n, deferred_rows))
                     if symbol_row.aligned_m1n is not None:
                         signatures.append(self._record_normalized_deferred_batch(symbol_row.aligned_m1n, deferred_rows))
+                        if prepared.m1g is not None:
+                            grounding_key = (
+                                int(symbol_row.m1g.uid.lo),
+                                int(prepared.m1g.uid.lo),
+                                int(prepared.m1g.environment_instance_id),
+                                0,
+                                0,
+                            )
+                            before_grounding = self.grounding.states.get(grounding_key)
+                            after_grounding = self.grounding.observe(
+                                GroundingEvidence(
+                                    int(symbol_row.m1g.uid.lo),
+                                    int(prepared.m1g.uid.lo),
+                                    int(prepared.m1g.environment_instance_id),
+                                    0,
+                                    0,
+                                    int(self._watermark),
+                                    recurrent_symbol=True,
+                                    cross_modal_association=True,
+                                )
+                            )
+                            if before_grounding is None or int(after_grounding.maturity) > int(before_grounding.maturity):
+                                self.telemetry["grounding_promotions"] += 1
                     self._advance_stage_interval_batch()
                 results.append(tuple(signatures))
             if deferred_rows:
