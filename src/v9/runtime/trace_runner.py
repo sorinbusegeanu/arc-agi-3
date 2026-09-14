@@ -202,6 +202,7 @@ def run_trace_bundle(
                 before_trace = _trace_observation(adapter, before)
                 before_signature = int(adapter.encode_observation(before))
                 before_symbols = tuple(adapter.optional_symbol_stream())
+                semantic_before = tuple(adapter.semantic_observation(before))
                 labels_before = _action_labels(adapter, actions)
                 action = int(rng.choice(actions))
                 action_label = labels_before.get(action, str(action))
