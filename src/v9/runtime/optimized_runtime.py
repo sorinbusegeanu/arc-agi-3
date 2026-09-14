@@ -5,6 +5,7 @@ import time
 from typing import Any, Iterable
 
 from v9.cognition.isf import ISFComponents
+from v9.cognition.action_selection import scoped_action_key
 from v9.memory.identity import MemoryUid
 from v9.memory.m1_normalized import M1NormalizedRelation, NormalizedChannel
 from v9.memory.model import CanonicalNode, MemoryLevel, MemoryType
@@ -151,18 +152,21 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
         self._m1n_supports[signature] = support
         if signature not in self._normalized_action_cache:
             observable = str(relation.observable_relation)
-            prefix, separator, remainder = observable.partition(":")
-            action_text, action_separator, _ = remainder.partition(":")
-            action: int | None = None
-            if prefix == "ACTION" and separator and action_separator:
+            parts = observable.split(":")
+            scoped: int | None = None
+            if len(parts) >= 5 and parts[0] == "ACTION":
                 try:
-                    action = int(action_text)
+                    scoped = scoped_action_key(
+                        int(parts[3]),
+                        action_schema_id=int(parts[1]),
+                        environment_type=parts[2],
+                    )
                 except ValueError:
-                    action = None
-            self._normalized_action_cache[signature] = action
-        action = self._normalized_action_cache[signature]
-        if action is not None:
-            self._actor_action_supports[action] = self._actor_action_supports.get(action, 0.0) + 1.0
+                    scoped = None
+            self._normalized_action_cache[signature] = scoped
+        scoped = self._normalized_action_cache[signature]
+        if scoped is not None:
+            self._actor_action_supports[scoped] = self._actor_action_supports.get(scoped, 0.0) + 1.0
             self._actor_policy_generation += 1
         if len(occurrences) < max(2, self.config.scientific.m1n_facts_per_channel):
             occurrences.append(relation)
