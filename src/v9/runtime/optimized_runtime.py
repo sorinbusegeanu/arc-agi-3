@@ -186,6 +186,11 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
     ) -> int:
         signature = int(relation.structural_signature)
         occurrences = self._m1n_occurrences.setdefault(signature, [])
+        if relation.channel is NormalizedChannel.CROSS_MODAL:
+            self._cross_modal_signatures.pop(signature, None)
+            self._cross_modal_signatures[signature] = None
+            while len(self._cross_modal_signatures) > 8192:
+                self._cross_modal_signatures.pop(next(iter(self._cross_modal_signatures)))
         support = int(self._m1n_supports.get(signature, 0)) + 1
         self._m1n_supports[signature] = support
         if signature not in self._normalized_action_cache:
