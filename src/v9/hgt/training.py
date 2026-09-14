@@ -114,6 +114,17 @@ def _semantic_node_type(kind: int) -> str:
     return "ENTITY"
 
 
+def _semantic_node_feature(fact: tuple[int, int, int, int, float], dim: int, torch: Any):
+    kind, subject, relation, obj, value = fact
+    values = [0.0] * int(dim)
+    values[0] = float(kind) / 10.0
+    values[1] = float(relation) / 32.0
+    values[2] = max(-1.0, min(1.0, float(value)))
+    values[3] = float(subject & 0xFFFF) / 65535.0
+    values[4] = float(obj & 0xFFFF) / 65535.0
+    return torch.tensor(values, dtype=torch.float32)
+
+
 def _recent_behavior_nodes(read_view: Any, limit: int) -> list[tuple[Any, Any]]:
     candidates = []
     for uid, node in read_view.nodes.items():
