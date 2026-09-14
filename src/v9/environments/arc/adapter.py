@@ -117,7 +117,11 @@ class ARCAdapter(StructuralAdapter):
                 max_r = max(r for r, _ in cells)
                 min_c = min(c for _, c in cells)
                 max_c = max(c for _, c in cells)
-                shape_signature = int(stable_u64(tuple(sorted((r - min_r, c - min_c) for r, c in cells)), person=b"v9-arc-shape"))
+                normalized_shape = ";".join(
+                    f"{r - min_r},{c - min_c}"
+                    for r, c in sorted(cells)
+                )
+                shape_signature = int(stable_u64(normalized_shape, person=b"v9-arc-shape"))
                 entity = _semantic_id(f"arc:{color}:{min_r}:{min_c}:{shape_signature}")
                 facts.append(_fact(2, entity, 6, color, float(color)))
                 facts.append(_fact(3, entity, 1, "area", float(len(cells))))
