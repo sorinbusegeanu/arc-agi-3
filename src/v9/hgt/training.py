@@ -134,20 +134,55 @@ def _semantic_node_feature(fact: tuple[int, int, int, int, float], dim: int, tor
 
 
 def _recent_behavior_nodes(read_view: Any, limit: int) -> list[tuple[Any, Any]]:
-    candidates = []
+    maximum = max(0, int(limit))
+    if maximum <= 0:
+        return []
+    per_environment: dict[int, list[tuple[tuple[int, int, int, int], Any, Any]]] = {}
+    global_heap: list[tuple[tuple[int, int, int, int], Any, Any]] = []
+    per_environment_cap = 4
     for uid, node in read_view.nodes.items():
         if node.level is not MemoryLevel.M0:
             continue
         payload = read_view.payloads.get(uid, {})
         if payload.get("action_id") is None or payload.get("environment_instance_id") is None:
             continue
-        candidates.append((uid, node, abs(int(payload.get("primary_valence", 0)))))
-    rows = heapq.nlargest(
-        max(0, int(limit)),
-        candidates,
-        key=lambda row: (row[2], int(row[1].created_watermark), row[0]),
-    )
-    return [(uid, node) for uid, node, _ in rows]
+        environment_id = int(payload["environment_instance_id"])
+        rank = (abs(int(payload.get("primary_valence", 0))), int(node.created_watermark), int(uid.hi), int(uid.lo))
+        row = (rank, uid, node)
+        bucket = per_environment.setdefault(environment_id, [])
+        heapq.heappush(bucket, row)
+        if len(bucket) > per_environment_cap:
+            heapq.heappop(bucket)
+        heapq.heappush(global_heap, row)
+        if len(global_heap) > maximum:
+            heapq.heappop(global_heap)
+    selected: dict[Any, Any] = {}
+    ordered_buckets = {environment_id: sorted(rows, key=lambda row: row[0], reverse=True) for environment_id, rows in per_environment.items()}
+    depth = 0
+    environment_ids = sorted(ordered_buckets)
+    while len(selected) < maximum:
+        added = False
+        for environment_id in environment_ids:
+            rows = ordered_buckets[environment_id]
+            if depth >= len(rows):
+                continue
+            _, uid, node = rows[depth]
+            if uid not in selected:
+                selected[uid] = node
+                added = True
+                if len(selected) >= maximum:
+                    break
+        if not added:
+            break
+        depth += 1
+    if len(selected) < maximum:
+        for _, uid, node in sorted(global_heap, key=lambda row: row[0], reverse=True):
+            if uid in selected:
+                continue
+            selected[uid] = node
+            if len(selected) >= maximum:
+                break
+    return list(selected.items())
 
 
 def _select_connected_nodes(read_view: Any, max_nodes: int) -> tuple[Any, ...]:
@@ -614,8 +649,8 @@ def _should_promote(
         return False
     if parent_version is None or not math.isfinite(parent_validation_loss):
         return True
-    loss_ok = float(candidate_validation_loss) <= float(parent_validation_loss) * 1.01
-    accuracy_ok = not math.isfinite(parent_validation_accuracy) or float(candidate_validation_accuracy) >= float(parent_validation_accuracy) - 0.02
+    loss_ok = float(candidate_validation_loss) <= float(parent_validation_loss)
+    accuracy_ok = not math.isfinite(parent_validation_accuracy) or float(candidate_validation_accuracy) >= float(parent_validation_accuracy)
     return bool(loss_ok and accuracy_ok)
 
 
@@ -674,6 +709,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     runtime.set_telemetry_gauge("hgt_oom_retry_count", int(_oom_retry))
     selected_examples = sum(int(v.numel()) for v in y_dict.values())
     action_examples = sum(int(mask.sum().item()) for mask in action_masks.values())
+    action_opportunities = sum(int(mask.numel()) for mask in action_masks.values())
     metadata = _stable_metadata()
     if not edge_index_dict:
         return HGTTrainingResult(epoch, "SKIPPED_NO_RELATIONS", runtime.unified_telemetry.model_version, None, 0.0, 0.0, action_examples, 0, None)
@@ -1005,7 +1041,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         inference_latency_ms=float(inference_latency_ms),
         subgraph_nodes=sum(int(value.shape[0]) for value in x_dict.values()),
         subgraph_edges=sum(int(value.shape[1]) for value in edge_index_dict.values()),
-        relevance_precision=action_examples / max(1, selected_examples),
+        relevance_precision=max(0.0, min(1.0, action_examples / max(1, action_opportunities))),
     )
     if torch.cuda.is_available():
         runtime.set_telemetry_gauge("hgt_peak_allocated_bytes", int(torch.cuda.max_memory_allocated()))
