@@ -140,7 +140,7 @@ class StructuralAdapter:
             values = list(observation)
         except Exception:
             return ()
-        if values and isinstance(values[0], (list, tuple)):
+        if values and (isinstance(values[0], (list, tuple)) or hasattr(values[0], "__iter__")):
             for r, row in enumerate(values[:64]):
                 for col, value in enumerate(list(row)[:64]):
                     try:
