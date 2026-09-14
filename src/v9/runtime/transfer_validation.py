@@ -3,14 +3,23 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
+import logging
 import multiprocessing as mp
 from pathlib import Path
 from random import Random
 import time
+import warnings
 from typing import Any, Callable
 
 from v9.cognition.action_selection import choose_action
 from v9.research.experiments import run_matched_transfer_trial
+
+
+def _transfer_worker_init() -> None:
+    logging.disable(logging.INFO)
+    logging.getLogger("arc_agi").setLevel(logging.WARNING)
+    logging.getLogger("arc_agi.scorecard").setLevel(logging.WARNING)
+    warnings.filterwarnings("ignore")
 
 
 def _append_transfer_log(root: str | Path, payload: dict[str, Any]) -> None:
@@ -338,6 +347,7 @@ def run_transfer_validation_interval(
     executor_kwargs: dict[str, Any] = {"max_workers": min(workers, len(tasks))}
     if process_safe:
         executor_kwargs["mp_context"] = mp.get_context("spawn")
+        executor_kwargs["initializer"] = _transfer_worker_init
     else:
         executor_kwargs["thread_name_prefix"] = "v9-transfer-fallback"
     runtime.set_telemetry_gauge("transfer_validation_executor", "process" if process_safe else "thread_fallback")
