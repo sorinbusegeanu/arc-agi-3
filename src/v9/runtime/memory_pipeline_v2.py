@@ -157,11 +157,12 @@ def build_commit_plan(prepared: PreparedIngestion) -> CommitPlan:
             raise RuntimeError("prepared interaction is incomplete")
         base_writes = (
             _m0_write(prepared.m0, prepared.event, prepared.transition),
-            _m1g_write(prepared.m1g, prepared.m0, prepared.event),
+            _m1g_write(prepared.m1g, prepared.m0, prepared.event, prepared.transition),
         )
         normalized_write = _m1n_write(
             prepared.m1n,
             watermark=int(prepared.event.identity.causal_watermark),
+            transition=prepared.transition,
         )
         experience = prepared.event.experience
         isf_static = (
