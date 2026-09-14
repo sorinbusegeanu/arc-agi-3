@@ -10,20 +10,17 @@ from .multiprocess import WorkerStop
 def _close_queue(queue_obj: Any, *, drain: bool) -> None:
     if queue_obj is None:
         return
-    if not drain:
-        try:
-            queue_obj.cancel_join_thread()
-        except (AttributeError, OSError, ValueError):
-            pass
+    # All application-level payloads are explicitly drained before topology
+    # shutdown. Never wait on multiprocessing's private feeder thread here:
+    # Queue.join_thread() has no timeout and can deadlock the epoch boundary.
+    try:
+        queue_obj.cancel_join_thread()
+    except (AttributeError, OSError, ValueError):
+        pass
     try:
         queue_obj.close()
     except (AttributeError, OSError, ValueError):
         pass
-    if drain:
-        try:
-            queue_obj.join_thread()
-        except (AttributeError, AssertionError, OSError, ValueError):
-            pass
 
 
 def _close_process(process: Any) -> None:
