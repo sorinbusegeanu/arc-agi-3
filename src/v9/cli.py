@@ -18,6 +18,7 @@ from v9.environments.synthetic_symbolic import SyntheticSymbolicConfig
 from v9.modalities.symbols import DeterministicSymbolCodec
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig
 from v9.runtime.epoch_runner import run_epochs
+from v9.runtime.trace_runner import run_trace_bundle
 from v9.telemetry import MetricsHTTPServer
 
 MIX_GAMES = ("gp03", "tp02", "FrozenLake-v1", "Chess-v0", "Sudoku-v0")
@@ -288,6 +289,21 @@ def run_continuous(args: argparse.Namespace) -> int:
         x_display=getattr(args, "alfred_x_display", None),
     )
     games = tuple(spec.display_name for spec in specs)
+    if getattr(args, "trace", False):
+        bundle = run_trace_bundle(
+            specs,
+            root=args.root,
+            seed=int(args.seed),
+            env_root=args.env_root,
+            alfred_backend_factory=args.alfred_backend_factory,
+            make_adapter=make_adapter,
+            steps_per_game=100,
+        )
+        print(
+            f"{time.strftime('[%H:%M]')} trace complete games={len(games)} steps/game=100 bundle={bundle}",
+            flush=True,
+        )
+        return 0
     curriculum_modes = sorted({spec.validation_mode for spec in specs if spec.validation_mode})
     effective_validation_mode = (
         "learning_only"
@@ -396,6 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--dashboard-host", default="0.0.0.0")
     continuous.add_argument("--dashboard-port", type=int, default=8765)
     continuous.add_argument("--no-dashboard", action="store_true")
+    continuous.add_argument("--trace", action="store_true", help="collect 100 diagnostic interaction steps per selected game and write trace_bundle.zip")
     continuous.add_argument("--verbose-progress", action="store_true")
     continuous.add_argument("--drain-timeout", type=float, default=300.0)
     continuous.add_argument("--final-save-timeout", type=float, default=300.0)
