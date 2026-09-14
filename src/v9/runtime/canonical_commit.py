@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from v9.cognition.isf import ISFComponents
+from v9.cognition.grounding import GroundingEvidence
 from v9.modalities.symbols import DeterministicSymbolCodec
 
 from .canonical_commit_derivation import derivation_candidates
