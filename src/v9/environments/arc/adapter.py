@@ -63,8 +63,8 @@ def _state(raw: Any) -> str:
 class ARCAdapter(StructuralAdapter):
     def __init__(self, game_id: str, *, seed: int = 0, env_root: str | None = None, env_factory: Callable[..., Any] | None = None) -> None:
         self.game_id, self.seed, self.env_root = str(game_id), int(seed), env_root
-        factory = env_factory or make_arc_environment
-        self.env = factory(self.game_id, seed=self.seed, env_root=env_root)
+        self._env_factory = env_factory or make_arc_environment
+        self.env = self._env_factory(self.game_id, seed=self.seed, env_root=env_root)
         self._identity = EnvironmentIdentity("arc", self.game_id, "default", f"seed={seed}")
         self._observation_schema = ObservationSchema("grid", "arc-color-grid")
         self._action_schema = ActionSchema("environment-local", "arc-native-actions")
@@ -73,6 +73,7 @@ class ARCAdapter(StructuralAdapter):
         self._boundary = BoundaryEvent()
         self._last_trace = None
         self._levels = 0
+        self._action_history: list[int] = []
         self.reset()
 
     def reset(self) -> np.ndarray:
@@ -81,6 +82,7 @@ class ARCAdapter(StructuralAdapter):
         self._levels = int(getattr(self._raw, "levels_completed", 0) or 0)
         self._boundary = BoundaryEvent()
         self._last_trace = None
+        self._action_history = []
         return self.observe()
 
     def observe(self) -> np.ndarray:
@@ -95,12 +97,14 @@ class ARCAdapter(StructuralAdapter):
 
     def step(self, native_action: Any) -> np.ndarray:
         before = self.observe()
+        encoded_action = int(native_action)
         try:
             from arcengine import GameAction
-            action = GameAction.from_id(int(native_action))
+            action = GameAction.from_id(encoded_action)
         except ImportError:
-            action = int(native_action)
+            action = encoded_action
         raw = self.env.step(action)
+        self._action_history.append(encoded_action)
         state = _state(raw)
         levels = int(getattr(raw, "levels_completed", self._levels) or 0)
         advanced = levels > self._levels
@@ -121,8 +125,37 @@ class ARCAdapter(StructuralAdapter):
         self._last_trace = WithinActionTrace(before, (WithinActionFrame(after.copy(), 0),), after.copy())
         return self.observe()
 
+    def capture_state(self) -> dict[str, object]:
+        """Capture a reproducible ARC state as seed plus exact action replay."""
+        return {
+            "schema_version": 1,
+            "actions": tuple(self._action_history),
+            "observation_signature": int(self.encode_observation(self._observation)),
+            "available_actions": tuple(self.available_actions()),
+            "levels_completed": int(self._levels),
+        }
+
+    def restore_state(self, state: Any) -> None:
+        if not isinstance(state, dict) or int(state.get("schema_version", 0)) != 1:
+            raise ValueError("unsupported ARC replay snapshot")
+        actions = tuple(int(value) for value in state.get("actions", ()))
+        close = getattr(self.env, "close", None)
+        if callable(close):
+            close()
+        self.env = self._env_factory(self.game_id, seed=self.seed, env_root=self.env_root)
+        self.reset()
+        for action in actions:
+            if action not in self.available_actions():
+                raise RuntimeError("ARC replay snapshot action is no longer available")
+            self.step(action)
+        if int(self.encode_observation(self._observation)) != int(state["observation_signature"]):
+            raise RuntimeError("ARC replay snapshot did not reproduce the captured observation")
+        if tuple(self.available_actions()) != tuple(int(value) for value in state["available_actions"]):
+            raise RuntimeError("ARC replay snapshot did not reproduce available actions")
+        if int(self._levels) != int(state["levels_completed"]):
+            raise RuntimeError("ARC replay snapshot did not reproduce level progress")
+
     def close(self) -> None:
         callback = getattr(self.env, "close", None)
         if callable(callback):
             callback()
-
