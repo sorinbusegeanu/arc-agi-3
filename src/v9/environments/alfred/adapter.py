@@ -211,6 +211,7 @@ class AlfworldThorBackend:
         self._trajectory = json.loads(self._task_path.read_text(encoding="utf-8"))
         self._environment_factory = environment_factory or self._make_environment
         self._controller_factory = controller_factory or self._make_controller
+        self._injected_backend = environment_factory is not None and controller_factory is not None
         self._x_display = x_display
         self._max_episode_steps = int(max_episode_steps)
         self._environment: Any | None = None
@@ -263,9 +264,11 @@ class AlfworldThorBackend:
         self._environment.step(dict(scene["init_action"]))
         try:
             import alfworld.agents
+            reward_config = Path(alfworld.agents.__path__[0]) / "config" / "rewards.json"
         except ImportError as exc:
-            raise RuntimeError("ALFWorld embodied execution requires the 'alfworld' package") from exc
-        reward_config = Path(alfworld.agents.__path__[0]) / "config" / "rewards.json"
+            if not self._injected_backend:
+                raise RuntimeError("ALFWorld embodied execution requires the 'alfworld' package") from exc
+            reward_config = self._task_path.parent / "rewards.json"
         self._environment.set_task(
             self._trajectory,
             SimpleNamespace(reward_config=str(reward_config)),
