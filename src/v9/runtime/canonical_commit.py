@@ -72,6 +72,7 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                 if plan.relation is None or plan.normalized_write is None:
                     raise RuntimeError("interaction commit plan is incomplete")
 
+                prior_support = int(runtime._m1n_supports.get(int(plan.relation.structural_signature), 0))
                 signature = record_normalized_fast(
                     runtime,
                     plan.relation,
