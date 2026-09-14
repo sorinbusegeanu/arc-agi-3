@@ -275,6 +275,11 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             abs(float(rate) - float(previous_scenario_success.get(game_id, 0.0))) > 1e-12
             for game_id, rate in scenario_success.items()
         )
+        runtime.record_hgt_ablation(
+            enabled_outcome=float(training.validation_accuracy),
+            hydra_baseline_outcome=float(behavioral_success),
+        )
+
         runtime.record_deliberation_metrics(
             reasoning_cycles=max(1, int(training.training_steps)),
             initial_score=float(baseline_success or 0.0),
