@@ -6,7 +6,7 @@ from typing import Any
 
 from v9.hgt import train_hgt_epoch
 from .lifecycle import run_lifecycle_maintenance
-from .parallel_memory_coordinator import run_parallel_memory_jobs
+from .parallel_memory_coordinator_v2 import run_parallel_memory_jobs
 from .transfer_validation import run_transfer_validation_interval
 
 
