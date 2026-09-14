@@ -57,6 +57,7 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
     def actor_policy_snapshot(self) -> ActorPolicySnapshot:
         with self._lock:
             grounded_by_type: dict[str, dict[int, list[float]]] = {}
+            grounded_context_by_type: dict[str, dict[int, dict[int, list[float]]]] = {}
             for strategy in getattr(self, "_m7", {}).values():
                 try:
                     environment_type = self.environments.resolve(int(strategy.target_environment_id)).environment_type
@@ -64,16 +65,32 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                     continue
                 if not strategy.native_actions:
                     continue
+                payload = self.graph.payloads.get(strategy.uid, {})
+                context_signature = payload.get("context_scope_id")
                 target = grounded_by_type.setdefault(str(environment_type), {})
                 for action in strategy.native_actions:
                     target.setdefault(int(action), []).append(float(strategy.reliability))
+                    if context_signature is not None:
+                        contextual = grounded_context_by_type.setdefault(str(environment_type), {}).setdefault(int(context_signature), {})
+                        contextual.setdefault(int(action), []).append(float(strategy.reliability))
             grounded_scores = {
                 environment_type: {
-                    action: sum(scores) / len(scores)
+                    action: max(scores)
                     for action, scores in actions.items()
                     if scores
                 }
                 for environment_type, actions in grounded_by_type.items()
+            }
+            grounded_context_scores = {
+                environment_type: {
+                    context: {
+                        action: max(scores)
+                        for action, scores in actions.items()
+                        if scores
+                    }
+                    for context, actions in contexts.items()
+                }
+                for environment_type, contexts in grounded_context_by_type.items()
             }
             return ActorPolicySnapshot.build(
                 generation=max(self.graph.generation, self._actor_policy_generation),
@@ -82,6 +99,7 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                 hgt_context_action_scores=self._hgt_context_action_scores,
                 hgt_action_scores_by_type=self._hgt_scores_by_environment_type(),
                 grounded_action_scores_by_type=grounded_scores,
+                grounded_context_action_scores_by_type=grounded_context_scores,
                 model_version=self.unified_telemetry.model_version,
             )
 
