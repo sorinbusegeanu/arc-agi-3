@@ -215,6 +215,8 @@ class UnifiedTelemetry:
         result["mean_subgraph_edges"] = self._ratio(self.sums.get("hgt_subgraph_edges", 0.0), i)
         result["relevance_precision"] = self._ratio(self.sums.get("hgt_relevance_precision", 0.0), self.counters["hgt_relevance_samples"])
         result["correspondence_accuracy"] = self._ratio(self.sums.get("hgt_correspondence_accuracy", 0.0), self.counters["hgt_correspondence_samples"])
+        result["hgt_relevance_precision"] = result["relevance_precision"]
+        result["hgt_correspondence_accuracy"] = result["correspondence_accuracy"]
         result["hgt_behavior_improvement_rate"] = self._ratio(self.counters["hgt_behavior_improvements"], self.counters["hgt_behavior_samples"])
         result["hgt_behavior_regression_rate"] = self._ratio(self.counters["hgt_behavior_regressions"], self.counters["hgt_behavior_samples"])
         result["hgt_contribution"] = self._ratio(self.sums.get("hgt_contribution", 0.0), self.counters["hgt_ablation_samples"])
