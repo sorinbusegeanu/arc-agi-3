@@ -93,6 +93,7 @@ def _m0_write(m0: Any, event: Any, transition: Any = None) -> CanonicalWrite:
             "primary_valence": m0.primary_valence,
             "future_option_delta": m0.future_option_delta,
             "realized_cost": m0.realized_cost,
+            **({"task_success": bool(transition.task_success), "task_failure": bool(transition.task_failure), "task_truncated": bool(transition.task_truncated), "level_index": int(transition.level_index), "levels_completed": int(transition.levels_completed)} if transition is not None else {}),
             **({"semantic_before": [list(row) for row in transition.semantic_before]} if transition is not None and transition.semantic_before else {}),
             **({"semantic_action": [list(row) for row in transition.semantic_action]} if transition is not None and transition.semantic_action else {}),
             **({"semantic_options": [list(row) for row in transition.semantic_options]} if transition is not None and transition.semantic_options else {}),
