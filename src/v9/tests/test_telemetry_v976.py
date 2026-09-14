@@ -131,7 +131,7 @@ def test_unified_telemetry_covers_all_v976_categories_and_persists(tmp_path) -> 
     assert dashboard["current_curriculum_gain"] == 0.08
     assert dashboard["cross_family_validation_gain"] == 0.04
     assert dashboard["ModelVersion"] == "hgt-2"
-    assert dashboard["GPU_memory"] == 4_000_000_000
+    assert dashboard["GPU_memory_GB"] == round(4_000_000_000 / (1024.0 ** 3), 2)
     assert dashboard["inference_latency"] == 12.0
     assert dashboard["training_step_latency"] == 18.0
 
