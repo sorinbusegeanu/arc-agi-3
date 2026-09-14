@@ -133,7 +133,15 @@ class StructuralAdapter:
                     facts.append(_fact(6, str(key), 1, str(key), float(value)))
                 elif isinstance(value, str):
                     facts.append(_fact(7, str(key), 1, value, 1.0))
-            return tuple(facts[:1024])
+            return tuple(facts[:256])
+        if isinstance(observation, str):
+            return (_fact(7, "text", 1, observation, 1.0),)
+        if isinstance(observation, (bytes, bytearray, memoryview)):
+            try:
+                text = bytes(observation).decode("utf-8")
+            except Exception:
+                text = repr(bytes(observation)[:256])
+            return (_fact(7, "text", 1, text, 1.0),)
         if isinstance(observation, (int, float)):
             return (_fact(6, "state", 1, int(observation), float(observation)),)
         try:
@@ -152,7 +160,7 @@ class StructuralAdapter:
                     entity = _semantic_id(f"{family}:{r}:{col}")
                     facts.append(_fact(2, entity, 6, numeric, float(numeric)))
                     facts.append(_fact(5, entity, 2, r * 4096 + col, 1.0))
-                    if len(facts) >= 1024:
+                    if len(facts) >= 256:
                         return tuple(facts)
             return tuple(facts)
         names = ()
