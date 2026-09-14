@@ -84,6 +84,11 @@ def _transition_from_trace(row: dict[str, Any], actor_id: int, sequence: int) ->
         task_truncated=bool(progress.get("truncated", False)),
         level_index=int(progress.get("level_index", 0) or 0),
         levels_completed=int(progress.get("levels_completed", 0) or 0),
+        semantic_before=rows(row, "semantic_before"),
+        semantic_action=rows(row, "semantic_action"),
+        semantic_options=rows(row, "semantic_options"),
+        semantic_after=rows(row, "semantic_after"),
+        semantic_delta=rows(row, "semantic_delta"),
     )
 
 
