@@ -136,8 +136,12 @@ def run_transfer_validation_interval(
     horizon = max(1, min(32, int(getattr(args, "steps_per_game", 32))))
     deadline = time.monotonic() + float(runtime.config.scientific.transfer_validation_time_budget_seconds)
     candidates = tuple(runtime.transfer_validation_candidates(limit=max(1, budget)))
+    log_root = Path(getattr(args, "root", "."))
+    threshold = float(runtime.config.scientific.transfer_effect_threshold)
     if not candidates:
-        return TransferValidationStats(blocker="no M4 concept with grounded action evidence")
+        blocker = "no M4 concept with grounded action evidence"
+        _append_transfer_log(log_root, {"epoch": int(epoch), "event": "interval_summary", "attempted": 0, "completed": 0, "passed": 0, "validated": 0, "blocker": blocker})
+        return TransferValidationStats(blocker=blocker)
 
     attempted = completed = passed = validated = 0
     last_blocker: str | None = None
