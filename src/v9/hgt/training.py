@@ -240,33 +240,69 @@ def _episode_rank(environment_id: int, episode_id: int) -> int:
     return int.from_bytes(digest, "little")
 
 
-def _split_masks(action_meta: dict[str, list[Any]], action_masks: dict[str, Any], torch: Any):
-    """Hold out whole episodes so train and validation never share a trajectory."""
+def _split_masks(
+    action_meta: dict[str, list[Any]],
+    action_masks: dict[str, Any],
+    torch: Any,
+    *,
+    environment_families: dict[int, str] | None = None,
+):
+    """Prefer held-out environment families; fall back to held-out episodes."""
     train_masks: dict[str, Any] = {}
     val_masks: dict[str, Any] = {}
+    families = environment_families or {}
     for node_type, action_mask in action_masks.items():
         rows = action_meta[node_type]
         count = int(action_mask.numel())
-        episodes = sorted(
-            {(int(row[0]), int(row[3])) for row in rows if row is not None},
-            key=lambda key: (_episode_rank(*key), key),
-        )
-        if len(episodes) < 2:
-            train_masks[node_type] = action_mask.clone()
-            val_masks[node_type] = torch.zeros(count, dtype=torch.bool)
-            continue
-        val_count = min(len(episodes) - 1, max(1, int(math.ceil(len(episodes) * 0.2))))
-        validation_episodes = set(episodes[:val_count])
+        present_families = sorted({
+            families.get(int(row[0]), "")
+            for row in rows
+            if row is not None and families.get(int(row[0]), "")
+        })
+        validation_families: set[str] = set()
+        if len(present_families) >= 2:
+            family_count = min(len(present_families) - 1, max(1, int(math.ceil(len(present_families) * 0.2))))
+            validation_families = set(
+                sorted(
+                    present_families,
+                    key=lambda family: hashlib.blake2b(
+                        family.encode("utf-8"),
+                        digest_size=8,
+                        person=b"v9-hgt-family",
+                    ).digest(),
+                )[:family_count]
+            )
+
         train = torch.zeros(count, dtype=torch.bool)
         validation = torch.zeros(count, dtype=torch.bool)
-        for index, row in enumerate(rows):
-            if row is None:
+        if validation_families:
+            for index, row in enumerate(rows):
+                if row is None:
+                    continue
+                family = families.get(int(row[0]), "")
+                if family in validation_families:
+                    validation[index] = True
+                else:
+                    train[index] = True
+        else:
+            episodes = sorted(
+                {(int(row[0]), int(row[3])) for row in rows if row is not None},
+                key=lambda key: (_episode_rank(*key), key),
+            )
+            if len(episodes) < 2:
+                train_masks[node_type] = action_mask.clone()
+                val_masks[node_type] = torch.zeros(count, dtype=torch.bool)
                 continue
-            key = (int(row[0]), int(row[3]))
-            if key in validation_episodes:
-                validation[index] = True
-            else:
-                train[index] = True
+            val_count = min(len(episodes) - 1, max(1, int(math.ceil(len(episodes) * 0.2))))
+            validation_episodes = set(episodes[:val_count])
+            for index, row in enumerate(rows):
+                if row is None:
+                    continue
+                key = (int(row[0]), int(row[3]))
+                if key in validation_episodes:
+                    validation[index] = True
+                else:
+                    train[index] = True
         train_masks[node_type] = train
         val_masks[node_type] = validation
     return train_masks, val_masks
@@ -347,7 +383,24 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         return HGTTrainingResult(epoch, "SKIPPED_NO_RELATIONS", runtime.unified_telemetry.model_version, None, 0.0, 0.0, action_examples, 0, None)
     if action_examples <= 0:
         return HGTTrainingResult(epoch, "SKIPPED_NO_ACTION_EVIDENCE", runtime.unified_telemetry.model_version, None, 0.0, 0.0, 0, 0, None)
-    train_masks, val_masks = _split_masks(action_meta, action_masks, torch)
+    environment_families: dict[int, str] = {}
+    for rows in action_meta.values():
+        for row in rows:
+            if row is None:
+                continue
+            environment_id = int(row[0])
+            if environment_id in environment_families:
+                continue
+            try:
+                environment_families[environment_id] = str(runtime.environments.resolve(environment_id).family)
+            except KeyError:
+                pass
+    train_masks, val_masks = _split_masks(
+        action_meta,
+        action_masks,
+        torch,
+        environment_families=environment_families,
+    )
     training_examples = _masked_count(train_masks, action_masks)
     validation_examples = _masked_count(val_masks, action_masks)
     if training_examples <= 0:
