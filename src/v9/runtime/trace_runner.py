@@ -206,6 +206,8 @@ def run_trace_bundle(
                 labels_before = _action_labels(adapter, actions)
                 action = int(rng.choice(actions))
                 action_label = labels_before.get(action, str(action))
+                semantic_action = tuple(adapter.semantic_action(action))
+                semantic_options = tuple(fact for candidate in actions[:64] for fact in adapter.semantic_action(candidate))
 
                 after = adapter.step(action)
                 after_trace = _trace_observation(adapter, after)
