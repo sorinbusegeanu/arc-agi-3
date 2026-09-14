@@ -95,7 +95,7 @@ def test_parallel_derivation_forms_m4_from_recurrent_single_source_scope(tmp_pat
             task_id=1,
             structural_signature=signature,
             rows=rows,
-            support=4,
+            support=2,
             formation_scope=(7,),
             causal_watermark=runtime.watermark,
         )
