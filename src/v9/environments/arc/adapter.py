@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from v9.environments.base import StructuralAdapter
+from v9.environments.base import StructuralAdapter, _fact, _semantic_id
 from v9.environments.contract import BoundaryEvent, BoundaryScope, TaskProgress, WithinActionFrame, WithinActionTrace
 from v9.environments.schemas import ActionSchema, EnvironmentIdentity, ObservationSchema
 
@@ -89,6 +89,45 @@ class ARCAdapter(StructuralAdapter):
 
     def observe(self) -> np.ndarray:
         return self._observation.copy()
+
+    def semantic_observation(self, observation: Any):
+        grid = np.asarray(observation, dtype=np.int64)
+        if grid.ndim != 2 or not grid.size:
+            return ()
+        height, width = grid.shape
+        seen = np.zeros_like(grid, dtype=np.bool_)
+        facts = []
+        for row in range(height):
+            for col in range(width):
+                color = int(grid[row, col])
+                if color == 0 or bool(seen[row, col]):
+                    continue
+                stack = [(row, col)]
+                seen[row, col] = True
+                cells = []
+                while stack:
+                    r, c = stack.pop()
+                    cells.append((r, c))
+                    for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                        if 0 <= nr < height and 0 <= nc < width and not seen[nr, nc] and int(grid[nr, nc]) == color:
+                            seen[nr, nc] = True
+                            stack.append((nr, nc))
+                min_r = min(r for r, _ in cells)
+                max_r = max(r for r, _ in cells)
+                min_c = min(c for _, c in cells)
+                max_c = max(c for _, c in cells)
+                shape_signature = int(stable_u64(tuple(sorted((r - min_r, c - min_c) for r, c in cells)), person=b"v9-arc-shape"))
+                entity = _semantic_id(f"arc:{color}:{min_r}:{min_c}:{shape_signature}")
+                facts.append(_fact(2, entity, 6, color, float(color)))
+                facts.append(_fact(3, entity, 1, "area", float(len(cells))))
+                facts.append(_fact(5, entity, 2, min_r * 4096 + min_c, 1.0))
+                facts.append(_fact(5, entity, 3, max_r, float(max_r)))
+                facts.append(_fact(5, entity, 4, max_c, float(max_c)))
+                facts.append(_fact(3, entity, 1, shape_signature, float(len(cells))))
+        for color in sorted(int(value) for value in np.unique(grid) if int(value) != 0):
+            count = int(np.count_nonzero(grid == color))
+            facts.append(_fact(1, f"arc-color:{color}", 1, color, float(count)))
+        return tuple(facts)
 
     def available_actions(self) -> tuple[int, ...]:
         values = getattr(self._raw, "available_actions", None)
