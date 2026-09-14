@@ -137,7 +137,15 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                     touched_signatures.add(aligned_signature)
                     if plan.interaction_grounding is not None:
                         g = plan.interaction_grounding
-                        runtime.grounding.observe(
+                        grounding_key = (
+                            int(symbol.relation.uid.lo),
+                            int(g.uid.lo),
+                            int(g.environment_instance_id),
+                            0,
+                            0,
+                        )
+                        before_grounding = runtime.grounding.states.get(grounding_key)
+                        after_grounding = runtime.grounding.observe(
                             GroundingEvidence(
                                 int(symbol.relation.uid.lo),
                                 int(g.uid.lo),
@@ -149,6 +157,8 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                                 cross_modal_association=True,
                             )
                         )
+                        if before_grounding is None or int(after_grounding.maturity) > int(before_grounding.maturity):
+                            runtime.telemetry["grounding_promotions"] += 1
                 advance_stage_fast(runtime)
 
             last_step = plan.curriculum_step or "none"
