@@ -90,16 +90,17 @@ def test_step1_continuous_run_executes_curriculum(tmp_path) -> None:
     import json
     summary = json.loads((root / "v9_run_summary.json").read_text(encoding="utf-8"))
     assert len(summary["games"]) == 12
+    assert len(summary["actors"]) == 12
     assert summary["automatic_transfer_experiments"]["mode"] == "learning_only"
     counts = summary["metrics"]["telemetry_diagnostics"]["curriculum_counts"]
     assert sum(counts.values()) == 12
     assert all(key.startswith("step1|synthetic|") for key in counts)
 
 
-def test_broad_preset_resolves_exactly_thirty_games() -> None:
+def test_broad_preset_includes_all_runnable_babyai_language_games() -> None:
     selection = resolve_curriculum_selector("broad")
     assert selection is not None
-    assert len(selection.specs) == 30
+    assert len(selection.specs) == 47
     assert {spec.adapter for spec in selection.specs} == {
         "synthetic_causal",
         "gym_discrete",
@@ -110,6 +111,10 @@ def test_broad_preset_resolves_exactly_thirty_games() -> None:
         "arc",
     }
     assert all(spec.curriculum_step == "broad" for spec in selection.specs)
+    babyai = tuple(spec.game_id for spec in selection.specs if spec.adapter == "babyai")
+    assert len(babyai) == 21
+    assert "BabyAI-OpenDoorsOrder-v0" not in babyai
+    assert "BabyAI-PutNext-v0" not in babyai
     assert tuple(spec.game_id for spec in selection.specs if spec.adapter == "arc") == (
         "g50t",
         "ls20",
