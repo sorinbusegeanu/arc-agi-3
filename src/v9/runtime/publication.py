@@ -551,7 +551,7 @@ class CanonicalGraph:
             (
                 (int(result.nodes[uid].created_watermark), uid)
                 for uid in result._uids_by_level[MemoryLevel.M0]
-                if uid in result.nodes
+                if uid in result.nodes and result.payloads.get(uid, {}).get("action_id") is not None
             ),
             key=lambda row: (row[0], row[1]),
         )
