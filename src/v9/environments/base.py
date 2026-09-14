@@ -185,6 +185,19 @@ class StructuralAdapter:
         action_type: object = token
         if family == "sokoban":
             action_type = {0: "up", 1: "down", 2: "left", 3: "right"}.get(token, token)
+        elif family == "chess":
+            try:
+                from v9.environments.chess.adapter import decode_move
+                move = decode_move(token)
+                action_type = "move"
+                subject = _semantic_id("action:move")
+                return (
+                    _fact(8, subject, 23, "move", 1.0),
+                    _fact(8, subject, 16, "from", float(move.from_square)),
+                    _fact(8, subject, 16, "to", float(move.to_square)),
+                )
+            except Exception:
+                pass
         subject = _semantic_id(f"action:{action_type}")
         return (_fact(8, subject, 23, action_type, 1.0),)
 
