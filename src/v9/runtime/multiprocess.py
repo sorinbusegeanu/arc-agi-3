@@ -48,6 +48,7 @@ class EncodedTransition:
     levels_completed: int = 0
     semantic_before: tuple[tuple[int, int, int, int, float], ...] = ()
     semantic_action: tuple[tuple[int, int, int, int, float], ...] = ()
+    semantic_options: tuple[tuple[int, int, int, int, float], ...] = ()
     semantic_after: tuple[tuple[int, int, int, int, float], ...] = ()
     semantic_delta: tuple[tuple[int, int, int, int, float], ...] = ()
 
