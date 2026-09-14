@@ -158,6 +158,8 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                                 cross_modal_association=True,
                             )
                         )
+                        if before_grounding is None or int(after_grounding.maturity) > int(before_grounding.maturity):
+                            runtime.telemetry["grounding_promotions"] += 1
                 advance_stage_fast(runtime)
 
             last_step = plan.curriculum_step or "none"
