@@ -179,7 +179,7 @@ class CanonicalGraph:
                 owner = uid.shard(self.partition_count)
                 self._uids_by_level[node.level].add(uid)
                 self._node_uids_by_partition[owner].add(uid)
-                if node.level is MemoryLevel.M0:
+                if node.level is MemoryLevel.M0 and payload.get("action_id") is not None:
                     self._training_m0_reservoir.append(uid)
                 self.retired_tombstones.pop(uid, None)
             self.nodes[uid] = node
