@@ -215,7 +215,11 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                 semantic_observer = getattr(adapter, "semantic_observation", None)
                 semantic_before = tuple(semantic_observer(before)) if callable(semantic_observer) else ()
                 learned_scores = policy.learned_scores(environment_instance_id, actions, environment_type=identity.environment_type, context_signature=before_signature)
-                grounded_scores = policy.grounded_scores(actions, environment_type=identity.environment_type)
+                grounded_scores = policy.grounded_scores(
+                    actions,
+                    environment_type=identity.environment_type,
+                    context_signature=before_signature,
+                )
                 action_schema_id = int(adapter.action_schema().schema_id)
                 base_preference = min(actions, key=lambda value: (-float(learned_scores.get(int(value), 0.0)), int(value)))
                 enriched_scores = {
