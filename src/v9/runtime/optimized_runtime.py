@@ -298,11 +298,13 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                     }
                     deferred_rows.extend(((m0_node, m0_payload, (m0.uid,)), (m1g_node, m1g_payload, (m0.uid,))))
                     self._latest_interaction_grounding[(m1g.environment_instance_id, m1g.episode_id)] = m1g
+                    prior_support = int(self._m1n_supports.get(int(m1n.structural_signature), 0))
                     signature = self._record_normalized_deferred_batch(m1n, deferred_rows)
                     signatures.append(signature)
                     next_stage = self._advance_stage_interval_batch()
                     experience = event.experience
                     recurrence = int(self._m1n_supports.get(signature, 0))
+                    recurrence_surprise = 1.0 / max(1.0, float(prior_support + 1))
                     self.isf.score(
                         ISFComponents(
                             abs(experience.primary_valence),
