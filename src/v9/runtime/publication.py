@@ -71,6 +71,7 @@ class CanonicalGraph:
         self._node_uids_by_partition = [set() for _ in range(self.partition_count)]
         self._edge_keys_by_partition = [set() for _ in range(self.partition_count)]
         self._uids_by_level = {level: set() for level in MemoryLevel}
+        self._training_m0_reservoir: deque[MemoryUid] = deque(maxlen=65_536)
         self._outgoing_edge_keys: dict[MemoryUid, set[tuple[MemoryUid, str, MemoryUid]]] = {}
         self._incoming_edge_keys: dict[MemoryUid, set[tuple[MemoryUid, str, MemoryUid]]] = {}
         self._provenance_sources_by_target: dict[MemoryUid, set[MemoryUid]] = {}
@@ -178,6 +179,8 @@ class CanonicalGraph:
                 owner = uid.shard(self.partition_count)
                 self._uids_by_level[node.level].add(uid)
                 self._node_uids_by_partition[owner].add(uid)
+                if node.level is MemoryLevel.M0:
+                    self._training_m0_reservoir.append(uid)
                 self.retired_tombstones.pop(uid, None)
             self.nodes[uid] = node
             self.payloads[uid] = payload
@@ -357,7 +360,10 @@ class CanonicalGraph:
         maximum_edges = max(1, int(max_edges))
         with self._publication_lock:
             behavior_candidates = []
-            for uid in self._uids_by_level[MemoryLevel.M0]:
+            m0_training_uids = tuple(self._training_m0_reservoir)
+            if not m0_training_uids:
+                m0_training_uids = tuple(self._uids_by_level[MemoryLevel.M0])
+            for uid in m0_training_uids:
                 node = self.nodes.get(uid)
                 if node is None:
                     continue
@@ -540,6 +546,18 @@ class CanonicalGraph:
             result._node_counts_by_partition[owner] += 1
             result._node_uids_by_partition[owner].add(uid)
             result._uids_by_level[node.level].add(uid)
+        recent_m0 = heapq.nlargest(
+            result._training_m0_reservoir.maxlen or 65_536,
+            (
+                (int(result.nodes[uid].created_watermark), uid)
+                for uid in result._uids_by_level[MemoryLevel.M0]
+                if uid in result.nodes
+            ),
+            key=lambda row: (row[0], row[1]),
+        )
+        for _, uid in reversed(recent_m0):
+            result._training_m0_reservoir.append(uid)
+
         for raw in state.get("edges", []):
             edge = RelationEdge(
                 MemoryUid(int(raw["source_hi"]), int(raw["source_lo"])),
