@@ -10,6 +10,7 @@ import sys
 import numpy as np
 import pytest
 
+import v9.environments.arc.adapter as arc_adapter_module
 from v9.environments import (
     ARCAdapter, AlfredAdapter, AlfworldTextBackend, AlfworldThorBackend, BabyAIAdapter, BoundaryEvent, BoundaryScope,
     EnvironmentCognitionAdapter, GymDiscreteAdapter, SudokuAdapter,
@@ -131,6 +132,20 @@ class FakeArc:
     def step(self, action: int):
         self.value += 1
         return FakeArcRaw([np.full((2, 2), self.value, dtype=int)], (0, 1), "WIN" if self.value == 2 else "NOT_FINISHED", self.value)
+
+
+def test_arc_environment_root_resolves_from_repository_checkout(tmp_path, monkeypatch) -> None:
+    repository = tmp_path / "checkout"
+    module_path = repository / "src/v9/environments/arc/adapter.py"
+    metadata = repository / "other_repos/arc-interactive/environment_files/ez02/version/metadata.json"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(arc_adapter_module, "__file__", str(module_path))
+    monkeypatch.delenv("ENVIRONMENTS_DIR", raising=False)
+
+    assert arc_adapter_module._resolve_root("ez02", None) == str(
+        repository / "other_repos/arc-interactive/environment_files"
+    )
 
 
 def test_arc_adapter_is_v9_owned_and_supports_injected_environment() -> None:

@@ -17,7 +17,7 @@ def _has_environment(root: Path, game_id: str) -> bool:
 
 
 def _resolve_root(game_id: str, explicit: str | None) -> str | None:
-    repository = Path(__file__).resolve().parents[5]
+    repository = Path(__file__).resolve().parents[4]
     candidates = [explicit, os.environ.get("ENVIRONMENTS_DIR"), str(repository / "other_repos/arc-interactive/environment_files"), str(repository / "environment_files")]
     paths = [Path(value).expanduser() for value in candidates if value]
     for path in paths:
