@@ -212,6 +212,21 @@ class StructuralAdapter:
                 )
             except Exception:
                 pass
+        elif family == "arc":
+            try:
+                from arcengine import GameAction
+                action_type = str(GameAction.from_id(token))
+            except Exception:
+                pass
+        elif family == "gymnasium":
+            meanings = getattr(getattr(getattr(self, "env", None), "unwrapped", None), "get_action_meanings", None)
+            if callable(meanings):
+                try:
+                    labels = tuple(str(value) for value in meanings())
+                    if 0 <= token < len(labels):
+                        action_type = labels[token]
+                except Exception:
+                    pass
         elif family in {"babyai", "minigrid"}:
             try:
                 action_type = self.native_env.unwrapped.actions(token).name
