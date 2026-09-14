@@ -290,6 +290,7 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                     if m0 is None or m1g is None or m1n is None:
                         raise RuntimeError("prepared interaction is incomplete")
                     m0_node = CanonicalNode(m0.uid, MemoryLevel.M0, MemoryType.EPISODE, (event.identity.event_id.hi, event.identity.event_id.lo), self._watermark)
+                    transition = prepared.transition
                     m0_payload = {
                         "modality_id": m0.modality_id,
                         "environment_instance_id": m0.provenance.environment_instance_id,
@@ -303,6 +304,16 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                         "primary_valence": m0.primary_valence,
                         "future_option_delta": m0.future_option_delta,
                         "realized_cost": m0.realized_cost,
+                        "task_success": bool(transition.task_success),
+                        "task_failure": bool(transition.task_failure),
+                        "task_truncated": bool(transition.task_truncated),
+                        "level_index": int(transition.level_index),
+                        "levels_completed": int(transition.levels_completed),
+                        **({"semantic_before": [list(row) for row in transition.semantic_before]} if transition.semantic_before else {}),
+                        **({"semantic_action": [list(row) for row in transition.semantic_action]} if transition.semantic_action else {}),
+                        **({"semantic_options": [list(row) for row in transition.semantic_options]} if transition.semantic_options else {}),
+                        **({"semantic_after": [list(row) for row in transition.semantic_after]} if transition.semantic_after else {}),
+                        **({"semantic_effects": [list(row) for row in transition.semantic_delta]} if transition.semantic_delta else {}),
                     }
                     m1g_node = CanonicalNode(m1g.uid, MemoryLevel.M1, MemoryType.GROUNDED_CONTINGENCY, (m1g.uid.hi, m1g.uid.lo), self._watermark)
                     m1g_payload = {
@@ -313,12 +324,14 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                         "executable_action_token": m1g.executable_action_token,
                         "realized_transition_signature": m1g.realized_transition_signature,
                         "grounded_next_context_signature": m1g.grounded_next_context_signature,
+                        **({"semantic_action": [list(row) for row in transition.semantic_action]} if transition.semantic_action else {}),
+                        **({"semantic_effects": [list(row) for row in transition.semantic_delta]} if transition.semantic_delta else {}),
                         "parents": [[m0.uid.hi, m0.uid.lo]],
                     }
                     deferred_rows.extend(((m0_node, m0_payload, (m0.uid,)), (m1g_node, m1g_payload, (m0.uid,))))
                     self._latest_interaction_grounding[(m1g.environment_instance_id, m1g.episode_id)] = m1g
                     prior_support = int(self._m1n_supports.get(int(m1n.structural_signature), 0))
-                    signature = self._record_normalized_deferred_batch(m1n, deferred_rows)
+                    signature = self._record_normalized_deferred_batch(m1n, deferred_rows, transition)
                     signatures.append(signature)
                     next_stage = self._advance_stage_interval_batch()
                     experience = event.experience
