@@ -7,6 +7,7 @@ from threading import RLock
 from typing import Any
 
 from v9.cognition.compression import form_families
+from v9.cognition.action_selection import scoped_action_key
 from v9.cognition.developmental_stage import DevelopmentalStageTracker, StageEvidence
 from v9.cognition.grounding import GroundingRegistry
 from v9.cognition.isf import ISFComponents, InteractionSignificanceFunction
