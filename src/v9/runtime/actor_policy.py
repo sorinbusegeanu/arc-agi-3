@@ -13,6 +13,7 @@ class ActorPolicySnapshot:
     hgt_action_scores_by_type: dict[str, dict[int, float]]
     model_version: str
     grounded_action_scores_by_type: dict[str, dict[int, float]] = field(default_factory=dict)
+    grounded_context_action_scores_by_type: dict[str, dict[int, dict[int, float]]] = field(default_factory=dict)
 
     @classmethod
     def build(
