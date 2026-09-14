@@ -93,24 +93,10 @@ def _transition_from_trace(row: dict[str, Any], actor_id: int, sequence: int) ->
 
 
 def _m0_payload(prepared: Any) -> dict[str, Any]:
-    m0 = prepared.m0
-    if m0 is None:
+    if prepared.m0 is None:
         return {}
-    return {
-        "modality_id": int(m0.modality_id),
-        "environment_instance_id": int(m0.provenance.environment_instance_id),
-        "episode_id": int(m0.provenance.episode_id.value),
-        "context_signature": int(m0.context_signature),
-        "payload_digest": int(m0.payload_digest),
-        "action_id": m0.action_id,
-        "outcome_signature": m0.outcome_signature,
-        "next_context_signature": m0.next_context_signature,
-        "symbol_identity": m0.symbol_identity,
-        "primary_valence": int(m0.primary_valence),
-        "future_option_delta": float(m0.future_option_delta),
-        "realized_cost": int(m0.realized_cost),
-    }
-
+    plan = build_commit_plan(prepared)
+    return dict(plan.base_writes[0].payload) if plan.base_writes else {}
 
 def _hgt_feature(prepared: Any) -> list[float]:
     m0 = prepared.m0
