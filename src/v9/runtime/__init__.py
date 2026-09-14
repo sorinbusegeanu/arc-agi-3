@@ -1,5 +1,6 @@
 from dataclasses import replace
 
+from v9.cognition.grounding import GroundingEvidence
 from v9.memory.identity import MemoryUid
 from v9.memory.m5_consequence import M5ConsequenceStructure
 from v9.memory.m6_outcome import M6Outcome
