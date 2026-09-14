@@ -4,6 +4,7 @@ from dataclasses import asdict
 import time
 from typing import Any, Iterable
 
+from v9.cognition.isf import ISFComponents
 from v9.memory.identity import MemoryUid
 from v9.memory.m1_normalized import M1NormalizedRelation, NormalizedChannel
 from v9.memory.model import CanonicalNode, MemoryLevel, MemoryType
@@ -21,6 +22,7 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
 
     def __init__(self, config: Any) -> None:
         self._hgt_context_action_scores: dict[int, dict[int, dict[int, float]]] = {}
+        self._normalized_action_cache: dict[int, int | None] = {}
         self._metrics_cache: dict[str, Any] | None = None
         self._metrics_cache_at = 0.0
         restore_path = latest_snapshot(config.root) if bool(getattr(config, "restore", False)) else None
@@ -138,12 +140,237 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                 signatures.extend(self._apply_prepared_symbol(row))
         return tuple(signatures)
 
+    def _record_normalized_deferred_batch(
+        self,
+        relation: M1NormalizedRelation,
+        deferred_rows: list[tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]]],
+    ) -> int:
+        signature = int(relation.structural_signature)
+        occurrences = self._m1n_occurrences.setdefault(signature, [])
+        support = int(self._m1n_supports.get(signature, 0)) + 1
+        self._m1n_supports[signature] = support
+        if signature not in self._normalized_action_cache:
+            observable = str(relation.observable_relation)
+            prefix, separator, remainder = observable.partition(":")
+            action_text, action_separator, _ = remainder.partition(":")
+            action: int | None = None
+            if prefix == "ACTION" and separator and action_separator:
+                try:
+                    action = int(action_text)
+                except ValueError:
+                    action = None
+            self._normalized_action_cache[signature] = action
+        action = self._normalized_action_cache[signature]
+        if action is not None:
+            self._actor_action_supports[action] = self._actor_action_supports.get(action, 0.0) + 1.0
+            self._actor_policy_generation += 1
+        if len(occurrences) < max(2, self.config.scientific.m1n_facts_per_channel):
+            occurrences.append(relation)
+        self._replay_pool[relation.uid] = float(support)
+        if support == 1:
+            retained_parents = tuple(uid for occurrence in occurrences for uid in occurrence.provenance.parents)
+            retained_evidence = tuple(uid for occurrence in occurrences for uid in occurrence.provenance.evidence)
+            deferred_rows.append((
+                CanonicalNode(relation.uid, MemoryLevel.M1, MemoryType.NORMALIZED_RELATION, (relation.structural_signature,), self._watermark),
+                {
+                    "observable_relation": relation.observable_relation,
+                    "channel": relation.channel.value,
+                    "structural_signature": relation.structural_signature,
+                    "support": support,
+                    "parents": [[uid.hi, uid.lo] for uid in retained_parents],
+                },
+                retained_evidence,
+            ))
+        else:
+            self._m1n_dirty.add(signature)
+        return signature
+
+    def _advance_stage_interval_batch(self) -> Any:
+        self._stage_interval_events += 1
+        next_stage = self.stage_tracker.stage
+        if self._stage_interval_events >= self._stage_interval_size:
+            stage_snapshot = self.stage_tracker.close_interval(self._stage_evidence(), evidence_watermark=self._watermark)
+            self._stage_interval_events = 0
+            next_stage = stage_snapshot.next_stage
+        return next_stage
+
+    def _trim_replay_pool_batch(self) -> None:
+        limit = int(self.config.scientific.replay_candidates)
+        overflow = len(self._replay_pool) - limit
+        if overflow <= 0:
+            return
+        victims = sorted(self._replay_pool, key=lambda uid: (self._replay_pool[uid], uid))[:overflow]
+        for uid in victims:
+            self._replay_pool.pop(uid, None)
+
+    def record_curriculum_events_batch(self, rows: Iterable[PreparedIngestion]) -> None:
+        prepared_rows = tuple(rows)
+        if not prepared_rows:
+            return
+        with self._lock:
+            counts: dict[str, int] = {}
+            last_step = "none"
+            last_family = ""
+            last_scenario = ""
+            for prepared in prepared_rows:
+                transition = prepared.transition
+                last_step = transition.curriculum_step or "none"
+                last_family = str(prepared.identity.family)
+                last_scenario = str(transition.game_scenario)
+                key = f"{last_step}|{last_family}|{last_scenario}"
+                counts[key] = counts.get(key, 0) + 1
+            self.unified_telemetry.curriculum_counts.update(counts)
+            self.unified_telemetry.gauges["curriculum_step"] = last_step
+            self.unified_telemetry.gauges["environment_family"] = last_family
+            self.unified_telemetry.gauges["game_scenario"] = last_scenario
+
     def apply_prepared_ingestion_batch(self, rows: Iterable[PreparedIngestion]) -> tuple[tuple[int, ...], ...]:
+        """Apply one contiguous ordered prefix under one authoritative runtime lock."""
         prepared_rows = tuple(rows)
         if not prepared_rows:
             return ()
+        if any(not isinstance(row, PreparedIngestion) for row in prepared_rows):
+            raise TypeError("prepared ingestion has unexpected type")
         with self._lock:
-            return tuple(self.apply_prepared_ingestion(row) for row in prepared_rows)
+            deferred_rows: list[tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]]] = []
+            results: list[tuple[int, ...]] = []
+            registered_identities: dict[int, Any] = {}
+            formation_environments: set[int] = set()
+            modality_deltas: dict[int, int] = {}
+            timeline_events_delta = 0
+            timeline_actions_delta = 0
+            telemetry_events_delta = 0
+            last_ordering_key = self.timeline.last_ordering_key
+            for prepared in prepared_rows:
+                signatures: list[int] = []
+                event = prepared.event
+                if event is not None:
+                    environment_id = int(event.identity.environment_instance_id)
+                    previous_identity = registered_identities.get(environment_id)
+                    if previous_identity is None:
+                        identity = self.environments.register(prepared.identity)
+                        if int(identity.value) != environment_id:
+                            raise RuntimeError("prepared environment identity mismatch")
+                        registered_identities[environment_id] = prepared.identity
+                    elif previous_identity != prepared.identity:
+                        raise RuntimeError("prepared environment identity collision inside batch")
+                    self._watermark = max(self._watermark, int(event.identity.causal_watermark))
+                    timeline_events_delta += 1
+                    timeline_actions_delta += 1
+                    telemetry_events_delta += 1
+                    last_ordering_key = event.identity.ordering_key
+                    modality = int(event.identity.modality_id.value)
+                    modality_deltas[modality] = modality_deltas.get(modality, 0) + 1
+                    formation_environments.add(environment_id)
+                    stage_before = self.stage_tracker.stage
+                    m0, m1g, m1n = prepared.m0, prepared.m1g, prepared.m1n
+                    if m0 is None or m1g is None or m1n is None:
+                        raise RuntimeError("prepared interaction is incomplete")
+                    m0_node = CanonicalNode(m0.uid, MemoryLevel.M0, MemoryType.EPISODE, (event.identity.event_id.hi, event.identity.event_id.lo), self._watermark)
+                    m0_payload = {
+                        "modality_id": m0.modality_id,
+                        "environment_instance_id": m0.provenance.environment_instance_id,
+                        "episode_id": m0.provenance.episode_id.value,
+                        "context_signature": m0.context_signature,
+                        "payload_digest": m0.payload_digest,
+                        "action_id": m0.action_id,
+                        "outcome_signature": m0.outcome_signature,
+                        "next_context_signature": m0.next_context_signature,
+                        "symbol_identity": m0.symbol_identity,
+                        "primary_valence": m0.primary_valence,
+                        "future_option_delta": m0.future_option_delta,
+                        "realized_cost": m0.realized_cost,
+                    }
+                    m1g_node = CanonicalNode(m1g.uid, MemoryLevel.M1, MemoryType.GROUNDED_CONTINGENCY, (m1g.uid.hi, m1g.uid.lo), self._watermark)
+                    m1g_payload = {
+                        "relation": m1g.relation.value,
+                        "environment_instance_id": m1g.environment_instance_id,
+                        "episode_id": m1g.episode_id,
+                        "grounded_context_signature": m1g.grounded_context_signature,
+                        "executable_action_token": m1g.executable_action_token,
+                        "realized_transition_signature": m1g.realized_transition_signature,
+                        "grounded_next_context_signature": m1g.grounded_next_context_signature,
+                        "parents": [[m0.uid.hi, m0.uid.lo]],
+                    }
+                    deferred_rows.extend(((m0_node, m0_payload, (m0.uid,)), (m1g_node, m1g_payload, (m0.uid,))))
+                    self._latest_interaction_grounding[(m1g.environment_instance_id, m1g.episode_id)] = m1g
+                    signature = self._record_normalized_deferred_batch(m1n, deferred_rows)
+                    signatures.append(signature)
+                    next_stage = self._advance_stage_interval_batch()
+                    experience = event.experience
+                    recurrence = int(self._m1n_supports.get(signature, 0))
+                    self.isf.score(
+                        ISFComponents(
+                            abs(experience.primary_valence),
+                            abs(experience.future_option_delta),
+                            experience.prediction_error,
+                            1.0 / max(1, recurrence),
+                            0.5 if experience.family_signature else 0.0,
+                            min(1.0, experience.changed_cells / 16.0),
+                        ),
+                        decision_watermark=self._watermark,
+                        evidence_availability_watermark=event.identity.causal_watermark,
+                        stage=stage_before,
+                        next_stage=next_stage,
+                        graph_generation=self.graph.generation,
+                    )
+                    self._prediction_error_sum += abs(float(experience.prediction_error))
+                    self._prediction_error_count += 1
+                if prepared.symbol_codec_state:
+                    codec = DeterministicSymbolCodec.from_state_dict(dict(prepared.symbol_codec_state))
+                    self.symbol_codecs[codec.vocabulary_id.value] = codec
+                for symbol_row in prepared.symbols:
+                    symbol_event = symbol_row.event
+                    self._watermark = max(self._watermark, int(symbol_event.identity.causal_watermark))
+                    timeline_events_delta += 1
+                    telemetry_events_delta += 1
+                    modality = int(symbol_event.identity.modality_id.value)
+                    modality_deltas[modality] = modality_deltas.get(modality, 0) + 1
+                    formation_environments.add(int(symbol_event.identity.environment_instance_id))
+                    m0, m1g, m1n = symbol_row.m0, symbol_row.m1g, symbol_row.m1n
+                    m0_node = CanonicalNode(m0.uid, MemoryLevel.M0, MemoryType.EPISODE, (symbol_event.identity.event_id.hi, symbol_event.identity.event_id.lo), self._watermark)
+                    m0_payload = {
+                        "modality_id": m0.modality_id,
+                        "environment_instance_id": m0.provenance.environment_instance_id,
+                        "episode_id": m0.provenance.episode_id.value,
+                        "context_signature": m0.context_signature,
+                        "payload_digest": m0.payload_digest,
+                        "action_id": m0.action_id,
+                        "outcome_signature": m0.outcome_signature,
+                        "next_context_signature": m0.next_context_signature,
+                        "symbol_identity": m0.symbol_identity,
+                        "primary_valence": m0.primary_valence,
+                        "future_option_delta": m0.future_option_delta,
+                        "realized_cost": m0.realized_cost,
+                    }
+                    m1g_node = CanonicalNode(m1g.uid, MemoryLevel.M1, MemoryType.GROUNDED_CONTINGENCY, (m1g.uid.hi, m1g.uid.lo), self._watermark)
+                    m1g_payload = {
+                        "relation": m1g.relation.value,
+                        "environment_instance_id": m1g.environment_instance_id,
+                        "episode_id": m1g.episode_id,
+                        "grounded_context_signature": m1g.grounded_context_signature,
+                        "executable_action_token": m1g.executable_action_token,
+                        "realized_transition_signature": m1g.realized_transition_signature,
+                        "grounded_next_context_signature": m1g.grounded_next_context_signature,
+                        "parents": [[m0.uid.hi, m0.uid.lo]],
+                    }
+                    deferred_rows.extend(((m0_node, m0_payload, (m0.uid,)), (m1g_node, m1g_payload, (m0.uid,))))
+                    signatures.append(self._record_normalized_deferred_batch(m1n, deferred_rows))
+                    if symbol_row.aligned_m1n is not None:
+                        signatures.append(self._record_normalized_deferred_batch(symbol_row.aligned_m1n, deferred_rows))
+                    self._advance_stage_interval_batch()
+                results.append(tuple(signatures))
+            if deferred_rows:
+                self._defer_base_group(tuple(deferred_rows))
+            self._trim_replay_pool_batch()
+            self._formation_environments.update(formation_environments)
+            self.timeline.events_seen += timeline_events_delta
+            self.timeline.actions_committed += timeline_actions_delta
+            self.timeline.last_ordering_key = last_ordering_key
+            self.telemetry["events"] += telemetry_events_delta
+            for modality, count in modality_deltas.items():
+                self._modality_events[modality] = self._modality_events.get(modality, 0) + count
+            return tuple(results)
 
     @staticmethod
     def _publication_row_dependency_cost(row: tuple[CanonicalNode, dict[str, Any], tuple[Any, ...]]) -> int:

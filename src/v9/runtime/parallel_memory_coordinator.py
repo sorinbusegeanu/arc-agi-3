@@ -13,6 +13,18 @@ from .multiprocess import ActorDone, ActorError, ProcessTopology
 
 _ACTOR_COMPLETION_GRACE_SECONDS = 2.0
 _PIPELINE_DRAIN_STALL_SECONDS = 30.0
+_CANONICAL_BATCH_MIN = 256
+_CANONICAL_BATCH_MAX = 4096
+
+
+def _adaptive_canonical_batch_size(current: int, backlog: int) -> int:
+    current = max(_CANONICAL_BATCH_MIN, min(_CANONICAL_BATCH_MAX, int(current)))
+    backlog = max(0, int(backlog))
+    if backlog >= current * 2 and current < _CANONICAL_BATCH_MAX:
+        return min(_CANONICAL_BATCH_MAX, current * 2)
+    if backlog <= current // 2 and current > _CANONICAL_BATCH_MIN:
+        return max(_CANONICAL_BATCH_MIN, current // 2)
+    return current
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +130,8 @@ def run_parallel_memory_jobs(
     inflight: set[int] = set()
     last_support: dict[int, int] = {}
     coordinator_batch_size = 256
+    canonical_batch_size = _CANONICAL_BATCH_MIN
+    last_canonical_ingest_batch = 0
     canonical_apply_seconds = 0.0
     canonical_apply_events = 0
     clean_shutdown = False
@@ -209,28 +223,32 @@ def run_parallel_memory_jobs(
     def apply_ready() -> bool:
         nonlocal ingest_apply, derive_apply, ingested, derived
         nonlocal canonical_apply_seconds, canonical_apply_events
+        nonlocal canonical_batch_size, last_canonical_ingest_batch
         apply_started = time.perf_counter()
         prepared_batch: list[PreparedIngestion] = []
-        while ingest_apply in ingest_results and len(prepared_batch) < coordinator_batch_size:
+        while ingest_apply in ingest_results and len(prepared_batch) < canonical_batch_size:
             prepared_batch.append(ingest_results.pop(ingest_apply))
             ingest_apply += 1
         if prepared_batch:
             batch_method = getattr(runtime, "apply_prepared_ingestion_batch", None)
-            signature_rows = (
-                batch_method(prepared_batch)
-                if callable(batch_method)
-                else tuple(runtime.apply_prepared_ingestion(row) for row in prepared_batch)
-            )
-            for prepared, signatures in zip(prepared_batch, signature_rows):
-                runtime.record_curriculum_event(
-                    step=prepared.transition.curriculum_step,
-                    environment_family=prepared.identity.family,
-                    game_scenario=prepared.transition.game_scenario,
-                )
-                ingested += 1
+            signature_rows = batch_method(prepared_batch) if callable(batch_method) else tuple(runtime.apply_prepared_ingestion(row) for row in prepared_batch)
+            curriculum_batch = getattr(runtime, "record_curriculum_events_batch", None)
+            if callable(curriculum_batch):
+                curriculum_batch(prepared_batch)
+            else:
+                for prepared in prepared_batch:
+                    runtime.record_curriculum_event(step=prepared.transition.curriculum_step, environment_family=prepared.identity.family, game_scenario=prepared.transition.game_scenario)
+            ingested += len(prepared_batch)
+            scheduled: set[int] = set()
+            for signatures in signature_rows:
                 for signature in signatures:
-                    schedule(int(signature))
-
+                    value = int(signature)
+                    if value not in scheduled:
+                        scheduled.add(value)
+                        schedule(value)
+            last_canonical_ingest_batch = len(prepared_batch)
+            backlog = max(len(pending_ingest), len(ingest_results), max(0, sampled - ingested))
+            canonical_batch_size = _adaptive_canonical_batch_size(canonical_batch_size, backlog)
         derivation_batch: list[DerivationResult] = []
         while derive_apply in derive_results and len(derivation_batch) < coordinator_batch_size:
             derivation_batch.append(derive_results.pop(derive_apply))
@@ -248,7 +266,6 @@ def run_parallel_memory_jobs(
                 inflight.discard(signature)
                 derived += 1
                 schedule(signature)
-
         applied = len(prepared_batch) + len(derivation_batch)
         if applied:
             canonical_apply_seconds += time.perf_counter() - apply_started
@@ -258,7 +275,7 @@ def run_parallel_memory_jobs(
     def drain_results(*, block: bool = False, timeout: float = 0.0) -> bool:
         progressed = apply_ready()
         first = not progressed
-        for _ in range(coordinator_batch_size * 2):
+        for _ in range(max(coordinator_batch_size, canonical_batch_size) * 2):
             try:
                 item = memory.result_queue.get(timeout=timeout) if block and first else memory.result_queue.get_nowait()
             except queue.Empty:
@@ -329,7 +346,8 @@ def run_parallel_memory_jobs(
             "derivation_rate": derived / elapsed,
             "canonical_apply_rate": canonical_apply_events / max(1e-9, canonical_apply_seconds),
             "canonical_apply_latency_ms": 1000.0 * canonical_apply_seconds / max(1, canonical_apply_events),
-            "canonical_batch_size": coordinator_batch_size,
+            "canonical_batch_size": canonical_batch_size,
+            "canonical_batch_last_applied": last_canonical_ingest_batch,
             "actors_exited_without_done": len(clean_exit_without_done),
         }
         for key, value in gauges.items():
