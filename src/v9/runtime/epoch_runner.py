@@ -294,7 +294,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             prediction_improvement=max(0.0, -float(training.validation_loss)),
             strategy_changes=int(changed_scenarios),
         )
-        previous_scenario_success = dict(scenario_success)
+        prior_scenario_success = dict(previous_scenario_success)
 
         for game_id, row in game_level["current_run_game_results"].items():
             wins = int(row["wins"])
@@ -308,7 +308,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                 OptimizationSample(
                     initial_solution_cost=initial_cost,
                     optimized_solution_cost=optimized_cost,
-                    initial_solution_reliability=float(previous_scenario_success.get(game_id, scenario_success.get(game_id, 0.0))),
+                    initial_solution_reliability=float(prior_scenario_success.get(game_id, scenario_success.get(game_id, 0.0))),
                     optimized_solution_reliability=float(scenario_success.get(game_id, 0.0)),
                     optimization_cycles=max(1, int(training.training_steps)),
                     candidates_generated=max(1, int(row["episodes"])),
@@ -326,6 +326,14 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             )
             runtime.record_replanning_evidence(improved_efficiency=improved)
             previous_game_cost[game_id] = optimized_cost
+
+        total_successes = sum(int(row["wins"]) for row in game_level["current_run_game_results"].values())
+        total_steps = sum(int(row["steps"]) for row in game_level["current_run_game_results"].values())
+        runtime.set_telemetry_gauge(
+            "environment_trajectory_efficiency",
+            total_successes / max(1.0, float(total_steps)),
+        )
+        previous_scenario_success = dict(scenario_success)
         print(
             f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} training "
             f"status={training.status} model={training.model_version} "
