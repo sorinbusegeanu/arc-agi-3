@@ -154,13 +154,28 @@ def test_behavioral_success_is_game_independent() -> None:
     from v9.runtime.parallel_memory_coordinator import ProcessActorResult
 
     rows = [
-        ProcessActorResult(1, "game_a", 10, 8, 1, 10, 0),
-        ProcessActorResult(2, "game_b", 10, 2, 3, 4, 0),
+        ProcessActorResult(1, "game_a", 10, 8, 1, 10, 0, 0, 8, 1, 1, 3),
+        ProcessActorResult(2, "game_b", 10, 2, 3, 4, 0, 0, 2, 1, 1, 1),
     ]
     rates, macro = _scenario_success(rows)
 
     assert rates == {"game_a": 0.8, "game_b": 0.5}
     assert macro == 0.65
+
+
+def test_game_level_metrics_report_wins_and_best_level() -> None:
+    from v9.runtime.epoch_runner import _game_level_metrics
+    from v9.runtime.parallel_memory_coordinator import ProcessActorResult
+
+    rows = [
+        ProcessActorResult(1, "arc_a", 20, 3, 0, 1, 0, 0, 1, 0, 0, 3),
+        ProcessActorResult(2, "arc_b", 20, 2, 1, 1, 0, 0, 0, 1, 0, 2),
+    ]
+    metrics = _game_level_metrics(rows)
+    assert metrics["current_run_solved_games"] == 1
+    assert metrics["current_run_total_games"] == 2
+    assert metrics["current_run_levels_completed"] == 5
+    assert metrics["current_run_best_level_by_game"] == {"arc_a": 3, "arc_b": 2}
 
 
 def test_actor_policy_snapshot_is_picklable(tmp_path) -> None:
@@ -193,6 +208,14 @@ def test_parallel_sampling_defers_raw_graph_publication(tmp_path) -> None:
         available_actions_after=2,
         primary_valence=0,
         observation_schema_id=1,
+        action_schema_id=2,
+        available_action_set_signature=3,
+        boundary_scope="NONE",
+        task_success=False,
+        task_failure=False,
+        task_truncated=False,
+        level_index=0,
+        levels_completed=0,
         symbols=(),
         symbols_only=False,
         curriculum_step="step1",
