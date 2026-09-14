@@ -59,6 +59,16 @@ class ActorPolicySnapshot:
             }
             for environment_type, actions in (grounded_action_scores_by_type or {}).items()
         }
+        grounded_contextual = {
+            str(environment_type): {
+                int(context): {
+                    int(action): float(score)
+                    for action, score in actions.items()
+                }
+                for context, actions in contexts.items()
+            }
+            for environment_type, contexts in (grounded_context_action_scores_by_type or {}).items()
+        }
         return cls(
             int(generation),
             {
@@ -70,6 +80,7 @@ class ActorPolicySnapshot:
             by_type,
             str(model_version),
             grounded,
+            grounded_contextual,
         )
 
 
@@ -78,8 +89,13 @@ class ActorPolicySnapshot:
         actions: tuple[int, ...],
         *,
         environment_type: str | None = None,
+        context_signature: int | None = None,
     ) -> dict[int, float]:
-        source = {} if environment_type is None else self.grounded_action_scores_by_type.get(str(environment_type), {})
+        source = {}
+        if environment_type is not None and context_signature is not None:
+            source = self.grounded_context_action_scores_by_type.get(str(environment_type), {}).get(int(context_signature), {})
+        if not source and environment_type is not None:
+            source = self.grounded_action_scores_by_type.get(str(environment_type), {})
         return {
             int(action): float(source.get(int(action), 0.0))
             for action in actions
