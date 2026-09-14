@@ -132,7 +132,7 @@ def test_epoch_transfer_interval_uses_matched_intervention_and_unlocks_higher_me
         return _FakeTransferAdapter(seed)
 
     stats = run_transfer_validation_interval(runtime, (spec,), args, epoch=1, adapter_factory=factory)
-    assert stats.completed == 4
+    assert stats.completed == 8
     assert stats.passed >= 2
     assert stats.validated_concepts >= 1
     levels = runtime.metrics()["memory_levels"]
