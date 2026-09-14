@@ -575,7 +575,7 @@ class ContinuousMemoryRuntime:
         with self._lock:
             pending = tuple(self._deferred_base_nodes.values())
             self._deferred_base_nodes.clear()
-            batch_size = 4096
+            batch_size = 16384
             for offset in range(0, len(pending), batch_size):
                 chunk = pending[offset : offset + batch_size]
                 writes: list[MutationWrite] = []
