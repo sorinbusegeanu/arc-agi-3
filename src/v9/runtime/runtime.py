@@ -1189,6 +1189,7 @@ class ContinuousMemoryRuntime:
             dummy = M1NormalizedRelation(node, str(payload["observable_relation"]), NormalizedChannel(str(payload["channel"])), int(signature), DerivationProvenance((dummy_parent_uid,), evidence_refs))
             self._m1n_occurrences[int(signature)] = [dummy] if int(count) > 0 else []
         self._m1n_supports = {int(key): int(value) for key, value in dict(state.get("m1n_supports", state.get("m1n_occurrences", {}))).items()}
+        self._cross_modal_signatures = {int(value): None for value in state.get("cross_modal_signatures", [])}
         self._actor_action_supports = {}
         self._actor_policy_generation = self.graph.generation
         for signature, support in self._m1n_supports.items():
