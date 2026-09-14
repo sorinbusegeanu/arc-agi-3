@@ -80,6 +80,17 @@ def _baseline_policy(
     return policy
 
 
+def _eligible_target_specs(specs: tuple[Any, ...], source_types: set[str]) -> tuple[Any, ...]:
+    """Select target specs from metadata before constructing any environment."""
+    if not source_types:
+        return tuple(specs)
+    exact = tuple(
+        spec for spec in specs
+        if str(getattr(spec, "game_id", "")) in source_types
+    )
+    return exact
+
+
 def run_transfer_validation_interval(
     runtime: Any,
     specs: tuple[Any, ...],
@@ -104,7 +115,11 @@ def run_transfer_validation_interval(
 
     attempted = completed = passed = validated = 0
     last_blocker: str | None = None
-    target_cursor = 0
+    target_cursor_by_type: dict[tuple[str, ...], int] = {}
+    per_candidate_seconds = max(
+        0.25,
+        float(runtime.config.scientific.transfer_validation_time_budget_seconds) / max(1, len(candidates)),
+    )
 
     for candidate in candidates:
         if attempted >= budget:
@@ -116,24 +131,29 @@ def run_transfer_validation_interval(
         before_validated = bool(candidate["validated"])
         trials_for_concept = 0
 
-        target_specs = tuple(specs)
+        target_specs = _eligible_target_specs(tuple(specs), source_types)
         if not target_specs:
-            last_blocker = "no held-out target specification"
+            last_blocker = "no compatible held-out target specification"
             continue
 
-        eligibility_scans = 0
-        maximum_scans = max(len(target_specs) * 3, budget * 2)
+        type_key = tuple(sorted(source_types))
+        target_cursor = target_cursor_by_type.get(type_key, 0)
+        candidate_deadline = min(deadline, time.monotonic() + per_candidate_seconds)
+        scans = 0
+        maximum_scans = max(len(target_specs) * 2, minimum_trials * 2)
         while attempted < budget and trials_for_concept < minimum_trials:
-            if mode == "validation_budgeted" and time.monotonic() >= deadline:
-                last_blocker = "transfer validation time budget exhausted"
+            now = time.monotonic()
+            if mode == "validation_budgeted" and now >= candidate_deadline:
+                last_blocker = "candidate transfer validation time budget exhausted"
                 break
-            if eligibility_scans >= maximum_scans:
-                last_blocker = last_blocker or "no eligible held-out target with exact snapshot/restore"
+            if scans >= maximum_scans:
+                last_blocker = last_blocker or "no eligible held-out target instance"
                 break
             spec = target_specs[target_cursor % len(target_specs)]
             target_cursor += 1
-            eligibility_scans += 1
-            seed = int(getattr(args, "seed", 0)) + int(epoch) * 10_000_019 + (attempted + eligibility_scans) * 1009 + 7_000_001
+            target_cursor_by_type[type_key] = target_cursor
+            scans += 1
+            seed = int(getattr(args, "seed", 0)) + int(epoch) * 10_000_019 + (attempted + scans) * 1009 + 7_000_001
             adapter = None
             try:
                 adapter = adapter_factory(
@@ -147,7 +167,7 @@ def run_transfer_validation_interval(
                     continue
                 identity = adapter.identity()
                 if source_types and str(identity.environment_type) not in source_types:
-                    last_blocker = "target environment type is incompatible with concept action grounding"
+                    last_blocker = "target metadata/adapter environment type mismatch"
                     continue
                 target_environment_id = int(identity.instance_id.value)
                 if target_environment_id in formation_scope:
