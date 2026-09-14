@@ -203,6 +203,61 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
             self._m6[outcome.uid] = outcome
             self._m7[strategy.uid] = strategy
 
+            best_effect = max(
+                float(trial["enabled_metric"]) - float(trial["ablated_metric"])
+                for trial in admissible
+            )
+            context = self.contexts.form(
+                (target_environment_id, action),
+                evidence_refs=concept.provenance.evidence,
+                formation_watermark=self._watermark,
+                support=len(admissible),
+                improvement=best_effect,
+            )
+            lineage = self.lineages.derive(LineageUid(0), concept.uid, self._watermark)
+            self.lineages.put_overlay(
+                LineageContextOverlay(
+                    concept.uid,
+                    lineage,
+                    context.scope_id,
+                    RegimeState.PREDICTIVE,
+                    support=len(admissible),
+                    evidence_opportunities=len(admissible),
+                )
+            )
+            dependency = LineageAwareDependencyEdge(
+                concept.uid,
+                consequence.uid,
+                lineage,
+                context.scope_id,
+                independent_support=len(admissible),
+            )
+            self.lineages.dependencies[
+                (dependency.source, dependency.target, dependency.lineage_uid, dependency.context_scope)
+            ] = dependency
+            grounding_key = (
+                int(concept.uid.lo),
+                int(role.uid.lo),
+                target_environment_id,
+                int(context.scope_id.value),
+                int(lineage.value),
+            )
+            before_grounding = self.grounding.states.get(grounding_key)
+            after_grounding = self.grounding.observe(
+                GroundingEvidence(
+                    int(concept.uid.lo),
+                    int(role.uid.lo),
+                    target_environment_id,
+                    int(context.scope_id.value),
+                    int(lineage.value),
+                    int(self._watermark),
+                    causal_intervention=True,
+                    positive=True,
+                )
+            )
+            if before_grounding is None or int(after_grounding.maturity) > int(before_grounding.maturity):
+                self.telemetry["grounding_promotions"] += 1
+
     @staticmethod
     def _payload_provenance(payload: dict[str, object]) -> DerivationProvenance | None:
         parents = tuple(MemoryUid(int(raw[0]), int(raw[1])) for raw in payload.get("parents", []))
