@@ -488,30 +488,80 @@ def _masked_count(masks: dict[str, Any], action_masks: dict[str, Any]) -> int:
     return sum(int((masks[key] & action_masks[key]).sum().item()) for key in masks)
 
 
-def _loss(logits_dict, value_dict, y_dict, masks, action_targets, action_masks, torch):
-    classification_losses, value_losses = [], []
+def _loss(
+    logits_dict,
+    value_dict,
+    auxiliary_dict,
+    y_dict,
+    masks,
+    action_targets,
+    action_masks,
+    task_targets,
+    task_masks,
+    torch,
+    *,
+    objective_weights,
+    log_vars,
+    dynamic_weighting: bool,
+):
+    raw_losses: dict[str, Any] = {}
     correct = total = 0
+
+    consequence_losses = []
     for node_type, logits in logits_dict.items():
         mask = masks[node_type].to(logits.device) & action_masks[node_type].to(logits.device)
         if not bool(mask.any()):
             continue
         target = y_dict[node_type].to(logits.device)[mask]
         selected = logits[mask]
-        classification_losses.append(torch.nn.functional.cross_entropy(selected, target))
+        consequence_losses.append(torch.nn.functional.cross_entropy(selected, target))
         correct += int((selected.argmax(dim=-1) == target).sum().item())
         total += int(target.numel())
+    if consequence_losses:
+        raw_losses["consequence"] = torch.stack(consequence_losses).mean()
+
+    strategy_losses = []
     for node_type, values in value_dict.items():
         mask = masks[node_type].to(values.device) & action_masks[node_type].to(values.device)
         if bool(mask.any()):
             target = action_targets[node_type].to(values.device)[mask]
-            value_losses.append(torch.nn.functional.smooth_l1_loss(values[mask], target))
-    if not classification_losses and not value_losses:
-        return None, 0.0
-    anchor = next(iter(value_dict.values()))
-    classification = torch.stack(classification_losses).mean() if classification_losses else anchor.new_tensor(0.0)
-    value_loss = torch.stack(value_losses).mean() if value_losses else anchor.new_tensor(0.0)
-    return 0.25 * classification + value_loss, correct / max(1, total)
+            strategy_losses.append(torch.nn.functional.smooth_l1_loss(values[mask], target))
+    if strategy_losses:
+        raw_losses["strategy"] = torch.stack(strategy_losses).mean()
 
+    for objective in AUX_OBJECTIVES:
+        losses = []
+        for node_type, predictions in auxiliary_dict[objective].items():
+            mask = masks[node_type].to(predictions.device) & task_masks[objective][node_type].to(predictions.device)
+            if not bool(mask.any()):
+                continue
+            target = task_targets[objective][node_type].to(predictions.device)[mask]
+            selected = predictions[mask]
+            if objective == "deliberation_improvement":
+                losses.append(torch.nn.functional.smooth_l1_loss(selected, target))
+            else:
+                losses.append(torch.nn.functional.binary_cross_entropy_with_logits(selected, target))
+        if losses:
+            raw_losses[objective] = torch.stack(losses).mean()
+
+    if not raw_losses:
+        return None, 0.0, {}
+
+    weight_map = {name: float(weight) for name, weight in zip(OBJECTIVE_NAMES, objective_weights)}
+    total_loss = None
+    active_weight = 0.0
+    for objective, loss in raw_losses.items():
+        weight = max(1e-9, weight_map.get(objective, 1.0))
+        if dynamic_weighting:
+            log_var = log_vars[objective]
+            term = weight * (torch.exp(-log_var) * loss + log_var)
+        else:
+            term = weight * loss
+        total_loss = term if total_loss is None else total_loss + term
+        active_weight += weight
+    total_loss = total_loss / max(1e-9, active_weight)
+    by_head = {name: float(loss.detach().cpu().item()) for name, loss in raw_losses.items()}
+    return total_loss, correct / max(1, total), by_head
 
 def _should_promote(
     parent_version: str | None,
