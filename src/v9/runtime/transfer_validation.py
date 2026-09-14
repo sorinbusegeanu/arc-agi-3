@@ -25,9 +25,9 @@ class _BoundaryScoredEnvironment:
         self.adapter = adapter
         self.score = 0.0
         self.terminal = False
-        self._last_progress = self.adapter.task_progress()
         self.family = str(adapter.identity().family)
-        self._last_progress = adapter.task_progress()
+        progress = getattr(adapter, "task_progress", None)
+        self._last_progress = progress() if callable(progress) else None
 
     def capture_state(self) -> Any:
         return self.adapter.capture_state()
@@ -45,17 +45,19 @@ class _BoundaryScoredEnvironment:
     def step(self, action: int) -> Any:
         observation = self.adapter.step(int(action))
         boundary = self.adapter.boundary_event()
-        progress = self.adapter.task_progress()
+        progress_fn = getattr(self.adapter, "task_progress", None)
+        progress = progress_fn() if callable(progress_fn) else None
         self.score += 10.0 * float(boundary.primary_valence)
-        if self.family == "gymnasium":
-            self.score += float(progress.score)
-        else:
-            self.score += float(progress.score) - float(self._last_progress.score)
-        if progress.success:
-            self.score += 10.0
-        elif progress.failure:
-            self.score -= 10.0
-        self._last_progress = progress
+        if progress is not None:
+            if self.family == "gymnasium":
+                self.score += float(progress.score)
+            elif self._last_progress is not None:
+                self.score += float(progress.score) - float(self._last_progress.score)
+            if progress.success:
+                self.score += 10.0
+            elif progress.failure:
+                self.score -= 10.0
+            self._last_progress = progress
         if not boundary.continuation:
             self.terminal = True
         return observation
