@@ -135,6 +135,20 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                     )
                     signatures.append(aligned_signature)
                     touched_signatures.add(aligned_signature)
+                    if plan.interaction_grounding is not None:
+                        g = plan.interaction_grounding
+                        runtime.grounding.observe(
+                            GroundingEvidence(
+                                int(symbol.relation.uid.lo),
+                                int(g.uid.lo),
+                                int(g.environment_instance_id),
+                                0,
+                                0,
+                                int(runtime._watermark),
+                                recurrent_symbol=True,
+                                cross_modal_association=True,
+                            )
+                        )
                 advance_stage_fast(runtime)
 
             last_step = plan.curriculum_step or "none"
