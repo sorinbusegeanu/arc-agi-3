@@ -95,6 +95,17 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
             result["actions_committed"] = self.timeline.actions_committed
             diagnostic = self.unified_telemetry.diagnostic_metrics()
             result["telemetry_diagnostics"] = diagnostic
+            total_memories = sum(int(v) for v in result["memory_levels"].values())
+            result["success_rate"] = float(diagnostic.get("behavioral_success_rate", 0.0))
+            result["trajectory_efficiency"] = float(
+                diagnostic.get("environment_trajectory_efficiency", 0.0)
+            )
+            result["prediction_error"] = self._prediction_error_sum / max(1, self._prediction_error_count)
+            result["persistent_memory_growth_ratio"] = total_memories / max(1, self.telemetry["events"])
+            retired = int(diagnostic.get("hydra_nodes_retired", 0))
+            replaced = int(diagnostic.get("hydra_nodes_replaced_by_abstractions", 0))
+            result["compression_ratio"] = (retired + replaced) / max(1, total_memories + retired)
+            result["m4_validated"] = sum(bool(row.validated) for row in self._m4.values())
             result["primary_dashboard"] = build_primary_dashboard(result, diagnostic)
             return result
 
