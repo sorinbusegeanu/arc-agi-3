@@ -16,6 +16,7 @@ from v9.telemetry import HGTTrainingSample, ModelEvolutionSample, read_gpu_snaps
 
 MODEL_SCHEMA_VERSION = 3
 NODE_TYPE = "MEMORY"
+SEMANTIC_NODE_TYPES = ("ENTITY", "ACTION", "TEXT", "STATE", "EFFECT")
 
 
 @dataclass(frozen=True, slots=True)
