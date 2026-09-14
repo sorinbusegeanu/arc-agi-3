@@ -203,3 +203,22 @@ def test_metrics_waits_for_an_in_progress_runtime_mutation(tmp_path) -> None:
 
     assert metrics_finished.is_set()
     assert not failures
+
+
+def test_hgt_probability_metrics_are_bounded(tmp_path) -> None:
+    runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False))
+    runtime.record_hgt_inference(
+        HGTInferenceSample(
+            consequence_error=0.0,
+            strategy_ranking_correct=True,
+            candidate_refinement_success=True,
+            subgraph_nodes=1,
+            subgraph_edges=1,
+            inference_latency_ms=1.0,
+            relevance_precision=1.5,
+            correspondence_accuracy=2.0,
+        )
+    )
+    metrics = runtime.metrics()["telemetry_diagnostics"]
+    assert metrics["relevance_precision"] == 1.0
+    assert metrics["correspondence_accuracy"] == 1.0
