@@ -29,11 +29,19 @@ class EncodedTransition:
     environment_identity: tuple[str, str, str, str]
     episode_id: int
     observation_schema_id: int
+    action_schema_id: int
     before_signature: int
     action_id: int
     after_signature: int
     available_actions_after: int
+    available_action_set_signature: int
     primary_valence: int
+    boundary_scope: str
+    task_success: bool
+    task_failure: bool
+    task_truncated: bool
+    level_index: int
+    levels_completed: int
     symbols: tuple[object, ...]
     curriculum_step: str | None
     game_scenario: str
@@ -50,6 +58,10 @@ class ActorDone:
     episode_boundaries: int
     resets: int
     policy_refreshes: int = 0
+    task_successes: int = 0
+    task_failures: int = 0
+    task_truncations: int = 0
+    levels_completed: int = 0
 
 
 @dataclass(frozen=True, slots=True)
