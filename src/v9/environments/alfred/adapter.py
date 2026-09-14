@@ -389,6 +389,12 @@ class AlfredAdapter(StructuralAdapter):
             if int(token) in set(int(value) for value in actions)
         }
 
+    def semantic_observation(self, observation: Any):
+        rows = list(super().semantic_observation(observation))
+        if self._trace_world is not None:
+            rows.extend(super().semantic_observation(self._trace_world))
+        return tuple(rows[:2048])
+
     def optional_symbol_stream(self) -> tuple[object, ...]:
         return tuple(self.observe().instruction_bytes)
 
