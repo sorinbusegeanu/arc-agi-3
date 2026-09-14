@@ -234,3 +234,16 @@ def test_first_hgt_model_can_rollback_to_untrained(tmp_path) -> None:
     assert restored == "untrained"
     assert runtime.hgt_action_scores(7, (1,)) == {1: 0.0}
     assert runtime.actor_policy_snapshot().learned_scores(7, (1,), context_signature=11) == {1: 0.0}
+
+
+def test_hgt_policy_scores_are_clamped_to_training_target_range() -> None:
+    snapshot = ActorPolicySnapshot.build(
+        generation=1,
+        normalized_action_supports={},
+        hgt_action_scores={7: {1: 4.0, 2: -3.0}},
+        hgt_context_action_scores={7: {9: {1: 2.5, 2: -2.5}}},
+        hgt_action_scores_by_type={"target": {1: 5.0, 2: -5.0}},
+        model_version="test",
+    )
+    assert snapshot.learned_scores(7, (1, 2)) == {1: 1.0, 2: -1.0}
+    assert snapshot.learned_scores(7, (1, 2), context_signature=9) == {1: 1.0, 2: -1.0}
