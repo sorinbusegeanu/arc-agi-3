@@ -272,6 +272,26 @@ def _execute_transfer_trial(
                     pass
 
 
+def _balance_transfer_candidates(candidates: tuple[dict[str, Any], ...]) -> tuple[dict[str, Any], ...]:
+    groups: dict[str, deque[dict[str, Any]]] = {}
+    for candidate in candidates:
+        types = tuple(str(value) for value in candidate.get("source_environment_types", ()))
+        key = types[0] if types else "__unknown__"
+        groups.setdefault(key, deque()).append(candidate)
+    balanced: list[dict[str, Any]] = []
+    group_order = sorted(groups)
+    while group_order:
+        next_order: list[str] = []
+        for key in group_order:
+            group = groups[key]
+            if group:
+                balanced.append(group.popleft())
+            if group:
+                next_order.append(key)
+        group_order = next_order
+    return tuple(balanced)
+
+
 def run_transfer_validation_interval(
     runtime: Any,
     specs: tuple[Any, ...],
@@ -293,29 +313,17 @@ def run_transfer_validation_interval(
     horizon = max(1, min(32, int(getattr(args, "steps_per_game", 32))))
     deadline = time.monotonic() + float(config.transfer_validation_time_budget_seconds)
     candidates = tuple(runtime.transfer_validation_candidates(limit=max(1, budget)))
-    candidate_groups: dict[str, deque[dict[str, Any]]] = {}
-    for candidate in candidates:
-        types = tuple(str(value) for value in candidate.get("source_environment_types", ()))
-        key = types[0] if types else "__unknown__"
-        candidate_groups.setdefault(key, deque()).append(candidate)
-    balanced_candidates: list[dict[str, Any]] = []
-    group_order = sorted(candidate_groups)
-    while group_order:
-        next_order: list[str] = []
-        for key in group_order:
-            group = candidate_groups[key]
-            if group:
-                balanced_candidates.append(group.popleft())
-            if group:
-                next_order.append(key)
-        group_order = next_order
-    candidates = tuple(balanced_candidates)
+    candidate_environment_types = {
+        (tuple(str(value) for value in candidate.get("source_environment_types", ())) or ("__unknown__",))[0]
+        for candidate in candidates
+    }
+    candidates = _balance_transfer_candidates(candidates)
     log_root = Path(getattr(args, "root", "."))
     threshold = float(config.transfer_effect_threshold)
 
     runtime.set_telemetry_gauge("transfer_validation_workers", workers)
     runtime.set_telemetry_gauge("transfer_validation_trial_budget", budget)
-    runtime.set_telemetry_gauge("transfer_validation_candidate_environment_types", len(candidate_groups))
+    runtime.set_telemetry_gauge("transfer_validation_candidate_environment_types", len(candidate_environment_types))
 
     if not candidates:
         blocker = "no M4 concept with grounded action evidence"
