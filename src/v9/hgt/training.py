@@ -256,7 +256,7 @@ def build_hgt_graph(
     action_rows: list[tuple[int, int, int, int, int] | None] = []
     task_targets: dict[str, list[float]] = {name: [] for name in AUX_OBJECTIVES}
     task_masks: dict[str, list[bool]] = {name: [] for name in AUX_OBJECTIVES}
-    episode_rows: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
+    episode_rows: dict[tuple[int, int], list[tuple[int, int, int, bool, bool, bool, int]]] = {}
     for index, uid in enumerate(ordered_uids):
         node = read_view.nodes[uid]
         payload = dict(read_view.payloads.get(uid, {}))
@@ -320,14 +320,38 @@ def build_hgt_graph(
         if usable_action:
             env, context, action, episode = int(environment_id), int(context_signature), int(action_id), int(episode_id)
             action_rows.append((env, context, action, episode, int(node.created_watermark)))
-            episode_rows.setdefault((env, episode), []).append((index, int(node.created_watermark), valence))
+            episode_rows.setdefault((env, episode), []).append((
+                index,
+                int(node.created_watermark),
+                valence,
+                bool(payload.get("task_success", False)),
+                bool(payload.get("task_failure", False)),
+                bool(payload.get("task_truncated", False)),
+                int(payload.get("levels_completed", 0)),
+            ))
         else:
             action_rows.append(None)
     gamma = float(return_discount)
     for rows in episode_rows.values():
+        ordered = sorted(rows, key=lambda row: row[1])
+        previous_levels = 0
+        immediate: list[tuple[int, int, float]] = []
+        for index, watermark, valence, task_success, task_failure, task_truncated, levels_completed in ordered:
+            level_gain = max(0, int(levels_completed) - int(previous_levels))
+            previous_levels = max(int(previous_levels), int(levels_completed))
+            outcome_signal = float(valence)
+            if task_success:
+                outcome_signal += 1.0
+            if task_failure:
+                outcome_signal -= 1.0
+            if task_truncated:
+                outcome_signal -= 0.10
+            if level_gain:
+                outcome_signal += min(1.0, 0.5 * float(level_gain))
+            immediate.append((index, watermark, max(-1.0, min(1.0, outcome_signal))))
         running = 0.0
-        for index, _, valence in sorted(rows, key=lambda row: row[1], reverse=True):
-            running = max(-1.0, min(1.0, float(valence) + gamma * running))
+        for index, _, signal in reversed(immediate):
+            running = max(-1.0, min(1.0, float(signal) + gamma * running))
             action_targets[index] = running
     x_dict = {NODE_TYPE: torch.stack(features, dim=0)}
     y_dict = {NODE_TYPE: torch.tensor(labels, dtype=torch.long)}
