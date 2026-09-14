@@ -249,6 +249,10 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     adapter.reset()
                     episode_ordinal += 1
                     resets += 1
+            if completed and adapter.boundary_event().continuation:
+                task_truncations += 1
+                episode_boundaries += 1
+
             # ActorDone is an end-of-stream marker. Ensure every transition this
             # actor produced has left its feeder before publishing completion.
             _flush_child_queue(stage_queue)
