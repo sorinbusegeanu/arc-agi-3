@@ -85,10 +85,10 @@ class UnifiedTelemetry:
         self._sum("hgt_inference_latency_ms", sample.inference_latency_ms)
         if sample.relevance_precision is not None:
             self.counters["hgt_relevance_samples"] += 1
-            self._sum("hgt_relevance_precision", sample.relevance_precision)
+            self._sum("hgt_relevance_precision", max(0.0, min(1.0, float(sample.relevance_precision))))
         if sample.correspondence_accuracy is not None:
             self.counters["hgt_correspondence_samples"] += 1
-            self._sum("hgt_correspondence_accuracy", sample.correspondence_accuracy)
+            self._sum("hgt_correspondence_accuracy", max(0.0, min(1.0, float(sample.correspondence_accuracy))))
         if sample.behavior_delta is not None:
             self.counters["hgt_behavior_samples"] += 1
             self._sum("hgt_behavior_delta", sample.behavior_delta)
