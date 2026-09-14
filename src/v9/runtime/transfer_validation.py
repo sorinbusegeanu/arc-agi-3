@@ -146,8 +146,8 @@ def run_transfer_validation_interval(
                     last_blocker = f"{adapter.identity().family} adapter lacks exact snapshot/restore"
                     continue
                 identity = adapter.identity()
-                if source_types and str(identity.environment_type) in source_types:
-                    last_blocker = "target environment type is part of concept formation provenance"
+                if source_types and str(identity.environment_type) not in source_types:
+                    last_blocker = "target environment type is incompatible with concept action grounding"
                     continue
                 target_environment_id = int(identity.instance_id.value)
                 if target_environment_id in formation_scope:
