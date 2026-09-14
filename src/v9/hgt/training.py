@@ -246,6 +246,13 @@ def build_hgt_graph(
                 table[fact] = semantic_index
                 semantic_features.setdefault(node_type, []).append(_semantic_node_feature(fact, input_dim, torch))
             semantic_links.append((memory_index, node_type, semantic_index))
+    for node_type, rows in semantic_features.items():
+        x_dict[node_type] = torch.stack(rows, dim=0)
+        count = len(rows)
+        y_dict[node_type] = torch.zeros(count, dtype=torch.long)
+        action_target_dict[node_type] = torch.zeros(count, dtype=torch.float32)
+        action_mask_dict[node_type] = torch.zeros(count, dtype=torch.bool)
+        action_meta[node_type] = [None] * count
     eligible = (edge for edge in read_view.edges if edge.source in index_by_uid and edge.target in index_by_uid)
     selected_edges = heapq.nlargest(
         max(1, int(max_edges)),
