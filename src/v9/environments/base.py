@@ -114,6 +114,16 @@ class StructuralAdapter:
             facts.append(_fact(6, name, 1, index, numeric))
         return tuple(facts)
 
+    def semantic_delta(self, before: tuple[SemanticFact, ...], after: tuple[SemanticFact, ...]) -> tuple[SemanticFact, ...]:
+        before_set = set(before)
+        after_set = set(after)
+        rows: list[SemanticFact] = []
+        for item in tuple(after_set - before_set)[:512]:
+            rows.append((9, int(item[1]), 13, int(item[3]), float(item[4])))
+        for item in tuple(before_set - after_set)[:512]:
+            rows.append((9, int(item[1]), 14, int(item[3]), float(item[4])))
+        return tuple(rows)
+
     def semantic_action(self, action: Any) -> tuple[SemanticFact, ...]:
         return (_fact(8, f"action:{int(action)}", 23, int(action), 1.0),)
 
