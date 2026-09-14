@@ -612,7 +612,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             current_stage_delta=max(0.0, val_accuracy - (1.0 / 3.0)),
             historical_retention_delta=retention_delta,
             cross_family_transfer_delta=val_accuracy - train_accuracy,
-            reasoning_improvement_delta=0.0,
+            reasoning_improvement_delta=float(val_accuracy if not math.isfinite(parent_validation_accuracy) else val_accuracy - parent_validation_accuracy),
             inference_latency_delta_ms=0.0,
             promotion_result=status,
         )
