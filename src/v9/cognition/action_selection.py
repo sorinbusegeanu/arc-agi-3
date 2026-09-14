@@ -78,7 +78,7 @@ def choose_action(view: ReadView, actions: tuple[int, ...], *, rng: Random, epsi
         ) == 0.0
         and (not learned_scores or float(learned_scores.get(int(action), 0.0)) == 0.0)
     )
-    if rng.random() < epsilon or unseen:
+    if rng.random() < epsilon:
         candidates = unseen or actions
         return int(candidates[rng.randrange(len(candidates))])
     return min(actions, key=lambda action: (-scores[action], action))
