@@ -265,6 +265,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                         levels_completed=int(progress.levels_completed),
                         semantic_before=semantic_before,
                         semantic_action=semantic_action,
+                        semantic_options=semantic_options,
                         semantic_after=semantic_after,
                         semantic_delta=semantic_delta,
                         symbols=tuple(adapter.optional_symbol_stream()),
