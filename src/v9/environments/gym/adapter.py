@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from v9.environments.base import StructuralAdapter
-from v9.environments.contract import BoundaryEvent, BoundaryScope, WithinActionFrame, WithinActionTrace
+from v9.environments.contract import BoundaryEvent, BoundaryScope, TaskProgress, WithinActionFrame, WithinActionTrace
 from v9.environments.schemas import ActionSchema, DiscreteActionCodec, DiscreteObservationCodec, EnvironmentIdentity, ObservationSchema
 
 
@@ -30,6 +30,7 @@ class GymDiscreteAdapter(StructuralAdapter):
         self._observation = 0
         self._boundary = BoundaryEvent()
         self._last_trace = None
+        self._task_progress = TaskProgress(game_id=self.environment_id)
         self.reset()
 
     def reset(self) -> int:
@@ -38,6 +39,7 @@ class GymDiscreteAdapter(StructuralAdapter):
         self._observation = self.observation_codec.encode(observation)
         self._boundary = BoundaryEvent()
         self._last_trace = None
+        self._task_progress = TaskProgress(game_id=self.environment_id)
         return self._observation
 
     def observe(self) -> int:
@@ -51,14 +53,38 @@ class GymDiscreteAdapter(StructuralAdapter):
         action = self.action_codec.decode(native_action)
         observation, reward, terminated, truncated, _ = self.env.step(action)
         self._observation = self.observation_codec.encode(observation)
-        if terminated:
-            self._boundary = BoundaryEvent(BoundaryScope.EPISODE, 1 if float(reward) > 0 else -1, False)
-        elif truncated:
-            self._boundary = BoundaryEvent(BoundaryScope.EPISODE, 0, False)
+        success = False
+        failure = False
+        if self.environment_id.startswith("FrozenLake"):
+            success = bool(terminated and float(reward) > 0)
+            failure = bool(terminated and not success)
+        elif self.environment_id.startswith("Taxi"):
+            success = bool(terminated and float(reward) > 0)
+            failure = bool(terminated and not success)
+        elif self.environment_id.startswith("CliffWalking"):
+            success = bool(terminated)
+        else:
+            success = bool(terminated and float(reward) > 0)
+            failure = bool(terminated and float(reward) <= 0)
+        if terminated or truncated:
+            valence = 1 if success else (-1 if failure else 0)
+            self._boundary = BoundaryEvent(BoundaryScope.EPISODE, valence, False)
+            self._task_progress = TaskProgress(
+                game_id=self.environment_id,
+                terminal=True,
+                success=success,
+                failure=failure,
+                truncated=bool(truncated),
+                score=float(reward),
+            )
         else:
             self._boundary = BoundaryEvent()
+            self._task_progress = TaskProgress(game_id=self.environment_id, score=float(reward))
         self._last_trace = WithinActionTrace(before, (WithinActionFrame(self._observation, 0),), self._observation)
         return self.observe()
+
+    def task_progress(self) -> TaskProgress:
+        return self._task_progress
 
     def encode_observation(self, observation: Any) -> int:
         return self.observation_codec.signature(observation)
@@ -103,6 +129,7 @@ class GymStructuredAdapter(StructuralAdapter):
         self._observation = None
         self._boundary = BoundaryEvent()
         self._last_trace = None
+        self._task_progress = TaskProgress(game_id=self.environment_id)
         self.reset()
 
     def reset(self) -> Any:
@@ -111,6 +138,7 @@ class GymStructuredAdapter(StructuralAdapter):
         self._observation = observation
         self._boundary = BoundaryEvent()
         self._last_trace = None
+        self._task_progress = TaskProgress(game_id=self.environment_id)
         return self._observation
 
     def observe(self) -> Any:
@@ -138,14 +166,38 @@ class GymStructuredAdapter(StructuralAdapter):
         action = self._decode_action(native_action)
         observation, reward, terminated, truncated, _ = self.env.step(action)
         self._observation = observation
-        if terminated:
-            self._boundary = BoundaryEvent(BoundaryScope.EPISODE, 1 if float(reward) > 0 else (-1 if float(reward) < 0 else 0), False)
-        elif truncated:
-            self._boundary = BoundaryEvent(BoundaryScope.EPISODE, 0, False)
+        success = failure = False
+        if self.environment_id.startswith("CartPole"):
+            success = bool(truncated)
+            failure = bool(terminated)
+        elif self.environment_id.startswith("MountainCar") or self.environment_id.startswith("Acrobot"):
+            success = bool(terminated)
+            failure = bool(truncated)
+        elif self.environment_id.startswith("Blackjack"):
+            success = bool(terminated and float(reward) > 0)
+            failure = bool(terminated and float(reward) < 0)
+        else:
+            success = bool(terminated and float(reward) > 0)
+            failure = bool(terminated and float(reward) < 0)
+        if terminated or truncated:
+            valence = 1 if success else (-1 if failure else 0)
+            self._boundary = BoundaryEvent(BoundaryScope.EPISODE, valence, False)
+            self._task_progress = TaskProgress(
+                game_id=self.environment_id,
+                terminal=True,
+                success=success,
+                failure=failure,
+                truncated=bool(truncated),
+                score=float(reward),
+            )
         else:
             self._boundary = BoundaryEvent()
+            self._task_progress = TaskProgress(game_id=self.environment_id, score=float(reward))
         self._last_trace = WithinActionTrace(before, (WithinActionFrame(self._observation, 0),), self._observation)
         return self.observe()
+
+    def task_progress(self) -> TaskProgress:
+        return self._task_progress
 
     def encode_action(self, action: Any) -> int:
         return self.action_codec.encode(action)
