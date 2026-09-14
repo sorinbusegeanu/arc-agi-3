@@ -275,6 +275,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             training_epochs=effective_training_steps,
             learning_rate=args.hgt_learning_rate,
             root=args.root,
+            allow_promotion=bool(behavioral_gain >= -0.005),
         )
         training_done = time.perf_counter()
         runtime.set_telemetry_gauge("post_sampling_training_seconds", training_done - training_started)
