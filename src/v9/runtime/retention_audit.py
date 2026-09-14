@@ -119,10 +119,19 @@ def _hgt_feature(prepared: Any) -> list[float]:
     )
     try:
         import torch
+        tensor = _node_feature(node, payload, 64, torch)
+        return [float(v) for v in tensor.tolist()]
     except ImportError:
-        return []
-    tensor = _node_feature(node, payload, 64, torch)
-    return [float(v) for v in tensor.tolist()]
+        class _Tensor(list):
+            def tolist(self):
+                return list(self)
+        class _TorchShim:
+            float32 = float
+            @staticmethod
+            def tensor(values, dtype=None):
+                return _Tensor(float(value) for value in values)
+        tensor = _node_feature(node, payload, 64, _TorchShim)
+        return [float(v) for v in tensor.tolist()]
 
 
 def _classification(row: dict[str, Any], prepared: Any) -> dict[str, dict[str, str]]:
