@@ -1,10 +1,73 @@
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from v9.environments.base import StructuralAdapter
 from v9.environments.contract import BoundaryEvent, BoundaryScope, TaskProgress, WithinActionFrame, WithinActionTrace
 from v9.environments.schemas import ActionSchema, DiscreteActionCodec, DiscreteObservationCodec, EnvironmentIdentity, ObservationSchema
+
+
+_GYM_MUTABLE_STATE_FIELDS = (
+    "_elapsed_steps",
+    "_has_reset",
+    "state",
+    "s",
+    "lastaction",
+    "steps_beyond_terminated",
+)
+
+
+def _capture_gym_adapter_state(adapter: Any) -> dict[str, Any]:
+    layers: list[dict[str, Any]] = []
+    current = adapter.env
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        fields = {
+            name: copy.deepcopy(getattr(current, name))
+            for name in _GYM_MUTABLE_STATE_FIELDS
+            if hasattr(current, name)
+        }
+        rng_state = None
+        rng = getattr(current, "np_random", None)
+        bit_generator = getattr(rng, "bit_generator", None)
+        if bit_generator is not None:
+            rng_state = copy.deepcopy(bit_generator.state)
+        layers.append({"fields": fields, "rng_state": rng_state})
+        current = getattr(current, "env", None)
+    return {
+        "layers": layers,
+        "episode": int(adapter._episode),
+        "observation": copy.deepcopy(adapter._observation),
+        "boundary": copy.deepcopy(adapter._boundary),
+        "last_trace": copy.deepcopy(adapter._last_trace),
+        "task_progress": copy.deepcopy(adapter._task_progress),
+    }
+
+
+def _restore_gym_adapter_state(adapter: Any, state: dict[str, Any]) -> None:
+    current = adapter.env
+    seen: set[int] = set()
+    for saved in state["layers"]:
+        if current is None or id(current) in seen:
+            raise RuntimeError("gymnasium wrapper topology changed during matched trial")
+        seen.add(id(current))
+        for name, value in saved["fields"].items():
+            setattr(current, name, copy.deepcopy(value))
+        rng_state = saved.get("rng_state")
+        if rng_state is not None:
+            rng = getattr(current, "np_random", None)
+            bit_generator = getattr(rng, "bit_generator", None)
+            if bit_generator is None:
+                raise RuntimeError("gymnasium RNG state is not restorable")
+            bit_generator.state = copy.deepcopy(rng_state)
+        current = getattr(current, "env", None)
+    adapter._episode = int(state["episode"])
+    adapter._observation = copy.deepcopy(state["observation"])
+    adapter._boundary = copy.deepcopy(state["boundary"])
+    adapter._last_trace = copy.deepcopy(state["last_trace"])
+    adapter._task_progress = copy.deepcopy(state["task_progress"])
 
 
 class GymDiscreteAdapter(StructuralAdapter):
@@ -85,6 +148,12 @@ class GymDiscreteAdapter(StructuralAdapter):
 
     def task_progress(self) -> TaskProgress:
         return self._task_progress
+
+    def capture_state(self) -> dict[str, Any]:
+        return _capture_gym_adapter_state(self)
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        _restore_gym_adapter_state(self, state)
 
     def encode_observation(self, observation: Any) -> int:
         return self.observation_codec.signature(observation)
@@ -198,6 +267,12 @@ class GymStructuredAdapter(StructuralAdapter):
 
     def task_progress(self) -> TaskProgress:
         return self._task_progress
+
+    def capture_state(self) -> dict[str, Any]:
+        return _capture_gym_adapter_state(self)
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        _restore_gym_adapter_state(self, state)
 
     def encode_action(self, action: Any) -> int:
         return self.action_codec.encode(action)
