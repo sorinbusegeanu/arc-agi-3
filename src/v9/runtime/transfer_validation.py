@@ -161,10 +161,14 @@ def run_transfer_validation_interval(
         context_candidates = {int(value) for value in candidate.get("contexts", ())}
         before_validated = bool(candidate["validated"])
         trials_for_concept = 0
+        concept_passed = 0
+        concept_blockers: list[str] = []
 
         target_specs = _eligible_target_specs(tuple(specs), source_types)
         if not target_specs:
             last_blocker = "no compatible held-out target specification"
+            concept_blockers.append(last_blocker)
+            _append_transfer_log(log_root, {"epoch": int(epoch), "event": "concept_blocker", "concept_uid": str(concept_uid), "blocker": last_blocker, "source_types": sorted(source_types), "formation_scope": sorted(formation_scope)})
             continue
 
         type_key = tuple(sorted(source_types))
