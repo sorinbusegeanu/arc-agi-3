@@ -233,6 +233,8 @@ def build_hgt_graph(
     action_mask_dict = {NODE_TYPE: torch.tensor(action_masks, dtype=torch.bool)}
     action_meta = {NODE_TYPE: action_rows}
     semantic_links = []
+    semantic_tables = {}
+    semantic_features = {}
     eligible = (edge for edge in read_view.edges if edge.source in index_by_uid and edge.target in index_by_uid)
     selected_edges = heapq.nlargest(
         max(1, int(max_edges)),
