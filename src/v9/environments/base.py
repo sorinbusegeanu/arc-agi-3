@@ -180,7 +180,13 @@ class StructuralAdapter:
         return tuple(rows)
 
     def semantic_action(self, action: Any) -> tuple[SemanticFact, ...]:
-        return (_fact(8, f"action:{int(action)}", 23, int(action), 1.0),)
+        family = str(self._identity.family).lower()
+        token = int(action)
+        action_type: object = token
+        if family == "sokoban":
+            action_type = {0: "up", 1: "down", 2: "left", 3: "right"}.get(token, token)
+        subject = _semantic_id(f"action:{action_type}")
+        return (_fact(8, subject, 23, action_type, 1.0),)
 
     def transition(self, before: Any, after: Any, action: Any) -> EnvironmentTransition:
         before_actions = tuple(self.available_actions())
