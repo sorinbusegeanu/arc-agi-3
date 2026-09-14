@@ -83,6 +83,32 @@ class StructuralAdapter:
                 facts.append(_fact(7, "instruction", 1, text, 1.0))
             if world is not None:
                 observation = world
+        if family == "chess":
+            try:
+                values = list(observation)
+            except Exception:
+                values = []
+            for square, value in enumerate(values[:64]):
+                piece = int(value)
+                if piece:
+                    entity = _semantic_id(f"chess:{square}")
+                    facts.append(_fact(2, entity, 6, piece, float(piece)))
+                    facts.append(_fact(5, entity, 21, square, 1.0))
+            if len(values) > 64:
+                facts.append(_fact(1, "side_to_move", 1, int(values[64]), float(values[64])))
+            return tuple(facts)
+        if family in {"puzzle", "sudoku"} or "sudoku" in environment:
+            try:
+                values = list(observation)
+            except Exception:
+                values = []
+            for index, value in enumerate(values[:81]):
+                row, col = divmod(index, 9)
+                entity = _semantic_id(f"sudoku:{row}:{col}")
+                facts.append(_fact(2, entity, 3, row, float(row)))
+                facts.append(_fact(2, entity, 4, col, float(col)))
+                facts.append(_fact(3, entity, 1, int(value), float(value)))
+            return tuple(facts)
         if isinstance(observation, dict):
             for key, value in sorted(observation.items()):
                 if isinstance(value, (int, float)):
