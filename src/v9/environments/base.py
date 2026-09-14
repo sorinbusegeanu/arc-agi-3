@@ -110,12 +110,30 @@ class StructuralAdapter:
                 facts.append(_fact(3, entity, 1, int(value), float(value)))
             return tuple(facts)
         if isinstance(observation, dict):
+            image = observation.get("image")
+            if image is not None:
+                try:
+                    shape = tuple(int(v) for v in image.shape)
+                    for row in range(min(shape[0], 32)):
+                        for col in range(min(shape[1], 32)):
+                            cell = [int(v) for v in list(image[row][col])[:3]]
+                            if not cell or cell[0] == 0:
+                                continue
+                            entity = _semantic_id(f"{family}:{row}:{col}")
+                            facts.append(_fact(2, entity, 6, cell[0], float(cell[0])))
+                            facts.append(_fact(5, entity, 2, row * 4096 + col, 1.0))
+                            if len(cell) > 1:
+                                facts.append(_fact(3, entity, 5, cell[1], float(cell[1])))
+                except Exception:
+                    pass
             for key, value in sorted(observation.items()):
+                if key == "image":
+                    continue
                 if isinstance(value, (int, float)):
                     facts.append(_fact(6, str(key), 1, str(key), float(value)))
                 elif isinstance(value, str):
                     facts.append(_fact(7, str(key), 1, value, 1.0))
-            return tuple(facts[:512])
+            return tuple(facts[:1024])
         if isinstance(observation, (int, float)):
             return (_fact(6, "state", 1, int(observation), float(observation)),)
         try:
