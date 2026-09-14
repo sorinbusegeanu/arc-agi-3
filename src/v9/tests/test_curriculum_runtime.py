@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from v9.cli import build_parser, make_adapter, resolve_game_specs, resolve_games, run_continuous
+from v9.cli import _runtime_config, build_parser, make_adapter, resolve_game_specs, resolve_games, run_continuous
 from v9.curriculum import load_curriculum, resolve_curriculum_selector
 from v9.environments import GymDiscreteAdapter, SokobanAdapter, SyntheticSymbolicEnvironment
 
@@ -156,3 +156,16 @@ def test_broad_preset_spans_all_runnable_language_and_symbolic_families() -> Non
     assert len(arc_games) == 40
     assert arc_games[:4] == ("ez01", "ez02", "ez03", "ez04")
     assert arc_games[-4:] == ("wk01", "rf01", "mo01", "zq01")
+
+
+def test_continuous_cli_inherits_scientific_transfer_defaults(tmp_path) -> None:
+    args = build_parser().parse_args([
+        "continuous-run",
+        "--root", str(tmp_path / "fresh"),
+        "--games", "step1",
+        "--no-dashboard",
+    ])
+    config = _runtime_config(args)
+    assert config.scientific.transfer_validation_trials_per_interval == 900
+    assert config.scientific.transfer_validation_workers == 30
+    assert config.scientific.transfer_validation_time_budget_seconds == 300.0
