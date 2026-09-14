@@ -184,6 +184,9 @@ def run_transfer_validation_interval(
                     environment_type=str(identity.environment_type),
                     seed=seed,
                 )
+                current_actions = tuple(int(value) for value in adapter.available_actions())
+                fallback_action = next((action for action in action_candidates if action in current_actions), None)
+                fallback_state = adapter.capture_state() if fallback_action is not None else None
                 if context_candidates:
                     matched_context = int(adapter.encode_observation(adapter.observe())) in context_candidates
                     seek_limit = max(4, min(128, horizon * 4))
