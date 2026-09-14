@@ -93,8 +93,12 @@ class ActorPolicySnapshot:
     ) -> dict[int, float]:
         source = {}
         if environment_type is not None and context_signature is not None:
-            source = self.grounded_context_action_scores_by_type.get(str(environment_type), {}).get(int(context_signature), {})
-        if not source and environment_type is not None:
+            contextual = self.grounded_context_action_scores_by_type.get(str(environment_type), {})
+            if contextual:
+                source = contextual.get(int(context_signature), {})
+            else:
+                source = self.grounded_action_scores_by_type.get(str(environment_type), {})
+        elif environment_type is not None:
             source = self.grounded_action_scores_by_type.get(str(environment_type), {})
         return {
             int(action): float(source.get(int(action), 0.0))
