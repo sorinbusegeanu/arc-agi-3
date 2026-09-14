@@ -167,10 +167,21 @@ def derive_memory(task: DerivationTask) -> DerivationResult:
         raise ValueError("derivation requires recurrent M1 support")
     family = form_families(task.rows)[0]
     family = replace(family, recurrence=int(task.support), compression_benefit=float(task.support - 1))
-    roles = form_roles((family,), consequence_by_family={family.uid.lo: family.structural_signature})
+    roles = (
+        form_roles((family,), consequence_by_family={family.uid.lo: family.structural_signature})
+        if int(task.support) >= 3
+        else ()
+    )
     concepts = tuple(
-        M4Concept.candidate((role,), compression_benefit=family.compression_benefit, explanatory_reach=max(1, len(role.provenance.evidence)), transfer_prior=0.5, formation_scope=task.formation_scope)
+        M4Concept.candidate(
+            (role,),
+            compression_benefit=family.compression_benefit,
+            explanatory_reach=max(1, len(role.provenance.evidence)),
+            transfer_prior=0.5,
+            formation_scope=task.formation_scope,
+        )
         for role in roles
+        if int(task.support) >= 4 and len(task.formation_scope) >= 2
     )
     return DerivationResult(task.task_id, task.structural_signature, task.support, family, roles, concepts, task.causal_watermark)
 
