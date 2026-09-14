@@ -285,7 +285,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             reasoning_cost=float(max(1, training.training_steps)),
             stop_reason=str(training.status),
             candidate_changes=int(changed_scenarios),
-            prediction_improvement=max(0.0, -float(training.validation_loss)),
+            prediction_improvement=max(0.0, float(behavioral_gain)),
             strategy_changes=int(changed_scenarios),
         )
         prior_scenario_success = dict(previous_scenario_success)
