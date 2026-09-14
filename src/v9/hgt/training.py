@@ -14,7 +14,7 @@ from v9.memory.model import MemoryLevel
 from v9.memory.relations import RelationType
 from v9.telemetry import HGTTrainingSample, ModelEvolutionSample, read_gpu_snapshot
 
-MODEL_SCHEMA_VERSION = 2
+MODEL_SCHEMA_VERSION = 3
 NODE_TYPE = "MEMORY"
 
 
