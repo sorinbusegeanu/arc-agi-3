@@ -913,6 +913,9 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
                 "validation_loss": validation_loss,
                 "validation_accuracy": val_accuracy,
                 "training_loss": training_loss,
+                "loss_by_head": dict(validation_loss_by_head),
+                "objective_weights": list(config.hgt_loss_weights),
+                "dynamic_loss_weighting": bool(config.hgt_dynamic_loss_weighting),
                 "action_scores": action_scores,
                 "context_action_scores": context_action_scores,
             },
@@ -930,6 +933,9 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             "promotion_baseline_validation_loss": None if not math.isfinite(parent_validation_loss) else parent_validation_loss,
             "promotion_baseline_validation_accuracy": None if not math.isfinite(parent_validation_accuracy) else parent_validation_accuracy,
             "training_loss": training_loss,
+            "loss_by_head": dict(validation_loss_by_head),
+            "objective_weights": list(config.hgt_loss_weights),
+            "dynamic_loss_weighting": bool(config.hgt_dynamic_loss_weighting),
             "graph_generation": int(read_view.generation),
             "selected_nodes": selected_examples,
             "examples": action_examples,
@@ -981,7 +987,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             promotion_result=status,
         )
     )
-    return HGTTrainingResult(
+    result = HGTTrainingResult(
         epoch=epoch,
         status=status,
         model_version=model_version,
@@ -997,3 +1003,11 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         subgraph_edges=sum(int(value.shape[1]) for value in edge_index_dict.values()),
         relevance_precision=action_examples / max(1, selected_examples),
     )
+    if torch.cuda.is_available():
+        runtime.set_telemetry_gauge("hgt_peak_allocated_bytes", int(torch.cuda.max_memory_allocated()))
+        runtime.set_telemetry_gauge("hgt_peak_reserved_bytes", int(torch.cuda.max_memory_reserved()))
+        del logits, values, auxiliary, x_device, edges_device, optimizer, model
+        torch.cuda.empty_cache()
+        free_after, _ = torch.cuda.mem_get_info()
+        runtime.set_telemetry_gauge("hgt_vram_free_after_training_bytes", int(free_after))
+    return result
