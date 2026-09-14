@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 from random import Random
 import time
 from typing import Any, Callable
 
 from v9.cognition.action_selection import choose_action
 from v9.research.experiments import run_matched_transfer_trial
+
+
+def _append_transfer_log(root: str | Path, payload: dict[str, Any]) -> None:
+    path = Path(root) / "transfer_validation.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
 
 
 @dataclass(frozen=True, slots=True)
