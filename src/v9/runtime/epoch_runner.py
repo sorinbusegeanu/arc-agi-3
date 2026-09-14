@@ -98,27 +98,29 @@ def _game_level_metrics(rows: list[Any]) -> dict[str, Any]:
     }
 
 
-def _record_symbol_prediction_evidence(runtime: Any, *, limit: int = 128) -> int:
-    world_by_parent: dict[Any, int] = {}
-    cross_rows: list[tuple[Any, int]] = []
-    for signature, rows in runtime._m1n_occurrences.items():
-        support = int(runtime._m1n_supports.get(int(signature), len(rows)))
-        for relation in rows:
-            if relation.channel is NormalizedChannel.WORLD:
-                for parent in relation.provenance.parents:
-                    world_by_parent[parent] = max(world_by_parent.get(parent, 0), support)
-            elif relation.channel is NormalizedChannel.CROSS_MODAL:
-                cross_rows.append((relation, support))
-
+def _record_symbol_prediction_evidence(runtime: Any, *, limit: int = 128, scan_budget: int = 8192) -> int:
     recorded = 0
-    for relation, cross_support in cross_rows:
-        interaction_parent = next(
-            (parent for parent in relation.provenance.parents if parent in world_by_parent),
-            None,
-        )
-        if interaction_parent is None:
+    scanned = 0
+    signatures = reversed(tuple(runtime._m1n_occurrences.keys()))
+    for signature in signatures:
+        if recorded >= int(limit) or scanned >= int(scan_budget):
+            break
+        scanned += 1
+        rows = runtime._m1n_occurrences.get(int(signature), ())
+        if not rows:
             continue
-        world_support = int(world_by_parent[interaction_parent])
+        relation = rows[0]
+        if relation.channel is not NormalizedChannel.CROSS_MODAL:
+            continue
+        cross_support = int(runtime._m1n_supports.get(int(signature), len(rows)))
+        world_support = 0
+        for parent in relation.provenance.parents:
+            payload = runtime.graph.payloads.get(parent)
+            if not payload or str(payload.get("channel", "")) != NormalizedChannel.WORLD.value:
+                continue
+            world_support = max(world_support, int(payload.get("support", 1)))
+        if world_support <= 0:
+            continue
         baseline = world_support / max(1.0, float(world_support + 1))
         conditioned = cross_support / max(1.0, float(cross_support + 1))
         runtime.record_symbol_conditioned_prediction(
@@ -127,8 +129,7 @@ def _record_symbol_prediction_evidence(runtime: Any, *, limit: int = 128) -> int
             actual=1.0,
         )
         recorded += 1
-        if recorded >= int(limit):
-            break
+    runtime.set_telemetry_gauge("symbol_prediction_scan_count", scanned)
     return recorded
 
 
