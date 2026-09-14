@@ -145,6 +145,7 @@ def run_parallel_memory_jobs(
             free_slots.sort()
             grounded_influence_total += int(getattr(done, "grounded_action_influence", 0))
             runtime.set_telemetry_gauge("grounded_action_influence", grounded_influence_total)
+            runtime.telemetry["grounded_action_influence"] = grounded_influence_total
             results.append(
                 ProcessActorResult(
                     done.actor_id,
