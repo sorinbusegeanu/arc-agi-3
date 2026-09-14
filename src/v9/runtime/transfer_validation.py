@@ -273,8 +273,8 @@ def run_transfer_validation_interval(
         return TransferValidationStats(blocker="no validation adapter factory")
 
     config = runtime.config.scientific
-    budget = max(1, int(config.transfer_validation_trials_per_interval))
-    workers = max(1, int(getattr(config, "transfer_validation_workers", 1)))
+    budget = max(900, int(config.transfer_validation_trials_per_interval))
+    workers = max(30, int(getattr(config, "transfer_validation_workers", 1)))
     minimum_trials = max(1, int(config.transfer_minimum_trials))
     horizon = max(1, min(32, int(getattr(args, "steps_per_game", 32))))
     deadline = time.monotonic() + float(config.transfer_validation_time_budget_seconds)
