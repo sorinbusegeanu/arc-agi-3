@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping
 
 
@@ -11,8 +11,8 @@ class ActorPolicySnapshot:
     hgt_action_scores: dict[int, dict[int, float]]
     hgt_context_action_scores: dict[int, dict[int, dict[int, float]]]
     hgt_action_scores_by_type: dict[str, dict[int, float]]
-    grounded_action_scores_by_type: dict[str, dict[int, float]]
     model_version: str
+    grounded_action_scores_by_type: dict[str, dict[int, float]] = field(default_factory=dict)
 
     @classmethod
     def build(
@@ -66,8 +66,8 @@ class ActorPolicySnapshot:
             learned,
             contextual,
             by_type,
-            grounded,
             str(model_version),
+            grounded,
         )
 
 
