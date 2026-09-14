@@ -78,7 +78,7 @@ class BabyAIAdapter(StructuralAdapter):
         observation, reward, terminated, truncated, _ = raw[:5]
         self._last = self._split(observation)
         done = bool(terminated or truncated)
-        valence = 1 if bool(terminated) and float(reward) > 0 else (-1 if done else 0)
+        valence = 1 if bool(terminated) and float(reward) > 0 else (-1 if bool(terminated) else 0)
         self._boundary = BoundaryEvent(BoundaryScope.EPISODE if done else BoundaryScope.NONE, valence, not done)
         self._last_trace = WithinActionTrace(before.world, (WithinActionFrame(self._last.world, 0),), self._last.world)
         return self._last
