@@ -257,17 +257,42 @@ def run_parallel_memory_jobs(
         topology.stop_shard_workers()
 
         shard_done = 0
+        shard_drain_started = time.monotonic()
+        last_shard_progress = shard_drain_started
+        completed_shards: set[int] = set()
         while shard_done < int(shards):
             try:
                 item = topology.publication_queue.get(timeout=0.05)
             except queue.Empty:
                 pipeline.service()
+                exited = {
+                    index: process.exitcode
+                    for index, process in enumerate(topology.shard_processes)
+                    if process.exitcode is not None
+                }
+                if exited and len(completed_shards) < int(shards):
+                    missing = sorted(set(range(int(shards))) - completed_shards)
+                    raise RuntimeError(
+                        f"shard drain terminated before completion: completed={sorted(completed_shards)} "
+                        f"missing={missing} exitcodes={exited}"
+                    )
+                if time.monotonic() - last_shard_progress >= _PIPELINE_DRAIN_STALL_SECONDS:
+                    missing = sorted(set(range(int(shards))) - completed_shards)
+                    raise RuntimeError(
+                        f"shard drain stalled for {_PIPELINE_DRAIN_STALL_SECONDS:.0f}s: "
+                        f"completed={sorted(completed_shards)} missing={missing} "
+                        f"sampled={pipeline.sampled} ingested={pipeline.ingested}"
+                    )
                 continue
             if item[0] == "transition":
                 pipeline.dispatch_transition(item[3])
+                last_shard_progress = time.monotonic()
             elif item[0] == "shard_done":
-                shard_done += 1
+                completed_shards.add(int(item[1]))
+                shard_done = len(completed_shards)
+                last_shard_progress = time.monotonic()
             pipeline.service()
+        runtime.set_telemetry_gauge("shard_drain_seconds", time.monotonic() - shard_drain_started)
         topology.join_shard_workers()
 
         last_progress_at = time.monotonic()
