@@ -158,6 +158,7 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
         self,
         relation: M1NormalizedRelation,
         deferred_rows: list[tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]]],
+        transition: Any = None,
     ) -> int:
         signature = int(relation.structural_signature)
         occurrences = self._m1n_occurrences.setdefault(signature, [])
@@ -195,6 +196,11 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                     "structural_signature": relation.structural_signature,
                     "support": support,
                     "parents": [[uid.hi, uid.lo] for uid in retained_parents],
+                    **({"semantic_before": [list(row) for row in transition.semantic_before]} if transition is not None and transition.semantic_before else {}),
+                    **({"semantic_action": [list(row) for row in transition.semantic_action]} if transition is not None and transition.semantic_action else {}),
+                    **({"semantic_options": [list(row) for row in transition.semantic_options]} if transition is not None and transition.semantic_options else {}),
+                    **({"semantic_after": [list(row) for row in transition.semantic_after]} if transition is not None and transition.semantic_after else {}),
+                    **({"semantic_effects": [list(row) for row in transition.semantic_delta]} if transition is not None and transition.semantic_delta else {}),
                 },
                 retained_evidence,
             ))
