@@ -430,6 +430,48 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                     publication_rows.append((CanonicalNode(candidate.uid, MemoryLevel.M4, MemoryType.CONCEPT, candidate.invariant_descriptor, self._watermark), {"invariant_descriptor": list(candidate.invariant_descriptor), "compression_benefit": candidate.compression_benefit, "explanatory_reach": candidate.explanatory_reach, "transfer_prior": candidate.transfer_prior, "formation_scope": list(candidate.provenance.formation_scope), "held_out_targets": [], "validated": False, "concept_state": candidate.state.value, "parents": [[uid.hi, uid.lo] for uid in candidate.provenance.parents]}, candidate.provenance.evidence))
             self._publish_derivation_rows(publication_rows)
 
+            descriptor_rows: dict[int, dict[int, StructuralDescriptor]] = {}
+            for node, payload, _evidence in publication_rows[:64]:
+                if not (MemoryLevel.M2 <= node.level <= MemoryLevel.M4):
+                    continue
+                by_radius: dict[int, StructuralDescriptor] = {}
+                key0 = int(node.structural_key[0]) if node.structural_key else 0
+                components = (
+                    float(int(node.level)),
+                    float(int(node.memory_type)),
+                    float(key0 & 0xFFFF) / 65535.0,
+                    float(payload.get("recurrence", payload.get("support", 0)) or 0),
+                    float(payload.get("compression_benefit", 0.0) or 0.0),
+                    float(payload.get("explanatory_reach", 0) or 0),
+                )
+                for radius in self.config.scientific.structural_radii:
+                    descriptor = StructuralDescriptor(
+                        int(node.uid.lo),
+                        int(self.graph.generation),
+                        1,
+                        int(radius),
+                        1,
+                        int(self.scale_statistics.estimator_generation),
+                        components,
+                    )
+                    self.scale_statistics.observe(
+                        descriptor,
+                        stable_contingency_uid=int(node.uid.lo),
+                        authoritative_evidence=True,
+                    )
+                    by_radius[int(radius)] = descriptor
+                descriptor_rows[int(node.uid.lo)] = by_radius
+
+            if len(descriptor_rows) >= 2:
+                ordered = sorted(descriptor_rows)
+                query_uid = ordered[0]
+                candidates = {uid: descriptor_rows[uid] for uid in ordered[1:]}
+                self.search_structural(
+                    descriptor_rows[query_uid],
+                    candidates,
+                    compute_budget=max(64, int(self.config.scientific.candidates_per_radius) * 16),
+                )
+
     def state_dict(self) -> dict[str, Any]:
         state = super().state_dict()
         state["hgt_context_action_scores"] = {str(environment): {str(context): {str(action): score for action, score in actions.items()} for context, actions in contexts.items()} for environment, contexts in self._hgt_context_action_scores.items()}
