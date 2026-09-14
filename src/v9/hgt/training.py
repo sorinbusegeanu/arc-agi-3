@@ -235,6 +235,17 @@ def build_hgt_graph(
     semantic_links = []
     semantic_tables = {}
     semantic_features = {}
+    for memory_index, uid in enumerate(ordered_uids):
+        payload = dict(read_view.payloads.get(uid, {}))
+        for fact in _semantic_rows(payload):
+            node_type = _semantic_node_type(int(fact[0]))
+            table = semantic_tables.setdefault(node_type, {})
+            semantic_index = table.get(fact)
+            if semantic_index is None:
+                semantic_index = len(table)
+                table[fact] = semantic_index
+                semantic_features.setdefault(node_type, []).append(_semantic_node_feature(fact, input_dim, torch))
+            semantic_links.append((memory_index, node_type, semantic_index))
     eligible = (edge for edge in read_view.edges if edge.source in index_by_uid and edge.target in index_by_uid)
     selected_edges = heapq.nlargest(
         max(1, int(max_edges)),
