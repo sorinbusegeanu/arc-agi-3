@@ -98,6 +98,9 @@ def run_parallel_memory_jobs(
             "actor_launch_latency_ms", 1000.0 * (time.perf_counter() - launch_started)
         )
         runtime.set_telemetry_gauge("actors_launched", len(topology.actor_processes))
+        runtime.set_telemetry_gauge("live_environment_instances", len(active))
+        runtime.set_telemetry_gauge("available_actor_slots", len(free_slots))
+        runtime.set_telemetry_gauge("pending_environment_jobs", len(pending))
         return True
 
     def drain_publication_queue() -> bool:
@@ -154,6 +157,9 @@ def run_parallel_memory_jobs(
                     done.levels_completed,
                 )
             )
+            runtime.set_telemetry_gauge("live_environment_instances", len(active))
+            runtime.set_telemetry_gauge("available_actor_slots", len(free_slots))
+            runtime.set_telemetry_gauge("pending_environment_jobs", len(pending))
             progressed = True
         return progressed
 
@@ -165,6 +171,9 @@ def run_parallel_memory_jobs(
         gauges.update(
             {
                 "active_actor_processes": len(active),
+                "live_environment_instances": len(active),
+                "available_actor_slots": len(free_slots),
+                "pending_environment_jobs": len(pending),
                 "coordinator_action_requests": 0,
                 "policy_snapshot_generation": int(published_policy_generation),
                 "active_ingest_workers": int(ingest_workers),
