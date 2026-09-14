@@ -212,6 +212,18 @@ class StructuralAdapter:
                 )
             except Exception:
                 pass
+        elif family in {"babyai", "minigrid"}:
+            try:
+                action_type = self.native_env.unwrapped.actions(token).name
+            except Exception:
+                pass
+        elif family == "alfred":
+            labels = getattr(self, "trace_action_labels", None)
+            if callable(labels):
+                try:
+                    action_type = labels((token,)).get(token, token)
+                except Exception:
+                    pass
         subject = _semantic_id(f"action:{action_type}")
         return (_fact(8, subject, 23, action_type, 1.0),)
 
