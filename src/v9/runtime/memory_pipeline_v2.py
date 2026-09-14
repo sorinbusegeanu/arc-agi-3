@@ -126,7 +126,7 @@ def _m1g_write(m1g: Any, m0: Any, event: Any, transition: Any = None) -> Canonic
     )
 
 
-def _m1n_write(relation: M1NormalizedRelation, *, watermark: int) -> CanonicalWrite:
+def _m1n_write(relation: M1NormalizedRelation, *, watermark: int, transition: Any = None) -> CanonicalWrite:
     parents = tuple(relation.provenance.parents)
     evidence = tuple(relation.provenance.evidence)
     return CanonicalWrite(
