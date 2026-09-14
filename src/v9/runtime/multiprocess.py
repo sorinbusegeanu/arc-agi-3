@@ -213,6 +213,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
 
                 before = adapter.observe()
                 before_signature = int(adapter.encode_observation(before))
+                semantic_before = tuple(adapter.semantic_observation(before))
                 learned_scores = policy.learned_scores(environment_instance_id, actions, environment_type=identity.environment_type, context_signature=before_signature)
                 grounded_scores = policy.grounded_scores(actions, environment_type=identity.environment_type)
                 action_schema_id = int(adapter.action_schema().schema_id)
