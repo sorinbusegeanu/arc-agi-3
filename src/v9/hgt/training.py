@@ -78,22 +78,27 @@ def _node_feature(node: Any, payload: dict[str, Any], dim: int, torch: Any):
         float(payload.get("support", 0)) / 64.0,
         float(len(payload.get("parents", ()))) / 8.0,
     ]
-    seed = hashlib.blake2b(
-        json.dumps(
-            {
-                "level": int(node.level),
-                "key": list(node.structural_key),
-                "context": int(payload.get("context_signature", payload.get("grounded_context_signature", 0)) or 0),
-                "environment": int(payload.get("environment_instance_id", 0) or 0),
-            },
-            sort_keys=True,
-        ).encode("utf-8"),
-        digest_size=32,
-        person=b"v9-hgt-feature",
-    ).digest()
     while len(values) < dim:
-        byte = seed[(len(values) - 10) % len(seed)]
-        values.append((float(byte) / 127.5) - 1.0)
+        values.append(0.0)
+    for kind, subject, relation, obj, value in _semantic_rows(payload):
+        if kind == 7:
+            base, width = 40, 8
+        elif kind == 8:
+            base, width = 32, 8
+        elif kind == 9:
+            base, width = 48, 8
+        elif kind in {2, 3, 4, 5}:
+            base, width = 16, 16
+        else:
+            base, width = 10, 6
+        digest = hashlib.blake2b(
+            f"{kind}:{subject}:{relation}:{obj}".encode("ascii"),
+            digest_size=2,
+            person=b"v9-sem-slot",
+        ).digest()
+        slot = base + (int.from_bytes(digest, "little") % width)
+        magnitude = float(value) if float(value) != 0.0 else 1.0
+        values[slot] = max(-1.0, min(1.0, values[slot] + magnitude))
     return torch.tensor(values[:dim], dtype=torch.float32)
 
 
