@@ -499,7 +499,7 @@ class ContinuousMemoryRuntime:
             stored.setdefault("evidence_refs", [[uid.hi, uid.lo] for uid in sorted(set(evidence))])
             self._deferred_base_nodes[node.uid] = (node, stored, tuple(evidence))
 
-    def _record_normalized(self, relation: M1NormalizedRelation, *, defer_publication: bool = False) -> int:
+    def _record_normalized(self, relation: M1NormalizedRelation, *, defer_publication: bool = False, payload_extra: dict[str, Any] | None = None) -> int:
         occurrences = self._m1n_occurrences.setdefault(relation.structural_signature, [])
         support = self._m1n_supports.get(relation.structural_signature, 0) + 1
         self._m1n_supports[relation.structural_signature] = support
@@ -548,6 +548,8 @@ class ContinuousMemoryRuntime:
                 "support": support,
                 "parents": [[uid.hi, uid.lo] for uid in retained_parents],
             }
+            if payload_extra:
+                normalized_payload.update(dict(payload_extra))
             if defer_publication:
                 self._defer_base_group(((normalized_node, normalized_payload, retained_evidence),))
             else:
@@ -793,7 +795,18 @@ class ContinuousMemoryRuntime:
                 if before_grounding is None or int(after_grounding.maturity) > int(before_grounding.maturity):
                     self.telemetry["grounding_promotions"] += 1
             prior_support = int(self._m1n_supports.get(int(m1n.structural_signature), 0))
-            signature = self._record_normalized(m1n, defer_publication=True)
+            normalized_extra = {}
+            if transition.semantic_before:
+                normalized_extra["semantic_before"] = [list(row) for row in transition.semantic_before]
+            if transition.semantic_action:
+                normalized_extra["semantic_action"] = [list(row) for row in transition.semantic_action]
+            if transition.semantic_options:
+                normalized_extra["semantic_options"] = [list(row) for row in transition.semantic_options]
+            if transition.semantic_after:
+                normalized_extra["semantic_after"] = [list(row) for row in transition.semantic_after]
+            if transition.semantic_delta:
+                normalized_extra["semantic_effects"] = [list(row) for row in transition.semantic_delta]
+            signature = self._record_normalized(m1n, defer_publication=True, payload_extra=normalized_extra)
             self.evidence.append(
                 "INGESTION",
                 self._watermark,
