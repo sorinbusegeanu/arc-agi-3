@@ -185,12 +185,21 @@ def _select_connected_nodes(read_view: Any, max_nodes: int) -> tuple[Any, ...]:
     return tuple(selected)
 
 
+def _semantic_priority(fact: tuple[int, int, int, int, float]) -> tuple[int, int, int, int]:
+    kind, subject, relation, obj, _ = fact
+    priority = {9: 0, 8: 1, 7: 2, 5: 3, 6: 3, 2: 4, 3: 4, 4: 4}.get(int(kind), 5)
+    return priority, int(relation), int(subject), int(obj)
+
+
 def build_hgt_graph(
     read_view: Any,
     *,
     input_dim: int = 64,
     max_nodes: int = 800,
     max_edges: int = 4000,
+    max_total_nodes: int = 6000,
+    max_total_edges: int = 40000,
+    max_semantic_facts_per_memory: int = 16,
     return_discount: float = 0.97,
 ):
     torch, _, _ = _require_torch()
@@ -238,19 +247,39 @@ def build_hgt_graph(
     action_target_dict = {NODE_TYPE: torch.tensor(action_targets, dtype=torch.float32)}
     action_mask_dict = {NODE_TYPE: torch.tensor(action_masks, dtype=torch.bool)}
     action_meta = {NODE_TYPE: action_rows}
+    eligible = (edge for edge in read_view.edges if edge.source in index_by_uid and edge.target in index_by_uid)
+    selected_edges = heapq.nlargest(
+        max(1, min(int(max_edges), int(max_total_edges))),
+        eligible,
+        key=lambda edge: max(
+            int(read_view.nodes[edge.source].created_watermark),
+            int(read_view.nodes[edge.target].created_watermark),
+        ),
+    )
     semantic_links = []
     semantic_tables = {}
     semantic_features = {}
+    semantic_node_budget = max(0, int(max_total_nodes) - len(ordered_uids))
+    semantic_link_budget = max(0, (int(max_total_edges) - len(selected_edges)) // 2)
+    semantic_node_count = 0
     for memory_index, uid in enumerate(ordered_uids):
+        if len(semantic_links) >= semantic_link_budget:
+            break
         payload = dict(read_view.payloads.get(uid, {}))
-        for fact in _semantic_rows(payload):
+        facts = sorted(set(_semantic_rows(payload)), key=_semantic_priority)
+        for fact in facts[: max(1, int(max_semantic_facts_per_memory))]:
+            if len(semantic_links) >= semantic_link_budget:
+                break
             node_type = _semantic_node_type(int(fact[0]))
             table = semantic_tables.setdefault(node_type, {})
             semantic_index = table.get(fact)
             if semantic_index is None:
+                if semantic_node_count >= semantic_node_budget:
+                    continue
                 semantic_index = len(table)
                 table[fact] = semantic_index
                 semantic_features.setdefault(node_type, []).append(_semantic_node_feature(fact, input_dim, torch))
+                semantic_node_count += 1
             semantic_links.append((memory_index, node_type, semantic_index))
     for node_type, rows in semantic_features.items():
         x_dict[node_type] = torch.stack(rows, dim=0)
@@ -259,15 +288,6 @@ def build_hgt_graph(
         action_target_dict[node_type] = torch.zeros(count, dtype=torch.float32)
         action_mask_dict[node_type] = torch.zeros(count, dtype=torch.bool)
         action_meta[node_type] = [None] * count
-    eligible = (edge for edge in read_view.edges if edge.source in index_by_uid and edge.target in index_by_uid)
-    selected_edges = heapq.nlargest(
-        max(1, int(max_edges)),
-        eligible,
-        key=lambda edge: max(
-            int(read_view.nodes[edge.source].created_watermark),
-            int(read_view.nodes[edge.target].created_watermark),
-        ),
-    )
     edges: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
     for edge in selected_edges:
         edges.setdefault((NODE_TYPE, str(edge.relation.value), NODE_TYPE), []).append(
