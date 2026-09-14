@@ -375,13 +375,13 @@ def run_lifecycle_maintenance(
     retirement_limit: int = 2048,
     dormant_threshold: float = 0.22,
     reactivation_threshold: float = 0.40,
-    dormancy_grace_cycles: int = 3,
-    retirement_grace_cycles: int = 3,
+    dormancy_grace_cycles: int = 1,
+    retirement_grace_cycles: int = 1,
     validation_tolerance: float = 0.05,
     compaction_pressure_threshold: float = 1.0,
     compaction_target_ratio: float = 0.90,
-    max_compaction_batch: int = 65_536,
-    max_scan_batch: int = 131_072,
+    max_compaction_batch: int = 131_072,
+    max_scan_batch: int = 262_144,
     m0_representative_floor: int = 8,
     m1_representative_floor: int = 2,
 ) -> dict[str, int | float]:
@@ -404,7 +404,12 @@ def run_lifecycle_maintenance(
     target_capacity = 0
     if graph.node_capacity_per_partition is not None:
         target_capacity = int(graph.partition_count * graph.node_capacity_per_partition * float(compaction_target_ratio))
-    excess_nodes = max(0, graph.memory_count() - target_capacity) if target_capacity else 0
+        excess_nodes = max(0, graph.memory_count() - target_capacity)
+    else:
+        low_level_nodes = len(graph._uids_by_level[MemoryLevel.M0]) + len(graph._uids_by_level[MemoryLevel.M1])
+        events = max(1, int(getattr(runtime, "telemetry", {}).get("events", 0)))
+        low_level_target = max(65_536, events + max(32_768, events // 8))
+        excess_nodes = max(0, low_level_nodes - low_level_target)
     if compaction_enabled:
         effective_retirement_limit = min(
             max(1, int(max_compaction_batch)),
