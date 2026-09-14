@@ -95,6 +95,7 @@ def _m0_write(m0: Any, event: Any, transition: Any = None) -> CanonicalWrite:
             "realized_cost": m0.realized_cost,
             "semantic_before": [] if transition is None else [list(row) for row in transition.semantic_before],
             "semantic_action": [] if transition is None else [list(row) for row in transition.semantic_action],
+            "semantic_effects": [] if transition is None else [list(row) for row in transition.semantic_delta],
         },
         (m0.uid,),
     )
