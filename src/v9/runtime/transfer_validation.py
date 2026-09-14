@@ -197,10 +197,16 @@ def run_transfer_validation_interval(
                         return int(target_action)
                     return baseline(observation, actions, step)
 
+                def ablated(observation: Any, actions: tuple[int, ...], step: int) -> int:
+                    if step == 0 and target_action in actions and len(actions) > 1:
+                        controls = tuple(action for action in actions if action != target_action)
+                        return baseline(observation, controls, step)
+                    return baseline(observation, actions, step)
+
                 result = run_matched_transfer_trial(
                     environment,
                     enabled_policy=enabled,
-                    ablated_policy=baseline,
+                    ablated_policy=ablated,
                     metric=lambda row: float(row.score),
                     horizon=horizon,
                 )
