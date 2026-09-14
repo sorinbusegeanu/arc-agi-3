@@ -9,7 +9,7 @@ from v9.memory.m1_normalized import M1NormalizedRelation
 from v9.memory.model import CanonicalNode, MemoryLevel, MemoryType
 from v9.modalities.contract import InteractionEvent, PassiveSymbolEvent
 
-from .memory_pipeline import IngestionTask, PreparedIngestion, prepare_ingestion
+from .memory_pipeline import DerivationTask, IngestionTask, PreparedIngestion, derive_memory, prepare_ingestion
 from .multiprocess import WorkerStop
 from .shared_batch_transport import publish_shared_batch
 
@@ -19,6 +19,13 @@ class IngestionBatchTask:
     start_sequence: int
     end_sequence: int
     tasks: tuple[IngestionTask, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DerivationBatchTask:
+    start_task_id: int
+    end_task_id: int
+    tasks: tuple[DerivationTask, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,3 +232,27 @@ def ingest_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
             result_queue.put(("ingest_batch_shm", result.start_sequence, result.end_sequence, descriptor))
         except BaseException as exc:
             result_queue.put(("worker_error", "ingest", int(item.start_sequence), repr(exc)))
+
+
+def derivation_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
+    while True:
+        item = task_queue.get()
+        if isinstance(item, WorkerStop):
+            return
+        if not isinstance(item, DerivationBatchTask):
+            continue
+        try:
+            results = tuple(derive_memory(task) for task in item.tasks)
+            descriptor = publish_shared_batch(
+                results,
+                start_sequence=item.start_task_id,
+                end_sequence=item.end_task_id,
+                rows=len(results),
+            )
+            result_queue.put(
+                ("derivation_batch_shm", item.start_task_id, item.end_task_id, descriptor)
+            )
+        except BaseException as exc:
+            result_queue.put(
+                ("worker_error", "derivation", int(item.start_task_id), repr(exc))
+            )
