@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -10,7 +11,7 @@ import numpy as np
 import pytest
 
 from v9.environments import (
-    ARCAdapter, AlfredAdapter, AlfworldTextBackend, BabyAIAdapter, BoundaryEvent, BoundaryScope,
+    ARCAdapter, AlfredAdapter, AlfworldTextBackend, AlfworldThorBackend, BabyAIAdapter, BoundaryEvent, BoundaryScope,
     EnvironmentCognitionAdapter, GymDiscreteAdapter, SudokuAdapter,
     SyntheticSymbolicEnvironment,
 )
@@ -67,6 +68,48 @@ class FakeAlfworldTextEnvironment:
 
     def close(self):
         self.closed = True
+
+
+class FakeAlfworldThorEnvironment:
+    def __init__(self):
+        self.last_event = type("Event", (), {"frame": np.arange(12, dtype=np.uint8).reshape(2, 2, 3)})()
+        self.native_actions = []
+        self.won = False
+        self.stopped = False
+
+    def reset(self, scene: str):
+        self.scene = scene
+
+    def restore_scene(self, poses, toggles, dirty):
+        self.restored = (poses, toggles, dirty)
+
+    def step(self, action):
+        self.native_actions.append(action)
+
+    def set_task(self, trajectory, args, reward_type):
+        self.task = (trajectory, args.reward_config, reward_type)
+
+    def get_goal_satisfied(self):
+        return self.won
+
+    def stop(self):
+        self.stopped = True
+
+
+class FakeAlfworldThorController:
+    feedback = "a kitchen"
+
+    def __init__(self, environment):
+        self.environment = environment
+        self.commands = []
+
+    def get_admissible_commands(self):
+        return ("take apple", "look")
+
+    def step(self, command: str):
+        self.commands.append(command)
+        self.environment.won = True
+        return "you won"
 
 
 @dataclass
@@ -193,6 +236,51 @@ def test_alfworld_text_backend_reports_missing_downloaded_tasks(tmp_path: Path) 
         AlfworldTextBackend("pick_and_place_simple", data_root=tmp_path)
 
 
+def test_alfworld_thor_backend_maps_commands_and_captures_rgb_frame(tmp_path: Path) -> None:
+    task = tmp_path / "json_2.1.1" / "train" / "pick_and_place_simple-Apple-None-Table-1" / "trial_1"
+    task.mkdir(parents=True)
+    (task / "traj_data.json").write_text(
+        json.dumps(
+            {
+                "task_type": "pick_and_place_simple",
+                "turk_annotations": {"anns": [{"task_desc": "put the apple away"}]},
+                "scene": {
+                    "scene_num": 7,
+                    "object_poses": ["poses"],
+                    "object_toggles": ["toggles"],
+                    "dirty_and_empty": ["dirty"],
+                    "init_action": {"action": "TeleportFull"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    native = FakeAlfworldThorEnvironment()
+    controller = FakeAlfworldThorController(native)
+    backend = AlfworldThorBackend(
+        "pick_and_place_simple",
+        data_root=tmp_path,
+        environment_factory=lambda: native,
+        controller_factory=lambda *_args: controller,
+    )
+
+    world, instruction = backend.reset()
+    header_size = int.from_bytes(world[:4], "big")
+    header = json.loads(world[4:4 + header_size])
+    assert instruction == b"put the apple away"
+    assert native.scene == "FloorPlan7"
+    assert native.native_actions == [{"action": "TeleportFull"}]
+    assert header["shape"] == [2, 2, 3]
+    assert world[4 + header_size:] == native.last_event.frame.tobytes()
+    assert backend.available_actions() == (0, 1)
+
+    _, _, boundary = backend.step(1)
+    assert controller.commands == ["take apple"]
+    assert boundary == BoundaryEvent(BoundaryScope.EPISODE, 1, False)
+    backend.close()
+    assert native.stopped is True
+
+
 def test_cli_alfred_adapter_uses_builtin_backend_and_is_ready_after_construction(monkeypatch) -> None:
     from v9 import cli
     from v9.curriculum import EnvironmentSpec
@@ -208,6 +296,22 @@ def test_cli_alfred_adapter_uses_builtin_backend_and_is_ready_after_construction
 
     assert adapter.observe().instruction_bytes == b"move"
     assert adapter.available_actions() == (4, 5)
+
+
+def test_cli_alfred_mode_override_reaches_curriculum_specs() -> None:
+    from v9 import cli
+    from v9.curriculum import EnvironmentSpec
+
+    configured = cli._configure_alfred_specs(
+        (EnvironmentSpec("alfred", "pick_and_place_simple"), EnvironmentSpec("arc", "ls20")),
+        mode="thor",
+        x_display="0.0",
+    )
+
+    assert configured[0].kwargs == {"mode": "thor", "x_display": "0.0"}
+    assert configured[1].kwargs == {}
+    with pytest.raises(ValueError, match="requires --alfred-mode thor"):
+        cli._configure_alfred_specs(configured, mode="text", x_display="0.0")
 
 
 def test_babyai_factory_registers_environments_in_a_clean_process() -> None:

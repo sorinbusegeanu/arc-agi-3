@@ -65,6 +65,28 @@ def resolve_games(selector: str, *, curriculum_config: str | None = None) -> tup
     return tuple(spec.display_name for spec in resolve_game_specs(selector, curriculum_config=curriculum_config))
 
 
+def _configure_alfred_specs(
+    specs: tuple[EnvironmentSpec, ...],
+    *,
+    mode: str | None,
+    x_display: str | None,
+) -> tuple[EnvironmentSpec, ...]:
+    if x_display is not None and mode != "thor":
+        raise ValueError("--alfred-x-display requires --alfred-mode thor")
+    if mode is None:
+        return specs
+    configured = []
+    for spec in specs:
+        if spec.adapter.lower() != "alfred":
+            configured.append(spec)
+            continue
+        kwargs = {**spec.kwargs, "mode": mode}
+        if x_display is not None:
+            kwargs["x_display"] = x_display
+        configured.append(replace(spec, kwargs=kwargs))
+    return tuple(configured)
+
+
 def _condition_config(condition: str | None) -> tuple[bool, bool, bool]:
     value = (condition or "").upper()
     if value == "C0":
@@ -256,7 +278,11 @@ def run_continuous(args: argparse.Namespace) -> int:
         raise ValueError("actors, steps-per-game, graph-check and progress interval must be positive; wait and epsilon must be valid")
     if min(args.ingest_workers, args.derivation_workers, args.ingest_queue_capacity, args.derivation_queue_capacity, args.publication_queue_capacity, args.actor_view_refresh_steps) <= 0 or args.actor_view_refresh_ms <= 0:
         raise ValueError("memory worker counts, queue capacities and actor policy refresh controls must be positive")
-    specs = resolve_game_specs(args.games, curriculum_config=args.curriculum_config)
+    specs = _configure_alfred_specs(
+        resolve_game_specs(args.games, curriculum_config=args.curriculum_config),
+        mode=getattr(args, "alfred_mode", None),
+        x_display=getattr(args, "alfred_x_display", None),
+    )
     games = tuple(spec.display_name for spec in specs)
     runtime = ContinuousMemoryRuntime(_runtime_config(args))
     curriculum_modes = sorted({spec.validation_mode for spec in specs if spec.validation_mode})
@@ -329,6 +355,8 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--games", default=None)
     continuous.add_argument("--curriculum-config", default=None)
     continuous.add_argument("--alfred-backend-factory", default=None, metavar="MODULE:FUNCTION")
+    continuous.add_argument("--alfred-mode", choices=("text", "thor"), default=None)
+    continuous.add_argument("--alfred-x-display", default=None, metavar="DISPLAY")
     trajectory = continuous.add_mutually_exclusive_group()
     trajectory.add_argument("--show-best-trajectory", metavar="GAME_ID", default=None)
     trajectory.add_argument("--save-best-trajectory", metavar="FILE", default=None)

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 from random import Random
+from types import SimpleNamespace
 from typing import Any, Callable, Protocol
 
 from v9.environments.base import StructuralAdapter
@@ -22,6 +23,64 @@ class AlfredBackend(Protocol):
     def close(self) -> None: ...
 
 
+def _resolve_alfworld_data_root(data_root: str | Path | None) -> Path:
+    if data_root is not None:
+        return Path(data_root).expanduser().resolve()
+    configured = os.environ.get("ALFWORLD_DATA")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    try:
+        from alfworld.info import ALFWORLD_DATA
+    except ImportError as exc:
+        raise RuntimeError("ALFWorld support requires the 'alfworld' package") from exc
+    return Path(ALFWORLD_DATA).expanduser().resolve()
+
+
+def _select_alfworld_task(
+    data_root: Path,
+    task_type: str,
+    seed: int,
+    *,
+    require_textworld_game: bool,
+) -> tuple[Path, bytes]:
+    dataset_root = data_root / "json_2.1.1"
+    metadata_paths: list[Path] = []
+    standard_layout = dataset_root.is_dir()
+    if standard_layout:
+        for split in sorted(path for path in dataset_root.iterdir() if path.is_dir()):
+            metadata_paths.extend(split.glob(f"{task_type}-*/trial_*/traj_data.json"))
+    elif data_root.is_dir():
+        metadata_paths.extend(data_root.rglob("traj_data.json"))
+
+    candidates: list[Path] = []
+    for metadata_path in metadata_paths:
+        if require_textworld_game and not metadata_path.with_name("game.tw-pddl").is_file():
+            continue
+        if not standard_layout:
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                continue
+            if str(metadata.get("task_type", "")) != str(task_type):
+                continue
+        candidates.append(metadata_path)
+    if not candidates:
+        raise RuntimeError(
+            f"no ALFWorld task data for {task_type!r} under {data_root}; "
+            "run 'alfworld-download' or set ALFWORLD_DATA"
+        )
+    metadata_path = Random(seed).choice(sorted(candidates, key=str))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    annotations = metadata.get("turk_annotations", {}).get("anns", ())
+    descriptions = [
+        str(row.get("task_desc", "")).strip()
+        for row in annotations
+        if isinstance(row, dict) and str(row.get("task_desc", "")).strip()
+    ]
+    instruction = descriptions[seed % len(descriptions)] if descriptions else task_type
+    return metadata_path, instruction.encode("utf-8")
+
+
 class AlfworldTextBackend:
     """Target-local integer action facade over ALFWorld's TextWorld simulator."""
 
@@ -35,65 +94,16 @@ class AlfworldTextBackend:
     ) -> None:
         self.environment_name = str(game_id)
         self._seed = int(seed)
-        self._data_root = self._resolve_data_root(data_root)
-        self._game_path, self._instruction = self._select_game(self.environment_name)
+        self._data_root = _resolve_alfworld_data_root(data_root)
+        metadata_path, self._instruction = _select_alfworld_task(
+            self._data_root,
+            self.environment_name,
+            self._seed,
+            require_textworld_game=True,
+        )
+        self._game_path = metadata_path.with_name("game.tw-pddl")
         self._environment = (environment_factory or self._make_environment)(self._game_path)
         self._actions: tuple[str, ...] = ()
-
-    @staticmethod
-    def _resolve_data_root(data_root: str | Path | None) -> Path:
-        if data_root is not None:
-            return Path(data_root).expanduser().resolve()
-        configured = os.environ.get("ALFWORLD_DATA")
-        if configured:
-            return Path(configured).expanduser().resolve()
-        try:
-            from alfworld.info import ALFWORLD_DATA
-        except ImportError as exc:
-            raise RuntimeError("ALFWorld support requires the 'alfworld' package") from exc
-        return Path(ALFWORLD_DATA).expanduser().resolve()
-
-    def _select_game(self, task_type: str) -> tuple[Path, bytes]:
-        dataset_root = self._data_root / "json_2.1.1"
-        metadata_paths: list[Path] = []
-        standard_layout = dataset_root.is_dir()
-        if standard_layout:
-            for split in sorted(path for path in dataset_root.iterdir() if path.is_dir()):
-                metadata_paths.extend(split.glob(f"{task_type}-*/trial_*/traj_data.json"))
-        elif self._data_root.is_dir():
-            metadata_paths.extend(self._data_root.rglob("traj_data.json"))
-
-        candidates: list[Path] = []
-        for metadata_path in metadata_paths:
-            game_path = metadata_path.with_name("game.tw-pddl")
-            if standard_layout:
-                if game_path.is_file():
-                    candidates.append(metadata_path)
-                continue
-            try:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, TypeError):
-                continue
-            if str(metadata.get("task_type", "")) != str(task_type):
-                continue
-            if not game_path.is_file():
-                continue
-            candidates.append(metadata_path)
-        if not candidates:
-            raise RuntimeError(
-                f"no ALFWorld task data for {task_type!r} under {self._data_root}; "
-                "run 'alfworld-download' or set ALFWORLD_DATA"
-            )
-        metadata_path = Random(self._seed).choice(sorted(candidates, key=str))
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        annotations = metadata.get("turk_annotations", {}).get("anns", ())
-        descriptions = [
-            str(row.get("task_desc", "")).strip()
-            for row in annotations
-            if isinstance(row, dict) and str(row.get("task_desc", "")).strip()
-        ]
-        instruction = descriptions[self._seed % len(descriptions)] if descriptions else task_type
-        return metadata_path.with_name("game.tw-pddl"), instruction.encode("utf-8")
 
     @staticmethod
     def _make_environment(game_path: Path) -> Any:
@@ -169,9 +179,131 @@ class AlfworldTextBackend:
             close()
 
 
-def make_alfworld_backend(game_id: str, *, seed: int = 0, **kwargs: object) -> AlfworldTextBackend:
+class AlfworldThorBackend:
+    """Integer action facade over ALFWorld's embodied AI2-THOR simulator."""
+
+    def __init__(
+        self,
+        game_id: str,
+        *,
+        seed: int = 0,
+        data_root: str | Path | None = None,
+        x_display: str | None = None,
+        max_episode_steps: int = 200,
+        environment_factory: Callable[..., Any] | None = None,
+        controller_factory: Callable[[Any, dict[str, Any], Path], Any] | None = None,
+    ) -> None:
+        if max_episode_steps <= 0:
+            raise ValueError("max_episode_steps must be positive")
+        self.environment_name = str(game_id)
+        self._data_root = _resolve_alfworld_data_root(data_root)
+        self._task_path, self._instruction = _select_alfworld_task(
+            self._data_root,
+            self.environment_name,
+            int(seed),
+            require_textworld_game=False,
+        )
+        self._trajectory = json.loads(self._task_path.read_text(encoding="utf-8"))
+        self._environment_factory = environment_factory or self._make_environment
+        self._controller_factory = controller_factory or self._make_controller
+        self._x_display = x_display
+        self._max_episode_steps = int(max_episode_steps)
+        self._environment: Any | None = None
+        self._controller: Any | None = None
+        self._actions: tuple[str, ...] = ()
+        self._steps = 0
+
+    def _make_environment(self) -> Any:
+        try:
+            from alfworld.env.thor_env import ThorEnv
+        except ImportError as exc:
+            raise RuntimeError("ALFWorld embodied execution requires 'alfworld[full]' and 'ai2thor'") from exc
+        return ThorEnv(x_display=self._x_display)
+
+    @staticmethod
+    def _make_controller(environment: Any, trajectory: dict[str, Any], task_root: Path) -> Any:
+        try:
+            from alfworld.agents.controller import OracleAgent
+        except ImportError as exc:
+            raise RuntimeError("ALFWorld embodied execution requires 'alfworld[full]' and 'ai2thor'") from exc
+        return OracleAgent(environment, trajectory, str(task_root))
+
+    def _world(self, feedback: Any) -> bytes:
+        frame = getattr(getattr(self._environment, "last_event", None), "frame", None)
+        if frame is None:
+            raise RuntimeError("AI2-THOR did not provide an RGB frame")
+        self._actions = tuple(sorted({str(command) for command in self._controller.get_admissible_commands()}))
+        header = json.dumps(
+            {
+                "admissible_commands": self._actions,
+                "dtype": str(frame.dtype),
+                "feedback": str(feedback),
+                "shape": tuple(int(value) for value in frame.shape),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return len(header).to_bytes(4, "big") + header + frame.tobytes(order="C")
+
+    def reset(self) -> tuple[bytes, bytes]:
+        if self._environment is None:
+            self._environment = self._environment_factory()
+        scene = dict(self._trajectory["scene"])
+        self._environment.reset(f"FloorPlan{int(scene['scene_num'])}")
+        self._environment.restore_scene(
+            scene["object_poses"],
+            scene["object_toggles"],
+            scene["dirty_and_empty"],
+        )
+        self._environment.step(dict(scene["init_action"]))
+        try:
+            import alfworld.agents
+        except ImportError as exc:
+            raise RuntimeError("ALFWorld embodied execution requires the 'alfworld' package") from exc
+        reward_config = Path(alfworld.agents.__path__[0]) / "config" / "rewards.json"
+        self._environment.set_task(
+            self._trajectory,
+            SimpleNamespace(reward_config=str(reward_config)),
+            reward_type="dense",
+        )
+        self._controller = self._controller_factory(self._environment, self._trajectory, self._task_path.parent)
+        self._steps = 0
+        return self._world(self._controller.feedback), self._instruction
+
+    def available_actions(self) -> tuple[int, ...]:
+        return tuple(range(len(self._actions)))
+
+    def step(self, action: int) -> tuple[bytes, bytes, BoundaryEvent]:
+        index = int(action)
+        if self._controller is None or self._environment is None:
+            raise RuntimeError("ALFWorld embodied backend must be reset before stepping")
+        if index < 0 or index >= len(self._actions):
+            raise ValueError("ALFWorld action index is unavailable")
+        feedback = self._controller.step(self._actions[index])
+        self._steps += 1
+        won = bool(self._environment.get_goal_satisfied())
+        finished = won or self._steps >= self._max_episode_steps
+        valence = 1 if won else (-1 if finished else 0)
+        boundary = BoundaryEvent(BoundaryScope.EPISODE if finished else BoundaryScope.NONE, valence, not finished)
+        return self._world(feedback), self._instruction, boundary
+
+    def close(self) -> None:
+        if self._environment is not None:
+            stop = getattr(self._environment, "stop", None)
+            if callable(stop):
+                stop()
+            self._environment = None
+            self._controller = None
+
+
+def make_alfworld_backend(game_id: str, *, seed: int = 0, **kwargs: object) -> AlfredBackend:
+    mode = str(kwargs.pop("mode", "text")).lower()
     data_root = kwargs.pop("data_root", None)
-    return AlfworldTextBackend(game_id, seed=seed, data_root=data_root)
+    if mode == "text":
+        return AlfworldTextBackend(game_id, seed=seed, data_root=data_root, **kwargs)
+    if mode in {"thor", "visual", "embodied"}:
+        return AlfworldThorBackend(game_id, seed=seed, data_root=data_root, **kwargs)
+    raise ValueError("ALFWorld mode must be 'text' or 'thor'")
 
 
 @dataclass(frozen=True, slots=True)

@@ -22,8 +22,8 @@ Predecessor roots are intentionally not migrated; use a fresh v9 root.
 
 Core environments are ARC, FrozenLake, Chess, Sudoku, and the controlled
 synthetic symbolic environment. BabyAI/MiniGrid is available through the
-`babyai` optional dependency. ALFRED uses an injected live backend so its large
-datasets remain outside the core installation.
+`babyai` optional dependency. ALFRED uses its installed ALFWorld backend and
+keeps the large downloaded datasets outside the core installation.
 
 
 ## Developmental curriculum
@@ -34,3 +34,8 @@ The runtime resolves `--games step1` through `--games step14` from
 
 Step-specific adapter type, environment kwargs, grounding condition, symbol
 suppression, and validation mode are preserved by the runtime resolver.
+
+Step 14 uses ALFWorld's fast TextWorld simulator by default. Select the embodied
+AI2-THOR backend with `--alfred-mode thor`; on a remote shell, pass the available
+X display explicitly when needed, for example `--alfred-x-display 0.0`. Start
+embodied runs with one actor because every actor owns a Unity simulator process.
