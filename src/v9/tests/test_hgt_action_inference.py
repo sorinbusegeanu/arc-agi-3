@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from random import Random
 
+import pytest
+
 from v9.cognition.action_selection import choose_action
 from v9.hgt import training
 from v9.memory import CanonicalNode, MemoryLevel, MemoryType
@@ -131,7 +133,7 @@ def test_optimized_runtime_policy_snapshot_keeps_grounded_strategy_scores(tmp_pa
 
 def test_hgt_behavior_rollback_restores_parent_policy(tmp_path) -> None:
     import json
-    import torch
+    torch = pytest.importorskip("torch")
 
     runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False))
     models = tmp_path / "models"
