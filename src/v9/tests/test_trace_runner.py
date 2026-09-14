@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from v9.environments.contract import BoundaryEvent, BoundaryScope, TaskProgress
 from v9.environments.schemas import ActionSchema, EnvironmentIdentity, ObservationSchema
 from v9.runtime.trace_runner import run_trace_bundle
+from v9.runtime.retention_audit import run_retention_audit
 
 
 @dataclass(frozen=True)
@@ -114,3 +115,32 @@ def test_trace_bundle_contains_100_steps_and_readable_fields(tmp_path) -> None:
     assert "before_observation" in rows[0]
     assert "after_observation" in rows[0]
     assert "task_progress" in rows[0]
+
+
+def test_retention_audit_replays_trace_through_memory_and_hgt(tmp_path) -> None:
+    def factory(spec, **kwargs):
+        return FakeAdapter()
+
+    trace_bundle = run_trace_bundle(
+        (FakeSpec(),),
+        root=tmp_path,
+        seed=0,
+        env_root=None,
+        alfred_backend_factory=None,
+        make_adapter=factory,
+        steps_per_game=4,
+    )
+    retention_bundle = run_retention_audit(trace_bundle, root=tmp_path)
+    assert retention_bundle.exists()
+    with zipfile.ZipFile(retention_bundle) as archive:
+        summary = json.loads(archive.read("retention_summary.json"))
+        assert summary["games"][0]["steps"] == 4
+        report_name = summary["games"][0]["report_file"]
+        rows = [json.loads(line) for line in archive.read(report_name).decode("utf-8").splitlines()]
+    assert len(rows) == 4
+    assert rows[0]["encoded_transition"]["action_id"] in {0, 1}
+    assert rows[0]["m0"] is not None
+    assert rows[0]["m1_grounded"] is not None
+    assert rows[0]["m1_normalized"] is not None
+    assert len(rows[0]["hgt_feature_64"]) == 64
+    assert rows[0]["retention"]["raw_observation"]["encoded_transition"] == "HASHED_ONLY"
