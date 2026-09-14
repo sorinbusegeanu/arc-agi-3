@@ -360,8 +360,22 @@ class AlfredAdapter(StructuralAdapter):
         return () if not self._boundary.continuation else tuple(int(value) for value in self.backend.available_actions())
 
     def trace_observation(self) -> object:
+        world = self._trace_world
+        if isinstance(world, (bytes, bytearray, memoryview)):
+            raw = bytes(world)
+            if len(raw) >= 4:
+                header_size = int.from_bytes(raw[:4], "big")
+                if 0 < header_size <= len(raw) - 4:
+                    try:
+                        header = json.loads(raw[4:4 + header_size].decode("utf-8"))
+                        world = {
+                            "header": header,
+                            "binary_payload_bytes": len(raw) - 4 - header_size,
+                        }
+                    except (UnicodeDecodeError, ValueError, TypeError):
+                        pass
         return {
-            "world": self._trace_world,
+            "world": world,
             "instruction": self.observe().instruction_bytes,
             "world_signature": int(self.observe().world_signature),
             "payload_uid": int(self.observe().payload_uid),
