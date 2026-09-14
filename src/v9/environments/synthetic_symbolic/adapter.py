@@ -86,7 +86,8 @@ class SyntheticSymbolicEnvironment(StructuralAdapter):
         self._state = (self._state + (1 if action else -1)) % 4
         self._step += 1
         terminal = self._step >= self.config.horizon
-        self._boundary = BoundaryEvent(BoundaryScope.EPISODE, 1 if terminal and self._state == 3 else 0, not terminal)
+        valence = 1 if terminal and self._state == 3 else (-1 if terminal else 0)
+        self._boundary = BoundaryEvent(BoundaryScope.EPISODE if terminal else BoundaryScope.NONE, valence, not terminal)
         self._symbols = (self._symbol_for_state(),)
         self._last_trace = WithinActionTrace(before, (WithinActionFrame(self._state, 0),), self._state)
         return self.observe()
