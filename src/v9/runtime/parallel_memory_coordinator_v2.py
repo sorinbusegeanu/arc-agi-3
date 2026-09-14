@@ -148,6 +148,10 @@ def run_parallel_memory_jobs(
                     done.episode_boundaries,
                     done.resets,
                     done.policy_refreshes,
+                    done.task_successes,
+                    done.task_failures,
+                    done.task_truncations,
+                    done.levels_completed,
                 )
             )
             progressed = True
