@@ -1109,15 +1109,14 @@ class ContinuousMemoryRuntime:
             if not rows:
                 continue
             observable = str(rows[0].observable_relation)
-            prefix, separator, remainder = observable.partition(":")
-            action_text, action_separator, _ = remainder.partition(":")
-            if prefix != "ACTION" or not separator or not action_separator:
+            parts = observable.split(":")
+            if len(parts) < 5 or parts[0] != "ACTION":
                 continue
             try:
-                action = int(action_text)
+                scoped = scoped_action_key(int(parts[3]), action_schema_id=int(parts[1]), environment_type=parts[2])
             except ValueError:
                 continue
-            self._actor_action_supports[action] = self._actor_action_supports.get(action, 0.0) + float(support)
+            self._actor_action_supports[scoped] = self._actor_action_supports.get(scoped, 0.0) + float(support)
         self._replay_pool = {MemoryUid(int(key[:16], 16), int(key[16:], 16)): float(value) for key, value in dict(state.get("replay_pool", {})).items()}
         self._formation_environments = {int(value) for value in state.get("formation_environments", [])}
         self._latest_interaction_grounding = {}
