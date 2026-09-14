@@ -323,7 +323,7 @@ presets:
   cross_family:
     include_steps: [step12]
   broad:
-    validation_mode: learning_only
+    validation_mode: validation_budgeted
     environments:
       - adapter: synthetic_causal
         games:
