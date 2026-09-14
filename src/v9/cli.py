@@ -205,8 +205,10 @@ def _runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     overrides["random_seeds"] = (int(getattr(args, "seed", 0)),)
     if hasattr(args, "validation_mode"):
         overrides["transfer_validation_mode"] = "learning_only" if args.no_automatic_experiments else args.validation_mode
-        overrides["transfer_validation_trials_per_interval"] = args.max_transfer_experiments
-        overrides["transfer_validation_time_budget_seconds"] = args.transfer_experiment_time_budget_seconds
+        if args.max_transfer_experiments is not None:
+            overrides["transfer_validation_trials_per_interval"] = args.max_transfer_experiments
+        if args.transfer_experiment_time_budget_seconds is not None:
+            overrides["transfer_validation_time_budget_seconds"] = args.transfer_experiment_time_budget_seconds
     if overrides:
         scientific = replace(scientific, **overrides)
     return RuntimeConfig.from_path(args.root, shards=args.shards, stage_workers=args.stage_workers, stage_ring_capacity=args.stage_ring_capacity, shard_ring_capacity=args.shard_ring_capacity, node_capacity_per_shard=args.node_capacity_per_shard, edge_capacity_per_shard=args.edge_capacity_per_shard, action_capacity_per_shard=args.action_capacity_per_shard, snapshot_interval_seconds=args.snapshot_interval_seconds, peer_interval_seconds=args.peer_interval_seconds, enable_snapshots=not args.no_snapshots, restore=not args.no_restore, enable_peers=not args.no_peers, enable_lifecycle=getattr(args, "lifecycle", "on") == "on", reset_persistent_identity=args.reset_persistent_identity, scientific=scientific)
@@ -431,8 +433,8 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--drain-timeout", type=float, default=300.0)
     continuous.add_argument("--final-save-timeout", type=float, default=300.0)
     continuous.add_argument("--transfer-experiment-steps", type=int, default=32)
-    continuous.add_argument("--max-transfer-experiments", type=int, default=8)
-    continuous.add_argument("--transfer-experiment-time-budget-seconds", type=float, default=30.0)
+    continuous.add_argument("--max-transfer-experiments", type=int, default=None)
+    continuous.add_argument("--transfer-experiment-time-budget-seconds", type=float, default=None)
     continuous.add_argument("--validation-mode", choices=("learning_only", "validation_budgeted", "validation_full"), default="validation_budgeted")
     continuous.add_argument("--no-automatic-experiments", action="store_true")
     smoke = sub.add_parser("smoke")
