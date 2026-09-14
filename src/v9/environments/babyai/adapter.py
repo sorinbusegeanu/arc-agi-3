@@ -95,4 +95,6 @@ def make_babyai_adapter(environment_id: str, *, seed: int = 0, suppress_symbols:
         _quiet_native_call(env.reset, seed=int(seed))
     except TypeError:
         pass
-    return BabyAIAdapter(env, environment_name=environment_id, suppress_symbols=suppress_symbols)
+    adapter = BabyAIAdapter(env, environment_name=environment_id, suppress_symbols=suppress_symbols)
+    adapter.reset()
+    return adapter
