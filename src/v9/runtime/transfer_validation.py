@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
+import multiprocessing as mp
 from pathlib import Path
 from random import Random
 import time
@@ -127,6 +128,7 @@ class _TransferTrialExecution:
     target_environment_type: str | None = None
     target_environment_id: int | None = None
     target_action: int | None = None
+    context_scope_id: int = 0
     enabled_metric: float = 0.0
     ablated_metric: float = 0.0
     matched: bool = False
@@ -212,6 +214,7 @@ def _execute_transfer_trial(
             if not matched_context and fallback_state is not None:
                 adapter.restore_state(fallback_state)
 
+        context_scope_id = int(adapter.encode_observation(adapter.observe()))
         initial_actions = tuple(sorted(set(int(value) for value in adapter.available_actions())))
         target_action = next((action for action in action_candidates if action in initial_actions), None)
         if target_action is None:
@@ -242,6 +245,7 @@ def _execute_transfer_trial(
             target_environment_type=environment_type,
             target_environment_id=target_environment_id,
             target_action=int(target_action),
+            context_scope_id=int(context_scope_id),
             enabled_metric=float(result.enabled_metric),
             ablated_metric=float(result.ablated_metric),
             matched=bool(result.matched),
@@ -326,7 +330,17 @@ def run_transfer_validation_interval(
     results_by_concept: dict[Any, list[_TransferTrialExecution]] = {}
     before_validated: dict[Any, bool] = {candidate["concept_uid"]: bool(candidate["validated"]) for candidate in candidates}
 
-    with ThreadPoolExecutor(max_workers=min(workers, len(tasks)), thread_name_prefix="v9-transfer") as pool:
+    factory_qualname = str(getattr(adapter_factory, "__qualname__", ""))
+    process_safe = bool(getattr(adapter_factory, "__module__", "")) and "<locals>" not in factory_qualname
+    executor_type = ProcessPoolExecutor if process_safe else ThreadPoolExecutor
+    executor_kwargs: dict[str, Any] = {"max_workers": min(workers, len(tasks))}
+    if process_safe:
+        executor_kwargs["mp_context"] = mp.get_context("spawn")
+    else:
+        executor_kwargs["thread_name_prefix"] = "v9-transfer-fallback"
+    runtime.set_telemetry_gauge("transfer_validation_executor", "process" if process_safe else "thread_fallback")
+
+    with executor_type(**executor_kwargs) as pool:
         futures = [
             pool.submit(
                 _execute_transfer_trial,
@@ -357,6 +371,7 @@ def run_transfer_validation_interval(
                 ablated_metric=float(result.ablated_metric),
                 matched=bool(result.matched),
                 held_out=True,
+                context_scope_id=int(result.context_scope_id),
             )
             completed += 1
             trial_passed = bool(result.matched and result.effect > threshold)
@@ -372,6 +387,7 @@ def run_transfer_validation_interval(
                     "target_environment_type": result.target_environment_type,
                     "target_environment_id": int(result.target_environment_id),
                     "target_action": int(result.target_action),
+                    "context_scope_id": int(result.context_scope_id),
                     "enabled_metric": float(result.enabled_metric),
                     "ablated_metric": float(result.ablated_metric),
                     "effect": float(result.effect),
