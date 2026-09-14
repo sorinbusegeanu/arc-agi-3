@@ -127,3 +127,43 @@ def test_optimized_runtime_policy_snapshot_keeps_grounded_strategy_scores(tmp_pa
 
     snapshot = runtime.actor_policy_snapshot()
     assert snapshot.grounded_scores((1, 2), environment_type="FrozenLake-v1")[2] == 0.75
+
+
+def test_hgt_behavior_rollback_restores_parent_policy(tmp_path) -> None:
+    import json
+    import torch
+
+    runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False))
+    models = tmp_path / "models"
+    models.mkdir(exist_ok=True)
+    parent = "hgt-000001"
+    current = "hgt-000002"
+    torch.save(
+        {
+            "model_schema_version": training.MODEL_SCHEMA_VERSION,
+            "validation_loss": 0.5,
+            "validation_accuracy": 0.7,
+            "action_scores": {7: {1: 0.9, 2: 0.1}},
+            "context_action_scores": {7: {11: {1: 0.8, 2: 0.2}}},
+        },
+        models / f"{parent}.pt",
+    )
+    (models / "hgt_manifest.json").write_text(
+        json.dumps(
+            {
+                "model_schema_version": training.MODEL_SCHEMA_VERSION,
+                "current_model_version": current,
+                "current_checkpoint": f"models/{current}.pt",
+                "parent_model_version": parent,
+                "validation_loss": 0.6,
+                "validation_accuracy": 0.6,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restored = training.rollback_hgt_model(runtime, root=tmp_path)
+    assert restored == parent
+    assert runtime.hgt_action_scores(7, (1, 2)) == {1: 0.9, 2: 0.1}
+    manifest = json.loads((models / "hgt_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["current_model_version"] == parent
