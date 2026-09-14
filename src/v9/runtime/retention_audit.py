@@ -128,28 +128,29 @@ def _hgt_feature(prepared: Any) -> list[float]:
 
 
 def _classification(row: dict[str, Any], prepared: Any) -> dict[str, dict[str, str]]:
+    transition = prepared.transition
     has_text = bool(row.get("symbols_after"))
-    before_observation = row.get("before_observation")
-    has_structured_observation = isinstance(before_observation, (dict, list))
-    semantic_actions = any(
-        isinstance(item, dict) and str(item.get("semantic", "")) != str(item.get("token", ""))
-        for item in row.get("available_actions_before", ())
-    )
+    has_observation = bool(transition.semantic_before or transition.semantic_after)
+    has_action = bool(transition.semantic_action)
+    has_options = bool(transition.semantic_options)
+    has_delta = bool(transition.semantic_delta)
+    has_spatial = any(int(fact[0]) == 5 for fact in transition.semantic_before + transition.semantic_after)
+    has_text_fact = any(int(fact[0]) == 7 for fact in transition.semantic_before + transition.semantic_after)
     return {
         "raw_observation": {
-            "encoded_transition": "HASHED_ONLY",
-            "m0_m1": "HASHED_ONLY",
-            "hgt": "HASH_DERIVED",
+            "encoded_transition": "PRESERVED_AS_SEMANTIC_FACTS" if has_observation else "HASHED_ONLY",
+            "m0_m1": "PRESERVED_AS_SEMANTIC_FACTS" if has_observation else "HASHED_ONLY",
+            "hgt": "PRESERVED_AS_TYPED_SEMANTIC_NODES" if has_observation else "HASH_DERIVED",
         },
         "spatial_structure": {
-            "encoded_transition": "HASHED_ONLY" if has_structured_observation else "NOT_APPLICABLE",
-            "m0_m1": "HASHED_ONLY" if has_structured_observation else "NOT_APPLICABLE",
-            "hgt": "HASH_DERIVED" if has_structured_observation else "NOT_APPLICABLE",
+            "encoded_transition": "PRESERVED_AS_SEMANTIC_FACTS" if has_spatial else "HASHED_ONLY",
+            "m0_m1": "PRESERVED_AS_SEMANTIC_FACTS" if has_spatial else "HASHED_ONLY",
+            "hgt": "PRESERVED_AS_TYPED_SEMANTIC_NODES" if has_spatial else "HASH_DERIVED",
         },
         "text_content": {
-            "encoded_transition": "PRESERVED_AS_SYMBOL_STREAM" if has_text else "ABSENT",
-            "m0_m1": "PRESERVED_AS_SYMBOL_EVENTS" if has_text and prepared.symbols else ("ABSENT" if not has_text else "LOST"),
-            "hgt": "INDIRECT_GRAPH_ONLY" if has_text and prepared.symbols else "ABSENT",
+            "encoded_transition": "PRESERVED_AS_SEMANTIC_FACTS" if has_text_fact else ("PRESERVED_AS_SYMBOL_STREAM" if has_text else "ABSENT"),
+            "m0_m1": "PRESERVED_AS_SEMANTIC_FACTS" if has_text_fact else ("PRESERVED_AS_SYMBOL_EVENTS" if has_text and prepared.symbols else ("ABSENT" if not has_text else "LOST")),
+            "hgt": "PRESERVED_AS_TYPED_SEMANTIC_NODES" if has_text_fact else ("INDIRECT_GRAPH_ONLY" if has_text and prepared.symbols else "ABSENT"),
         },
         "action_identity": {
             "encoded_transition": "PRESERVED_TOKEN",
@@ -157,14 +158,19 @@ def _classification(row: dict[str, Any], prepared: Any) -> dict[str, dict[str, s
             "hgt": "PRESERVED_NUMERIC_TOKEN",
         },
         "action_semantics": {
-            "encoded_transition": "LOST" if semantic_actions else "NOT_APPLICABLE",
-            "m0_m1": "LOST" if semantic_actions else "NOT_APPLICABLE",
-            "hgt": "LOST" if semantic_actions else "NOT_APPLICABLE",
+            "encoded_transition": "PRESERVED_AS_SEMANTIC_FACTS" if has_action else "LOST",
+            "m0_m1": "PRESERVED_AS_SEMANTIC_FACTS" if has_action else "LOST",
+            "hgt": "PRESERVED_AS_TYPED_SEMANTIC_NODES" if has_action else "LOST",
         },
         "available_action_set": {
-            "encoded_transition": "COUNT_AND_HASH_ONLY",
-            "m0_m1": "COUNT_AND_HASH_ONLY",
-            "hgt": "INDIRECT_ONLY",
+            "encoded_transition": "PRESERVED_AS_SEMANTIC_FACTS" if has_options else "COUNT_AND_HASH_ONLY",
+            "m0_m1": "PRESERVED_AS_SEMANTIC_FACTS" if has_options else "COUNT_AND_HASH_ONLY",
+            "hgt": "PRESERVED_AS_TYPED_SEMANTIC_NODES" if has_options else "INDIRECT_ONLY",
+        },
+        "state_delta": {
+            "encoded_transition": "PRESERVED_AS_SEMANTIC_FACTS" if has_delta else "LOST",
+            "m0_m1": "PRESERVED_AS_SEMANTIC_FACTS" if has_delta else "LOST",
+            "hgt": "PRESERVED_AS_TYPED_SEMANTIC_NODES" if has_delta else "LOST",
         },
         "reward_boundary": {
             "encoded_transition": "PRESERVED",
@@ -173,11 +179,10 @@ def _classification(row: dict[str, Any], prepared: Any) -> dict[str, dict[str, s
         },
         "level_game_progress": {
             "encoded_transition": "PRESERVED",
-            "m0_m1": "PRESERVED_IN_NORMALIZED_RELATION",
-            "hgt": "INDIRECT_GRAPH_ONLY",
+            "m0_m1": "PRESERVED",
+            "hgt": "PRESERVED_NUMERIC",
         },
     }
-
 
 def _retention_score(classification: dict[str, dict[str, str]]) -> float:
     weights = {
@@ -188,6 +193,8 @@ def _retention_score(classification: dict[str, dict[str, str]]) -> float:
         "PRESERVED_AS_SYMBOL_STREAM": 0.9,
         "PRESERVED_AS_SYMBOL_EVENTS": 0.8,
         "PRESERVED_IN_NORMALIZED_RELATION": 0.8,
+        "PRESERVED_AS_SEMANTIC_FACTS": 0.95,
+        "PRESERVED_AS_TYPED_SEMANTIC_NODES": 0.95,
         "COUNT_AND_HASH_ONLY": 0.35,
         "INDIRECT_GRAPH_ONLY": 0.35,
         "INDIRECT_ONLY": 0.25,
