@@ -4,7 +4,7 @@ from v9.memory.identity import MemoryUid
 from v9.memory.m5_consequence import M5ConsequenceStructure
 from v9.memory.m6_outcome import M6Outcome
 from v9.memory.m7_strategy import M7Strategy
-from v9.memory.model import MemoryLevel
+from v9.memory.model import CanonicalNode, MemoryLevel, MemoryType
 from v9.memory.provenance import DerivationProvenance
 from v9.mutation.proposals import MutationKind, ProposalClass
 
@@ -189,6 +189,65 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
             self._m5[consequence.uid] = consequence
             self._m6[outcome.uid] = outcome
             self._m7[strategy.uid] = strategy
+
+            self._publish(
+                CanonicalNode(
+                    consequence.uid,
+                    MemoryLevel.M5,
+                    MemoryType.CONSEQUENCE,
+                    consequence.consequence_descriptor,
+                    self._watermark,
+                ),
+                {
+                    "descriptor": list(consequence.consequence_descriptor),
+                    "mature": bool(consequence.mature),
+                    "parents": [[uid.hi, uid.lo] for uid in consequence.provenance.parents],
+                },
+                consequence.provenance.evidence,
+            )
+            self._publish(
+                CanonicalNode(
+                    outcome.uid,
+                    MemoryLevel.M6,
+                    MemoryType.OUTCOME,
+                    outcome.class_signature,
+                    self._watermark,
+                ),
+                {
+                    "class_signature": list(outcome.class_signature),
+                    "members": [[uid.hi, uid.lo] for uid in outcome.members],
+                    "class_version": int(outcome.class_version),
+                    "parents": [[uid.hi, uid.lo] for uid in outcome.provenance.parents],
+                },
+                outcome.provenance.evidence,
+            )
+            self._publish(
+                CanonicalNode(
+                    strategy.uid,
+                    MemoryLevel.M7,
+                    MemoryType.STRATEGY,
+                    (
+                        outcome.uid.hi,
+                        outcome.uid.lo,
+                        int(strategy.target_environment_id),
+                        *strategy.native_actions,
+                    ),
+                    self._watermark,
+                ),
+                {
+                    "target_outcome": [strategy.target_outcome.hi, strategy.target_outcome.lo],
+                    "target_environment_id": int(strategy.target_environment_id),
+                    "native_actions": list(strategy.native_actions),
+                    "reliability_successes": int(strategy.reliability_successes),
+                    "reliability_trials": int(strategy.reliability_trials),
+                    "primary_valence_sum": int(strategy.primary_valence_sum),
+                    "realized_cost_sum": int(strategy.realized_cost_sum),
+                    "reliability": float(strategy.reliability),
+                    "expected_cost": strategy.expected_cost,
+                    "parents": [[uid.hi, uid.lo] for uid in strategy.provenance.parents],
+                },
+                strategy.provenance.evidence,
+            )
 
     @staticmethod
     def _payload_provenance(payload: dict[str, object]) -> DerivationProvenance | None:
