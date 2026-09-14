@@ -317,11 +317,12 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                     experience = event.experience
                     recurrence = int(self._m1n_supports.get(signature, 0))
                     recurrence_surprise = 1.0 / max(1.0, float(prior_support + 1))
+                    prediction_error = abs(float(experience.prediction_error)) if float(experience.prediction_error) != 0.0 else recurrence_surprise
                     self.isf.score(
                         ISFComponents(
                             abs(experience.primary_valence),
                             abs(experience.future_option_delta),
-                            recurrence_surprise,
+                            prediction_error,
                             1.0 / max(1, recurrence),
                             0.5 if experience.family_signature else 0.0,
                             min(1.0, experience.changed_cells / 16.0),
@@ -332,7 +333,7 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                         next_stage=next_stage,
                         graph_generation=self.graph.generation,
                     )
-                    self._prediction_error_sum += float(recurrence_surprise)
+                    self._prediction_error_sum += float(prediction_error)
                     self._prediction_error_count += 1
                 if prepared.symbol_codec_state:
                     codec = DeterministicSymbolCodec.from_state_dict(dict(prepared.symbol_codec_state))
