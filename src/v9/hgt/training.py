@@ -657,6 +657,7 @@ def _retry_after_oom(runtime: Any, *, epoch: int, training_epochs: int, learning
         training_epochs=training_epochs,
         learning_rate=learning_rate,
         root=root,
+        allow_promotion=allow_promotion,
         _budget_scale=next_scale,
         _oom_retry=int(oom_retry) + 1,
     )
@@ -732,7 +733,7 @@ def rollback_hgt_model(runtime: Any, *, root: str | Path) -> str | None:
     return str(parent_version)
 
 
-def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_rate: float, root: str | Path, _budget_scale: float = 1.0, _oom_retry: int = 0) -> HGTTrainingResult:
+def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_rate: float, root: str | Path, allow_promotion: bool = True, _budget_scale: float = 1.0, _oom_retry: int = 0) -> HGTTrainingResult:
     try:
         torch, _, _ = _require_torch()
     except RuntimeError:
@@ -1015,14 +1016,14 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         }
         for environment_id, contexts in context_score_sums.items()
     }
-    promote = _should_promote(
+    promote = bool(allow_promotion) and _should_promote(
         parent_version,
         parent_validation_loss,
         validation_loss,
         parent_validation_accuracy,
         val_accuracy,
     )
-    status = "PROMOTED" if promote else "REJECTED"
+    status = "PROMOTED" if promote else ("REJECTED_BEHAVIOR_GATE" if not allow_promotion else "REJECTED")
     if promote:
         temporary_checkpoint = checkpoint_path.with_suffix(".pt.tmp")
         torch.save(
