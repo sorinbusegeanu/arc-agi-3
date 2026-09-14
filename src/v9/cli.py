@@ -19,6 +19,7 @@ from v9.modalities.symbols import DeterministicSymbolCodec
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig
 from v9.runtime.epoch_runner import run_epochs
 from v9.runtime.trace_runner import run_trace_bundle
+from v9.runtime.retention_audit import run_retention_audit
 from v9.telemetry import MetricsHTTPServer
 
 MIX_GAMES = ("gp03", "tp02", "FrozenLake-v1", "Chess-v0", "Sudoku-v0")
@@ -270,6 +271,18 @@ def _trajectory_rows(root: Path) -> list[dict[str, Any]]:
 
 
 def run_continuous(args: argparse.Namespace) -> int:
+    if getattr(args, "trace_retention", None) is not None:
+        trace_bundle = (
+            Path(args.trace_retention)
+            if str(args.trace_retention).strip()
+            else Path(args.root) / "trace" / "trace_bundle.zip"
+        )
+        bundle = run_retention_audit(trace_bundle, root=args.root)
+        print(
+            f"{time.strftime('[%H:%M]')} retention audit complete source={trace_bundle} bundle={bundle}",
+            flush=True,
+        )
+        return 0
     if args.show_best_trajectory:
         rows = _trajectory_rows(Path(args.root))
         print(json.dumps(rows, indent=2, sort_keys=True))
@@ -413,6 +426,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--dashboard-port", type=int, default=8765)
     continuous.add_argument("--no-dashboard", action="store_true")
     continuous.add_argument("--trace", action="store_true", help="collect 100 diagnostic interaction steps per selected game and write trace_bundle.zip")
+    continuous.add_argument("--trace-retention", nargs="?", const="", default=None, metavar="TRACE_BUNDLE", help="audit trace-to-memory/HGT information retention and write retention_bundle.zip; defaults to ROOT/trace/trace_bundle.zip")
     continuous.add_argument("--verbose-progress", action="store_true")
     continuous.add_argument("--drain-timeout", type=float, default=300.0)
     continuous.add_argument("--final-save-timeout", type=float, default=300.0)
