@@ -3,12 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
+import re
 from pathlib import Path
 from random import Random
 from types import SimpleNamespace
 from typing import Any, Callable, Protocol
 
-from v9.environments.base import StructuralAdapter
+from v9.environments.base import StructuralAdapter, _fact, _semantic_id
 from v9.environments.contract import BoundaryEvent, BoundaryScope, WithinActionFrame, WithinActionTrace
 from v9.environments.schemas import ActionSchema, EnvironmentIdentity, ObservationSchema
 from v9.memory.identity import MemoryUid, stable_u64
@@ -389,11 +390,52 @@ class AlfredAdapter(StructuralAdapter):
             if int(token) in set(int(value) for value in actions)
         }
 
+    @staticmethod
+    def _world_text(world: Any) -> tuple[str, tuple[str, ...]]:
+        feedback = ""
+        commands: tuple[str, ...] = ()
+        if isinstance(world, dict):
+            feedback = str(world.get("feedback", "") or "")
+            raw_commands = world.get("admissible_commands", ())
+            commands = tuple(str(value) for value in raw_commands or ())
+        elif isinstance(world, (bytes, bytearray, memoryview)):
+            raw = bytes(world)
+            if len(raw) >= 4:
+                size = int.from_bytes(raw[:4], "big")
+                if 0 < size <= len(raw) - 4:
+                    try:
+                        header = json.loads(raw[4:4 + size].decode("utf-8"))
+                        feedback = str(header.get("feedback", "") or "")
+                        commands = tuple(str(value) for value in header.get("admissible_commands", ()) or ())
+                    except (UnicodeDecodeError, ValueError, TypeError):
+                        pass
+        elif isinstance(world, str):
+            feedback = world
+        return feedback, commands
+
+    @staticmethod
+    def _content_words(text: str) -> tuple[str, ...]:
+        stop = {"the", "a", "an", "to", "from", "in", "on", "at", "of", "and", "is", "are", "you", "your", "with"}
+        return tuple(
+            token
+            for token in re.findall(r"[a-z0-9_-]+", text.lower())
+            if len(token) > 1 and token not in stop
+        )
+
     def semantic_observation(self, observation: Any):
         rows = list(super().semantic_observation(observation))
-        if self._trace_world is not None:
-            rows.extend(super().semantic_observation(self._trace_world))
-        return tuple(rows[:2048])
+        feedback, commands = self._world_text(self._trace_world)
+        if feedback:
+            rows.append(_fact(7, "feedback", 1, feedback, 1.0))
+            for token in self._content_words(feedback):
+                rows.append(_fact(2, f"alfred-entity:{token}", 6, token, 1.0))
+        for command in commands[:128]:
+            command_id = _semantic_id(f"alfred-command:{command}")
+            rows.append(_fact(8, command_id, 23, command, 1.0))
+            for token in self._content_words(command):
+                rows.append(_fact(2, f"alfred-entity:{token}", 6, token, 1.0))
+                rows.append(_fact(8, command_id, 16, token, 1.0))
+        return tuple(rows[:4096])
 
     def optional_symbol_stream(self) -> tuple[object, ...]:
         return tuple(self.observe().instruction_bytes)
