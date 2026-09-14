@@ -53,6 +53,11 @@ def record_normalized_fast(runtime: Any, relation: Any, initial_write: Canonical
     ensure_fast_state(runtime)
     signature = int(relation.structural_signature)
     occurrences = runtime._m1n_occurrences.setdefault(signature, [])
+    if getattr(relation, "channel", None) is not None and str(relation.channel.value) == "CROSS_MODAL":
+        runtime._cross_modal_signatures.pop(signature, None)
+        runtime._cross_modal_signatures[signature] = None
+        while len(runtime._cross_modal_signatures) > 8192:
+            runtime._cross_modal_signatures.pop(next(iter(runtime._cross_modal_signatures)))
     was_stable = len(occurrences) >= 2
     support = int(runtime._m1n_supports.get(signature, 0)) + 1
     runtime._m1n_supports[signature] = support
