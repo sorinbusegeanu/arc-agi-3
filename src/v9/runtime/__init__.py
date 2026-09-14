@@ -120,6 +120,9 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
                 )
                 if not actions:
                     continue
+                positive_evidence = sum(stats[0] for stats in action_stats.values())
+                negative_evidence = sum(stats[2] for stats in action_stats.values())
+                support = sum(stats[1] for stats in action_stats.values())
                 rows.append(
                     {
                         "concept_uid": concept.uid,
@@ -127,12 +130,21 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
                         "source_environment_types": tuple(sorted(source_types)),
                         "actions": actions,
                         "contexts": contexts,
+                        "positive_evidence": int(positive_evidence),
+                        "negative_evidence": int(negative_evidence),
+                        "support": int(support),
                         "validated": bool(concept.validated),
                     }
                 )
-                if len(rows) >= max(1, int(limit)):
-                    break
-            return tuple(rows)
+            rows.sort(
+                key=lambda row: (
+                    -int(row["positive_evidence"]),
+                    -int(row["support"]),
+                    int(row["negative_evidence"]),
+                    row["concept_uid"],
+                )
+            )
+            return tuple(rows[: max(1, int(limit))])
 
     def is_concept_validated(self, concept_uid: MemoryUid) -> bool:
         with self._lock:
