@@ -194,6 +194,7 @@ def run_parallel_memory_jobs(
         pct = 100.0 * pipeline.ingested / requested_steps if requested_steps else 100.0
         print(
             f"{time.strftime('[%H:%M]')} {pct:5.1f}% sampled={pipeline.sampled}/{requested_steps} "
+            f"games_finished={len(results)}/{len(jobs)} actors_active={len(active)} "
             f"ingested={pipeline.ingested} rate={float(diag.get('ingestion_rate', 0.0)):.0f}/s "
             f"backlog={max(0, pipeline.sampled - pipeline.ingested)}",
             flush=True,
