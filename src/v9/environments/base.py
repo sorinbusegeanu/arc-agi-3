@@ -7,6 +7,18 @@ from v9.memory.identity import stable_u64
 from .contract import BoundaryEvent, EnvironmentTransition, TaskProgress, WithinActionTrace
 from .schemas import ActionSchema, EnvironmentIdentity, ObservationSchema
 
+SemanticFact = tuple[int, int, int, int, float]
+
+
+def _semantic_id(value: object) -> int:
+    return int(stable_u64(str(value).strip().lower(), person=b"v9-semantic"))
+
+
+def _fact(kind: int, subject: object, relation: int, obj: object = 0, value: float = 0.0) -> SemanticFact:
+    s = int(subject) if isinstance(subject, int) else _semantic_id(subject)
+    o = int(obj) if isinstance(obj, int) else _semantic_id(obj)
+    return (int(kind), s, int(relation), o, float(value))
+
 
 class StructuralAdapter:
     _identity: EnvironmentIdentity
