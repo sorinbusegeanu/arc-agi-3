@@ -201,9 +201,8 @@ def run_transfer_validation_interval(
                         matched_context = int(adapter.encode_observation(adapter.observe())) in context_candidates
                         if not adapter.boundary_event().continuation:
                             adapter.reset()
-                    if not matched_context:
-                        last_blocker = "no corresponding target context found"
-                        continue
+                    if not matched_context and fallback_state is not None:
+                        adapter.restore_state(fallback_state)
 
                 initial_actions = tuple(sorted(set(int(value) for value in adapter.available_actions())))
                 target_action = next((action for action in action_candidates if action in initial_actions), None)
