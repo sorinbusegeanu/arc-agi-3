@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .memory_pipeline import derivation_worker_main
-from .memory_pipeline_v2 import ingest_batch_worker_main
+from .memory_pipeline_v2 import derivation_batch_worker_main, ingest_batch_worker_main
 from .multiprocess import WorkerStop
 
 
@@ -72,7 +71,7 @@ class MemoryWorkerTopologyV2:
             self.ingest_processes.append(process)
         for index in range(self.derivation_workers):
             process = self.ctx.Process(
-                target=derivation_worker_main,
+                target=derivation_batch_worker_main,
                 args=(self.derivation_queue, self.derivation_result_queue),
                 name=f"v9-derive-v2-{index}",
             )
