@@ -503,7 +503,7 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                     self._m3[role.uid] = role
                     publication_rows.append((CanonicalNode(role.uid, MemoryLevel.M3, MemoryType.ROLE, (role.relational_signature, role.consequence_signature), self._watermark), {"relational_signature": role.relational_signature, "consequence_signature": role.consequence_signature, "parents": [[uid.hi, uid.lo] for uid in role.provenance.parents]}, role.provenance.evidence))
                 for candidate in result.concepts:
-                    if candidate.uid in self._m4:
+                    if candidate.uid in self._m4 and candidate.uid in self.graph.nodes:
                         continue
                     self._m4[candidate.uid] = candidate
                     publication_rows.append((CanonicalNode(candidate.uid, MemoryLevel.M4, MemoryType.CONCEPT, candidate.invariant_descriptor, self._watermark), {"invariant_descriptor": list(candidate.invariant_descriptor), "compression_benefit": candidate.compression_benefit, "explanatory_reach": candidate.explanatory_reach, "transfer_prior": candidate.transfer_prior, "formation_scope": list(candidate.provenance.formation_scope), "held_out_targets": [], "validated": False, "concept_state": candidate.state.value, "parents": [[uid.hi, uid.lo] for uid in candidate.provenance.parents]}, candidate.provenance.evidence))
