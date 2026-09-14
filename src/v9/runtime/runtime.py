@@ -313,7 +313,7 @@ class ContinuousMemoryRuntime:
                     next_stage=stage_snapshot.next_stage,
                     graph_generation=self.graph.generation,
                 )
-                self._prediction_error_sum += abs(float(experience.prediction_error))
+                self._prediction_error_sum += float(recurrence_surprise)
                 self._prediction_error_count += 1
                 self.evidence.append("ISF_DECISION", self._watermark, {"stage": int(decision.developmental_stage), "next_stage": int(decision.next_developmental_stage), "score": decision.score, "raw": asdict(decision.raw_components), "normalized": asdict(decision.normalized_components), "graph_generation": decision.graph_generation})
 
@@ -732,6 +732,7 @@ class ContinuousMemoryRuntime:
             )
             key = (m1g.environment_instance_id, m1g.episode_id)
             self._latest_interaction_grounding[key] = m1g
+            prior_support = int(self._m1n_supports.get(int(m1n.structural_signature), 0))
             signature = self._record_normalized(m1n, defer_publication=True)
             self.evidence.append(
                 "INGESTION",
@@ -766,11 +767,12 @@ class ContinuousMemoryRuntime:
                 )
             experience = event.experience
             recurrence = self._m1n_supports.get(signature, 0)
+            recurrence_surprise = 1.0 / max(1.0, float(prior_support + 1))
             decision = self.isf.score(
                 ISFComponents(
                     abs(experience.primary_valence),
                     abs(experience.future_option_delta),
-                    experience.prediction_error,
+                    recurrence_surprise,
                     1.0 / max(1, recurrence),
                     0.5 if experience.family_signature else 0.0,
                     min(1.0, experience.changed_cells / 16.0),
