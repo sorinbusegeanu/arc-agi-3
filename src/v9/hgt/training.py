@@ -208,11 +208,18 @@ def build_hgt_graph(
     selected_uids = _select_connected_nodes(read_view, max_nodes)
     ordered_uids = sorted(selected_uids, key=lambda uid: (int(read_view.nodes[uid].created_watermark), uid))
     index_by_uid = {uid: index for index, uid in enumerate(ordered_uids)}
+    relation_nodes: dict[str, set[Any]] = {}
+    for edge in read_view.edges:
+        if edge.source not in index_by_uid or edge.target not in index_by_uid:
+            continue
+        relation_nodes.setdefault(str(edge.relation.value), set()).update((edge.source, edge.target))
     features = []
     labels = []
     action_targets = [0.0] * len(ordered_uids)
     action_masks = []
     action_rows: list[tuple[int, int, int, int, int] | None] = []
+    task_targets: dict[str, list[float]] = {name: [] for name in AUX_OBJECTIVES}
+    task_masks: dict[str, list[bool]] = {name: [] for name in AUX_OBJECTIVES}
     episode_rows: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
     for index, uid in enumerate(ordered_uids):
         node = read_view.nodes[uid]
@@ -231,6 +238,48 @@ def build_hgt_graph(
             and context_signature is not None
             and episode_id is not None
         )
+        semantic_rows = _semantic_rows(payload)
+        transition_positive = bool(payload.get("semantic_effects")) or (
+            payload.get("context_signature") is not None
+            and payload.get("next_context_signature") is not None
+            and int(payload.get("context_signature")) != int(payload.get("next_context_signature"))
+        )
+        task_targets["transition"].append(float(transition_positive))
+        task_masks["transition"].append(bool(usable_action))
+
+        relevance_positive = bool(
+            abs(int(payload.get("primary_valence", 0))) > 0
+            or int(payload.get("support", 0)) > 1
+            or int(payload.get("recurrence", 0)) > 1
+            or bool(payload.get("validated", False))
+            or int(payload.get("explanatory_reach", 0)) > 0
+        )
+        task_targets["relevance"].append(float(relevance_positive))
+        task_masks["relevance"].append(True)
+
+        correspondence_positive = uid in relation_nodes.get(RelationType.TRANSFER_CORRESPONDENCE.value, set())
+        task_targets["correspondence"].append(float(correspondence_positive))
+        task_masks["correspondence"].append(node.level in {MemoryLevel.M3, MemoryLevel.M4})
+
+        similarity_positive = uid in relation_nodes.get(RelationType.SIMILAR_TO.value, set())
+        task_targets["similarity"].append(float(similarity_positive))
+        task_masks["similarity"].append(node.level in {MemoryLevel.M2, MemoryLevel.M3, MemoryLevel.M4})
+
+        grounding_positive = (
+            uid in relation_nodes.get(RelationType.GROUNDS.value, set())
+            or any(int(row[0]) == 7 for row in semantic_rows)
+        )
+        task_targets["grounding"].append(float(grounding_positive))
+        task_masks["grounding"].append(bool(semantic_rows) or node.level in {MemoryLevel.M0, MemoryLevel.M1})
+
+        deliberation_target = 1.0 if bool(payload.get("task_success", False)) or int(payload.get("levels_completed", 0)) > 0 else (-1.0 if bool(payload.get("task_failure", False)) else 0.0)
+        task_targets["deliberation_improvement"].append(deliberation_target)
+        task_masks["deliberation_improvement"].append(bool(usable_action))
+
+        invariance_positive = bool(payload.get("validated", False)) or uid in relation_nodes.get(RelationType.OUTCOME_EQUIVALENT.value, set())
+        task_targets["invariance"].append(float(invariance_positive))
+        task_masks["invariance"].append(node.level in {MemoryLevel.M4, MemoryLevel.M5, MemoryLevel.M6})
+
         action_masks.append(bool(usable_action))
         if usable_action:
             env, context, action, episode = int(environment_id), int(context_signature), int(action_id), int(episode_id)
@@ -248,6 +297,14 @@ def build_hgt_graph(
     y_dict = {NODE_TYPE: torch.tensor(labels, dtype=torch.long)}
     action_target_dict = {NODE_TYPE: torch.tensor(action_targets, dtype=torch.float32)}
     action_mask_dict = {NODE_TYPE: torch.tensor(action_masks, dtype=torch.bool)}
+    task_target_dict = {
+        name: {NODE_TYPE: torch.tensor(values, dtype=torch.float32)}
+        for name, values in task_targets.items()
+    }
+    task_mask_dict = {
+        name: {NODE_TYPE: torch.tensor(values, dtype=torch.bool)}
+        for name, values in task_masks.items()
+    }
     action_meta = {NODE_TYPE: action_rows}
     eligible = (edge for edge in read_view.edges if edge.source in index_by_uid and edge.target in index_by_uid)
     selected_edges = heapq.nlargest(
@@ -289,6 +346,9 @@ def build_hgt_graph(
         y_dict[node_type] = torch.zeros(count, dtype=torch.long)
         action_target_dict[node_type] = torch.zeros(count, dtype=torch.float32)
         action_mask_dict[node_type] = torch.zeros(count, dtype=torch.bool)
+        for name in AUX_OBJECTIVES:
+            task_target_dict[name][node_type] = torch.zeros(count, dtype=torch.float32)
+            task_mask_dict[name][node_type] = torch.zeros(count, dtype=torch.bool)
         action_meta[node_type] = [None] * count
     edges: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
     for edge in selected_edges:
@@ -303,7 +363,7 @@ def build_hgt_graph(
         for key, pairs in edges.items()
         if pairs
     }
-    return x_dict, edge_index_dict, y_dict, action_target_dict, action_mask_dict, action_meta
+    return x_dict, edge_index_dict, y_dict, action_target_dict, action_mask_dict, action_meta, task_target_dict, task_mask_dict
 
 
 class _HGTWrapper:
