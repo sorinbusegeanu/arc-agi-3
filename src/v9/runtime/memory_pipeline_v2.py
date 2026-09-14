@@ -156,7 +156,7 @@ def build_commit_plan(prepared: PreparedIngestion) -> CommitPlan:
         if prepared.m0 is None or prepared.m1g is None or prepared.m1n is None:
             raise RuntimeError("prepared interaction is incomplete")
         base_writes = (
-            _m0_write(prepared.m0, prepared.event),
+            _m0_write(prepared.m0, prepared.event, prepared.transition),
             _m1g_write(prepared.m1g, prepared.m0, prepared.event),
         )
         normalized_write = _m1n_write(
