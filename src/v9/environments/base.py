@@ -4,7 +4,7 @@ from typing import Any
 
 from v9.memory.identity import stable_u64
 
-from .contract import BoundaryEvent, EnvironmentTransition, WithinActionTrace
+from .contract import BoundaryEvent, EnvironmentTransition, TaskProgress, WithinActionTrace
 from .schemas import ActionSchema, EnvironmentIdentity, ObservationSchema
 
 
@@ -26,6 +26,17 @@ class StructuralAdapter:
 
     def boundary_event(self) -> BoundaryEvent:
         return self._boundary
+
+    def task_progress(self) -> TaskProgress:
+        boundary = self._boundary
+        return TaskProgress(
+            game_id=str(self._identity.environment_type),
+            terminal=not bool(boundary.continuation),
+            success=bool(boundary.primary_valence > 0 and not boundary.continuation),
+            failure=bool(boundary.primary_valence < 0 and not boundary.continuation),
+            truncated=bool(not boundary.continuation and boundary.primary_valence == 0),
+            score=float(boundary.primary_valence),
+        )
 
     def optional_micro_trace(self) -> WithinActionTrace | None:
         return self._last_trace
