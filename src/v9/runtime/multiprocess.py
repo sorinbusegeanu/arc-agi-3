@@ -419,13 +419,20 @@ class ProcessTopology:
             self.stage_queue.put(WorkerStop())
 
     @staticmethod
-    def _join_checked(processes: tuple[Any, ...] | list[Any], *, role: str, timeout: float = _PROCESS_JOIN_TIMEOUT_SECONDS) -> None:
+    def _join_checked(processes: tuple[Any, ...] | list[Any], *, role: str, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + float(timeout)
         for process in processes:
-            process.join(timeout=float(timeout))
-            if process.is_alive():
-                raise RuntimeError(f"{role} process {process.name} did not exit within {float(timeout):.1f}s")
-            if process.exitcode != 0:
-                raise RuntimeError(f"{role} process {process.name} exited with code {process.exitcode}")
+            remaining = max(0.0, deadline - time.monotonic())
+            process.join(timeout=remaining)
+        stragglers = [process for process in processes if process.is_alive()]
+        for process in stragglers:
+            process.terminate()
+        for process in stragglers:
+            process.join(timeout=2.0)
+        failed = [process for process in processes if process.exitcode not in (0, -15)]
+        if failed:
+            details = ", ".join(f"{process.name}:{process.exitcode}" for process in failed)
+            raise RuntimeError(f"{role} worker shutdown failed: {details}")
 
     def join_actor_workers(self) -> None:
         self._join_checked(self.actor_processes, role="actor")
