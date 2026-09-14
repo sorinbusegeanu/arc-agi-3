@@ -254,15 +254,9 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         )
 
         diagnostics = runtime.unified_telemetry.diagnostic_metrics()
-        validation_accuracy = float(diagnostics.get("historical_retention", 0.0))
-        subgraph_nodes = min(
-            int(runtime.config.scientific.hgt_max_subgraph_nodes),
-            int(runtime.graph.memory_count()),
-        )
-        subgraph_edges = min(
-            int(runtime.config.scientific.hgt_max_subgraph_edges),
-            int(len(runtime.graph.edges)),
-        )
+        validation_accuracy = float(training.validation_accuracy)
+        subgraph_nodes = int(training.subgraph_nodes)
+        subgraph_edges = int(training.subgraph_edges)
         runtime.record_hgt_inference(
             HGTInferenceSample(
                 consequence_error=float(training.validation_loss),
