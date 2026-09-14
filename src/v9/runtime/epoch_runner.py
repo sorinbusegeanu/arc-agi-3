@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 import time
 from typing import Any
 
@@ -169,7 +170,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         runtime.set_telemetry_gauge("current_run_levels_completed", int(game_level["current_run_levels_completed"]))
         runtime.set_telemetry_gauge(
             "current_run_best_level_by_game",
-            game_level["current_run_best_level_by_game"],
+            json.dumps(game_level["current_run_best_level_by_game"], sort_keys=True),
         )
 
         # M4 -> M5 is a causal gate. Drive only matched held-out trials from an
