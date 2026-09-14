@@ -59,6 +59,25 @@ class SyntheticSymbolicEnvironment(StructuralAdapter):
     def optional_symbol_stream(self) -> tuple[object, ...]:
         return self._symbols if self.config.emit_symbols else ()
 
+
+    def capture_state(self) -> dict[str, Any]:
+        return {
+            "state": int(self._state),
+            "step": int(self._step),
+            "boundary": self._boundary,
+            "symbols": tuple(self._symbols),
+            "rng_state": self._rng.getstate(),
+            "last_trace": self._last_trace,
+        }
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        self._state = int(state["state"])
+        self._step = int(state["step"])
+        self._boundary = state["boundary"]
+        self._symbols = tuple(state["symbols"])
+        self._rng.setstate(state["rng_state"])
+        self._last_trace = state.get("last_trace")
+
     def step(self, native_action: Any) -> int:
         before = self._state
         action = int(native_action)
