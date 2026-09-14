@@ -85,9 +85,10 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                 next_stage = advance_stage_fast(runtime)
 
                 if plan.isf_static is not None:
-                    pvi, osi, _pe, tp, ep = plan.isf_static
+                    pvi, osi, explicit_pe, tp, ep = plan.isf_static
                     recurrence = int(runtime._m1n_supports.get(signature, 0))
-                    pe = 1.0 / max(1.0, float(prior_support + 1))
+                    recurrence_pe = 1.0 / max(1.0, float(prior_support + 1))
+                    pe = abs(float(explicit_pe)) if float(explicit_pe) != 0.0 else recurrence_pe
                     isf_rows.append(
                         (
                             ISFComponents(pvi, osi, pe, 1.0 / max(1, recurrence), tp, ep),
