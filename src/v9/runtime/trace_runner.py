@@ -224,6 +224,8 @@ def run_trace_bundle(
                     },
                     "episode": episode,
                     "step": step,
+                    "observation_schema_id": int(adapter.observation_schema().schema_id),
+                    "action_schema_id": int(adapter.action_schema().schema_id),
                     "before_observation": before_trace,
                     "before_signature": before_signature,
                     "symbols_before": _symbol_text(before_symbols),
