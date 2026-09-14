@@ -374,3 +374,18 @@ def test_babyai_world_symbols_and_cross_modal_alignment_enter_one_runtime(tmp_pa
     channels = {payload.get("channel") for uid, payload in runtime.graph.payloads.items() if runtime.graph.nodes[uid].memory_type is MemoryType.NORMALIZED_RELATION}
     assert {"WORLD", "SYMBOL", "CROSS_MODAL"}.issubset(channels)
     assert not runtime.grounding.states
+
+
+def test_gym_adapter_exact_snapshot_restore_replays_identically() -> None:
+    pytest.importorskip("gymnasium")
+    adapter = GymDiscreteAdapter("FrozenLake-v1", seed=13, make_kwargs={"is_slippery": True})
+    state = adapter.capture_state()
+    first = adapter.step(1)
+    first_boundary = adapter.boundary_event()
+    first_progress = adapter.task_progress()
+    adapter.restore_state(state)
+    second = adapter.step(1)
+    assert second == first
+    assert adapter.boundary_event() == first_boundary
+    assert adapter.task_progress() == first_progress
+    adapter.close()
