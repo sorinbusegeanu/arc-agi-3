@@ -42,9 +42,11 @@ def build_epoch_jobs(specs: tuple[Any, ...], args: Any, *, epoch: int) -> list[t
 def _scenario_success(rows: list[Any]) -> tuple[dict[str, float], float]:
     totals: dict[str, tuple[int, int]] = {}
     for row in rows:
-        success, episodes = totals.get(row.game_id, (0, 0))
-        totals[row.game_id] = (success + int(row.positive_boundaries), episodes + int(row.episode_boundaries))
-    rates = {game_id: (success / episodes if episodes else 0.0) for game_id, (success, episodes) in totals.items()}
+        successes, trials = totals.get(row.game_id, (0, 0))
+        row_successes = int(getattr(row, "task_successes", 0))
+        row_trials = row_successes + int(getattr(row, "task_failures", 0)) + int(getattr(row, "task_truncations", 0))
+        totals[row.game_id] = (successes + row_successes, trials + row_trials)
+    rates = {game_id: (successes / trials if trials else 0.0) for game_id, (successes, trials) in totals.items()}
     macro = sum(rates.values()) / len(rates) if rates else 0.0
     return rates, macro
 
