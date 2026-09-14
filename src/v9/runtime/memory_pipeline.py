@@ -142,7 +142,9 @@ def prepare_ingestion(task: IngestionTask) -> PreparedIngestion:
         payload_digest = stable_u64(experience.context_signature, experience.action_id, experience.outcome_signature, person=b"v9-interaction-payload")
         m0 = M0Episode.from_event(event, context_signature=experience.context_signature, payload_digest=payload_digest)
         m1g = M1GroundedContingency.build(GroundedRelation.ACTION_CONDITIONED, (m0,))
-        observable = (f"ACTION:{transition.action_schema_id}:{identity.environment_type}:{experience.action_id}" f":FAMILY:{experience.family_signature}:OUTCOME:{experience.outcome_signature}" f":OPTIONS:{transition.available_action_set_signature}:BOUNDARY:{transition.boundary_scope}" f":SUCCESS:{int(transition.task_success)}:FAILURE:{int(transition.task_failure)}" f":TRUNCATED:{int(transition.task_truncated)}:LEVEL:{transition.level_index}" f":LEVELS_COMPLETED:{transition.levels_completed}")
+        semantic_action_signature = stable_u64(transition.semantic_action if transition.semantic_action else (transition.action_id,), person=b"v9-sem-action")
+        semantic_delta_signature = stable_u64(transition.semantic_delta if transition.semantic_delta else (transition.before_signature, transition.after_signature), person=b"v9-sem-delta")
+        observable = (f"ACTION:{transition.action_schema_id}:{identity.environment_type}:{experience.action_id}" f":SEM_ACTION:{semantic_action_signature}:SEM_DELTA:{semantic_delta_signature}" f":FAMILY:{experience.family_signature}:OUTCOME:{experience.outcome_signature}" f":OPTIONS:{transition.available_action_set_signature}:BOUNDARY:{transition.boundary_scope}" f":SUCCESS:{int(transition.task_success)}:FAILURE:{int(transition.task_failure)}" f":TRUNCATED:{int(transition.task_truncated)}:LEVEL:{transition.level_index}" f":LEVELS_COMPLETED:{transition.levels_completed}")
         m1n = M1NormalizedRelation.build(observable, NormalizedChannel.WORLD, (m1g,))
 
     symbols, codec_state = _prepare_symbols(task, transition, identity, m1g)
