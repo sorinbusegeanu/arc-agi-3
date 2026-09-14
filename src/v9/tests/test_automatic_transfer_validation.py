@@ -139,3 +139,36 @@ def test_epoch_transfer_interval_uses_matched_intervention_and_unlocks_higher_me
     assert levels["M5"] > 0
     assert levels["M6"] > 0
     assert levels["M7"] > 0
+
+
+def test_repeated_success_after_validation_does_not_rematerialize_higher_memory(tmp_path: Path) -> None:
+    runtime = _runtime_with_concept(tmp_path)
+    concept_uid = next(iter(runtime._m4))
+    runtime.record_transfer_validation(
+        concept_uid,
+        target_environment_id=9,
+        target_native_action=2,
+        enabled_metric=1.0,
+        ablated_metric=0.0,
+    )
+    runtime.record_transfer_validation(
+        concept_uid,
+        target_environment_id=10,
+        target_native_action=2,
+        enabled_metric=1.0,
+        ablated_metric=0.0,
+    )
+    before = runtime.metrics()["memory_levels"].copy()
+    assert runtime.is_concept_validated(concept_uid)
+
+    runtime.record_transfer_validation(
+        concept_uid,
+        target_environment_id=11,
+        target_native_action=2,
+        enabled_metric=2.0,
+        ablated_metric=0.0,
+    )
+    after = runtime.metrics()["memory_levels"]
+    assert after["M5"] == before["M5"]
+    assert after["M6"] == before["M6"]
+    assert after["M7"] == before["M7"]
