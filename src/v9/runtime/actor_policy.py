@@ -11,6 +11,7 @@ class ActorPolicySnapshot:
     hgt_action_scores: dict[int, dict[int, float]]
     hgt_context_action_scores: dict[int, dict[int, dict[int, float]]]
     hgt_action_scores_by_type: dict[str, dict[int, float]]
+    grounded_action_scores_by_type: dict[str, dict[int, float]]
     model_version: str
 
     @classmethod
@@ -22,6 +23,7 @@ class ActorPolicySnapshot:
         hgt_action_scores: Mapping[int, Mapping[int, float]],
         hgt_context_action_scores: Mapping[int, Mapping[int, Mapping[int, float]]] | None = None,
         hgt_action_scores_by_type: Mapping[str, Mapping[int, float]] | None = None,
+        grounded_action_scores_by_type: Mapping[str, Mapping[int, float]] | None = None,
         model_version: str,
     ) -> "ActorPolicySnapshot":
         learned = {
@@ -48,6 +50,13 @@ class ActorPolicySnapshot:
             }
             for environment_type, actions in (hgt_action_scores_by_type or {}).items()
         }
+        grounded = {
+            str(environment_type): {
+                int(action): float(score)
+                for action, score in actions.items()
+            }
+            for environment_type, actions in (grounded_action_scores_by_type or {}).items()
+        }
         return cls(
             int(generation),
             {
@@ -57,8 +66,22 @@ class ActorPolicySnapshot:
             learned,
             contextual,
             by_type,
+            grounded,
             str(model_version),
         )
+
+
+    def grounded_scores(
+        self,
+        actions: tuple[int, ...],
+        *,
+        environment_type: str | None = None,
+    ) -> dict[int, float]:
+        source = {} if environment_type is None else self.grounded_action_scores_by_type.get(str(environment_type), {})
+        return {
+            int(action): float(source.get(int(action), 0.0))
+            for action in actions
+        }
 
     def learned_scores(
         self,
