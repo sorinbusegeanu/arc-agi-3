@@ -169,6 +169,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
             identity = adapter.identity()
             environment_instance_id = int(identity.instance_id.value)
             positives = negatives = episode_boundaries = resets = completed = 0
+            task_successes = task_failures = task_truncations = levels_completed = 0
             episode_ordinal = 1
             policy = initial_policy
             policy_refreshes = 0
@@ -202,10 +203,13 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                 before = adapter.observe()
                 before_signature = int(adapter.encode_observation(before))
                 learned_scores = policy.learned_scores(environment_instance_id, actions, environment_type=identity.environment_type, context_signature=before_signature)
-                action = choose_action(policy, actions, rng=rng, epsilon=float(epsilon), learned_scores=learned_scores, target_environment_id=environment_instance_id)
+                action_schema_id = int(adapter.action_schema().schema_id)
+                action = choose_action(policy, actions, rng=rng, epsilon=float(epsilon), learned_scores=learned_scores, target_environment_id=environment_instance_id, action_schema_id=action_schema_id, environment_type=identity.environment_type)
                 after = adapter.step(int(action))
                 boundary = adapter.boundary_event()
+                progress = adapter.task_progress()
                 observation_schema_id = int(adapter.observation_schema().schema_id)
+                available_after = tuple(int(v) for v in adapter.available_actions())
                 stage_queue.put(
                     EncodedTransition(
                         actor_id=actor_id,
@@ -214,11 +218,19 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                         environment_identity=(identity.family, identity.environment_type, identity.config, identity.instance),
                         episode_id=int(stable_u64(environment_instance_id, run_nonce, actor_id, episode_ordinal, person=b"v9-mp-episode")),
                         observation_schema_id=observation_schema_id,
+                        action_schema_id=action_schema_id,
                         before_signature=before_signature,
                         action_id=int(adapter.encode_action(action)),
                         after_signature=int(adapter.encode_observation(after)),
-                        available_actions_after=len(tuple(adapter.available_actions())),
+                        available_actions_after=len(available_after),
+                        available_action_set_signature=int(stable_u64(action_schema_id, available_after, person=b"v9-action-set")),
                         primary_valence=int(boundary.primary_valence),
+                        boundary_scope=str(boundary.scope.value),
+                        task_success=bool(progress.success),
+                        task_failure=bool(progress.failure),
+                        task_truncated=bool(progress.truncated),
+                        level_index=int(progress.level_index),
+                        levels_completed=int(progress.levels_completed),
                         symbols=tuple(adapter.optional_symbol_stream()),
                         curriculum_step=getattr(spec, "curriculum_step", None),
                         game_scenario=str(getattr(spec, "game_id", identity.environment_type)),
@@ -229,6 +241,10 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                 positives += int(boundary.primary_valence > 0)
                 negatives += int(boundary.primary_valence < 0)
                 episode_boundaries += int(not boundary.continuation)
+                task_successes += int(progress.success)
+                task_failures += int(progress.failure)
+                task_truncations += int(progress.truncated)
+                levels_completed = max(levels_completed, int(progress.levels_completed))
                 if not boundary.continuation:
                     adapter.reset()
                     episode_ordinal += 1
@@ -236,7 +252,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
             # ActorDone is an end-of-stream marker. Ensure every transition this
             # actor produced has left its feeder before publishing completion.
             _flush_child_queue(stage_queue)
-            result_queue.put(ActorDone(actor_id, game_id, completed, positives, negatives, episode_boundaries, resets, policy_refreshes))
+            result_queue.put(ActorDone(actor_id, game_id, completed, positives, negatives, episode_boundaries, resets, policy_refreshes, task_successes, task_failures, task_truncations, levels_completed))
             completion_sent = True
     except BaseException as exc:
         try:
