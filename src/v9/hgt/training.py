@@ -621,7 +621,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     )
     if len(read_view.nodes) < 8:
         return HGTTrainingResult(epoch, "SKIPPED_INSUFFICIENT_DATA", runtime.unified_telemetry.model_version, None, 0.0, 0.0, len(read_view.nodes), 0, None)
-    x_dict, edge_index_dict, y_dict, action_targets, action_masks, action_meta = build_hgt_graph(
+    x_dict, edge_index_dict, y_dict, action_targets, action_masks, action_meta, task_targets, task_masks = build_hgt_graph(
         read_view,
         max_nodes=memory_node_budget,
         max_edges=canonical_edge_budget,
@@ -706,15 +706,21 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     if parent_version is not None:
         model.eval()
         with torch.no_grad():
-            parent_logits, parent_values = model(x_device, edges_device)
-            parent_val_loss_t, parent_validation_accuracy = _loss(
+            parent_logits, parent_values, parent_auxiliary = model(x_device, edges_device)
+            parent_val_loss_t, parent_validation_accuracy, _ = _loss(
                 parent_logits,
                 parent_values,
+                parent_auxiliary,
                 y_dict,
                 val_masks,
                 action_targets,
                 action_masks,
+                task_targets,
+                task_masks,
                 torch,
+                objective_weights=config.hgt_loss_weights,
+                log_vars=model.objective_log_vars,
+                dynamic_weighting=bool(config.hgt_dynamic_loss_weighting),
             )
         if parent_val_loss_t is not None:
             parent_validation_loss = float(parent_val_loss_t.cpu().item())
@@ -734,8 +740,22 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     model.train()
     for _ in range(max(1, int(training_epochs))):
         optimizer.zero_grad(set_to_none=True)
-        logits, values = model(x_device, edges_device)
-        loss, _ = _loss(logits, values, y_dict, train_masks, action_targets, action_masks, torch)
+        logits, values, auxiliary = model(x_device, edges_device)
+        loss, _, _ = _loss(
+            logits,
+            values,
+            auxiliary,
+            y_dict,
+            train_masks,
+            action_targets,
+            action_masks,
+            task_targets,
+            task_masks,
+            torch,
+            objective_weights=config.hgt_loss_weights,
+            log_vars=model.objective_log_vars,
+            dynamic_weighting=bool(config.hgt_dynamic_loss_weighting),
+        )
         if loss is None:
             break
         loss.backward()
@@ -749,9 +769,37 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     model.eval()
     inference_started = time.perf_counter()
     with torch.no_grad():
-        logits, values = model(x_device, edges_device)
-        val_loss_t, val_accuracy = _loss(logits, values, y_dict, val_masks, action_targets, action_masks, torch)
-        train_loss_t, train_accuracy = _loss(logits, values, y_dict, train_masks, action_targets, action_masks, torch)
+        logits, values, auxiliary = model(x_device, edges_device)
+        val_loss_t, val_accuracy, validation_loss_by_head = _loss(
+            logits,
+            values,
+            auxiliary,
+            y_dict,
+            val_masks,
+            action_targets,
+            action_masks,
+            task_targets,
+            task_masks,
+            torch,
+            objective_weights=config.hgt_loss_weights,
+            log_vars=model.objective_log_vars,
+            dynamic_weighting=bool(config.hgt_dynamic_loss_weighting),
+        )
+        train_loss_t, train_accuracy, _ = _loss(
+            logits,
+            values,
+            auxiliary,
+            y_dict,
+            train_masks,
+            action_targets,
+            action_masks,
+            task_targets,
+            task_masks,
+            torch,
+            objective_weights=config.hgt_loss_weights,
+            log_vars=model.objective_log_vars,
+            dynamic_weighting=bool(config.hgt_dynamic_loss_weighting),
+        )
     inference_latency_ms = 1000.0 * (time.perf_counter() - inference_started)
     if val_loss_t is None:
         return HGTTrainingResult(epoch, "SKIPPED_NO_VALIDATION_EVIDENCE", runtime.unified_telemetry.model_version, parent_version, training_loss, 0.0, action_examples, training_steps, parent_checkpoint)
@@ -858,7 +906,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         historical_retention=val_accuracy,
         current_curriculum_gain=max(0.0, val_accuracy - (1.0 / 3.0)),
         cross_family_validation_gain=val_accuracy,
-        loss_by_head={"primary_valence": validation_loss, "discounted_action_value": validation_loss},
+        loss_by_head=dict(validation_loss_by_head),
     )
     runtime.record_hgt_training(sample)
     retention_delta = 0.0 if not math.isfinite(parent_validation_accuracy) else val_accuracy - parent_validation_accuracy
