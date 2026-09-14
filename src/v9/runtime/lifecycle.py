@@ -397,7 +397,8 @@ def run_lifecycle_maintenance(
     cycle = registry.begin_maintenance()
     watermark = int(runtime.watermark)
     pressure = float(graph.pressure_ratio())
-    compaction_enabled = pressure >= float(compaction_pressure_threshold)
+    dynamic_storage = graph.node_capacity_per_partition is None
+    compaction_enabled = dynamic_storage or pressure >= float(compaction_pressure_threshold)
     pressure_multiplier = min(4, 1 + max(0, int((pressure - 0.70) * 10)))
 
     target_capacity = 0
