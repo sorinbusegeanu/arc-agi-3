@@ -333,6 +333,18 @@ presets:
           - syn_block
           - syn_two_step
           - syn_history_context
+      - adapter: synthetic_symbolic
+        condition: C0
+        games: [sym_enable, sym_block, sym_navigate, sym_pick]
+      - adapter: synthetic_symbolic
+        condition: C1
+        games: [sym_enable, sym_block, sym_navigate, sym_pick]
+      - adapter: synthetic_symbolic
+        condition: C2
+        games: [sym_enable, sym_block, sym_navigate, sym_pick]
+      - adapter: synthetic_symbolic
+        condition: C3
+        games: [sym_enable, sym_block, sym_navigate, sym_pick]
       - adapter: gym_discrete
         games:
           - id: FrozenLake-v1
@@ -341,6 +353,10 @@ presets:
             kwargs: {map_name: 8x8, is_slippery: false}
           - id_candidates: [Taxi-v4, Taxi-v3]
           - id_candidates: [CliffWalking-v1, CliffWalking-v0]
+          - id: FrozenLake-v1
+            kwargs: {map_name: 4x4, is_slippery: true}
+          - id: FrozenLake-v1
+            kwargs: {map_name: 8x8, is_slippery: true}
       - adapter: gym_structured
         games:
           - CartPole-v1
@@ -357,6 +373,15 @@ presets:
           - MiniGrid-FourRooms-v0
           - MiniGrid-DoorKey-5x5-v0
           - MiniGrid-Unlock-v0
+      - adapter: chess
+        games:
+          - chess_first_white
+          - chess_random_white
+      - adapter: sudoku
+        games:
+          - sudoku_clues_45
+          - sudoku_clues_36
+          - sudoku_clues_30
       - adapter: babyai
         games:
           - BabyAI-GoToObjS6-v1
@@ -380,6 +405,14 @@ presets:
           - BabyAI-SynthLoc-v0
           - BabyAI-SynthSeq-v0
           - BabyAI-MiniBossLevel-v0
+      - adapter: alfred
+        games:
+          - pick_and_place_simple
+          - pick_clean_then_place_in_recep
+          - pick_heat_then_place_in_recep
+          - pick_cool_then_place_in_recep
+          - look_at_obj_in_light
+          - pick_two_obj_and_place
       - adapter: arc
         games:
           - g50t
