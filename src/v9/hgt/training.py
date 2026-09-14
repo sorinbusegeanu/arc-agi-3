@@ -102,6 +102,18 @@ def _node_feature(node: Any, payload: dict[str, Any], dim: int, torch: Any):
     return torch.tensor(values[:dim], dtype=torch.float32)
 
 
+def _semantic_node_type(kind: int) -> str:
+    if int(kind) == 8:
+        return "ACTION"
+    if int(kind) == 7:
+        return "TEXT"
+    if int(kind) == 9:
+        return "EFFECT"
+    if int(kind) in {5, 6}:
+        return "STATE"
+    return "ENTITY"
+
+
 def _recent_behavior_nodes(read_view: Any, limit: int) -> list[tuple[Any, Any]]:
     candidates = []
     for uid, node in read_view.nodes.items():
