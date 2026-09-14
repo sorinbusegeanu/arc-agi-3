@@ -46,6 +46,7 @@ class EncodedTransition:
     task_truncated: bool = False
     level_index: int = 0
     levels_completed: int = 0
+    grounded_action_influence: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +176,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
             environment_instance_id = int(identity.instance_id.value)
             positives = negatives = episode_boundaries = resets = completed = 0
             task_successes = task_failures = task_truncations = levels_completed = 0
+            grounded_action_influence = 0
             episode_ordinal = 1
             policy = initial_policy
             policy_refreshes = 0
