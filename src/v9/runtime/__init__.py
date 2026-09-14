@@ -106,6 +106,16 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
                         key=lambda item: (-item[1][0], -item[1][1], item[1][2], item[0]),
                     )
                 )
+                contexts = tuple(
+                    sorted(
+                        {
+                            int(payload["context_signature"])
+                            for uid in concept.provenance.evidence
+                            for payload in [self._evidence_payload(uid)]
+                            if payload is not None and payload.get("context_signature") is not None
+                        }
+                    )
+                )
                 if not actions:
                     continue
                 rows.append(
@@ -114,6 +124,7 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
                         "formation_scope": scope,
                         "source_environment_types": tuple(sorted(source_types)),
                         "actions": actions,
+                        "contexts": contexts,
                         "validated": bool(concept.validated),
                     }
                 )
