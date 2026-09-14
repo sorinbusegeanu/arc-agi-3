@@ -13,6 +13,7 @@ from v9.memory.model import CanonicalNode, MemoryLevel, MemoryType
 from v9.runtime.memory_pipeline import IngestionTask, prepare_ingestion
 from v9.runtime.memory_pipeline_v2 import build_commit_plan
 from v9.runtime.multiprocess import EncodedTransition
+from v9.runtime.trace_semantics import rows
 
 
 def _decode_symbols(value: Any) -> tuple[object, ...]:
