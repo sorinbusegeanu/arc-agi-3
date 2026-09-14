@@ -198,6 +198,12 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             if requested_training_steps > 1
             else int(runtime.config.scientific.hgt_gradient_accumulation)
         )
+        replay_result = runtime.replay_once()
+        runtime.set_telemetry_gauge("replay_selected_epoch", int(replay_result.selected))
+        runtime.set_telemetry_gauge("replay_processed_epoch", int(replay_result.processed))
+        runtime.set_telemetry_gauge("replay_new_memories_epoch", int(replay_result.new_memories))
+        runtime.set_telemetry_gauge("replay_revisions_epoch", int(replay_result.revisions))
+
         training = train_hgt_epoch(
             runtime,
             epoch=epoch,
