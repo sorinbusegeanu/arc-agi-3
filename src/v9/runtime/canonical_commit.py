@@ -138,8 +138,9 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                     touched_signatures.add(aligned_signature)
                     if plan.interaction_grounding is not None:
                         g = plan.interaction_grounding
+                        symbol_grounding_uid = symbol.base_writes[1].node.uid
                         grounding_key = (
-                            int(symbol.relation.uid.lo),
+                            int(symbol_grounding_uid.lo),
                             int(g.uid.lo),
                             int(g.environment_instance_id),
                             0,
@@ -148,7 +149,7 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                         before_grounding = runtime.grounding.states.get(grounding_key)
                         after_grounding = runtime.grounding.observe(
                             GroundingEvidence(
-                                int(symbol.relation.uid.lo),
+                                int(symbol_grounding_uid.lo),
                                 int(g.uid.lo),
                                 int(g.environment_instance_id),
                                 0,
