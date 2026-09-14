@@ -43,6 +43,10 @@ class ActorResult:
     negative_boundaries: int
     episode_boundaries: int
     resets: int
+    task_successes: int = 0
+    task_failures: int = 0
+    task_truncations: int = 0
+    levels_completed: int = 0
 
 
 def resolve_game_specs(selector: str, *, curriculum_config: str | None = None) -> tuple[EnvironmentSpec, ...]:
@@ -315,6 +319,10 @@ def run_continuous(args: argparse.Namespace) -> int:
                 row.negative_boundaries,
                 row.episode_boundaries,
                 row.resets,
+                row.task_successes,
+                row.task_failures,
+                row.task_truncations,
+                row.levels_completed,
             )
             for row in process_results
         ]
