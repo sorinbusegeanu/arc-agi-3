@@ -48,7 +48,12 @@ def _require_torch():
 
 
 def _stable_metadata() -> tuple[list[str], list[tuple[str, str, str]]]:
-    return ([NODE_TYPE], [(NODE_TYPE, relation.value, NODE_TYPE) for relation in RelationType])
+    node_types = [NODE_TYPE, *SEMANTIC_NODE_TYPES]
+    edge_types = [(NODE_TYPE, relation.value, NODE_TYPE) for relation in RelationType]
+    for semantic_type in SEMANTIC_NODE_TYPES:
+        edge_types.append((NODE_TYPE, "SEMANTIC", semantic_type))
+        edge_types.append((semantic_type, "SEMANTIC_OF", NODE_TYPE))
+    return node_types, edge_types
 
 
 def _node_feature(node: Any, payload: dict[str, Any], dim: int, torch: Any):
