@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from v9.cognition.developmental_stage import StageEvidence
+from v9.cognition.action_selection import scoped_action_key
 from v9.memory.model import MemoryLevel
 
 from .memory_pipeline_v2 import CanonicalWrite
@@ -59,18 +60,21 @@ def record_normalized_fast(runtime: Any, relation: Any, initial_write: Canonical
     cache = runtime._normalized_action_cache
     if signature not in cache:
         observable = str(relation.observable_relation)
-        prefix, separator, remainder = observable.partition(":")
-        action_text, action_separator, _ = remainder.partition(":")
-        action = None
-        if prefix == "ACTION" and separator and action_separator:
+        parts = observable.split(":")
+        scoped = None
+        if len(parts) >= 5 and parts[0] == "ACTION":
             try:
-                action = int(action_text)
+                scoped = scoped_action_key(
+                    int(parts[3]),
+                    action_schema_id=int(parts[1]),
+                    environment_type=parts[2],
+                )
             except ValueError:
                 pass
-        cache[signature] = action
-    action = cache[signature]
-    if action is not None:
-        runtime._actor_action_supports[action] = runtime._actor_action_supports.get(action, 0.0) + 1.0
+        cache[signature] = scoped
+    scoped = cache[signature]
+    if scoped is not None:
+        runtime._actor_action_supports[scoped] = runtime._actor_action_supports.get(scoped, 0.0) + 1.0
         runtime._actor_policy_generation += 1
 
     if len(occurrences) < max(2, runtime.config.scientific.m1n_facts_per_channel):
