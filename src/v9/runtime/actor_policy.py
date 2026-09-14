@@ -25,6 +25,7 @@ class ActorPolicySnapshot:
         hgt_context_action_scores: Mapping[int, Mapping[int, Mapping[int, float]]] | None = None,
         hgt_action_scores_by_type: Mapping[str, Mapping[int, float]] | None = None,
         grounded_action_scores_by_type: Mapping[str, Mapping[int, float]] | None = None,
+        grounded_context_action_scores_by_type: Mapping[str, Mapping[int, Mapping[int, float]]] | None = None,
         model_version: str,
     ) -> "ActorPolicySnapshot":
         learned = {
