@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from .memory_pipeline_v2 import derivation_batch_worker_main, ingest_batch_worker_main
@@ -87,13 +88,24 @@ class MemoryWorkerTopologyV2:
             self.derivation_queue.put(WorkerStop())
 
     @staticmethod
-    def _join_checked(processes: list[Any], *, role: str, timeout: float = 30.0) -> None:
+    def _join_checked(processes: list[Any], *, role: str, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + float(timeout)
         for process in processes:
-            process.join(timeout=float(timeout))
-            if process.is_alive():
-                raise RuntimeError(f"{role} process {process.name} did not exit within {float(timeout):.1f}s")
-            if process.exitcode != 0:
-                raise RuntimeError(f"{role} process {process.name} exited with code {process.exitcode}")
+            remaining = max(0.0, deadline - time.monotonic())
+            process.join(timeout=remaining)
+        stragglers = [process for process in processes if process.is_alive()]
+        for process in stragglers:
+            process.terminate()
+        for process in stragglers:
+            process.join(timeout=2.0)
+        failed = [
+            process
+            for process in processes
+            if process.exitcode not in (0, -15)
+        ]
+        if failed:
+            details = ", ".join(f"{process.name}:{process.exitcode}" for process in failed)
+            raise RuntimeError(f"{role} worker shutdown failed: {details}")
 
     def join_ingest(self) -> None:
         self._join_checked(self.ingest_processes, role="ingest")
