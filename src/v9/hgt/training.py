@@ -479,6 +479,14 @@ def _split_masks(
                     validation[index] = True
                 else:
                     train[index] = True
+        if node_type == NODE_TYPE:
+            for index, row in enumerate(rows):
+                if row is not None:
+                    continue
+                if index % 5 == 0:
+                    validation[index] = True
+                else:
+                    train[index] = True
         train_masks[node_type] = train
         val_masks[node_type] = validation
     return train_masks, val_masks
