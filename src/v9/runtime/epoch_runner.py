@@ -264,8 +264,8 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                 candidate_refinement_success=str(training.status).upper() == "PROMOTED",
                 subgraph_nodes=subgraph_nodes,
                 subgraph_edges=subgraph_edges,
-                inference_latency_ms=float(diagnostics.get("training_step_latency_ms", 0.0)),
-                relevance_precision=validation_accuracy,
+                inference_latency_ms=float(training.inference_latency_ms),
+                relevance_precision=float(training.relevance_precision),
                 correspondence_accuracy=validation_accuracy,
                 behavior_delta=float(behavioral_gain),
             )
