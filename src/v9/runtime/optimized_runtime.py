@@ -6,6 +6,7 @@ from typing import Any, Iterable
 
 from v9.cognition.isf import ISFComponents
 from v9.cognition.action_selection import scoped_action_key
+from v9.cognition.similarity import StructuralDescriptor
 from v9.memory.identity import MemoryUid
 from v9.memory.m1_normalized import M1NormalizedRelation, NormalizedChannel
 from v9.memory.model import CanonicalNode, MemoryLevel, MemoryType
