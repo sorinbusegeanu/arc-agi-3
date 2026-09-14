@@ -613,7 +613,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             historical_retention_delta=retention_delta,
             cross_family_transfer_delta=val_accuracy - train_accuracy,
             reasoning_improvement_delta=float(val_accuracy if not math.isfinite(parent_validation_accuracy) else val_accuracy - parent_validation_accuracy),
-            inference_latency_delta_ms=0.0,
+            inference_latency_delta_ms=float(inference_latency_ms - float(runtime.unified_telemetry.diagnostic_metrics().get("inference_latency_ms", 0.0))),
             promotion_result=status,
         )
     )
