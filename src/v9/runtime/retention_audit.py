@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from v9.hgt.training import _node_feature
+from v9.memory.identity import stable_u64
 from v9.memory.model import CanonicalNode, MemoryLevel, MemoryType
 from v9.runtime.memory_pipeline import IngestionTask, prepare_ingestion
 from v9.runtime.multiprocess import EncodedTransition
@@ -53,7 +54,7 @@ def _transition_from_trace(row: dict[str, Any], actor_id: int, sequence: int) ->
     progress = dict(row.get("task_progress") or {})
     action_schema_id = _schema_id(row, "action_schema_id", 0)
     observation_schema_id = _schema_id(row, "observation_schema_id", 0)
-    option_signature = hash((action_schema_id, tuple(sorted(set(after_actions))))) & ((1 << 63) - 1)
+    option_signature = stable_u64(action_schema_id, *tuple(sorted(set(after_actions))), person=b"v9-action-set")
     scope = str(boundary.get("scope", "NONE"))
     if "." in scope:
         scope = scope.rsplit(".", 1)[-1]
