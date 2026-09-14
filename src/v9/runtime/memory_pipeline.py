@@ -142,7 +142,7 @@ def prepare_ingestion(task: IngestionTask) -> PreparedIngestion:
         payload_digest = stable_u64(experience.context_signature, experience.action_id, experience.outcome_signature, person=b"v9-interaction-payload")
         m0 = M0Episode.from_event(event, context_signature=experience.context_signature, payload_digest=payload_digest)
         m1g = M1GroundedContingency.build(GroundedRelation.ACTION_CONDITIONED, (m0,))
-        observable = f"ACTION:{experience.action_id}:FAMILY:{experience.family_signature}:OUTCOME:{experience.outcome_signature}"
+        observable = f"ACTION:{transition.action_schema_id}:{identity.environment_type}:{experience.action_id}:FAMILY:{experience.family_signature}:OUTCOME:{experience.outcome_signature}"
         m1n = M1NormalizedRelation.build(observable, NormalizedChannel.WORLD, (m1g,))
 
     symbols, codec_state = _prepare_symbols(task, transition, identity, m1g)
