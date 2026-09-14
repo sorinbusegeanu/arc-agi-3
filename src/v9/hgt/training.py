@@ -571,6 +571,35 @@ def _loss(
     by_head = {name: float(loss.detach().cpu().item()) for name, loss in raw_losses.items()}
     return total_loss, correct / max(1, total), by_head
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "out of memory" in text and ("cuda" in text or "gpu" in text)
+
+
+def _retry_after_oom(runtime: Any, *, epoch: int, training_epochs: int, learning_rate: float, root: str | Path, budget_scale: float, oom_retry: int, exc: RuntimeError):
+    config = runtime.config.scientific
+    if not _is_cuda_oom(exc) or int(oom_retry) >= int(config.hgt_oom_retry_limit):
+        raise exc
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+    next_scale = max(0.125, float(budget_scale) * 0.5)
+    runtime.set_telemetry_gauge("hgt_oom_retry_count", int(oom_retry) + 1)
+    runtime.set_telemetry_gauge("hgt_oom_shedding_factor", float(next_scale))
+    return train_hgt_epoch(
+        runtime,
+        epoch=epoch,
+        training_epochs=training_epochs,
+        learning_rate=learning_rate,
+        root=root,
+        _budget_scale=next_scale,
+        _oom_retry=int(oom_retry) + 1,
+    )
+
+
 def _should_promote(
     parent_version: str | None,
     parent_validation_loss: float,
@@ -672,6 +701,8 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         return HGTTrainingResult(epoch, "SKIPPED_NO_VALIDATION_EVIDENCE", runtime.unified_telemetry.model_version, None, 0.0, 0.0, action_examples, 0, None)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     model = _HGTWrapper(
         metadata,
         input_dim=64,
@@ -698,8 +729,20 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             except (RuntimeError, KeyError):
                 checkpoint_state = None
                 parent_version = parent_checkpoint = None
-    x_device = {key: value.to(device) for key, value in x_dict.items()}
-    edges_device = {key: value.to(device) for key, value in edge_index_dict.items()}
+    try:
+        x_device = {key: value.to(device) for key, value in x_dict.items()}
+        edges_device = {key: value.to(device) for key, value in edge_index_dict.items()}
+    except RuntimeError as exc:
+        return _retry_after_oom(
+            runtime,
+            epoch=epoch,
+            training_epochs=training_epochs,
+            learning_rate=learning_rate,
+            root=root,
+            budget_scale=_budget_scale,
+            oom_retry=_oom_retry,
+            exc=exc,
+        )
 
     parent_validation_loss = float("inf")
     parent_validation_accuracy = float("nan")
@@ -738,31 +781,46 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     training_steps = 0
     last_grad_norm = 0.0
     model.train()
-    for _ in range(max(1, int(training_epochs))):
-        optimizer.zero_grad(set_to_none=True)
-        logits, values, auxiliary = model(x_device, edges_device)
-        loss, _, _ = _loss(
-            logits,
-            values,
-            auxiliary,
-            y_dict,
-            train_masks,
-            action_targets,
-            action_masks,
-            task_targets,
-            task_masks,
-            torch,
-            objective_weights=config.hgt_loss_weights,
-            log_vars=model.objective_log_vars,
-            dynamic_weighting=bool(config.hgt_dynamic_loss_weighting),
+    try:
+        for _ in range(max(1, int(training_epochs))):
+            optimizer.zero_grad(set_to_none=True)
+            logits, values, auxiliary = model(x_device, edges_device)
+            loss, _, _ = _loss(
+                logits,
+                values,
+                auxiliary,
+                y_dict,
+                train_masks,
+                action_targets,
+                action_masks,
+                task_targets,
+                task_masks,
+                torch,
+                objective_weights=config.hgt_loss_weights,
+                log_vars=model.objective_log_vars,
+                dynamic_weighting=bool(config.hgt_dynamic_loss_weighting),
+            )
+            if loss is None:
+                break
+            loss.backward()
+            last_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0).item())
+            optimizer.step()
+            training_loss = float(loss.detach().cpu().item())
+            training_steps += 1
+    except RuntimeError as exc:
+        del model, optimizer, x_device, edges_device
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return _retry_after_oom(
+            runtime,
+            epoch=epoch,
+            training_epochs=training_epochs,
+            learning_rate=learning_rate,
+            root=root,
+            budget_scale=_budget_scale,
+            oom_retry=_oom_retry,
+            exc=exc,
         )
-        if loss is None:
-            break
-        loss.backward()
-        last_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0).item())
-        optimizer.step()
-        training_loss = float(loss.detach().cpu().item())
-        training_steps += 1
     if training_steps <= 0:
         return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, parent_version, 0.0, parent_validation_loss if math.isfinite(parent_validation_loss) else 0.0, action_examples, 0, parent_checkpoint)
 
