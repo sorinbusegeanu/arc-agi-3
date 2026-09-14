@@ -144,6 +144,10 @@ def _m1n_write(relation: M1NormalizedRelation, *, watermark: int, transition: An
             "structural_signature": relation.structural_signature,
             "support": 1,
             "parents": [[uid.hi, uid.lo] for uid in parents],
+            **({"semantic_before": [list(row) for row in transition.semantic_before]} if transition is not None and transition.semantic_before else {}),
+            **({"semantic_action": [list(row) for row in transition.semantic_action]} if transition is not None and transition.semantic_action else {}),
+            **({"semantic_options": [list(row) for row in transition.semantic_options]} if transition is not None and transition.semantic_options else {}),
+            **({"semantic_effects": [list(row) for row in transition.semantic_delta]} if transition is not None and transition.semantic_delta else {}),
         },
         evidence,
     )
