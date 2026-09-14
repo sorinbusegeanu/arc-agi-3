@@ -14,8 +14,10 @@ from v9.memory.model import MemoryLevel
 from v9.memory.relations import RelationType
 from v9.telemetry import HGTTrainingSample, ModelEvolutionSample, read_gpu_snapshot
 
-MODEL_SCHEMA_VERSION = 3
+MODEL_SCHEMA_VERSION = 4
 NODE_TYPE = "MEMORY"
+OBJECTIVE_NAMES = ("transition", "consequence", "relevance", "correspondence", "similarity", "strategy", "grounding", "deliberation_improvement", "invariance")
+AUX_OBJECTIVES = ("transition", "relevance", "correspondence", "similarity", "grounding", "deliberation_improvement", "invariance")
 SEMANTIC_NODE_TYPES = ("ENTITY", "ACTION", "TEXT", "STATE", "EFFECT")
 
 
