@@ -1069,6 +1069,7 @@ class ContinuousMemoryRuntime:
         realized_cost_sum = sum(max(1, int(payload.get("realized_cost", 0))) for payload in grounded_payloads) or len(admissible)
         strategy = M7Strategy.form(outcome, target_environment_id=int(target_environment_id), native_actions=(action,), successes=len(admissible), trials=len(admissible), primary_valence_sum=primary_valence_sum, realized_cost_sum=realized_cost_sum)
         self.__dict__.setdefault("_m7", {})[strategy.uid] = strategy
+        self._hgt_action_scores.setdefault(int(target_environment_id), {})[action] = max(float(self._hgt_action_scores.get(int(target_environment_id), {}).get(action, 0.0)), float(strategy.reliability))
         self._publish(CanonicalNode(strategy.uid, MemoryLevel.M7, MemoryType.STRATEGY, (outcome.uid.hi, outcome.uid.lo, target_environment_id, action), self._watermark), {"target_outcome": [outcome.uid.hi, outcome.uid.lo], "target_environment_id": int(target_environment_id), "native_actions": [action], "reliability_successes": strategy.reliability_successes, "reliability_trials": strategy.reliability_trials, "primary_valence_sum": strategy.primary_valence_sum, "realized_cost_sum": strategy.realized_cost_sum, "parents": [[outcome.uid.hi, outcome.uid.lo]]}, strategy.provenance.evidence)
 
     def wait_quiescent(self, timeout: float = 300.0) -> None:
