@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 import pickle
 import time
 from typing import Any
@@ -26,6 +26,10 @@ def publish_shared_batch(value: Any, *, start_sequence: int, end_sequence: int, 
         name = segment.name
     finally:
         segment.close()
+    try:
+        resource_tracker.unregister(segment._name, "shared_memory")
+    except (AttributeError, KeyError):
+        pass
     return SharedBatchDescriptor(
         name=name,
         size=len(payload),
