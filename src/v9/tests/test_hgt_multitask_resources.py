@@ -15,6 +15,10 @@ def test_hgt_scientific_config_has_nine_objectives_and_final_graph_budgets() -> 
     assert config.hgt_max_total_edges >= config.hgt_max_subgraph_edges
     assert config.hgt_max_semantic_facts_per_memory > 0
     assert config.hgt_oom_retry_limit > 0
+    assert config.transfer_validation_trials_per_interval == 900
+    assert config.transfer_validation_workers == 30
+    assert config.hgt_max_subgraph_nodes == 12000
+    assert config.hgt_max_total_nodes == 60000
 
 
 def test_hgt_rejects_wrong_objective_weight_count() -> None:
