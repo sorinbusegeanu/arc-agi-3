@@ -247,6 +247,16 @@ def test_child_queue_flush_closes_and_joins_feeder() -> None:
     assert events == ["close", "join_thread"]
 
 
+def test_action_set_signature_accepts_and_canonicalizes_action_tuples() -> None:
+    from v9.runtime.multiprocess import _action_set_signature
+
+    signature = _action_set_signature(7, (3, 1, 3))
+
+    assert isinstance(signature, int)
+    assert signature == _action_set_signature(7, (1, 3))
+    assert signature != _action_set_signature(7, (1, 2))
+
+
 def test_clean_actor_exit_without_done_becomes_bounded_protocol_error() -> None:
     from v9.runtime.parallel_memory_coordinator import _reconcile_actor_liveness
 

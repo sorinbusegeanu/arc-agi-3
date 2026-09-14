@@ -146,6 +146,11 @@ def _load_factory(path: str):
     return getattr(importlib.import_module(module_name), attr)
 
 
+def _action_set_signature(action_schema_id: int, actions: tuple[int, ...]) -> int:
+    normalized = tuple(sorted(set(int(action) for action in actions)))
+    return stable_u64(int(action_schema_id), *normalized, person=b"v9-action-set")
+
+
 def _flush_child_queue(queue_obj: Any) -> None:
     """Ensure this child process has flushed all payloads it put on a queue."""
     try:
@@ -209,7 +214,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                 boundary = adapter.boundary_event()
                 progress = adapter.task_progress()
                 observation_schema_id = int(adapter.observation_schema().schema_id)
-                available_after = tuple(int(v) for v in adapter.available_actions())
+                available_after = tuple(sorted(set(int(v) for v in adapter.available_actions())))
                 stage_queue.put(
                     EncodedTransition(
                         actor_id=actor_id,
@@ -223,7 +228,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                         action_id=int(adapter.encode_action(action)),
                         after_signature=int(adapter.encode_observation(after)),
                         available_actions_after=len(available_after),
-                        available_action_set_signature=int(stable_u64(action_schema_id, available_after, person=b"v9-action-set")),
+                        available_action_set_signature=_action_set_signature(action_schema_id, available_after),
                         primary_valence=int(boundary.primary_valence),
                         boundary_scope=str(boundary.scope.value),
                         task_success=bool(progress.success),
