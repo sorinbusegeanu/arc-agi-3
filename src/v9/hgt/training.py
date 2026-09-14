@@ -368,7 +368,7 @@ def build_hgt_graph(
 
 class _HGTWrapper:
     def __init__(self, metadata: tuple[list[str], list[tuple[str, str, str]]], *, input_dim: int, hidden_dim: int, layers: int, heads: int):
-        _, nn, HGTConv = _require_torch()
+        torch, nn, HGTConv = _require_torch()
 
         class Model(nn.Module):
             def __init__(self):
@@ -377,15 +377,31 @@ class _HGTWrapper:
                 self.layers = nn.ModuleList([HGTConv(hidden_dim, hidden_dim, metadata, heads=heads) for _ in range(layers)])
                 self.valence_heads = nn.ModuleDict({node_type: nn.Linear(hidden_dim, 3) for node_type in metadata[0]})
                 self.value_heads = nn.ModuleDict({node_type: nn.Linear(hidden_dim, 1) for node_type in metadata[0]})
+                self.objective_heads = nn.ModuleDict({
+                    objective: nn.ModuleDict({node_type: nn.Linear(hidden_dim, 1) for node_type in metadata[0]})
+                    for objective in AUX_OBJECTIVES
+                })
+                self.objective_log_vars = nn.ParameterDict({
+                    objective: nn.Parameter(torch.zeros(()))
+                    for objective in OBJECTIVE_NAMES
+                })
 
             def forward(self, x_dict, edge_index_dict):
                 state = {key: self.encoders[key](value).relu() for key, value in x_dict.items()}
                 for layer in self.layers:
                     updated = layer(state, edge_index_dict)
                     state = {key: (state[key] if updated.get(key) is None else updated[key]).relu() for key in state}
+                auxiliary = {
+                    objective: {
+                        key: self.objective_heads[objective][key](value).squeeze(-1)
+                        for key, value in state.items()
+                    }
+                    for objective in AUX_OBJECTIVES
+                }
                 return (
                     {key: self.valence_heads[key](value) for key, value in state.items()},
                     {key: self.value_heads[key](value).squeeze(-1) for key, value in state.items()},
+                    auxiliary,
                 )
 
         self.model = Model()
