@@ -75,6 +75,8 @@ def _baseline_policy(
             epsilon=0.0,
             learned_scores=learned_scores,
             target_environment_id=environment_id,
+            action_schema_id=int(adapter.action_schema().schema_id),
+            environment_type=environment_type,
         )
 
     return policy
