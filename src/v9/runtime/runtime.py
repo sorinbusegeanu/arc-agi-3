@@ -1304,10 +1304,18 @@ class ContinuousMemoryRuntime:
             "m4_validated": validated_m4,
             "m7_strategy_success_rate": strategy_successes / max(1, strategy_trials),
             "success_rate": float(diagnostic.get("behavioral_success_rate", 0.0)),
-            "trajectory_efficiency": strategy_successes / max(1.0, realized_cost_total),
+            "trajectory_efficiency": float(
+                diagnostic.get(
+                    "environment_trajectory_efficiency",
+                    strategy_successes / max(1.0, realized_cost_total),
+                )
+            ),
             "explanatory_reach_per_persistent_byte": sum(int(payload.get("explanatory_reach", 0)) for payload in self.graph.payloads.values()) / persistent_bytes,
             "transfer_quality_per_persistent_byte": validated_transfers / persistent_bytes,
-            "prediction_quality_per_persistent_byte": max(0.0, self._symbol_prediction_delta_sum) / persistent_bytes,
+            "prediction_quality_per_persistent_byte": (
+                max(0.0, 1.0 - (self._prediction_error_sum / max(1, self._prediction_error_count)))
+                + max(0.0, self._symbol_prediction_delta_sum / max(1, prediction_observations))
+            ) / persistent_bytes,
             "hot_payload_bytes": self.payloads.hot_bytes,
             **self.telemetry,
         }
