@@ -62,6 +62,7 @@ class ActorDone:
     task_failures: int = 0
     task_truncations: int = 0
     levels_completed: int = 0
+    grounded_action_influence: int = 0
 
 
 @dataclass(frozen=True, slots=True)
