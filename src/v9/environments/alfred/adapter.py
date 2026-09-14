@@ -16,6 +16,10 @@ from v9.memory.residency import PayloadStore
 from v9.modalities.symbols import DeterministicSymbolCodec, SymbolObservation
 
 
+def _command_token(command: str) -> int:
+    return int(stable_u64("alfred-command", " ".join(str(command).strip().lower().split()), person=b"v9-alfred-action"))
+
+
 class AlfredBackend(Protocol):
     def reset(self) -> tuple[Any, str | bytes]: ...
     def available_actions(self) -> tuple[int, ...]: ...
@@ -156,13 +160,14 @@ class AlfworldTextBackend:
         return self._capture(raw[0], raw[1]), self._instruction
 
     def available_actions(self) -> tuple[int, ...]:
-        return tuple(range(len(self._actions)))
+        return tuple(_command_token(command) for command in self._actions)
 
     def step(self, action: int) -> tuple[Any, bytes, BoundaryEvent]:
-        index = int(action)
-        if index < 0 or index >= len(self._actions):
-            raise ValueError("ALFWorld action index is unavailable")
-        raw = self._environment.step(self._actions[index])
+        token = int(action)
+        commands = {_command_token(command): command for command in self._actions}
+        if token not in commands:
+            raise ValueError("ALFWorld action token is unavailable")
+        raw = self._environment.step(commands[token])
         if not isinstance(raw, tuple) or len(raw) != 4:
             raise RuntimeError("ALFWorld TextWorld step must return (observation, score, done, infos)")
         observation, score, done, infos = raw
@@ -271,15 +276,16 @@ class AlfworldThorBackend:
         return self._world(self._controller.feedback), self._instruction
 
     def available_actions(self) -> tuple[int, ...]:
-        return tuple(range(len(self._actions)))
+        return tuple(_command_token(command) for command in self._actions)
 
     def step(self, action: int) -> tuple[bytes, bytes, BoundaryEvent]:
-        index = int(action)
+        token = int(action)
         if self._controller is None or self._environment is None:
             raise RuntimeError("ALFWorld embodied backend must be reset before stepping")
-        if index < 0 or index >= len(self._actions):
-            raise ValueError("ALFWorld action index is unavailable")
-        feedback = self._controller.step(self._actions[index])
+        commands = {_command_token(command): command for command in self._actions}
+        if token not in commands:
+            raise ValueError("ALFWorld action token is unavailable")
+        feedback = self._controller.step(commands[token])
         self._steps += 1
         won = bool(self._environment.get_goal_satisfied())
         finished = won or self._steps >= self._max_episode_steps
