@@ -97,24 +97,60 @@ def test_step1_continuous_run_executes_curriculum(tmp_path) -> None:
     assert all(key.startswith("step1|synthetic|") for key in counts)
 
 
-def test_broad_preset_includes_all_runnable_babyai_language_games() -> None:
+def test_broad_preset_spans_all_runnable_language_and_symbolic_families() -> None:
     selection = resolve_curriculum_selector("broad")
     assert selection is not None
-    assert len(selection.specs) == 47
+    assert len(selection.specs) == 76
     assert {spec.adapter for spec in selection.specs} == {
         "synthetic_causal",
+        "synthetic_symbolic",
         "gym_discrete",
         "gym_structured",
         "sokoban",
         "minigrid",
+        "chess",
+        "sudoku",
         "babyai",
+        "alfred",
         "arc",
     }
     assert all(spec.curriculum_step == "broad" for spec in selection.specs)
+
+    symbolic = tuple(spec for spec in selection.specs if spec.adapter == "synthetic_symbolic")
+    assert len(symbolic) == 16
+    assert {spec.condition for spec in symbolic} == {"C0", "C1", "C2", "C3"}
+
+    frozen = tuple(spec for spec in selection.specs if spec.game_id == "FrozenLake-v1")
+    assert len(frozen) == 4
+    assert {(spec.kwargs["map_name"], spec.kwargs["is_slippery"]) for spec in frozen} == {
+        ("4x4", False),
+        ("8x8", False),
+        ("4x4", True),
+        ("8x8", True),
+    }
+
     babyai = tuple(spec.game_id for spec in selection.specs if spec.adapter == "babyai")
     assert len(babyai) == 21
     assert "BabyAI-OpenDoorsOrder-v0" not in babyai
     assert "BabyAI-PutNext-v0" not in babyai
+
+    assert tuple(spec.game_id for spec in selection.specs if spec.adapter == "alfred") == (
+        "pick_and_place_simple",
+        "pick_clean_then_place_in_recep",
+        "pick_heat_then_place_in_recep",
+        "pick_cool_then_place_in_recep",
+        "look_at_obj_in_light",
+        "pick_two_obj_and_place",
+    )
+    assert tuple(spec.game_id for spec in selection.specs if spec.adapter == "chess") == (
+        "chess_first_white",
+        "chess_random_white",
+    )
+    assert tuple(spec.game_id for spec in selection.specs if spec.adapter == "sudoku") == (
+        "sudoku_clues_45",
+        "sudoku_clues_36",
+        "sudoku_clues_30",
+    )
     assert tuple(spec.game_id for spec in selection.specs if spec.adapter == "arc") == (
         "g50t",
         "ls20",
