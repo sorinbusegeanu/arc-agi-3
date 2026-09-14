@@ -11,6 +11,7 @@ from v9.modalities.contract import InteractionEvent, PassiveSymbolEvent
 
 from .memory_pipeline import IngestionTask, PreparedIngestion, prepare_ingestion
 from .multiprocess import WorkerStop
+from .shared_batch_transport import publish_shared_batch
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +216,12 @@ def ingest_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
             continue
         try:
             result = prepare_commit_batch(item)
-            result_queue.put(("ingest_batch", result.start_sequence, result.end_sequence, result))
+            descriptor = publish_shared_batch(
+                result,
+                start_sequence=result.start_sequence,
+                end_sequence=result.end_sequence,
+                rows=len(result.rows),
+            )
+            result_queue.put(("ingest_batch_shm", result.start_sequence, result.end_sequence, descriptor))
         except BaseException as exc:
             result_queue.put(("worker_error", "ingest", int(item.start_sequence), repr(exc)))
