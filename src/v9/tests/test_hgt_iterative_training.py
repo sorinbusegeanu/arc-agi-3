@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from v9.hgt.epoch_dataset import EpochTransitionDataset, action_ranking_pairs, iter_epoch_transitions, transition_training_rows
+from v9.hgt.training import _split_transition_rows
 from v9.hgt.matched_evaluation import matched_jobs, select_matched_branch
 from v9.runtime.multiprocess import EncodedTransition
 from v9.runtime.runtime import ContinuousMemoryRuntime
@@ -54,6 +55,20 @@ class HGTIterativeTrainingTests(unittest.TestCase):
         on.clear()
         self.assertEqual(len(off), 1)
 
+
+
+    def test_transition_validation_split_has_no_episode_leakage(self):
+        rows = []
+        for episode in range(10):
+            for step in range(3):
+                rows.append({"game_scenario": "g", "actor_id": 1, "episode_id": episode, "global_step": step})
+        train, val = _split_transition_rows(rows)
+        train_episodes = {(r["game_scenario"], r["actor_id"], r["episode_id"]) for r in train}
+        val_episodes = {(r["game_scenario"], r["actor_id"], r["episode_id"]) for r in val}
+        self.assertTrue(train)
+        self.assertTrue(val)
+        self.assertFalse(train_episodes & val_episodes)
+        self.assertEqual(len(train) + len(val), len(rows))
 
     def test_experiment_state_restore_reinstates_branch_base(self):
         class Fake:
