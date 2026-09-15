@@ -58,7 +58,7 @@ from .partitions import PartitionMap
 from .publication import CanonicalGraph, edge_ref, node_ref
 from .read_view import ReadView
 from .rings import MultimodalTimeline
-from .snapshot_backend import SnapshotResult, assert_native_root, latest_snapshot, load_snapshot, write_snapshot
+from .snapshot_backend import SnapshotResult, assert_native_root, latest_snapshot, load_snapshot, load_snapshot_direct, decode_graph_shard, write_snapshot
 
 
 class ContinuousMemoryRuntime:
@@ -134,7 +134,17 @@ class ContinuousMemoryRuntime:
         if config.restore:
             path = latest_snapshot(self.root)
             if path is not None:
-                self._restore(load_snapshot(path, expected_config_id=scientific.config_id.value))
+                direct = load_snapshot_direct(path, expected_config_id=scientific.config_id.value)
+                if direct is None:
+                    self._restore(load_snapshot(path, expected_config_id=scientific.config_id.value))
+                else:
+                    runtime_state, graph_header, encoded_shards = direct
+                    from concurrent.futures import ThreadPoolExecutor
+                    workers = max(1, min(len(encoded_shards), 8))
+                    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="v9-restore") as pool:
+                        shard_rows = list(pool.map(lambda row: decode_graph_shard(row[1], expected_partition=row[0]), encoded_shards))
+                    runtime_state["graph"] = graph_header
+                    self._restore({"state": runtime_state}, graph_override=CanonicalGraph.from_sharded_state(graph_header, shard_rows))
             self._restore_hgt_checkpoint()
 
     def _restore_hgt_checkpoint(self) -> None:
@@ -1239,9 +1249,9 @@ class ContinuousMemoryRuntime:
             "transfer_trials": {uid.hex(): rows for uid, rows in self._transfer_trials.items()},
         }
 
-    def _restore(self, snapshot: dict[str, Any]) -> None:
+    def _restore(self, snapshot: dict[str, Any], *, graph_override: CanonicalGraph | None = None) -> None:
         state = dict(snapshot["state"])
-        self.graph = CanonicalGraph.from_state_dict(dict(state["graph"]))
+        self.graph = graph_override if graph_override is not None else CanonicalGraph.from_state_dict(dict(state["graph"]))
         self.partitions = PartitionMap(self.graph.partition_count)
         self.timeline = MultimodalTimeline.from_state_dict(dict(state["timeline"]))
         self.environments = EnvironmentRegistry.from_state_dict(dict(state["environments"]))
