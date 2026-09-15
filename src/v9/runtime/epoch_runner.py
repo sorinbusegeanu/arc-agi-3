@@ -49,8 +49,9 @@ def _episode_horizon(spec: Any) -> int:
             gym_spec = gym.spec(game)
             if gym_spec.max_episode_steps:
                 return max(1, int(gym_spec.max_episode_steps))
-        except Exception:
-            pass
+        except (ImportError, AttributeError, KeyError, TypeError, ValueError):
+            # Unknown/unavailable Gym metadata uses the conservative fallback horizon.
+            return 500
     return 500
 
 
