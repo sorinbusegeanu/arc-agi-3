@@ -1063,7 +1063,9 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     model_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = model_dir / "hgt_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
-    parent_version, parent_checkpoint = manifest.get("current_model_version"), manifest.get("current_checkpoint")
+    accepted_version = manifest.get("last_accepted_model_version")
+    parent_version = accepted_version
+    parent_checkpoint = f"models/{accepted_version}.pt" if accepted_version else None
     checkpoint_state = None
     if int(manifest.get("model_schema_version", 0)) != MODEL_SCHEMA_VERSION:
         parent_version = parent_checkpoint = None
@@ -1253,6 +1255,8 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             "version_index": version_index,
             "current_model_version": candidate_version,
             "current_checkpoint": checkpoint_rel,
+            "accepted_model_version": accepted_version,
+            "accepted_checkpoint": parent_checkpoint,
             "candidate_model_version": candidate_version,
             "candidate_status": "TESTING_PENDING_BEHAVIOR",
             "parent_model_version": parent_version,
