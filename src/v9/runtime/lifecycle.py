@@ -549,6 +549,16 @@ def run_lifecycle_maintenance(
         registry.remove(uid)
         runtime._replay_pool.pop(uid, None)
         runtime._deferred_base_nodes.pop(uid, None)
+        runtime._m2.pop(uid, None)
+        runtime._m3.pop(uid, None)
+        runtime._m4.pop(uid, None)
+        runtime._transfer_trials.pop(uid, None)
+        environment_index = getattr(runtime, "_memory_uids_by_environment", None)
+        if environment_index is not None:
+            for environment_id in tuple(environment_index):
+                environment_index[environment_id].discard(uid)
+                if not environment_index[environment_id]:
+                    del environment_index[environment_id]
     if retired_set:
         runtime._latest_interaction_grounding = {
             key: row for key, row in runtime._latest_interaction_grounding.items() if row.uid not in retired_set
