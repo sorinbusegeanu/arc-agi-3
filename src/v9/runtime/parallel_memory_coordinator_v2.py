@@ -34,6 +34,7 @@ def run_parallel_memory_jobs(
     publication_queue_capacity: int,
     actor_view_refresh_steps: int = 64,
     actor_view_refresh_ms: float = 250.0,
+    hgt_dataset: Any | None = None,
 ) -> list[ProcessActorResult]:
     topology = ProcessTopology(
         actors=min(int(actor_limit), len(jobs)),
@@ -73,6 +74,7 @@ def run_parallel_memory_jobs(
     started_at = time.monotonic()
     next_progress = started_at + max(1.0, float(progress_interval_seconds))
     clean_shutdown = False
+    dataset_start_count = int(getattr(hgt_dataset, "count", 0)) if hgt_dataset is not None else 0
 
     def launch_one() -> bool:
         if not pending or not free_slots:
@@ -119,6 +121,8 @@ def run_parallel_memory_jobs(
             except queue.Empty:
                 break
             if item[0] == "transition":
+                if hgt_dataset is not None:
+                    hgt_dataset.append(item[3])
                 pipeline.dispatch_transition(item[3])
                 progressed = True
             elif item[0] == "shard_done":
@@ -173,6 +177,9 @@ def run_parallel_memory_jobs(
         return progressed
 
     def telemetry() -> None:
+        if hgt_dataset is not None:
+            runtime.set_telemetry_gauge("hgt_dataset_written_transitions", int(hgt_dataset.count) - dataset_start_count)
+            runtime.set_telemetry_gauge("hgt_dataset_bytes", int(hgt_dataset.bytes_written))
         elapsed = max(1e-9, time.monotonic() - started_at)
         for key, value in memory.queue_depths().items():
             runtime.set_telemetry_gauge(key, value)
