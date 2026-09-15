@@ -166,7 +166,7 @@ def test_m7_failed_observation_does_not_add_realized_success_cost() -> None:
     strategy = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1,), successes=0, trials=1, primary_valence_sum=0, realized_cost_sum=0)
     updated = strategy.observe(success=False, realized_cost=9)
     assert updated.realized_cost_sum == 0
-    assert updated.reliability_trials == 1
+    assert updated.reliability_trials == 2
 
 
 def test_m7_success_observation_adds_realized_cost() -> None:
@@ -179,7 +179,7 @@ def test_m7_success_observation_adds_realized_cost() -> None:
 def test_actor_policy_snapshot_pickles_outcomes_and_strategies() -> None:
     outcome = ActorOutcomePolicy(_uid("o"), 7, 0.8, 2.0)
     strategy = _strategy("s", outcome.outcome_uid, (1, 2), 0.9, 2.0, 1.0)
-    snapshot = ActorPolicySnapshot.build(generation=4, outcomes_by_environment={7: (outcome,)}, strategies_by_environment={7: (strategy,)})
+    snapshot = ActorPolicySnapshot.build(generation=4, normalized_action_supports={}, hgt_action_scores={}, model_version='test', outcomes_by_environment={7: (outcome,)}, strategies_by_environment={7: (strategy,)})
     restored = pickle.loads(pickle.dumps(snapshot))
     assert restored.outcomes(7) == (outcome,)
     assert restored.strategies(7) == (strategy,)
