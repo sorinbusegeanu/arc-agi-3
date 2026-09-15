@@ -60,16 +60,8 @@ def build_epoch_jobs(specs: tuple[Any, ...], args: Any, *, epoch: int) -> list[t
     jobs = []
     actor_count = max(len(specs), int(args.actors))
     assigned = [specs[index % len(specs)] for index in range(actor_count)]
-    lanes = {spec_index: sum(1 for index in range(actor_count) if index % len(specs) == spec_index) for spec_index in range(len(specs))}
-    seen = {spec_index: 0 for spec_index in range(len(specs))}
     for actor_index, spec in enumerate(assigned):
-        spec_index = actor_index % len(specs)
-        lane_count = lanes[spec_index]
-        lane = seen[spec_index]
-        seen[spec_index] += 1
-        game_budget = _game_step_budget(spec, args)
-        base_steps, extra_steps = divmod(game_budget, lane_count)
-        steps = base_steps + int(lane < extra_steps)
+        steps = _game_step_budget(spec, args)
         if steps:
             actor_id = actor_index + 1
             seed = int(args.seed) + int(epoch) * 1_000_003 + actor_id * 1009
