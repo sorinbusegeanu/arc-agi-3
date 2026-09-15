@@ -58,3 +58,22 @@ def test_hgt_uses_symbol_not_text_node_type() -> None:
     assert "SYMBOL" in SEMANTIC_NODE_TYPES
     assert "TEXT" not in SEMANTIC_NODE_TYPES
     assert _semantic_node_type(7) == "SYMBOL"
+
+def test_m2_retains_modality_support_decomposition() -> None:
+    import inspect
+    from v9.memory.m2_family import M2TransformationFamily
+    assert "modality_support" in inspect.signature(M2TransformationFamily).parameters
+
+
+def test_symbolic_commit_plan_carries_occurrence_provenance() -> None:
+    import inspect
+    from v9.runtime.memory_pipeline import PreparedIngestion
+    from v9.runtime.memory_pipeline_v2 import CommitPlan
+    assert "symbol_occurrences" in inspect.signature(PreparedIngestion).parameters
+    assert "symbol_occurrences" in inspect.signature(CommitPlan).parameters
+
+
+def test_grounding_graph_relations_are_explicit() -> None:
+    from v9.memory.relations import RelationType
+    required = {"OBSERVED_IN", "PRECEDES", "FOLLOWS", "TEMPORALLY_ALIGNED_WITH", "STRUCTURALLY_CORRESPONDS_TO", "PARTICIPATES_IN", "SUPPORTS", "CONTRADICTS", "GROUNDS", "TRANSFER_VALIDATES"}
+    assert required <= {row.name for row in RelationType}
