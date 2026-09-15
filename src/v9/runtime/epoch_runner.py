@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from v9.hgt import rollback_hgt_model, train_hgt_epoch
+from v9.memory.identity import stable_u64
 from v9.memory.m1_normalized import NormalizedChannel
 from v9.telemetry import HGTInferenceSample, OptimizationSample
 from .lifecycle import run_lifecycle_maintenance
@@ -21,6 +22,27 @@ class EpochRunResult:
     training: dict[str, Any]
     performance: dict[str, Any]
     metrics: dict[str, Any]
+
+
+def _spec_environment_instance_id(spec: Any) -> int:
+    """Reproduce adapter EnvironmentIdentity.instance_id without requiring adapter construction."""
+    adapter = str(getattr(spec, "adapter", "auto")).lower()
+    game_id = str(getattr(spec, "game_id", ""))
+    lowered = game_id.lower()
+    if adapter == "auto":
+        if game_id == "FrozenLake-v1":
+            adapter = "gym_discrete"
+        elif lowered in {"chess-v0", "arcagi/chess-v0"}:
+            adapter = "chess"
+        elif lowered in {"sudoku-v0", "arcagi/sudoku-v0"}:
+            adapter = "sudoku"
+        elif lowered in {"synthetic", "synthetic-symbolic"}:
+            adapter = "synthetic_symbolic"
+        else:
+            adapter = "arc"
+    # Actor results already carry the real environment id; this helper is only a
+    # fallback for specs whose adapter identity is deterministic from configuration.
+    return int(stable_u64(adapter, game_id, repr(sorted(dict(getattr(spec, "kwargs", {}) or {}).items())), person=b"v9-env-spec"))
 
 
 def _episode_horizon(spec: Any) -> int:
@@ -385,10 +407,18 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         viability_profiles = _environment_viability(process_results, previous_viability_profiles)
         previous_viability_profiles = viability_profiles
         runtime.__dict__["_environment_viability_profiles"] = dict(viability_profiles)
-        environment_confidence = {
-            int(spec.instance_id.value): float(viability_profiles.get(str(spec.display_name), {}).get("evidence_confidence", 1.0))
-            for spec in specs
+        environment_confidence: dict[int, float] = {}
+        confidence_by_game = {
+            str(game): float(profile.get("evidence_confidence", 1.0))
+            for game, profile in viability_profiles.items()
         }
+        # Bind confidence to the actual environment IDs recorded by actor-produced
+        # memories. This avoids assuming EnvironmentSpec owns runtime identity.
+        for uid, payload in tuple(runtime.graph.payloads.items()):
+            game = str(payload.get("game_scenario", ""))
+            environment_id = payload.get("environment_instance_id")
+            if environment_id is not None and game in confidence_by_game:
+                environment_confidence[int(environment_id)] = confidence_by_game[game]
         runtime.__dict__["_environment_evidence_confidence"] = environment_confidence
         for uid, payload in tuple(runtime.graph.payloads.items()):
             environment_id = payload.get("environment_instance_id")
