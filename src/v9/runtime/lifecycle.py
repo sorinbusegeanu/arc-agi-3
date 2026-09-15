@@ -552,6 +552,9 @@ def run_lifecycle_maintenance(
         runtime._m2.pop(uid, None)
         runtime._m3.pop(uid, None)
         runtime._m4.pop(uid, None)
+        getattr(runtime, "_m5", {}).pop(uid, None)
+        getattr(runtime, "_m6", {}).pop(uid, None)
+        getattr(runtime, "_m7", {}).pop(uid, None)
         runtime._transfer_trials.pop(uid, None)
         environment_index = getattr(runtime, "_memory_uids_by_environment", None)
         if environment_index is not None:
