@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from random import Random
+from random import Random\nimport json\nfrom pathlib import Path\nfrom dataclasses import asdict
 from typing import Callable
 
 from v9.environments.synthetic_symbolic import SyntheticSymbolicConfig, SyntheticSymbolicEnvironment
@@ -273,3 +273,41 @@ def publish_h16_report(runtime: object, report: H16Report) -> None:
     aligned = report.metric_means.get(GroundingCondition.C2_ALIGNED.value, {})
     for metric, value in aligned.items():
         setter(f"h16_aligned_{metric}", float(value))
+
+
+def save_h16_trials(path: str | Path, trials: tuple[H16Trial, ...]) -> None:
+    payload = {
+        "schema_version": 1,
+        "trials": [
+            {
+                **asdict(row),
+                "condition": row.condition.value,
+            }
+            for row in trials
+        ],
+    }
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(target)
+
+
+def load_h16_trials(path: str | Path) -> tuple[H16Trial, ...]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if int(payload.get("schema_version", 0)) != 1:
+        raise ValueError("unsupported H16 trial schema")
+    rows = []
+    for raw in payload.get("trials", []):
+        metrics = H16Metrics(**dict(raw["metrics"]))
+        rows.append(H16Trial(
+            condition=GroundingCondition(str(raw["condition"])),
+            seed=int(raw["seed"]),
+            environment_config_id=int(raw["environment_config_id"]),
+            interaction_budget=int(raw["interaction_budget"]),
+            evaluation_id=int(raw["evaluation_id"]),
+            metrics=metrics,
+            held_out_causal_effect=float(raw["held_out_causal_effect"]),
+            trial_id=str(raw.get("trial_id", "")),
+        ))
+    return tuple(rows)
