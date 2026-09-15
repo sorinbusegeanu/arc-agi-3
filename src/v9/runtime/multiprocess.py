@@ -16,6 +16,7 @@ from random import Random
 from v9.cognition.action_selection import choose_action
 from v9.runtime.actor_policy import ActorPolicySnapshot
 from v9.cognition.planning import choose_strategy, replan
+from v9.cognition.outcome_selection import select_target_outcome
 from v9.memory.identity import stable_u64
 
 
@@ -59,6 +60,7 @@ class EncodedTransition:
     strategy_realized_cost: int = 0
     strategy_target_outcome_hi: int | None = None
     strategy_target_outcome_lo: int | None = None
+    strategy_replanned: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +269,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                 grounded_action_influence += int(base_preference != grounded_preference)
                 context_counts = context_action_counts.setdefault(before_signature, {})
                 strategy_rows = policy.strategies(environment_instance_id)
+                strategy_replanned = False
                 if active_strategy_uid is not None:
                     current = next((row for row in strategy_rows if row.strategy_uid == active_strategy_uid), None)
                     if current is None or active_strategy_position >= len(active_strategy_actions) or int(active_strategy_actions[active_strategy_position]) not in actions:
@@ -278,13 +281,21 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                             active_strategy_position = 0
                             active_strategy_outcome = None
                         else:
+                            strategy_replanned = True
                             active_strategy_uid = current.strategy_uid
                             active_strategy_actions = current.native_actions
                             active_strategy_position = 0
                             active_strategy_outcome = current.target_outcome_uid
                             active_strategy_realized_cost = 0
                 if active_strategy_uid is None and strategy_rows:
-                    candidates = tuple(row for row in strategy_rows if row.native_actions and int(row.native_actions[0]) in actions)
+                    outcome_rows = policy.outcomes(environment_instance_id)
+                    target = select_target_outcome(outcome_rows)
+                    candidates = tuple(
+                        row for row in strategy_rows
+                        if row.native_actions
+                        and int(row.native_actions[0]) in actions
+                        and (target is None or row.target_outcome_uid == target.outcome_uid)
+                    )
                     if candidates:
                         selected = choose_strategy(candidates, target_environment_id=environment_instance_id, available_actions=actions)
                         active_strategy_uid = selected.strategy_uid
@@ -378,6 +389,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                         strategy_realized_cost=active_strategy_realized_cost if executed_strategy_uid is not None else 0,
                         strategy_target_outcome_hi=None if active_strategy_outcome is None else int(active_strategy_outcome.hi),
                         strategy_target_outcome_lo=None if active_strategy_outcome is None else int(active_strategy_outcome.lo),
+                        strategy_replanned=strategy_replanned,
                     )
                 )
                 completed += 1
