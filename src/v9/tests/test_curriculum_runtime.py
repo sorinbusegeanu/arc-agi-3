@@ -154,7 +154,7 @@ def test_broad_preset_spans_all_runnable_language_and_symbolic_families() -> Non
     )
     arc_games = tuple(spec.game_id for spec in selection.specs if spec.adapter == "arc")
     assert len(arc_games) == 42
-    assert arc_games[:4] == ("ez01", "ez02", "ez03", "ez04")
+    assert arc_games[:4] == ("gp01", "gp02", "ez01", "ez02")
     assert arc_games[-4:] == ("wk01", "rf01", "mo01", "zq01")
 
 
