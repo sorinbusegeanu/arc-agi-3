@@ -961,9 +961,8 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
                 if int(checkpoint_state.get("model_schema_version", 0)) != MODEL_SCHEMA_VERSION:
                     raise RuntimeError("HGT checkpoint schema changed")
                 model.load_state_dict(checkpoint_state["model_state"])
-            except (RuntimeError, KeyError):
-                checkpoint_state = None
-                parent_version = parent_checkpoint = None
+            except (RuntimeError, KeyError) as exc:
+                raise RuntimeError(f"accepted HGT checkpoint {checkpoint_path} is incompatible or corrupt: {exc}") from exc
     try:
         x_device = {key: value.to(device) for key, value in x_dict.items()}
         edges_device = {key: value.to(device) for key, value in edge_index_dict.items()}
@@ -985,8 +984,8 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     if checkpoint_state is not None and checkpoint_state.get("optimizer_state"):
         try:
             optimizer.load_state_dict(checkpoint_state["optimizer_state"])
-        except (ValueError, RuntimeError):
-            pass
+        except (ValueError, RuntimeError) as exc:
+            raise RuntimeError(f"accepted HGT optimizer state is incompatible or corrupt: {exc}") from exc
     for group in optimizer.param_groups:
         group["lr"] = float(learning_rate)
     start = time.perf_counter()
@@ -1170,12 +1169,12 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         training_loss=training_loss,
         validation_loss=0.0,
         training_step_latency_ms=1000.0 * elapsed / max(1, training_steps),
-        training_examples_seen=training_examples,
-        effective_batch_size=training_examples,
+        training_examples_seen=int(locals().get("transitions_trained", training_examples)),
+        effective_batch_size=int(stream_batch_size),
         gradient_norm=last_grad_norm,
         learning_rate=float(learning_rate),
         training_steps=training_steps,
-        examples_per_second=(training_examples * max(1, training_steps)) / elapsed,
+        examples_per_second=float(locals().get("transitions_trained", training_examples)) / elapsed,
         gpu_memory_bytes=int(gpu.memory_used_bytes),
         gpu_utilization=float(gpu.utilization_percent),
         historical_retention=0.0,
