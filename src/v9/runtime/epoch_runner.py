@@ -518,6 +518,9 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         ) if not is_bootstrap else None
         if behavior_resolution is not None:
             verdict = "PROMOTED" if matched_hgt_accepted else "REJECTED"
+            runtime.set_telemetry_gauge("hgt_behavior_test_result", verdict)
+            runtime.set_telemetry_gauge("hgt_promotion_result", verdict)
+            runtime.set_telemetry_gauge("hgt_resolved_model_version", str(behavior_resolution))
             print(
                 f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} HGT behavior-test "
                 f"status={verdict} model={behavior_resolution} matched_gain={decision.gain:.4f}",
