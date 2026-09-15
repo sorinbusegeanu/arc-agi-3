@@ -525,10 +525,32 @@ class _HGTWrapper:
         self.model = Model()
 
 
+def _contextualize_transition_rows(rows: list[dict[str, Any]], read_view: Any) -> list[dict[str, Any]]:
+    """Attach bounded M0-M7 relational context summaries to transition rows."""
+    by_context: dict[int, list[tuple[int, int, int]]] = {}
+    for uid, payload in read_view.payloads.items():
+        context = payload.get("context_signature")
+        if context is None:
+            continue
+        node = read_view.nodes.get(uid)
+        if node is None:
+            continue
+        by_context.setdefault(int(context), []).append((int(node.level), int(node.created_watermark), int(payload.get("primary_valence", 0))))
+    contextualized = []
+    for row in rows:
+        related = sorted(by_context.get(int(row["context_signature"]), ()), key=lambda item: item[1], reverse=True)[:32]
+        copy = dict(row)
+        copy["hydra_context_levels"] = tuple(level for level, _, _ in related)
+        copy["hydra_context_valence_sum"] = sum(valence for _, _, valence in related)
+        copy["hydra_context_count"] = len(related)
+        contextualized.append(copy)
+    return contextualized
+
+
 def _transition_features(rows: list[dict[str, Any]], torch: Any, *, input_dim: int = 64):
     features = torch.zeros((len(rows), input_dim), dtype=torch.float32)
     for index, row in enumerate(rows):
-        for offset, value in enumerate((int(row.get("context_signature", 0)), int(row.get("next_context_signature", 0)), int(row.get("action_id", 0)), int(row.get("global_step", 0)), int(row.get("episode_id", 0)))):
+        for offset, value in enumerate((int(row.get("context_signature", 0)), int(row.get("next_context_signature", 0)), int(row.get("action_id", 0)), int(row.get("global_step", 0)), int(row.get("episode_id", 0)), int(row.get("hydra_context_count", 0)), int(row.get("hydra_context_valence_sum", 0)), *tuple(int(v) for v in row.get("hydra_context_levels", ())[:8]))):
             digest = hashlib.blake2b(str(value).encode("ascii"), digest_size=8, person=b"v9-hgt-row").digest()
             features[index, int.from_bytes(digest, "little") % input_dim] += 2.0 if offset == 2 else 1.0
     return features
@@ -950,6 +972,9 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         if callable(training_view_builder)
         else runtime.read_view
     )
+    transition_train_rows = _contextualize_transition_rows(transition_train_rows, read_view)
+    transition_val_rows = _contextualize_transition_rows(transition_val_rows, read_view)
+    runtime.set_telemetry_gauge("hgt_contextual_transition_rows", len(transition_train_rows) + len(transition_val_rows))
     if len(read_view.nodes) < 8:
         return HGTTrainingResult(epoch, "SKIPPED_INSUFFICIENT_DATA", runtime.unified_telemetry.model_version, None, 0.0, 0.0, len(read_view.nodes), 0, None)
     x_dict, edge_index_dict, y_dict, action_targets, action_masks, action_meta, task_targets, task_masks = build_hgt_graph(
