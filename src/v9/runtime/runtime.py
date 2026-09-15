@@ -1303,7 +1303,7 @@ class ContinuousMemoryRuntime:
             self.evidence.append("REPLAY", self._watermark, asdict(result))
             return result
 
-    def record_replanning_evidence(self, *, recovered: bool, improved_efficiency: bool = False) -> None:
+    def record_replanning_evidence(self, *, recovered: bool = False, improved_efficiency: bool = False) -> None:
         self._replans_demonstrated += 1
         self._recovered_replans += int(bool(recovered))
         self._efficient_replans += int(bool(recovered) and bool(improved_efficiency))
