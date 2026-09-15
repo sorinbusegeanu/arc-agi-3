@@ -55,16 +55,63 @@ def _episode_horizon(spec: Any) -> int:
     return 500
 
 
-def _game_step_budget(spec: Any, args: Any, *, previous_episodes: int | None = None) -> int:
+def _initial_game_weight(spec: Any) -> float:
+    # Initial allocation reflects the expected cost of obtaining one complete
+    # trajectory. Later epochs replace this prior with observed trajectory cost.
+    horizon = float(_episode_horizon(spec))
+    return max(1.0, horizon)
+
+
+def _allocate_game_step_budgets(
+    specs: tuple[Any, ...],
+    args: Any,
+    *,
+    previous_game_results: dict[str, dict[str, int | float]] | None = None,
+) -> dict[str, int]:
+    previous_game_results = previous_game_results or {}
+    total_budget = max(len(specs), int(args.steps_per_game) * len(specs))
     minimum_opportunities = max(1, int(getattr(args, "min_episode_opportunities", 2)))
-    horizon_budget = _episode_horizon(spec) * minimum_opportunities
-    base_budget = max(int(args.steps_per_game), horizon_budget)
-    if previous_episodes is not None and int(previous_episodes) > 10:
-        # Fast-reset environments already provide abundant complete trajectories.
-        # Scale toward ten episode opportunities while preserving the horizon floor.
-        scaled = max(1, int(round(base_budget * 10.0 / float(previous_episodes))))
-        return max(horizon_budget, scaled)
-    return base_budget
+    minimums = {
+        str(spec.display_name): _episode_horizon(spec) * minimum_opportunities
+        for spec in specs
+    }
+    weights: dict[str, float] = {}
+    for spec in specs:
+        game = str(spec.display_name)
+        previous = previous_game_results.get(game, {})
+        observed_steps = int(previous.get("steps", 0))
+        observed_episodes = int(previous.get("episodes", 0))
+        if observed_steps > 0 and observed_episodes > 0:
+            # Observed steps per complete trajectory is the best estimate of
+            # how much epoch budget this game needs for equal opportunities.
+            observed_cost = observed_steps / float(observed_episodes)
+            prior_cost = _initial_game_weight(spec)
+            weights[game] = 0.75 * observed_cost + 0.25 * prior_cost
+        else:
+            weights[game] = _initial_game_weight(spec)
+
+    minimum_total = sum(minimums.values())
+    effective_total = max(total_budget, minimum_total)
+    distributable = max(0, effective_total - minimum_total)
+    weight_total = sum(weights.values()) or 1.0
+    budgets = {
+        game: minimums[game] + int(round(distributable * weights[game] / weight_total))
+        for game in weights
+    }
+    # Preserve the exact epoch budget after integer rounding.
+    delta = effective_total - sum(budgets.values())
+    ordered = sorted(weights, key=weights.get, reverse=True)
+    index = 0
+    while delta != 0 and ordered:
+        game = ordered[index % len(ordered)]
+        if delta > 0:
+            budgets[game] += 1
+            delta -= 1
+        elif budgets[game] > minimums[game]:
+            budgets[game] -= 1
+            delta += 1
+        index += 1
+    return budgets
 
 
 def build_epoch_jobs(
@@ -74,19 +121,18 @@ def build_epoch_jobs(
     epoch: int,
     previous_game_results: dict[str, dict[str, int | float]] | None = None,
 ) -> list[tuple[int, Any, int, int]]:
+    # One actor owns one game for its complete dynamically allocated budget.
+    # If more actors than games are requested, extra actors remain unused.
+    budgets = _allocate_game_step_budgets(
+        specs, args, previous_game_results=previous_game_results
+    )
     jobs = []
-    actor_count = max(len(specs), int(args.actors))
-    assigned = [specs[index % len(specs)] for index in range(actor_count)]
-    previous_game_results = previous_game_results or {}
-    for actor_index, spec in enumerate(assigned):
-        previous = previous_game_results.get(str(spec.display_name), {})
-        steps = _game_step_budget(spec, args, previous_episodes=int(previous.get("episodes", 0)))
-        if steps:
-            actor_id = actor_index + 1
-            seed = int(args.seed) + int(epoch) * 1_000_003 + actor_id * 1009
-            jobs.append((actor_id, spec, steps, seed))
+    for actor_index, spec in enumerate(specs[: max(1, int(args.actors))]):
+        steps = int(budgets[str(spec.display_name)])
+        actor_id = actor_index + 1
+        seed = int(args.seed) + int(epoch) * 1_000_003 + actor_id * 1009
+        jobs.append((actor_id, spec, steps, seed))
     return jobs
-
 
 def _environment_viability(rows: list[Any], previous: dict[str, dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
     grouped: dict[str, list[Any]] = {}
