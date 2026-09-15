@@ -1831,6 +1831,13 @@ class ContinuousMemoryRuntime:
             "cross_family_transfer": validated_transfers / max(1, len(self.transfer_trust.records)),
             "grounding_relations": len(self.grounding.states),
             "grounding_counts": grounding_counts,
+            **{f"grounding_G{level}_count": grounding_counts[f"G{level}"] for level in range(6)},
+            "grounding_active_count": sum(int(row.behavior_eligible) for row in self.grounding.states.values()),
+            "grounding_suspended_count": sum(int(row.suspended) for row in self.grounding.states.values()),
+            "grounding_mean_confidence": (
+                sum(row.support / max(1e-9, row.support + row.contradiction) for row in self.grounding.states.values())
+                / max(1, len(self.grounding.states))
+            ),
             "lineage_overlays": len(self.lineages.overlays),
             "lineage_dependencies": len(self.lineages.dependencies),
             "context_scopes": len(self.contexts.records),
@@ -1848,6 +1855,7 @@ class ContinuousMemoryRuntime:
             "isf_decisions_hot": len(self.isf.decisions),
             "replay": self.replay.state_dict(),
             "symbol_conditioned_prediction_delta": self._symbol_prediction_delta_sum / max(1, prediction_observations),
+            "symbol_prediction_gain": self._symbol_prediction_delta_sum / max(1, prediction_observations),
             "prediction_error": self._prediction_error_sum / max(1, self._prediction_error_count),
             "persistent_consolidated_bytes": persistent_bytes,
             "persistent_memory_growth_ratio": total_memories / max(1, self.telemetry["events"]),
