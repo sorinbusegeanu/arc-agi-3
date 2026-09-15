@@ -9,6 +9,9 @@ from pathlib import Path
 from random import Random
 from typing import Any, Callable
 
+from v9.cognition.action_selection import adaptive_epsilon, action_scores, policy_uncertainty, scoped_action_key
+from v9.runtime.actor_policy import ActorPolicySnapshot
+
 
 TRACE_STEPS_PER_GAME = 100
 _MAX_TEXT = 32768
@@ -155,11 +158,16 @@ def run_trace_bundle(
     alfred_backend_factory: str | None,
     make_adapter: Callable[..., Any],
     steps_per_game: int = TRACE_STEPS_PER_GAME,
+    policy: ActorPolicySnapshot | None = None,
+    epsilon: float = 0.10,
 ) -> Path:
     trace_root = Path(root) / "trace"
     trace_root.mkdir(parents=True, exist_ok=True)
     manifest: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "policy_model_version": None if policy is None else policy.model_version,
+        "policy_generation": None if policy is None else int(policy.generation),
+        "epsilon": float(epsilon),
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "steps_per_game": int(steps_per_game),
         "games": [],
@@ -207,7 +215,45 @@ def run_trace_bundle(
                 semantic_delta_fn = getattr(adapter, "semantic_delta", lambda left, right: ())
                 semantic_before = tuple(semantic_observation_fn(before))
                 labels_before = _action_labels(adapter, actions)
-                action = int(rng.choice(actions))
+                random_control_action = int(rng.choice(actions))
+                decision_trace: dict[str, object]
+                if policy is None:
+                    action = random_control_action
+                    decision_trace = {"source": "RANDOM_CONTROL", "effective_epsilon": 1.0, "exploration": True}
+                else:
+                    environment_instance_id = int(identity.instance_id.value)
+                    learned_scores = policy.learned_scores(environment_instance_id, actions, environment_type=identity.environment_type, context_signature=before_signature)
+                    grounded_scores = policy.grounded_scores(actions, environment_type=identity.environment_type, context_signature=before_signature)
+                    action_schema_id = int(adapter.action_schema().schema_id)
+                    hydra_raw = {int(a): float(policy.normalized_action_supports.get(scoped_action_key(int(a), action_schema_id=action_schema_id, environment_type=identity.environment_type), 0.0)) for a in actions}
+                    hydra_max = max(hydra_raw.values(), default=0.0)
+                    hydra_scores = {a: (0.05 * v / hydra_max if hydra_max > 0.0 else 0.0) for a, v in hydra_raw.items()}
+                    enriched = {int(a): float(learned_scores.get(int(a), 0.0)) + float(grounded_scores.get(int(a), 0.0)) for a in actions}
+                    combined = action_scores(policy, actions, learned_scores=enriched, target_environment_id=environment_instance_id, action_schema_id=action_schema_id, environment_type=identity.environment_type)
+                    uncertainty = policy_uncertainty(actions, combined)
+                    effective = adaptive_epsilon(float(epsilon), len(actions), coverage=0.0, uncertainty=uncertainty, stagnation=0.0)
+                    exploration = rng.random() < effective
+                    if exploration:
+                        unseen = tuple(a for a in actions if hydra_raw.get(int(a), 0.0) == 0.0 and enriched.get(int(a), 0.0) == 0.0)
+                        candidates = unseen or actions
+                        action = int(candidates[rng.randrange(len(candidates))])
+                        source = "EXPLORATION"
+                    else:
+                        action = min(actions, key=lambda a: (-combined[int(a)], int(a)))
+                        parts = {"HGT": abs(float(learned_scores.get(int(action), 0.0))), "M7_STRATEGY": abs(float(grounded_scores.get(int(action), 0.0))), "HYDRA": abs(float(hydra_scores.get(int(action), 0.0)))}
+                        source = max(parts, key=parts.get) if max(parts.values(), default=0.0) > 0.0 else "FALLBACK"
+                    decision_trace = {
+                        "source": source, "exploration": exploration, "effective_epsilon": effective, "policy_uncertainty": uncertainty,
+                        "hydra_scores": {str(a): hydra_scores[int(a)] for a in actions},
+                        "hgt_scores": {str(a): float(learned_scores.get(int(a), 0.0)) for a in actions},
+                        "m7_grounded_scores": {str(a): float(grounded_scores.get(int(a), 0.0)) for a in actions},
+                        "combined_scores": {str(a): float(combined.get(int(a), 0.0)) for a in actions},
+                        "hgt_preference": min(actions, key=lambda a: (-float(learned_scores.get(int(a), 0.0)), int(a))),
+                        "hydra_preference": min(actions, key=lambda a: (-float(hydra_scores.get(int(a), 0.0)), int(a))),
+                        "m7_preference": min(actions, key=lambda a: (-float(grounded_scores.get(int(a), 0.0)), int(a))),
+                        "policy_action": int(action), "random_control_action": int(random_control_action),
+                        "hgt_changed_hydra_action": int(action) != min(actions, key=lambda a: (-float(hydra_scores.get(int(a), 0.0)), int(a))),
+                    }
                 action_label = labels_before.get(action, str(action))
                 semantic_action = tuple(semantic_action_fn(action))
                 semantic_options = tuple(fact for candidate in actions[:64] for fact in semantic_action_fn(candidate))
@@ -242,6 +288,7 @@ def run_trace_bundle(
                         for value in actions
                     ],
                     "chosen_action": {"token": action, "semantic": action_label},
+                    "action_selection": decision_trace,
                     "semantic_before": [list(x) for x in semantic_before],
                     "semantic_action": [list(x) for x in semantic_action],
                     "semantic_options": [list(x) for x in semantic_options],
