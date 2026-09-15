@@ -162,7 +162,6 @@ def run_synthetic_h16_controls(
     evaluation_id: int = 1,
     run_state: H16RunState | None = None,
 ) -> tuple[H16Trial, ...]:
-    """Execute deterministic arbitrary-symbol C0-C3 controls with matched budgets."""
     if interaction_budget < 6:
         raise ValueError("synthetic H16 requires at least six interactions")
 
@@ -217,14 +216,11 @@ def save_h16_evidence(path: str | Path, trials: tuple[H16Trial, ...], report: H1
     report = report or evaluate_h16(trials)
     payload = {
         "schema_version": 1,
-        "trials": [
-            {**asdict(row), "condition": row.condition.value}
-            for row in trials
-        ],
+        "trials": [{**asdict(row), "condition": row.condition.value} for row in trials],
         "report": {
             "status": report.result.status.value,
             "effect": report.result.effect,
-            "samples": report.result.samples,
+            "trials": report.result.trials,
             "reason": report.result.reason,
             "means": report.means,
             "matched": report.matched,
