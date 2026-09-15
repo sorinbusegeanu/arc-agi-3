@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from v9.environments.schemas import EnvironmentIdentity
-from v9.memory.identity import EpisodeId, EventUid, stable_u64
+from v9.memory.identity import EpisodeId, EventUid, MemoryUid, stable_u64
 from v9.modalities.contract import PassiveSymbolEvent, SYMBOL_MODALITY, TimelineIdentity
 from v9.modalities.symbols import DeterministicSymbolCodec
 
@@ -79,6 +79,18 @@ def publish_encoded_transition(runtime, transition: EncodedTransition) -> None:
         runtime.submit(experience, episode_id=episode_id)
 
     publish_transition_symbols(runtime, transition)
+
+    if (
+        transition.strategy_terminal
+        and transition.strategy_uid_hi is not None
+        and transition.strategy_uid_lo is not None
+    ):
+        runtime.record_strategy_execution(
+            MemoryUid(int(transition.strategy_uid_hi), int(transition.strategy_uid_lo)),
+            success=bool(transition.task_success),
+            realized_cost=max(1, int(transition.strategy_realized_cost)),
+            primary_valence=int(transition.primary_valence),
+        )
 
     runtime.record_curriculum_event(
         step=transition.curriculum_step,
