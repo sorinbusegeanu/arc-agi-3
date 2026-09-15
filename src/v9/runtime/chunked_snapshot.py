@@ -254,14 +254,22 @@ def load_snapshot_parts(path: Path, *, expected_config_id: str) -> tuple[dict[st
         raise RuntimeError("direct shard restore requires native v9 snapshot v4")
     if manifest.get("scientific_config_id") != expected_config_id:
         raise RuntimeError("snapshot ScientificConfigId does not match this run")
+    if str(manifest.get("state_format", "")) != STATE_FORMAT:
+        raise RuntimeError("snapshot binary state format is unsupported")
     root = path.parent.parent
     runtime_bytes = _checked_chunks(root, list(manifest.get("runtime_state_chunks", [])), str(manifest.get("runtime_state_sha256", "")), "runtime state")
     graph_header_bytes = _checked_chunks(root, list(manifest.get("graph_header_chunks", [])), str(manifest.get("graph_header_sha256", "")), "graph header")
     state = dict(pickle.loads(runtime_bytes))
     graph_header = dict(pickle.loads(graph_header_bytes))
+    shard_specs = sorted(list(manifest.get("graph_shards", [])), key=lambda row: int(row["partition"]))
+    expected_partitions = int(graph_header.get("partition_count", 0))
+    if expected_partitions <= 0 or len(shard_specs) != expected_partitions:
+        raise RuntimeError("snapshot graph shard count mismatch")
     shards = []
-    for spec in sorted(list(manifest.get("graph_shards", [])), key=lambda row: int(row["partition"])):
+    for expected_partition, spec in enumerate(shard_specs):
         partition = int(spec["partition"])
+        if partition != expected_partition:
+            raise RuntimeError("snapshot graph shard sequence mismatch")
         payload = _checked_chunks(root, list(spec.get("chunks", [])), str(spec.get("sha256", "")), f"graph shard {partition}")
         shards.append((partition, payload))
     return state, graph_header, shards
