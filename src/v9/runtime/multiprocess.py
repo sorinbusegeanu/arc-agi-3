@@ -180,6 +180,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
             positives = negatives = episode_boundaries = resets = completed = 0
             task_successes = task_failures = task_truncations = levels_completed = 0
             grounded_action_influence = 0
+            context_action_counts: dict[int, dict[int, int]] = {}
             episode_ordinal = 1
             policy = initial_policy
             policy_refreshes = 0
@@ -228,7 +229,19 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                 }
                 grounded_preference = min(actions, key=lambda value: (-float(enriched_scores.get(int(value), 0.0)), int(value)))
                 grounded_action_influence += int(base_preference != grounded_preference)
-                action = choose_action(policy, actions, rng=rng, epsilon=float(epsilon), learned_scores=enriched_scores, target_environment_id=environment_instance_id, action_schema_id=action_schema_id, environment_type=identity.environment_type)
+                context_counts = context_action_counts.setdefault(before_signature, {})
+                action = choose_action(
+                    policy,
+                    actions,
+                    rng=rng,
+                    epsilon=float(epsilon),
+                    learned_scores=enriched_scores,
+                    target_environment_id=environment_instance_id,
+                    action_schema_id=action_schema_id,
+                    environment_type=identity.environment_type,
+                    context_action_counts=context_counts,
+                )
+                context_counts[int(action)] = int(context_counts.get(int(action), 0)) + 1
                 semantic_action_fn = getattr(adapter, "semantic_action", None)
                 semantic_delta_fn = getattr(adapter, "semantic_delta", None)
                 semantic_action = tuple(semantic_action_fn(action)) if callable(semantic_action_fn) else ()
