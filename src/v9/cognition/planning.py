@@ -18,8 +18,10 @@ class StrategyLike(Protocol):
 T = TypeVar("T", bound=StrategyLike)
 
 
-def _rank(row: StrategyLike) -> tuple[float, float, float, MemoryUid]:
+def _rank(row: StrategyLike) -> tuple[float, float, float, float, MemoryUid]:
+    grounding = float(getattr(row, "grounding_authority", 0.0))
     return (
+        -grounding,
         -float(row.reliability),
         -float(row.primary_valence),
         -(float(row.relative_efficiency) if row.relative_efficiency is not None else -1.0),
@@ -31,7 +33,7 @@ def choose_strategy(strategies: tuple[T, ...], *, target_environment_id: int, av
     eligible = tuple(
         row for row in strategies
         if int(row.environment_id) == int(target_environment_id)
-        and row.reliability > 0
+        and (row.reliability > 0 or float(getattr(row, "grounding_authority", 0.0)) > 0.0)
         and row.native_actions
         and (not available_actions or int(row.native_actions[0]) in available_actions)
     )
