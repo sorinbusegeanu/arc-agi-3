@@ -31,5 +31,5 @@ class M1NormalizedRelation:
         uid = MemoryUid.from_key(MemoryLevel.M1, MemoryType.NORMALIZED_RELATION, (signature,))
         parent_ids = tuple(row.uid for row in parents)
         evidence = tuple(uid for row in parents for uid in row.provenance.evidence)
-        return cls(uid, observable_relation, channel, signature, DerivationProvenance(parent_ids, evidence))
+        watermark = max((int(getattr(row, "created_watermark", 0)) for row in parents), default=0)\n        return cls(uid, observable_relation, channel, signature, DerivationProvenance(parent_ids, evidence), float(len(parents)), 0.0, (), watermark)
 
