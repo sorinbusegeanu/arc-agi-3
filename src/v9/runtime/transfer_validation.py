@@ -333,6 +333,7 @@ def run_transfer_validation_interval(
     snapshot = runtime.actor_policy_snapshot()
     tasks: list[tuple[dict[str, Any], Any, int]] = []
     blocked_concepts: dict[Any, list[str]] = {}
+    scheduled_concepts: set[Any] = set()
     base_seed = int(getattr(args, "seed", 0)) + int(epoch) * 10_000_019 + 7_000_001
 
     for candidate in candidates:
@@ -351,6 +352,7 @@ def run_transfer_validation_interval(
             spec = target_specs[trial_index % len(target_specs)]
             seed = base_seed + len(tasks) * 1009 + trial_index
             tasks.append((candidate, spec, seed))
+            scheduled_concepts.add(concept_uid)
 
     if not tasks:
         blocker = "no eligible transfer-validation trials"
@@ -447,7 +449,9 @@ def run_transfer_validation_interval(
     concept_uids = {candidate["concept_uid"] for candidate in candidates}
     for concept_uid in concept_uids:
         rows = results_by_concept.get(concept_uid, [])
-        blockers = blocked_concepts.get(concept_uid, [])
+        blockers = list(blocked_concepts.get(concept_uid, []))
+        if concept_uid not in scheduled_concepts and not blockers:
+            blockers.append("not scheduled: interval trial budget exhausted")
         now_validated = bool(runtime.is_concept_validated(concept_uid))
         concept_passed = sum(int(row.blocker is None and row.matched and row.effect > threshold) for row in rows)
         _append_transfer_log(
