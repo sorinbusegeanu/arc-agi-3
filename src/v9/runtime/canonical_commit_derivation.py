@@ -23,6 +23,15 @@ def derivation_candidates(runtime: Any, signatures: set[int]) -> tuple[Derivatio
             if payload is not None and payload.get("environment_instance_id") is not None:
                 environments.add(int(payload["environment_instance_id"]))
         scope = tuple(sorted(environments or runtime._formation_environments))
+        confidence_values = []
+        for uid in evidence:
+            payload = runtime.graph.payloads.get(uid)
+            if payload is None:
+                deferred = runtime._deferred_base_nodes.get(uid)
+                payload = None if deferred is None else deferred[1]
+            if payload is not None:
+                confidence_values.append(float(payload.get("evidence_confidence", 1.0)))
+        evidence_confidence = sum(confidence_values) / len(confidence_values) if confidence_values else 1.0
         candidates.append(
             DerivationTask(
                 0,
@@ -31,6 +40,7 @@ def derivation_candidates(runtime: Any, signatures: set[int]) -> tuple[Derivatio
                 support,
                 scope,
                 int(runtime._watermark),
+                evidence_confidence,
             )
         )
     return tuple(candidates)
