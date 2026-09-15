@@ -808,6 +808,80 @@ def rollback_hgt_model(runtime: Any, *, root: str | Path) -> str | None:
     return str(parent_version)
 
 
+
+def _checkpoint_architecture(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    metadata = checkpoint.get("metadata")
+    if not isinstance(metadata, (list, tuple)) or len(metadata) != 2:
+        raise RuntimeError("HGT checkpoint is missing self-describing metadata")
+    node_types = [str(value) for value in metadata[0]]
+    edge_types = [tuple(str(part) for part in edge) for edge in metadata[1]]
+    if any(len(edge) != 3 for edge in edge_types):
+        raise RuntimeError("HGT checkpoint contains invalid edge metadata")
+    return {
+        "model_schema_version": int(checkpoint.get("model_schema_version", 0)),
+        "metadata": (node_types, edge_types),
+        "input_dim": int(checkpoint["input_dim"]),
+        "hidden_dim": int(checkpoint["hidden_dim"]),
+        "layers": int(checkpoint["layers"]),
+        "heads": int(checkpoint["heads"]),
+    }
+
+
+def _architecture_sidecar_path(checkpoint_path: Path) -> Path:
+    return checkpoint_path.with_suffix(".metadata.json")
+
+
+def _write_architecture_sidecar(checkpoint_path: Path, architecture: dict[str, Any]) -> None:
+    payload = dict(architecture)
+    payload["metadata"] = [
+        list(architecture["metadata"][0]),
+        [list(edge) for edge in architecture["metadata"][1]],
+    ]
+    sidecar = _architecture_sidecar_path(checkpoint_path)
+    temporary = sidecar.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, sidecar)
+
+
+def _load_self_describing_model(checkpoint: dict[str, Any], device: Any):
+    architecture = _checkpoint_architecture(checkpoint)
+    if architecture["model_schema_version"] != MODEL_SCHEMA_VERSION:
+        raise RuntimeError("HGT checkpoint schema changed")
+    model = _HGTWrapper(
+        architecture["metadata"],
+        input_dim=architecture["input_dim"],
+        hidden_dim=architecture["hidden_dim"],
+        layers=architecture["layers"],
+        heads=architecture["heads"],
+    ).model.to(device)
+    model.load_state_dict(checkpoint["model_state"])
+    return model, architecture
+
+
+def _migrate_model_state(source_model: Any, source_metadata: tuple[list[str], list[tuple[str, str, str]]], target_model: Any, target_metadata: tuple[list[str], list[tuple[str, str, str]]]) -> None:
+    source = source_model.state_dict()
+    target = target_model.state_dict()
+    source_edges = {edge: index for index, edge in enumerate(source_metadata[1])}
+    target_edges = {edge: index for index, edge in enumerate(target_metadata[1])}
+    relation_tensors = {
+        f"layers.{layer}.{name}.weight"
+        for layer in range(len(getattr(target_model, "layers", ())))
+        for name in ("k_rel", "v_rel")
+    }
+    for key, value in source.items():
+        if key in relation_tensors:
+            continue
+        if key in target and tuple(target[key].shape) == tuple(value.shape):
+            target[key].copy_(value)
+    for key in relation_tensors:
+        if key not in source or key not in target:
+            continue
+        for edge, source_index in source_edges.items():
+            target_index = target_edges.get(edge)
+            if target_index is not None:
+                target[key][target_index].copy_(source[key][source_index])
+    target_model.load_state_dict(target)
+
 def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_rate: float, root: str | Path, allow_promotion: bool = True, _budget_scale: float = 1.0, _oom_retry: int = 0) -> HGTTrainingResult:
     try:
         torch, _, _ = _require_torch()
