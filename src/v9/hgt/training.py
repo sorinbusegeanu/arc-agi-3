@@ -913,10 +913,13 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             try:
                 environment_families[environment_id] = str(runtime.environments.resolve(environment_id).family)
             except KeyError:
-                pass
+                environment_families[environment_id] = "unregistered"
+                runtime.set_telemetry_gauge(
+                    "hgt_unregistered_environment_count",
+                    sum(1 for family in environment_families.values() if family == "unregistered"),
+                )
     train_masks = {key: mask.clone() for key, mask in action_masks.items()}
     training_examples = _masked_count(train_masks, action_masks)
-    validation_examples = 0
     if training_examples <= 0:
         return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, None, 0.0, 0.0, action_examples, 0, None)
     dynamic_training_steps = max(
@@ -1150,7 +1153,6 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             "action_ranking_pairs": len(epoch_ranking_pairs),
             "training_coverage": float(coverage),
             "training_examples": training_examples,
-            "validation_examples": 0,
             "action_scores": action_scores,
             "context_action_scores": context_action_scores,
         }
@@ -1158,10 +1160,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         temporary_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary_manifest, manifest_path)
         model_version = candidate_version
-        try:
-            runtime.set_hgt_action_scores(action_scores, context_action_scores=context_action_scores)
-        except TypeError:
-            runtime.set_hgt_action_scores(action_scores)
+        runtime.set_hgt_action_scores(action_scores, context_action_scores=context_action_scores)
     else:
         model_version = str(parent_version)
     gpu = read_gpu_snapshot()
