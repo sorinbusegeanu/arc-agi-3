@@ -30,7 +30,7 @@ MEMORY_NODE_TYPES = (
 NODE_TYPE = "M0_EPISODE"
 OBJECTIVE_NAMES = ("transition", "consequence", "relevance", "correspondence", "similarity", "strategy", "grounding", "deliberation_improvement", "invariance")
 AUX_OBJECTIVES = ("transition", "relevance", "correspondence", "similarity", "grounding", "deliberation_improvement", "invariance")
-SEMANTIC_NODE_TYPES = ("ENTITY", "ACTION", "TEXT", "STATE", "EFFECT")
+SEMANTIC_NODE_TYPES = ("ENTITY", "ACTION", "SYMBOL", "STATE", "EFFECT")
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,7 +143,7 @@ def _semantic_node_type(kind: int) -> str:
     if int(kind) == 8:
         return "ACTION"
     if int(kind) == 7:
-        return "TEXT"
+        return "SYMBOL"
     if int(kind) == 9:
         return "EFFECT"
     if int(kind) in {5, 6}:
