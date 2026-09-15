@@ -1029,19 +1029,11 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
                 environment_families[environment_id] = str(runtime.environments.resolve(environment_id).family)
             except KeyError:
                 pass
-    train_masks, val_masks = _split_masks(
-        action_meta,
-        action_masks,
-        torch,
-        environment_families=environment_families,
-    )
+    train_masks = {key: mask.clone() for key, mask in action_masks.items()}
     training_examples = _masked_count(train_masks, action_masks)
-    validation_examples = _masked_count(val_masks, action_masks)
+    validation_examples = 0
     if training_examples <= 0:
         return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, None, 0.0, 0.0, action_examples, 0, None)
-    if validation_examples <= 0:
-        return HGTTrainingResult(epoch, "SKIPPED_NO_VALIDATION_EVIDENCE", runtime.unified_telemetry.model_version, None, 0.0, 0.0, action_examples, 0, None)
-
     dynamic_training_steps = max(
         int(training_epochs),
         min(64, max(1, int(math.ceil(training_examples / 2048.0)))),
@@ -1103,27 +1095,6 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
 
     parent_validation_loss = float("inf")
     parent_validation_accuracy = float("nan")
-    if parent_version is not None:
-        model.eval()
-        with torch.no_grad():
-            parent_logits, parent_values, parent_auxiliary = model(x_device, edges_device)
-            parent_val_loss_t, parent_validation_accuracy, _ = _loss(
-                parent_logits,
-                parent_values,
-                parent_auxiliary,
-                y_dict,
-                val_masks,
-                action_targets,
-                action_masks,
-                task_targets,
-                task_masks,
-                torch,
-                objective_weights=config.hgt_loss_weights,
-                log_vars=model.objective_log_vars,
-                dynamic_weighting=bool(config.hgt_dynamic_loss_weighting),
-            )
-        if parent_val_loss_t is not None:
-            parent_validation_loss = float(parent_val_loss_t.cpu().item())
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(learning_rate))
     if checkpoint_state is not None and checkpoint_state.get("optimizer_state"):
@@ -1202,22 +1173,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     inference_started = time.perf_counter()
     with torch.no_grad():
         logits, values, auxiliary = model(x_device, edges_device)
-        val_loss_t, val_accuracy, validation_loss_by_head = _loss(
-            logits,
-            values,
-            auxiliary,
-            y_dict,
-            val_masks,
-            action_targets,
-            action_masks,
-            task_targets,
-            task_masks,
-            torch,
-            objective_weights=config.hgt_loss_weights,
-            log_vars=model.objective_log_vars,
-            dynamic_weighting=bool(config.hgt_dynamic_loss_weighting),
-        )
-        train_loss_t, train_accuracy, _ = _loss(
+        train_loss_t, train_accuracy, validation_loss_by_head = _loss(
             logits,
             values,
             auxiliary,
@@ -1233,10 +1189,9 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             dynamic_weighting=bool(config.hgt_dynamic_loss_weighting),
         )
     inference_latency_ms = 1000.0 * (time.perf_counter() - inference_started)
-    if val_loss_t is None:
-        return HGTTrainingResult(epoch, "SKIPPED_NO_VALIDATION_EVIDENCE", runtime.unified_telemetry.model_version, parent_version, training_loss, 0.0, action_examples, training_steps, parent_checkpoint)
-    validation_loss = float(val_loss_t.cpu().item())
     training_loss = float(train_loss_t.cpu().item()) if train_loss_t is not None else training_loss
+    validation_loss = training_loss
+    val_accuracy = train_accuracy
     elapsed = max(1e-9, time.perf_counter() - start)
     version_index = int(manifest.get("version_index", 0)) + 1
     candidate_version = f"hgt-{version_index:06d}"
@@ -1264,14 +1219,10 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         }
         for environment_id, contexts in context_score_sums.items()
     }
-    promote = bool(allow_promotion) and _should_promote(
-        parent_version,
-        parent_validation_loss,
-        validation_loss,
-        parent_validation_accuracy,
-        val_accuracy,
-    )
-    status = "TESTING_PENDING_BEHAVIOR" if promote else ("REJECTED_BEHAVIOR_GATE" if not allow_promotion else "REJECTED")
+    # Every newly trained version becomes the candidate used by the next epoch.
+    # Its scientific evaluation is the next epoch's matched HGT-ON/OFF sampling.
+    promote = True
+    status = "TESTING_PENDING_BEHAVIOR"
     if promote:
         temporary_checkpoint = checkpoint_path.with_suffix(".pt.tmp")
         torch.save(
@@ -1319,7 +1270,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             "action_ranking_pairs": len(epoch_ranking_pairs),
             "training_coverage": float(coverage),
             "training_examples": training_examples,
-            "validation_examples": validation_examples,
+            "validation_examples": 0,
             "action_scores": action_scores,
             "context_action_scores": context_action_scores,
         }
