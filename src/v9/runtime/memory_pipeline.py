@@ -108,7 +108,7 @@ def _prepare_symbols(task: IngestionTask, transition: EncodedTransition, identit
         )
         occurrences.append(SymbolOccurrence(
             event.identity.event_id, row.symbol_id, row.position.value, row.stream_id, row.vocabulary_id,
-            str(codec.codec_id), int(event.identity.causal_watermark), int(transition.global_step), index,
+            f"{codec.vocabulary.codec_name}:{codec.vocabulary.version}", int(event.identity.causal_watermark), int(transition.global_step), index,
             environment, episode_id, event.identity.event_id,
         ))
         payload_digest = stable_u64(row.vocabulary_id.value, row.stream_id.value, row.symbol_id.value, row.position.value, person=b"v9-symbol-payload")
