@@ -45,6 +45,7 @@ class HGTTrainingResult:
     training_steps: int
     checkpoint: str | None
     validation_accuracy: float = 0.0
+    training_accuracy: float = 0.0
     inference_latency_ms: float = 0.0
     subgraph_nodes: int = 0
     subgraph_edges: int = 0
@@ -1327,7 +1328,8 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         examples=action_examples,
         training_steps=training_steps,
         checkpoint=checkpoint_rel if promote else parent_checkpoint,
-        validation_accuracy=float(val_accuracy),
+        validation_accuracy=0.0,
+        training_accuracy=float(train_accuracy),
         inference_latency_ms=float(inference_latency_ms),
         subgraph_nodes=sum(int(value.shape[0]) for value in x_dict.values()),
         subgraph_edges=sum(int(value.shape[1]) for value in edge_index_dict.values()),
