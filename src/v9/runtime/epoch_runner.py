@@ -91,7 +91,6 @@ def _environment_viability(rows: list[Any]) -> dict[str, dict[str, Any]]:
         grouped.setdefault(str(row.game_id), []).append(row)
     profiles: dict[str, dict[str, Any]] = {}
     for game, game_rows in grouped.items():
-        episodes = sum(int(row.episode_boundaries) for row in game_rows)
         successes = sum(int(row.task_successes) for row in game_rows)
         failures = sum(int(row.task_failures) for row in game_rows)
         truncations = sum(int(row.task_truncations) for row in game_rows)
@@ -99,17 +98,37 @@ def _environment_viability(rows: list[Any]) -> dict[str, dict[str, Any]]:
         negatives = sum(int(row.negative_boundaries) for row in game_rows)
         levels = max((int(row.levels_completed) for row in game_rows), default=0)
         steps = sum(int(row.steps) for row in game_rows)
-        progress = successes + positives + levels
         complete = successes + failures + truncations
+        contexts = sum(int(getattr(row, "unique_contexts", 0)) for row in game_rows)
+        context_actions = sum(int(getattr(row, "unique_context_actions", 0)) for row in game_rows)
+        changed = sum(int(getattr(row, "changed_transitions", 0)) for row in game_rows)
+        mean_branch = sum(float(getattr(row, "mean_branching_factor", 0.0)) * max(1, int(row.steps)) for row in game_rows) / max(1, steps)
+        max_branch = max((int(getattr(row, "max_branching_factor", 0)) for row in game_rows), default=0)
+        coverage = min(1.0, context_actions / max(1.0, contexts * max(1.0, mean_branch)))
+        action_influence = min(1.0, changed / max(1, steps))
+        progress = successes + positives + levels
+        reasons: list[str] = []
         if complete < 3:
-            state, confidence, reasons = "PROBING", min(1.0, complete / 3.0), ["insufficient complete episodes"]
+            state, confidence = "PROBING", min(1.0, complete / 3.0)
+            reasons.append("insufficient complete episodes")
         elif progress > 0:
-            state, confidence, reasons = "VIABLE", min(1.0, 0.5 + complete / 20.0), ["observed reachable progress"]
-        elif complete >= 10:
-            state, confidence, reasons = "VIABILITY_ANOMALY", min(1.0, complete / 20.0), ["10+ complete episodes with no observed progress"]
+            state, confidence = "VIABLE", min(1.0, 0.5 + complete / 20.0)
+            reasons.append("observed reachable progress")
+        elif complete >= 10 and coverage >= 0.50 and action_influence >= 0.10:
+            state, confidence = "VIABILITY_ANOMALY", min(1.0, (complete / 20.0) * (0.5 + 0.5 * coverage))
+            reasons.append("10+ complete episodes with broad action coverage and no progress")
         else:
-            state, confidence, reasons = "LOW_EVIDENCE", min(1.0, complete / 10.0), ["complete episodes observed without progress"]
-        profiles[game] = {"state": state, "confidence": confidence, "steps": steps, "complete_episodes": complete, "successes": successes, "failures": failures, "truncations": truncations, "positive_boundaries": positives, "negative_boundaries": negatives, "levels_completed": levels, "reasons": reasons}
+            state, confidence = "LOW_EVIDENCE", min(1.0, complete / 10.0)
+            reasons.append("additional coverage or progress evidence required")
+        evidence_confidence = 1.0 if state == "VIABLE" else max(0.10, 1.0 - confidence) if state == "VIABILITY_ANOMALY" else max(0.25, confidence)
+        profiles[game] = {
+            "state": state, "confidence": confidence, "evidence_confidence": evidence_confidence,
+            "steps": steps, "complete_episodes": complete, "successes": successes,
+            "failures": failures, "truncations": truncations, "positive_boundaries": positives,
+            "negative_boundaries": negatives, "levels_completed": levels, "mean_branching_factor": mean_branch,
+            "max_branching_factor": max_branch, "action_coverage": coverage,
+            "action_influence": action_influence, "reasons": reasons,
+        }
     return profiles
 
 
