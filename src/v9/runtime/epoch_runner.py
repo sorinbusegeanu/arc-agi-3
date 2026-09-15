@@ -7,7 +7,6 @@ import time
 from typing import Any
 
 from v9.hgt import rollback_hgt_model, train_hgt_epoch
-from v9.memory.identity import stable_u64
 from v9.memory.m1_normalized import NormalizedChannel
 from v9.telemetry import HGTInferenceSample, OptimizationSample
 from .lifecycle import run_lifecycle_maintenance
@@ -22,27 +21,6 @@ class EpochRunResult:
     training: dict[str, Any]
     performance: dict[str, Any]
     metrics: dict[str, Any]
-
-
-def _spec_environment_instance_id(spec: Any) -> int:
-    """Reproduce adapter EnvironmentIdentity.instance_id without requiring adapter construction."""
-    adapter = str(getattr(spec, "adapter", "auto")).lower()
-    game_id = str(getattr(spec, "game_id", ""))
-    lowered = game_id.lower()
-    if adapter == "auto":
-        if game_id == "FrozenLake-v1":
-            adapter = "gym_discrete"
-        elif lowered in {"chess-v0", "arcagi/chess-v0"}:
-            adapter = "chess"
-        elif lowered in {"sudoku-v0", "arcagi/sudoku-v0"}:
-            adapter = "sudoku"
-        elif lowered in {"synthetic", "synthetic-symbolic"}:
-            adapter = "synthetic_symbolic"
-        else:
-            adapter = "arc"
-    # Actor results already carry the real environment id; this helper is only a
-    # fallback for specs whose adapter identity is deterministic from configuration.
-    return int(stable_u64(adapter, game_id, repr(sorted(dict(getattr(spec, "kwargs", {}) or {}).items())), person=b"v9-env-spec"))
 
 
 def _episode_horizon(spec: Any) -> int:
