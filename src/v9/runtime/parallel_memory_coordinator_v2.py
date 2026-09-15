@@ -22,6 +22,7 @@ def run_parallel_memory_jobs(
     shards: int,
     queue_capacity: int,
     epsilon: float,
+    stagnation_by_game: dict[str, float] | None = None,
     env_root: str | None,
     alfred_backend_factory: str | None,
     start_method: str | None,
@@ -79,6 +80,8 @@ def run_parallel_memory_jobs(
         actor_id, spec, steps, seed = pending.pop(0)
         slot = free_slots.pop(0)
         launch_started = time.perf_counter()
+        game_name = str(getattr(spec, "display_name", getattr(spec, "game_id", "")))
+        stagnation = float((stagnation_by_game or {}).get(game_name, 0.0))
         topology.start_actor(
             index=slot,
             spec=spec,
@@ -91,6 +94,7 @@ def run_parallel_memory_jobs(
             run_nonce=run_nonce,
             initial_policy=runtime.actor_policy_snapshot(),
             epsilon=float(epsilon),
+            stagnation=stagnation,
             policy_refresh_steps=int(actor_view_refresh_steps),
             policy_refresh_ms=float(actor_view_refresh_ms),
         )
