@@ -79,7 +79,7 @@ def test_hgt_graph_builder_accepts_immutable_read_view_edges(monkeypatch) -> Non
     monkeypatch.setattr(training, "_require_torch", lambda: (_FakeTorch, None, None))
     _x, edge_indexes, _y, _targets, _masks, _meta = training.build_hgt_graph(read_view)
     assert isinstance(read_view.edges, tuple)
-    assert ("M0", "PROVENANCE", "M1") in edge_indexes
+    assert ("M0_EPISODE", "PROVENANCE", "M1_NORMALIZED_RELATION") in edge_indexes
 
 
 def test_hgt_graph_sampling_keeps_relation_endpoints(monkeypatch) -> None:
