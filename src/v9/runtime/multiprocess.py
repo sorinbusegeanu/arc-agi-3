@@ -52,6 +52,10 @@ class EncodedTransition:
     semantic_options: tuple[tuple[int, int, int, int, float], ...] = ()
     semantic_after: tuple[tuple[int, int, int, int, float], ...] = ()
     semantic_delta: tuple[tuple[int, int, int, int, float], ...] = ()
+    strategy_uid_hi: int | None = None
+    strategy_uid_lo: int | None = None
+    strategy_terminal: bool = False
+    strategy_realized_cost: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +309,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     active_strategy_actions = ()
                     active_strategy_position = 0
                     active_strategy_outcome = None
+                executed_strategy_uid = active_strategy_uid if planned_action is not None and not explore_over_strategy else None
                 if planned_action is not None and not explore_over_strategy:
                     active_strategy_position += 1
                     # Keep the completed procedure active until environment
@@ -324,6 +329,11 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                 progress = adapter.task_progress()
                 observation_schema_id = int(adapter.observation_schema().schema_id)
                 available_after = tuple(sorted(set(int(v) for v in adapter.available_actions())))
+                strategy_terminal = bool(
+                    executed_strategy_uid is not None
+                    and active_strategy_position >= len(active_strategy_actions)
+                    and (progress.success or progress.failure or not boundary.continuation)
+                )
                 stage_queue.put(
                     EncodedTransition(
                         actor_id=actor_id,
@@ -354,6 +364,10 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                         curriculum_step=getattr(spec, "curriculum_step", None),
                         game_scenario=str(getattr(spec, "game_id", identity.environment_type)),
                         symbols_only=str(getattr(spec, "condition", "") or "").upper() == "C1",
+                        strategy_uid_hi=None if executed_strategy_uid is None else int(executed_strategy_uid.hi),
+                        strategy_uid_lo=None if executed_strategy_uid is None else int(executed_strategy_uid.lo),
+                        strategy_terminal=strategy_terminal,
+                        strategy_realized_cost=len(active_strategy_actions) if executed_strategy_uid is not None else 0,
                     )
                 )
                 completed += 1
