@@ -1326,8 +1326,16 @@ class ContinuousMemoryRuntime:
         }
         if state.get("in_flight_proposals"):
             raise RuntimeError("native v9 snapshot contains unsupported in-flight proposals")
+        normalized_by_signature: dict[int, MemoryUid] = {}
+        for uid in self.graph._uids_by_level[MemoryLevel.M1]:
+            node = self.graph.nodes.get(uid)
+            if node is None or node.memory_type is not MemoryType.NORMALIZED_RELATION:
+                continue
+            signature = self.graph.payloads.get(uid, {}).get("structural_signature")
+            if signature is not None:
+                normalized_by_signature.setdefault(int(signature), uid)
         for signature, count in dict(state.get("m1n_occurrences", {})).items():
-            node = next((uid for uid, payload in self.graph.payloads.items() if payload.get("structural_signature") == int(signature) and self.graph.nodes[uid].memory_type is MemoryType.NORMALIZED_RELATION), None)
+            node = normalized_by_signature.get(int(signature))
             if node is None:
                 continue
             payload = self.graph.payloads[node]
@@ -1361,18 +1369,20 @@ class ContinuousMemoryRuntime:
             evidence = tuple(MemoryUid(int(value[0]), int(value[1])) for value in raw["evidence"])
             row = M1GroundedContingency(uid, GroundedRelation(str(raw["relation"])), DerivationProvenance(parents, evidence), int(raw["environment_instance_id"]), int(raw["episode_id"]), int(raw["grounded_context_signature"]), None if raw.get("executable_action_token") is None else int(raw["executable_action_token"]), int(raw["realized_transition_signature"]), int(raw["grounded_next_context_signature"]), int(raw.get("support", 1)))
             self._latest_interaction_grounding[(int(raw["key"][0]), int(raw["key"][1]))] = row
-        for uid, node in self.graph.nodes.items():
-            payload = self.graph.payloads[uid]
-            parents = tuple(MemoryUid(int(raw[0]), int(raw[1])) for raw in payload.get("parents", []))
-            evidence_refs = tuple(MemoryUid(int(raw[0]), int(raw[1])) for raw in payload.get("evidence_refs", payload.get("parents", [])))
-            provenance = DerivationProvenance(parents, evidence_refs) if parents else None
-            if node.level is MemoryLevel.M2 and provenance is not None:
-                self._m2[uid] = M2TransformationFamily(uid, int(payload["structural_signature"]), provenance, int(payload["recurrence"]), float(payload["compression_benefit"]))
-            elif node.level is MemoryLevel.M3 and provenance is not None:
-                self._m3[uid] = M3FunctionalRole(uid, int(payload["relational_signature"]), int(payload["consequence_signature"]), provenance)
-            elif node.level is MemoryLevel.M4 and provenance is not None:
-                from v9.memory.m4_concept import ConceptState
-                self._m4[uid] = M4Concept(uid, tuple(int(value) for value in payload.get("invariant_descriptor", node.structural_key)), DerivationProvenance(parents, evidence_refs, tuple(int(value) for value in payload.get("formation_scope", []))), float(payload["compression_benefit"]), int(payload["explanatory_reach"]), float(payload["transfer_prior"]), tuple(int(value) for value in payload.get("held_out_targets", [])), bool(payload.get("validated", False)), ConceptState(str(payload.get("concept_state", "VALIDATED_CONCEPT" if payload.get("validated") else "TRANSFER_TEST_ELIGIBLE"))))
+        for level in (MemoryLevel.M2, MemoryLevel.M3, MemoryLevel.M4):
+            for uid in self.graph._uids_by_level[level]:
+                node = self.graph.nodes[uid]
+                payload = self.graph.payloads[uid]
+                parents = tuple(MemoryUid(int(raw[0]), int(raw[1])) for raw in payload.get("parents", []))
+                evidence_refs = tuple(MemoryUid(int(raw[0]), int(raw[1])) for raw in payload.get("evidence_refs", payload.get("parents", [])))
+                provenance = DerivationProvenance(parents, evidence_refs) if parents else None
+                if node.level is MemoryLevel.M2 and provenance is not None:
+                    self._m2[uid] = M2TransformationFamily(uid, int(payload["structural_signature"]), provenance, int(payload["recurrence"]), float(payload["compression_benefit"]))
+                elif node.level is MemoryLevel.M3 and provenance is not None:
+                    self._m3[uid] = M3FunctionalRole(uid, int(payload["relational_signature"]), int(payload["consequence_signature"]), provenance)
+                elif node.level is MemoryLevel.M4 and provenance is not None:
+                    from v9.memory.m4_concept import ConceptState
+                    self._m4[uid] = M4Concept(uid, tuple(int(value) for value in payload.get("invariant_descriptor", node.structural_key)), DerivationProvenance(parents, evidence_refs, tuple(int(value) for value in payload.get("formation_scope", []))), float(payload["compression_benefit"]), int(payload["explanatory_reach"]), float(payload["transfer_prior"]), tuple(int(value) for value in payload.get("held_out_targets", [])), bool(payload.get("validated", False)), ConceptState(str(payload.get("concept_state", "VALIDATED_CONCEPT" if payload.get("validated") else "TRANSFER_TEST_ELIGIBLE"))))
         for raw_uid, rows in dict(state.get("transfer_trials", {})).items():
             self._transfer_trials[MemoryUid(int(raw_uid[:16], 16), int(raw_uid[16:], 16))] = list(rows)
 
