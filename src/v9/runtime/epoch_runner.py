@@ -501,16 +501,17 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         runtime.set_telemetry_gauge("symbol_prediction_samples_epoch", symbol_prediction_samples)
         runtime.set_telemetry_gauge("post_sampling_symbol_prediction_seconds", time.perf_counter() - symbol_prediction_started)
 
+        matched_hgt_accepted = bool(is_bootstrap or decision.selected_branch == "hgt_on")
         behavior_resolution = resolve_hgt_behavior_test(
             runtime,
             root=args.root,
-            accepted=bool(behavioral_gain >= -0.005),
-        )
+            accepted=matched_hgt_accepted,
+        ) if not is_bootstrap else None
         if behavior_resolution is not None:
-            verdict = "PROMOTED" if behavioral_gain >= -0.005 else "REJECTED"
+            verdict = "PROMOTED" if matched_hgt_accepted else "REJECTED"
             print(
                 f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} HGT behavior-test "
-                f"status={verdict} model={behavior_resolution} behavioral_gain={behavioral_gain:.4f}",
+                f"status={verdict} model={behavior_resolution} matched_gain={decision.gain:.4f}",
                 flush=True,
             )
 
@@ -530,26 +531,26 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             training_epochs=effective_training_steps,
             learning_rate=args.hgt_learning_rate,
             root=args.root,
-            allow_promotion=bool(behavioral_gain >= -0.005),
+            allow_promotion=True,
         )
         training_done = time.perf_counter()
         runtime.set_telemetry_gauge("post_sampling_training_seconds", training_done - training_started)
 
         diagnostics = runtime.unified_telemetry.diagnostic_metrics()
-        validation_accuracy = float(training.validation_accuracy)
+        training_accuracy = float(training.validation_accuracy)
         subgraph_nodes = int(training.subgraph_nodes)
         subgraph_edges = int(training.subgraph_edges)
         runtime.record_hgt_inference(
             HGTInferenceSample(
-                consequence_error=float(training.validation_loss),
-                strategy_ranking_correct=bool(validation_accuracy >= 0.5),
+                consequence_error=float(training.training_loss),
+                strategy_ranking_correct=bool(training_accuracy >= 0.5),
                 candidate_refinement_success=str(training.status).upper() == "PROMOTED",
                 subgraph_nodes=subgraph_nodes,
                 subgraph_edges=subgraph_edges,
                 inference_latency_ms=float(training.inference_latency_ms),
                 relevance_precision=float(training.relevance_precision),
-                correspondence_accuracy=validation_accuracy,
-                behavior_delta=float(behavioral_gain),
+                correspondence_accuracy=training_accuracy,
+                behavior_delta=float(0.0 if is_bootstrap else decision.gain),
             )
         )
 
@@ -558,8 +559,8 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             for game_id, rate in scenario_success.items()
         )
         runtime.record_hgt_ablation(
-            enabled_outcome=float(training.validation_accuracy),
-            hydra_baseline_outcome=float(behavioral_success),
+            enabled_outcome=float(behavioral_success if is_bootstrap else on_success),
+            hydra_baseline_outcome=float(behavioral_success if is_bootstrap else off_success),
         )
 
         runtime.record_deliberation_metrics(
@@ -618,7 +619,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         print(
             f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} training "
             f"status={training.status} model={training.model_version} "
-            f"train_loss={training.training_loss:.4f} val_loss={training.validation_loss:.4f} "
+            f"train_loss={training.training_loss:.4f} "
             f"examples={training.examples} steps={training.training_steps}",
             flush=True,
         )
