@@ -375,7 +375,7 @@ def build_hgt_graph(
             grounding_positive = uid in relation_nodes.get(RelationType.GROUNDS.value, set()) or any(int(row[0]) == 7 for row in semantic_rows)
             targets["grounding"].append(float(grounding_positive))
             masks["grounding"].append(bool(semantic_rows) or node.level in {MemoryLevel.M0, MemoryLevel.M1})
-            has_symbol = any(int(row[0]) == 7 for row in semantic_rows)
+            has_symbol = payload.get("symbol_identity") is not None or any(int(row[0]) == 7 for row in semantic_rows)
             cross_modal = uid in relation_nodes.get(RelationType.GROUNDS.value, set()) or uid in relation_nodes.get(RelationType.TRANSFER_CORRESPONDENCE.value, set())
             prospective = bool(payload.get("symbol_prediction_gain", 0.0) > 0.0 or payload.get("prospective_prediction", False))
             heldout = bool(payload.get("heldout_transfer", False))
