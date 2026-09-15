@@ -21,6 +21,24 @@ def _proxy(read_view: Any) -> Any:
     )
 
 
+def _relation_family(payload: dict[str, Any]) -> tuple[str, ...]:
+    relation = str(payload.get("symbol_relation", ""))
+    result: list[str] = ["PROVENANCE"]
+    if relation in {"SYMBOL_INTERACTION_ALIGNMENT", "SYMBOL_PRECEDES_ACTION", "SYMBOL_FOLLOWS_ACTION", "SYMBOL_PRECEDES_NORMALIZED_CHANGE", "SYMBOL_FOLLOWS_NORMALIZED_CHANGE"}:
+        result.append("TEMPORALLY_ALIGNED_WITH")
+    if relation in {"CROSS_MODAL_CORRESPONDENCE", "SYMBOL_TO_INTERACTION_PREDICTION", "INTERACTION_TO_SYMBOL_GENERALIZATION", "CROSS_MODAL_HELDOUT_TRANSFER", "CROSS_MODAL_COMPOSITION"}:
+        result.append("STRUCTURALLY_CORRESPONDS_TO")
+    if relation:
+        result.append("PARTICIPATES_IN")
+    support = float(payload.get("support", 0.0))
+    contradiction = float(payload.get("contradiction", 0.0))
+    if support > contradiction and support > 0.0:
+        result.append("SUPPORTS")
+    if contradiction > 0.0 or str(payload.get("cross_modal_control", "aligned")) == "shuffled":
+        result.append("CONTRADICTS")
+    return tuple(dict.fromkeys(result))
+
+
 def install(training_module: Any) -> None:
     if getattr(training_module, "_v978_symbol_graph_installed", False):
         return
@@ -50,7 +68,7 @@ def install(training_module: Any) -> None:
         context_features: list[Any] = []
         context_edges: list[tuple[str, int, int]] = []
         symbols: dict[tuple[int, int, int, int], int] = {}
-        symbol_occurrences: list[tuple[tuple[int, int, int, int], str, int, int, int]] = []
+        symbol_occurrences: list[tuple[tuple[int, int, int, int], str, int, int, int, dict[str, Any]]] = []
         for uid in ordered:
             payload = sanitized.payloads.get(uid, {})
             node_type, node_index = memory_index[uid]
@@ -80,7 +98,7 @@ def install(training_module: Any) -> None:
                 symbol_key = tuple(int(value) for value in identity)
                 if symbol_key not in symbols:
                     symbols[symbol_key] = len(symbols)
-                symbol_occurrences.append((symbol_key, node_type, node_index, int(payload.get("environment_instance_id", 0)), int(payload.get("episode_id", 0))))
+                symbol_occurrences.append((symbol_key, node_type, node_index, int(payload.get("environment_instance_id", 0)), int(payload.get("episode_id", 0)), dict(payload)))
 
         if context_features:
             x_dict["CONTEXT"] = torch.stack(context_features, dim=0)
@@ -100,12 +118,13 @@ def install(training_module: Any) -> None:
         if "SYMBOL" in x_dict and symbol_occurrences:
             symbol_index = {key: index for index, key in enumerate(symbols)}
             by_window: dict[tuple[int, int], list[tuple[tuple[int, int, int, int], int]]] = {}
-            for symbol_key, node_type, node_index, environment_id, episode_id in symbol_occurrences:
+            for symbol_key, node_type, node_index, environment_id, episode_id, payload in symbol_occurrences:
                 index = symbol_index.get(symbol_key)
                 if index is None or index >= int(x_dict["SYMBOL"].shape[0]):
                     continue
-                key = ("SYMBOL", "OBSERVED_IN", node_type)
-                edge_index_dict[key] = _append_edge(torch, edge_index_dict.get(key), index, node_index)
+                edge_index_dict[("SYMBOL", "OBSERVED_IN", node_type)] = _append_edge(torch, edge_index_dict.get(("SYMBOL", "OBSERVED_IN", node_type)), index, node_index)
+                for relation in _relation_family(payload):
+                    edge_index_dict[("SYMBOL", relation, node_type)] = _append_edge(torch, edge_index_dict.get(("SYMBOL", relation, node_type)), index, node_index)
                 by_window.setdefault((environment_id, episode_id), []).append((symbol_key, index))
             for rows in by_window.values():
                 ordered_rows = sorted(rows, key=lambda item: int(item[0][3]))
@@ -116,6 +135,20 @@ def install(training_module: Any) -> None:
                         _, next_idx = ordered_rows[position + 1]
                         edge_index_dict[("SYMBOL", "PRECEDES", "SYMBOL")] = _append_edge(torch, edge_index_dict.get(("SYMBOL", "PRECEDES", "SYMBOL")), symbol_idx, next_idx)
                         edge_index_dict[("SYMBOL", "FOLLOWS", "SYMBOL")] = _append_edge(torch, edge_index_dict.get(("SYMBOL", "FOLLOWS", "SYMBOL")), next_idx, symbol_idx)
+            for edge in sanitized.edges:
+                source_payload = sanitized.payloads.get(edge.source, {})
+                identity = source_payload.get("symbol_identity")
+                if not (isinstance(identity, (list, tuple)) and len(identity) == 4):
+                    continue
+                symbol_idx = symbol_index.get(tuple(int(value) for value in identity))
+                target = memory_index.get(edge.target)
+                if symbol_idx is None or target is None:
+                    continue
+                relation = str(edge.relation.value)
+                if relation not in {"GROUNDS", "TRANSFER_VALIDATES"}:
+                    continue
+                target_type, target_index = target
+                edge_index_dict[("SYMBOL", relation, target_type)] = _append_edge(torch, edge_index_dict.get(("SYMBOL", relation, target_type)), symbol_idx, target_index)
 
         training_module._v978_last_symbol_nodes = int(x_dict["SYMBOL"].shape[0]) if "SYMBOL" in x_dict else 0
         training_module._v978_last_symbol_edges = sum(int(value.shape[1]) for key, value in edge_index_dict.items() if "SYMBOL" in (key[0], key[2]))
