@@ -1427,6 +1427,12 @@ class ContinuousMemoryRuntime:
                 self._publish(CanonicalNode(strategy.uid, MemoryLevel.M7, MemoryType.STRATEGY, (outcome.uid.hi, outcome.uid.lo, target_environment_id, action), self._watermark), {"target_outcome": [outcome.uid.hi, outcome.uid.lo], "target_environment_id": int(target_environment_id), "native_actions": [action], "reliability_successes": strategy.reliability_successes, "reliability_trials": strategy.reliability_trials, "evidence_confidence": concept_confidence, "primary_valence_sum": 0, "realized_cost_sum": strategy.realized_cost_sum, "context_scope_id": int(context_scope_id), "parents": [[outcome.uid.hi, outcome.uid.lo]]}, strategy.provenance.evidence)
             self.__dict__.setdefault("_m5", {})[consequence.uid] = consequence
             self.__dict__.setdefault("_m6", {})[outcome.uid] = outcome
+            self.record_outcome_equivalence_evidence(
+                outcome.uid,
+                equivalent=True,
+                context_scope_id=int(context_scope_id),
+                environment_id=int(target_environment_id),
+            )
     
     def wait_quiescent(self, timeout: float = 300.0) -> None:
         del timeout
