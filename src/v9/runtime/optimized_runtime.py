@@ -41,6 +41,28 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                 flush=True,
             )
 
+    def apply_environment_evidence_confidence(self, confidence_by_environment: dict[int, float]) -> int:
+        """Apply evidence confidence through a lazily built environment-to-memory index."""
+        with self._lock:
+            confidence = {int(k): float(v) for k, v in confidence_by_environment.items()}
+            self._environment_evidence_confidence = confidence
+            index = getattr(self, "_memory_uids_by_environment", None)
+            if index is None:
+                index = {}
+                for uid, payload in self.graph.payloads.items():
+                    environment_id = payload.get("environment_instance_id")
+                    if environment_id is not None:
+                        index.setdefault(int(environment_id), set()).add(uid)
+                self._memory_uids_by_environment = index
+            changed = 0
+            for environment_id, value in confidence.items():
+                for uid in index.get(int(environment_id), ()):
+                    payload = self.graph.payloads.get(uid)
+                    if payload is not None and float(payload.get("evidence_confidence", 1.0)) != value:
+                        payload["evidence_confidence"] = value
+                        changed += 1
+            return changed
+
     def set_hgt_action_scores(self, scores: dict[int, dict[int, float]], *, context_action_scores: dict[int, dict[int, dict[int, float]]] | None = None) -> None:
         with self._lock:
             self._hgt_action_scores = {int(environment): {int(action): float(score) for action, score in actions.items()} for environment, actions in scores.items()}
