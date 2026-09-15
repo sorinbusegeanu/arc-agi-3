@@ -251,7 +251,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     current = next((row for row in strategy_rows if row.strategy_uid == active_strategy_uid), None)
                     if current is None or active_strategy_position >= len(active_strategy_actions) or int(active_strategy_actions[active_strategy_position]) not in actions:
                         alternatives = tuple(row for row in strategy_rows if row.target_outcome_uid == active_strategy_outcome and row.strategy_uid != active_strategy_uid and row.native_actions and int(row.native_actions[0]) in actions)
-                        current = alternatives[0] if alternatives else None
+                        current = min(alternatives, key=lambda row: (-row.reliability, -row.primary_valence, -(row.relative_efficiency if row.relative_efficiency is not None else -1.0), row.strategy_uid)) if alternatives else None
                         if current is None:
                             active_strategy_uid = None
                             active_strategy_actions = ()
@@ -264,7 +264,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                 if active_strategy_uid is None and strategy_rows:
                     candidates = tuple(row for row in strategy_rows if row.native_actions and int(row.native_actions[0]) in actions)
                     if candidates:
-                        selected = min(candidates, key=lambda row: (-row.reliability, -row.primary_valence, float("inf") if row.expected_cost is None else row.expected_cost, row.strategy_uid))
+                        selected = min(candidates, key=lambda row: (-row.reliability, -row.primary_valence, -(row.relative_efficiency if row.relative_efficiency is not None else -1.0), row.strategy_uid))
                         active_strategy_uid = selected.strategy_uid
                         active_strategy_actions = selected.native_actions
                         active_strategy_position = 0
@@ -274,7 +274,8 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     candidate_action = int(active_strategy_actions[active_strategy_position])
                     if candidate_action in actions:
                         planned_action = candidate_action
-                action = planned_action if planned_action is not None else choose_action(
+                explore_over_strategy = planned_action is not None and rng.random() < float(epsilon)
+                action = planned_action if planned_action is not None and not explore_over_strategy else choose_action(
                     policy,
                     actions,
                     rng=rng,
@@ -287,13 +288,10 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     stagnation=float(stagnation),
                 )
                 context_counts[int(action)] = int(context_counts.get(int(action), 0)) + 1
-                if planned_action is not None:
+                if planned_action is not None and not explore_over_strategy:
                     active_strategy_position += 1
-                    if active_strategy_position >= len(active_strategy_actions):
-                        active_strategy_uid = None
-                        active_strategy_actions = ()
-                        active_strategy_position = 0
-                        active_strategy_outcome = None
+                    # Keep the completed procedure active until environment
+                    # feedback establishes whether its target outcome was reached.
                 semantic_action_fn = getattr(adapter, "semantic_action", None)
                 semantic_delta_fn = getattr(adapter, "semantic_delta", None)
                 semantic_action = tuple(semantic_action_fn(action)) if callable(semantic_action_fn) else ()
@@ -350,6 +348,12 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                 task_failures += int(progress.failure)
                 task_truncations += int(progress.truncated)
                 levels_completed = max(levels_completed, int(progress.levels_completed))
+                if active_strategy_uid is not None and active_strategy_position >= len(active_strategy_actions):
+                    if progress.success or progress.failure or not boundary.continuation:
+                        active_strategy_uid = None
+                        active_strategy_actions = ()
+                        active_strategy_position = 0
+                        active_strategy_outcome = None
                 if not boundary.continuation:
                     adapter.reset()
                     episode_ordinal += 1
