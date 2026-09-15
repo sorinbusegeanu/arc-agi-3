@@ -535,7 +535,7 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
         state["hgt_context_action_scores"] = {str(environment): {str(context): {str(action): score for action, score in actions.items()} for context, actions in contexts.items()} for environment, contexts in self._hgt_context_action_scores.items()}
         return state
 
-    def _restore(self, snapshot: dict[str, Any]) -> None:
+    def _restore(self, snapshot: dict[str, Any], *, graph_override=None) -> None:
         state = dict(snapshot.get("state", {}))
         saved_occurrences = dict(state.get("m1n_occurrences", {}))
 
@@ -546,7 +546,7 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                 restore_state["m1n_supports"] = saved_occurrences
             restore_snapshot = dict(snapshot)
             restore_snapshot["state"] = restore_state
-            super()._restore(restore_snapshot)
+            super()._restore(restore_snapshot, graph_override=graph_override)
 
             normalized_by_signature: dict[int, MemoryUid] = {}
             for uid, node in self.graph.nodes.items():
@@ -601,6 +601,6 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                 self._actor_action_supports[scoped] = self._actor_action_supports.get(scoped, 0.0) + float(support)
             self._actor_policy_generation = self.graph.generation
         else:
-            super()._restore(snapshot)
+            super()._restore(snapshot, graph_override=graph_override)
 
         self._hgt_context_action_scores = {int(environment): {int(context): {int(action): float(score) for action, score in dict(actions).items()} for context, actions in dict(contexts).items()} for environment, contexts in dict(state.get("hgt_context_action_scores", {})).items()}
