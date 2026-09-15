@@ -75,6 +75,7 @@ def test_replanning_metrics_have_distinct_denominators_semantics(tmp_path):
 def _publish_strategy(runtime, outcome, strategy):
     runtime._m6[outcome.uid] = outcome
     runtime._m7[strategy.uid] = strategy
+    runtime._publish(CanonicalNode(outcome.uid, MemoryLevel.M6, MemoryType.OUTCOME, outcome.class_signature, runtime.watermark), {"class_signature": list(outcome.class_signature), "class_version": outcome.class_version, "equivalence_trials": outcome.equivalence_trials, "equivalence_successes": outcome.equivalence_successes, "contexts_observed": list(outcome.contexts_observed), "environments_observed": list(outcome.environments_observed), "primary_valence_sum": outcome.primary_valence_sum, "preference_trials": outcome.preference_trials, "parents": [[uid.hi, uid.lo] for uid in outcome.provenance.parents]}, outcome.provenance.evidence)
     runtime._publish(CanonicalNode(strategy.uid, MemoryLevel.M7, MemoryType.STRATEGY, (outcome.uid.hi, outcome.uid.lo, int(strategy.target_environment_id), *strategy.native_actions), runtime.watermark), {"target_outcome": [outcome.uid.hi, outcome.uid.lo], "target_environment_id": int(strategy.target_environment_id), "native_actions": list(strategy.native_actions), "reliability_successes": strategy.reliability_successes, "reliability_trials": strategy.reliability_trials, "primary_valence_sum": strategy.primary_valence_sum, "realized_cost_sum": strategy.realized_cost_sum, "parents": [[outcome.uid.hi, outcome.uid.lo]]}, strategy.provenance.evidence)
 
 
