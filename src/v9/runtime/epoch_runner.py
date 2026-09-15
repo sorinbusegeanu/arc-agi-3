@@ -305,12 +305,32 @@ def _performance_summary(metrics: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _load_viability_history(root: str | Path) -> dict[str, dict[str, Any]]:
+    target = Path(root) / "environment_viability.log"
+    if not target.exists():
+        return {}
+    latest: dict[str, dict[str, Any]] = {}
+    try:
+        with target.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                game = str(row.get("game", ""))
+                if game:
+                    latest[game] = row
+    except (OSError, ValueError, TypeError):
+        return {}
+    return latest
+
+
 def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_factory: Any | None = None):
     actor_results = []
     epoch_results = []
     baseline_success: float | None = None
     previous_game_results: dict[str, dict[str, int | float]] = {}
-    previous_viability_profiles: dict[str, dict[str, Any]] = {}
+    previous_viability_profiles: dict[str, dict[str, Any]] = _load_viability_history(args.root)
     previous_game_cost: dict[str, float] = {}
     previous_scenario_success: dict[str, float] = {}
     transfer_attempted = transfer_completed = transfer_passed = transfer_validated = 0
@@ -329,6 +349,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             shards=args.shards,
             queue_capacity=max(args.stage_ring_capacity, args.shard_ring_capacity),
             epsilon=args.epsilon,
+            stagnation_by_game={game: float(profile.get("stagnation", 0.0)) for game, profile in previous_viability_profiles.items()},
             env_root=args.env_root,
             alfred_backend_factory=getattr(args, "alfred_backend_factory", None),
             start_method=runtime.config.multiprocessing_start_method,
