@@ -801,23 +801,6 @@ def _retry_after_oom(runtime: Any, *, epoch: int, training_epochs: int, learning
     )
 
 
-def _should_promote(
-    parent_version: str | None,
-    parent_validation_loss: float,
-    candidate_validation_loss: float,
-    parent_validation_accuracy: float,
-    candidate_validation_accuracy: float,
-) -> bool:
-    if not math.isfinite(candidate_validation_loss):
-        return False
-    if parent_version is None or not math.isfinite(parent_validation_loss):
-        return True
-    loss_ok = float(candidate_validation_loss) <= float(parent_validation_loss)
-    accuracy_ok = not math.isfinite(parent_validation_accuracy) or float(candidate_validation_accuracy) >= float(parent_validation_accuracy)
-    return bool(loss_ok and accuracy_ok)
-
-
-
 def resolve_hgt_behavior_test(runtime: Any, *, root: str | Path, accepted: bool) -> str | None:
     """Resolve the candidate that was actually exercised during the just-finished sampling epoch."""
     manifest_path = Path(root) / "models" / "hgt_manifest.json"
@@ -828,9 +811,17 @@ def resolve_hgt_behavior_test(runtime: Any, *, root: str | Path, accepted: bool)
     if not candidate or manifest.get("candidate_status") != "TESTING_PENDING_BEHAVIOR":
         return None
     if accepted:
-        manifest["candidate_status"] = "PROMOTED"
-        manifest["last_accepted_model_version"] = str(candidate)
-        manifest["candidate_model_version"] = None
+        accepted_checkpoint = f"models/{candidate}.pt"
+        manifest.update({
+            "candidate_status": "PROMOTED",
+            "last_accepted_model_version": str(candidate),
+            "accepted_model_version": str(candidate),
+            "accepted_checkpoint": accepted_checkpoint,
+            "current_model_version": str(candidate),
+            "current_checkpoint": accepted_checkpoint,
+            "parent_model_version": None,
+            "candidate_model_version": None,
+        })
         temporary_manifest = manifest_path.with_suffix(".json.tmp")
         temporary_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary_manifest, manifest_path)
@@ -853,7 +844,7 @@ def rollback_hgt_model(runtime: Any, *, root: str | Path) -> str | None:
     if not manifest_path.exists():
         return None
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    parent_version = manifest.get("parent_model_version")
+    parent_version = manifest.get("last_accepted_model_version")
     current_version = manifest.get("current_model_version")
     if not current_version:
         return None
@@ -865,6 +856,8 @@ def rollback_hgt_model(runtime: Any, *, root: str | Path) -> str | None:
                 "parent_model_version": None,
                 "rollback_from_model_version": str(current_version),
                 "rollback_to_model_version": "untrained",
+                "accepted_model_version": None,
+                "accepted_checkpoint": None,
             }
         )
         temporary_manifest = manifest_path.with_suffix(".json.tmp")
@@ -905,8 +898,8 @@ def rollback_hgt_model(runtime: Any, *, root: str | Path) -> str | None:
             "current_model_version": str(parent_version),
             "current_checkpoint": checkpoint_rel,
             "parent_model_version": None,
-            "validation_loss": float(checkpoint.get("validation_loss", manifest.get("validation_loss", float("inf")))),
-            "validation_accuracy": float(checkpoint.get("validation_accuracy", manifest.get("validation_accuracy", float("nan")))),
+            "accepted_model_version": str(parent_version),
+            "accepted_checkpoint": checkpoint_rel,
             "rollback_from_model_version": str(current_version),
         }
     )
@@ -1096,8 +1089,6 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             exc=exc,
         )
 
-    parent_validation_loss = float("inf")
-    parent_validation_accuracy = float("nan")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(learning_rate))
     if checkpoint_state is not None and checkpoint_state.get("optimizer_state"):
@@ -1169,14 +1160,14 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     runtime.set_telemetry_gauge("hgt_action_ranking_accuracy", float(locals().get("ranking_correct", 0)) / max(1, locals().get("ranking_total", 0)))
     runtime.set_telemetry_gauge("hgt_action_ranking_validation_pairs", int(locals().get("ranking_total", 0)))
     if training_steps <= 0:
-        return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, parent_version, 0.0, parent_validation_loss if math.isfinite(parent_validation_loss) else 0.0, action_examples, 0, parent_checkpoint)
+        return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, parent_version, 0.0, 0.0, action_examples, 0, parent_checkpoint)
 
     runtime.set_telemetry_gauge("hgt_transition_training_examples", len(transition_train_rows))
     model.eval()
     inference_started = time.perf_counter()
     with torch.no_grad():
         logits, values, auxiliary = model(x_device, edges_device)
-        train_loss_t, train_accuracy, validation_loss_by_head = _loss(
+        train_loss_t, train_accuracy, training_loss_by_head = _loss(
             logits,
             values,
             auxiliary,
@@ -1193,8 +1184,6 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         )
     inference_latency_ms = 1000.0 * (time.perf_counter() - inference_started)
     training_loss = float(train_loss_t.cpu().item()) if train_loss_t is not None else training_loss
-    validation_loss = training_loss
-    val_accuracy = train_accuracy
     elapsed = max(1e-9, time.perf_counter() - start)
     version_index = int(manifest.get("version_index", 0)) + 1
     candidate_version = f"hgt-{version_index:06d}"
@@ -1289,7 +1278,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     gpu = read_gpu_snapshot()
     sample = HGTTrainingSample(
         training_loss=training_loss,
-        validation_loss=validation_loss,
+        validation_loss=0.0,
         training_step_latency_ms=1000.0 * elapsed / max(1, training_steps),
         training_examples_seen=training_examples,
         effective_batch_size=training_examples,
