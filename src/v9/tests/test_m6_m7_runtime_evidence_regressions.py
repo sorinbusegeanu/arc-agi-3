@@ -88,7 +88,7 @@ def test_actor_policy_exposes_outcome_for_published_strategy(tmp_path):
     runtime = _runtime(tmp_path)
     consequence = _validated_consequence("a")
     outcome = replace(M6Outcome.form((consequence,), diameter_bound=0), equivalence_trials=2, equivalence_successes=2, primary_valence_sum=4, preference_trials=2)
-    strategy = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1,), successes=2, trials=2)
+    strategy = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1,), successes=2, trials=2, primary_valence_sum=4, realized_cost_sum=2)
     runtime._m6[outcome.uid] = outcome
     runtime._m7[strategy.uid] = strategy
     snapshot = runtime.actor_policy_snapshot()
@@ -132,7 +132,7 @@ def test_m7_strategy_identity_distinguishes_action_sequences():
 
 def test_m7_strategy_identity_distinguishes_target_environment():
     outcome = M6Outcome.form((_validated_consequence("a"),), diameter_bound=0)
-    a = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1,))
+    a = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1,), successes=1, trials=1, primary_valence_sum=0, realized_cost_sum=1)
     b = M7Strategy.form(outcome, target_environment_id=8, native_actions=(1,), successes=1, trials=1, primary_valence_sum=0, realized_cost_sum=1)
     assert a.uid != b.uid
 
