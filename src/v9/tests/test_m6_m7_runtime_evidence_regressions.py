@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from v9.memory import DerivationProvenance, M4Concept, M5ConsequenceStructure, M6Outcome, M7Strategy, MemoryLevel, MemoryUid
+from v9.memory import CanonicalNode, DerivationProvenance, M4Concept, M5ConsequenceStructure, M6Outcome, M7Strategy, MemoryLevel, MemoryType, MemoryUid
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
 
 
@@ -72,13 +72,18 @@ def test_replanning_metrics_have_distinct_denominators_semantics(tmp_path):
     assert metrics["m7_replanning_efficiency_rate"] == 1 / 3
 
 
+def _publish_strategy(runtime, outcome, strategy):
+    runtime._m6[outcome.uid] = outcome
+    runtime._m7[strategy.uid] = strategy
+    runtime._publish(CanonicalNode(strategy.uid, MemoryLevel.M7, MemoryType.STRATEGY, (outcome.uid.hi, outcome.uid.lo, int(strategy.target_environment_id), *strategy.native_actions), runtime.watermark), {"target_outcome": [outcome.uid.hi, outcome.uid.lo], "target_environment_id": int(strategy.target_environment_id), "native_actions": list(strategy.native_actions), "reliability_successes": strategy.reliability_successes, "reliability_trials": strategy.reliability_trials, "primary_valence_sum": strategy.primary_valence_sum, "realized_cost_sum": strategy.realized_cost_sum, "parents": [[outcome.uid.hi, outcome.uid.lo]]}, strategy.provenance.evidence)
+
+
 def test_actor_policy_contains_no_m7_derived_grounded_action_scores(tmp_path):
     runtime = _runtime(tmp_path)
     consequence = _validated_consequence("a")
     outcome = M6Outcome.form((consequence,), diameter_bound=0)
     strategy = M7Strategy.form(outcome, target_environment_id=7, native_actions=(41,), successes=10, trials=10, primary_valence_sum=10, realized_cost_sum=10)
-    runtime._m6[outcome.uid] = outcome
-    runtime._m7[strategy.uid] = strategy
+    _publish_strategy(runtime, outcome, strategy)
     snapshot = runtime.actor_policy_snapshot()
     assert snapshot.grounded_action_scores_by_type == {}
     assert snapshot.strategies(7)
