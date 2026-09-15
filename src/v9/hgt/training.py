@@ -495,8 +495,8 @@ def build_hgt_graph(
             task_mask_dict[name][semantic_type] = torch.zeros(count, dtype=torch.bool)
 
     for memory_type, memory_index, semantic_type, semantic_index in semantic_links:
-        edges.setdefault((memory_type, "SEMANTIC", semantic_type), []).append((memory_index, semantic_index))
-        edges.setdefault((semantic_type, "SEMANTIC_OF", memory_type), []).append((semantic_index, memory_index))
+        edges.setdefault((memory_type, "SYMBOL_OCCURRENCE" if semantic_type == "SYMBOL" else "SEMANTIC", semantic_type), []).append((memory_index, semantic_index))
+        edges.setdefault((semantic_type, "OCCURS_IN_MEMORY" if semantic_type == "SYMBOL" else "SEMANTIC_OF", memory_type), []).append((semantic_index, memory_index))
 
     edge_index_dict = {
         key: torch.tensor(pairs, dtype=torch.long).t().contiguous()
