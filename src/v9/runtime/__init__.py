@@ -185,8 +185,15 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
             role = None if parent_uid is None else self._m3.get(parent_uid)
             if role is None or parent_uid not in self.graph.nodes or parent_uid not in self.graph.payloads:
                 return
-            consequence = M5ConsequenceStructure.form((concept,), (role.consequence_signature,))
-            outcome = M6Outcome.form((consequence,), diameter_bound=0)
+            consequence = next(
+                (
+                    row for row in self._m5.values()
+                    if concept.uid in row.provenance.parents
+                ),
+                None,
+            )
+            if consequence is None:
+                return
             formation_scope = set(concept.provenance.formation_scope)
             admissible = tuple(
                 trial
@@ -201,35 +208,6 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
                 return
             action = int(admissible[-1]["target_native_action"])
             target_environment_id = int(kwargs["target_environment_id"])
-            trajectory_actions = tuple(
-                int(payload["action_id"])
-                for uid in concept.provenance.evidence
-                for payload in [self._evidence_payload(uid)]
-                if payload is not None
-                and payload.get("action_id") is not None
-                and int(payload.get("environment_instance_id", target_environment_id)) == target_environment_id
-            )
-            native_actions = trajectory_actions or (action,)
-            grounded_payloads = [
-                self.graph.payloads[uid]
-                for uid in outcome.provenance.evidence
-                if uid in self.graph.payloads and uid in self.graph.nodes and self.graph.nodes[uid].level is MemoryLevel.M0
-            ]
-            primary_valence_sum = sum(int(payload.get("primary_valence", 0)) for payload in grounded_payloads)
-            realized_cost_sum = sum(max(1, int(payload.get("realized_cost", 0))) for payload in grounded_payloads) or len(admissible)
-            strategy = M7Strategy.form(
-                outcome,
-                target_environment_id=target_environment_id,
-                native_actions=native_actions,
-                successes=len(admissible),
-                trials=len(admissible),
-                primary_valence_sum=primary_valence_sum,
-                realized_cost_sum=realized_cost_sum,
-            )
-            self._m5[consequence.uid] = consequence
-            self._m6[outcome.uid] = outcome
-            self._m7[strategy.uid] = strategy
-
             best_effect = max(
                 float(trial["enabled_metric"]) - float(trial["ablated_metric"])
                 for trial in admissible
