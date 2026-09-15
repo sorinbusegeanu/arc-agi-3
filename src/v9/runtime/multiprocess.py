@@ -225,6 +225,14 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     if newest is not None and int(newest.generation) > int(policy.generation):
                         policy = newest
                         policy_refreshes += 1
+                        if active_strategy_uid is not None and not any(
+                            row.strategy_uid == active_strategy_uid
+                            for row in policy.strategies(environment_instance_id)
+                        ):
+                            active_strategy_uid = None
+                            active_strategy_actions = ()
+                            active_strategy_position = 0
+                            active_strategy_outcome = None
                     next_refresh_time = now + refresh_seconds
 
                 before = adapter.observe()
@@ -288,6 +296,11 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     stagnation=float(stagnation),
                 )
                 context_counts[int(action)] = int(context_counts.get(int(action), 0)) + 1
+                if explore_over_strategy:
+                    active_strategy_uid = None
+                    active_strategy_actions = ()
+                    active_strategy_position = 0
+                    active_strategy_outcome = None
                 if planned_action is not None and not explore_over_strategy:
                     active_strategy_position += 1
                     # Keep the completed procedure active until environment
