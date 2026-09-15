@@ -23,6 +23,7 @@ class GroundingObjectiveEvidence:
     causal_watermark: int
     evaluation_watermark: int
     provenance_id: str
+    control: str = "aligned"
 
     def __post_init__(self) -> None:
         if self.objective not in GROUNDING_OBJECTIVES:
@@ -56,4 +57,14 @@ def publish_objective_metrics(runtime: object, rows: Iterable[GroundingObjective
     return metrics
 
 
-def validate_objective_evidence(rows: Iterable[GroundingObjectiveEvidence]) -> dict[str, int]:\n    rows = tuple(rows)\n    counts = {name: [0, 0] for name in GROUNDING_OBJECTIVES}\n    controls: set[str] = set()\n    for row in rows:\n        counts[row.objective][int(float(row.target) >= 0.5)] += 1\n        controls.add(str(row.control))\n    for objective, (negative, positive) in counts.items():\n        if negative + positive and (negative == 0 or positive == 0):\n            raise ValueError(f"{objective} requires positive and negative evidence")\n    return {"examples": len(rows), "positive_examples": sum(v[1] for v in counts.values()), "negative_examples": sum(v[0] for v in counts.values()), "control_groups": len(controls)}\n
+def validate_objective_evidence(rows: Iterable[GroundingObjectiveEvidence]) -> dict[str, int]:
+    rows = tuple(rows)
+    counts = {name: [0, 0] for name in GROUNDING_OBJECTIVES}
+    controls: set[str] = set()
+    for row in rows:
+        counts[row.objective][int(float(row.target) >= 0.5)] += 1
+        controls.add(str(row.control))
+    for objective, (negative, positive) in counts.items():
+        if negative + positive and (negative == 0 or positive == 0):
+            raise ValueError(f"{objective} requires positive and negative evidence")
+    return {"examples": len(rows), "positive_examples": sum(v[1] for v in counts.values()), "negative_examples": sum(v[0] for v in counts.values()), "control_groups": len(controls)}
