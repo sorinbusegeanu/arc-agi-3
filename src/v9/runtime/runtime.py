@@ -111,6 +111,9 @@ class ContinuousMemoryRuntime:
         self._m2: dict[MemoryUid, M2TransformationFamily] = {}
         self._m3: dict[MemoryUid, M3FunctionalRole] = {}
         self._m4: dict[MemoryUid, M4Concept] = {}
+        self._m5: dict[MemoryUid, M5ConsequenceStructure] = {}
+        self._m6: dict[MemoryUid, M6Outcome] = {}
+        self._m7: dict[MemoryUid, M7Strategy] = {}
         self._transfer_trials: dict[MemoryUid, list[dict[str, Any]]] = {}
         self._modality_events: dict[int, int] = {}
         self._similarity_entropy_by_radius: dict[int, list[float]] = {}
