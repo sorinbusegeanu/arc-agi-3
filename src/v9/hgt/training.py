@@ -1017,9 +1017,14 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     model_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = model_dir / "hgt_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
-    accepted_version = manifest.get("last_accepted_model_version")
-    parent_version = accepted_version
-    parent_checkpoint = f"models/{accepted_version}.pt" if accepted_version else None
+    accepted_version = manifest.get("last_accepted_model_version") or manifest.get("accepted_model_version")
+    # The active model is authoritative for continued training. During a
+    # behavior-gate candidate epoch it may be newer than the last accepted
+    # model, and its checkpoint fully describes the architecture to restore.
+    parent_version = manifest.get("current_model_version") or accepted_version
+    parent_checkpoint = manifest.get("current_checkpoint") if parent_version else None
+    if parent_version and not parent_checkpoint:
+        parent_checkpoint = f"models/{parent_version}.pt"
     checkpoint_state = None
     parent_architecture = None
     if int(manifest.get("model_schema_version", 0)) != MODEL_SCHEMA_VERSION:
