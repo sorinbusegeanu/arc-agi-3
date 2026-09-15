@@ -1,14 +1,30 @@
 from __future__ import annotations
 
-from v9.memory.m6_outcome import M6Outcome
+from typing import Protocol, TypeVar
+
 from v9.memory.identity import MemoryUid
 
 
-def select_target_outcome(outcomes: tuple[M6Outcome, ...], *, reachable: set[MemoryUid] | None = None) -> M6Outcome | None:
-    eligible = tuple(row for row in outcomes if reachable is None or row.uid in reachable)
+class OutcomeLike(Protocol):
+    equivalence_confidence: float
+    mean_primary_valence: float
+
+
+T = TypeVar("T", bound=OutcomeLike)
+
+
+def _uid(row: OutcomeLike) -> MemoryUid:
+    value = getattr(row, "uid", None)
+    if value is None:
+        value = getattr(row, "outcome_uid")
+    return value
+
+
+def select_target_outcome(outcomes: tuple[T, ...], *, reachable: set[MemoryUid] | None = None) -> T | None:
+    eligible = tuple(row for row in outcomes if reachable is None or _uid(row) in reachable)
     if not eligible:
         return None
-    return min(eligible, key=lambda row: (-row.mean_primary_valence, -row.equivalence_confidence, row.uid))
+    return min(eligible, key=lambda row: (-float(row.mean_primary_valence), -float(row.equivalence_confidence), _uid(row)))
 
 
 def target_outcome_stability(selections: tuple[MemoryUid, ...]) -> float:
