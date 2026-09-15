@@ -1010,7 +1010,10 @@ class ContinuousMemoryRuntime:
 
     def replay_once(self) -> ReplayResult:
         before_m0 = self.graph.memory_count(MemoryLevel.M0)
-        candidates = tuple(ReplayCandidate(uid, fitness) for uid, fitness in sorted(self._replay_pool.items()))
+        candidates = tuple(
+            ReplayCandidate(uid, fitness * float(self.graph.payloads.get(uid, {}).get("evidence_confidence", 1.0)))
+            for uid, fitness in sorted(self._replay_pool.items())
+        )
 
         def process(_candidate: ReplayCandidate) -> tuple[int, int, int]:
             before_nodes, before_generation = len(self.graph.nodes), self.graph.generation
