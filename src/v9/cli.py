@@ -305,15 +305,22 @@ def run_continuous(args: argparse.Namespace) -> int:
     )
     games = tuple(spec.display_name for spec in specs)
     if getattr(args, "trace", False):
-        bundle = run_trace_bundle(
-            specs,
-            root=args.root,
-            seed=int(args.seed),
-            env_root=args.env_root,
-            alfred_backend_factory=args.alfred_backend_factory,
-            make_adapter=make_adapter,
-            steps_per_game=100,
-        )
+        trace_runtime = ContinuousMemoryRuntime(_runtime_config(args))
+        try:
+            policy = trace_runtime.actor_policy_snapshot()
+            bundle = run_trace_bundle(
+                specs,
+                root=args.root,
+                seed=int(args.seed),
+                env_root=args.env_root,
+                alfred_backend_factory=args.alfred_backend_factory,
+                make_adapter=make_adapter,
+                steps_per_game=100,
+                policy=policy,
+                epsilon=float(args.epsilon),
+            )
+        finally:
+            trace_runtime.close()
         print(
             f"{time.strftime('[%H:%M]')} trace complete games={len(games)} steps/game=100 bundle={bundle}",
             flush=True,
