@@ -1159,9 +1159,19 @@ class ContinuousMemoryRuntime:
         return comparison.delta
 
     def record_transfer_validation(self, concept_uid: MemoryUid, *, target_environment_id: int, target_native_action: int, enabled_metric: float, ablated_metric: float, matched: bool = True, held_out: bool = True, context_scope_id: int = 0) -> None:
-        if concept_uid not in self._m4:
-            raise KeyError("transfer validation requires an existing M4 concept candidate")
-        was_validated = bool(self._m4[concept_uid].validated)
+        concept = self._m4.get(concept_uid)
+        if concept is None or concept_uid not in self.graph.nodes or concept_uid not in self.graph.payloads:
+            # Transfer trials run concurrently with lifecycle/compaction. A concept
+            # selected for a trial may be retired before the result is recorded.
+            self._m4.pop(concept_uid, None)
+            self._transfer_trials.pop(concept_uid, None)
+            self.evidence.append(
+                "TRANSFER_TRIAL_STALE_CONCEPT",
+                self._watermark,
+                {"concept_uid": concept_uid.hex(), "target_environment_id": int(target_environment_id)},
+            )
+            return
+        was_validated = bool(concept.validated)
         row = {"target_environment_id": int(target_environment_id), "target_native_action": int(target_native_action), "enabled_metric": float(enabled_metric), "ablated_metric": float(ablated_metric), "matched": bool(matched), "held_out": bool(held_out), "context_scope_id": int(context_scope_id)}
         trial_rows = self._transfer_trials.setdefault(concept_uid, [])
         trial_rows.append(row)
