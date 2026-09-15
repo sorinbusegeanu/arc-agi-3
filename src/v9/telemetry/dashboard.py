@@ -4,7 +4,7 @@ from typing import Any
 
 
 PRIMARY_KEYS = (
-    "success_rate",
+    "current_run_wins",
     "behavioral_success_rate",
     "behavioral_success_gain",
     "trajectory_efficiency",
@@ -54,7 +54,7 @@ def build_primary_dashboard(runtime_metrics: dict[str, Any], diagnostic: dict[st
     hgt_samples = int(diagnostic.get("hgt_inference_samples", 0))
     training_reports = int(diagnostic.get("hgt_training_reports", 0))
     dashboard = {
-        "success_rate": float(runtime_metrics.get("success_rate", 0.0)),
+        "current_run_wins": float(runtime_metrics.get("current_run_wins", 0.0)),
         "behavioral_success_rate": float(diagnostic.get("behavioral_success_rate", 0.0)),
         "behavioral_success_gain": float(diagnostic.get("behavioral_success_gain", 0.0)),
         "trajectory_efficiency": float(runtime_metrics.get("trajectory_efficiency", 0.0)),
