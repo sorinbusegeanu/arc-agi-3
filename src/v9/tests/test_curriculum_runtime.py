@@ -169,3 +169,36 @@ def test_continuous_cli_inherits_scientific_transfer_defaults(tmp_path) -> None:
     assert config.scientific.transfer_validation_trials_per_interval == 900
     assert config.scientific.transfer_validation_workers == 30
     assert config.scientific.transfer_validation_time_budget_seconds == 300.0
+
+
+def test_environment_spec_has_no_runtime_identity_contract() -> None:
+    spec = resolve_game_specs("step1")[0]
+    assert not hasattr(spec, "instance_id")
+    adapter = make_adapter(spec, seed=0, env_root=None)
+    assert adapter.identity().instance_id.value > 0
+
+
+def test_viability_epoch_path_uses_runtime_environment_identity(tmp_path) -> None:
+    root = tmp_path / "viability_identity"
+    args = build_parser().parse_args([
+        "continuous-run",
+        "--root", str(root),
+        "--games", "step1",
+        "--steps-per-game", "1",
+        "--actors", "2",
+        "--shards", "2",
+        "--stage-workers", "1",
+        "--epochs", "1",
+        "--no-peers",
+        "--no-dashboard",
+        "--no-automatic-experiments",
+    ])
+    assert run_continuous(args) == 0
+    assert (root / "environment_viability.log").exists()
+    rows = [
+        __import__("json").loads(line)
+        for line in (root / "environment_viability.log").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert rows
+    assert all("evidence_confidence" in row for row in rows)
