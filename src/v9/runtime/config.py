@@ -99,7 +99,7 @@ class ScientificConfig:
     hgt_max_total_edges: int = 400000
     hgt_max_semantic_facts_per_memory: int = 16
     hgt_oom_retry_limit: int = 2
-    hgt_min_free_vram_bytes: int = 6 * 1024 * 1024 * 1024
+    hgt_min_free_vram_bytes: int = 2 * 1024 * 1024 * 1024
     hgt_dynamic_loss_weighting: bool = True
     hgt_loss_weights: tuple[float, ...] = (1.0, 1.0, 0.5, 0.5, 0.5, 1.0, 0.5, 0.5, 0.5)
     hgt_model_version: str = "untrained"
