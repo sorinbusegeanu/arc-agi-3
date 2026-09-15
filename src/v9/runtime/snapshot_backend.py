@@ -26,3 +26,11 @@ def load_snapshot(path: Path, *, expected_config_id: str):
 
 
 write_snapshot = chunked_snapshot.write_snapshot
+
+
+def load_snapshot_direct(path: Path, *, expected_config_id: str):
+    if path.is_file():
+        return None
+    return chunked_snapshot.load_snapshot_parts(path, expected_config_id=expected_config_id)
+
+decode_graph_shard = chunked_snapshot._decode_graph_shard
