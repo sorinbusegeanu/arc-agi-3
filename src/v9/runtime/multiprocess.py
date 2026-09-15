@@ -61,6 +61,7 @@ class EncodedTransition:
     strategy_target_outcome_hi: int | None = None
     strategy_target_outcome_lo: int | None = None
     strategy_replanned: bool = False
+    replanning_baseline_cost: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +201,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
             active_strategy_position = 0
             active_strategy_outcome = None
             active_strategy_realized_cost = 0
+            active_replanning_baseline_cost: float | None = None
             branching_total = 0
             branching_samples = 0
             max_branching_factor = 0
@@ -273,6 +275,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                 if active_strategy_uid is not None:
                     current = next((row for row in strategy_rows if row.strategy_uid == active_strategy_uid), None)
                     if current is None or active_strategy_position >= len(active_strategy_actions) or int(active_strategy_actions[active_strategy_position]) not in actions:
+                        displaced_expected_cost = None if current is None else current.expected_cost
                         alternatives = tuple(row for row in strategy_rows if row.target_outcome_uid == active_strategy_outcome and row.strategy_uid != active_strategy_uid and row.native_actions and int(row.native_actions[0]) in actions)
                         current = replan(current, alternatives, target_environment_id=environment_instance_id, available_actions=actions) if current is not None else choose_strategy(alternatives, target_environment_id=environment_instance_id, available_actions=actions)
                         if current is None:
@@ -287,6 +290,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                             active_strategy_position = 0
                             active_strategy_outcome = current.target_outcome_uid
                             active_strategy_realized_cost = 0
+                            active_replanning_baseline_cost = displaced_expected_cost
                 if active_strategy_uid is None and strategy_rows:
                     outcome_rows = policy.outcomes(environment_instance_id)
                     target = select_target_outcome(outcome_rows)
@@ -390,6 +394,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                         strategy_target_outcome_hi=None if active_strategy_outcome is None else int(active_strategy_outcome.hi),
                         strategy_target_outcome_lo=None if active_strategy_outcome is None else int(active_strategy_outcome.lo),
                         strategy_replanned=strategy_replanned,
+                        replanning_baseline_cost=active_replanning_baseline_cost if executed_strategy_uid is not None else None,
                     )
                 )
                 completed += 1
