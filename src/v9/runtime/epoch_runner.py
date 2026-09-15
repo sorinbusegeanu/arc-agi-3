@@ -52,17 +52,32 @@ def _episode_horizon(spec: Any) -> int:
     return 500
 
 
-def _game_step_budget(spec: Any, args: Any) -> int:
+def _game_step_budget(spec: Any, args: Any, *, previous_episodes: int | None = None) -> int:
     minimum_opportunities = max(1, int(getattr(args, "min_episode_opportunities", 2)))
-    return max(int(args.steps_per_game), _episode_horizon(spec) * minimum_opportunities)
+    horizon_budget = _episode_horizon(spec) * minimum_opportunities
+    base_budget = max(int(args.steps_per_game), horizon_budget)
+    if previous_episodes is not None and int(previous_episodes) > 10:
+        # Fast-reset environments already provide abundant complete trajectories.
+        # Scale toward ten episode opportunities while preserving the horizon floor.
+        scaled = max(1, int(round(base_budget * 10.0 / float(previous_episodes))))
+        return max(horizon_budget, scaled)
+    return base_budget
 
 
-def build_epoch_jobs(specs: tuple[Any, ...], args: Any, *, epoch: int) -> list[tuple[int, Any, int, int]]:
+def build_epoch_jobs(
+    specs: tuple[Any, ...],
+    args: Any,
+    *,
+    epoch: int,
+    previous_game_results: dict[str, dict[str, int | float]] | None = None,
+) -> list[tuple[int, Any, int, int]]:
     jobs = []
     actor_count = max(len(specs), int(args.actors))
     assigned = [specs[index % len(specs)] for index in range(actor_count)]
+    previous_game_results = previous_game_results or {}
     for actor_index, spec in enumerate(assigned):
-        steps = _game_step_budget(spec, args)
+        previous = previous_game_results.get(str(spec.display_name), {})
+        steps = _game_step_budget(spec, args, previous_episodes=int(previous.get("episodes", 0)))
         if steps:
             actor_id = actor_index + 1
             seed = int(args.seed) + int(epoch) * 1_000_003 + actor_id * 1009
@@ -98,14 +113,26 @@ def _append_game_results(root: str | Path, *, epoch: int, specs: tuple[Any, ...]
             }, sort_keys=True) + "\n")
 
 
-def _scenario_success(rows: list[Any]) -> tuple[dict[str, float], float]:
+def _scenario_success(rows: list[Any], specs: tuple[Any, ...] = ()) -> tuple[dict[str, float], float]:
     totals: dict[str, tuple[int, int]] = {}
     for row in rows:
         successes, trials = totals.get(row.game_id, (0, 0))
         row_successes = int(getattr(row, "task_successes", 0))
         row_trials = row_successes + int(getattr(row, "task_failures", 0)) + int(getattr(row, "task_truncations", 0))
         totals[row.game_id] = (successes + row_successes, trials + row_trials)
-    rates = {game_id: (successes / trials if trials else 0.0) for game_id, (successes, trials) in totals.items()}
+    spec_by_name = {str(spec.display_name): spec for spec in specs}
+    level_metrics = _game_level_metrics(rows)["by_game"]
+    rates = {}
+    for game_id, (successes, trials) in totals.items():
+        rate = successes / trials if trials else 0.0
+        spec = spec_by_name.get(str(game_id))
+        adapter = str(getattr(spec, "adapter", "")).lower() if spec is not None else ""
+        if adapter == "arc":
+            # ARC progress is level-based: a completed level is successful
+            # behavior even when the full multi-level game is unfinished.
+            levels = int(level_metrics.get(str(game_id), {}).get("levels_completed", 0))
+            rate = max(rate, min(1.0, levels / 5.0))
+        rates[game_id] = rate
     macro = sum(rates.values()) / len(rates) if rates else 0.0
     return rates, macro
 
@@ -216,6 +243,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
     actor_results = []
     epoch_results = []
     baseline_success: float | None = None
+    previous_game_results: dict[str, dict[str, int | float]] = {}
     previous_game_cost: dict[str, float] = {}
     previous_scenario_success: dict[str, float] = {}
     transfer_attempted = transfer_completed = transfer_passed = transfer_validated = 0
@@ -224,7 +252,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         from v9.cli import make_adapter as adapter_factory
 
     for epoch in range(1, int(args.epochs) + 1):
-        jobs = build_epoch_jobs(specs, args, epoch=epoch)
+        jobs = build_epoch_jobs(specs, args, epoch=epoch, previous_game_results=previous_game_results)
         print(f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} sampling start actors={len(jobs)}", flush=True)
         process_results = run_parallel_memory_jobs(
             runtime,
@@ -257,7 +285,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
 
         # Current-epoch behavioral evidence must be visible before model validation
         # and before any memory is hidden or physically compacted.
-        scenario_success, behavioral_success = _scenario_success(process_results)
+        scenario_success, behavioral_success = _scenario_success(process_results, specs)
         if baseline_success is None:
             baseline_success = behavioral_success
         behavioral_gain = behavioral_success - baseline_success
@@ -265,6 +293,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         runtime.set_telemetry_gauge("behavioral_success_gain", behavioral_gain)
         runtime.set_telemetry_gauge("successful_scenarios", sum(rate > 0.0 for rate in scenario_success.values()))
         game_level = _game_level_metrics(process_results)
+        previous_game_results = dict(game_level["by_game"])
         _append_game_results(args.root, epoch=epoch, specs=specs, rows=process_results)
         runtime.set_telemetry_gauge("current_run_wins", float(game_level["current_run_wins"]))
         runtime.set_telemetry_gauge("current_run_solved_games", int(game_level["current_run_solved_games"]))
