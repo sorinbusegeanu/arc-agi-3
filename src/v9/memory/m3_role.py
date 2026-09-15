@@ -25,4 +25,4 @@ class M3FunctionalRole:
         uid = MemoryUid.from_key(MemoryLevel.M3, MemoryType.ROLE, (relational, int(consequence_signature)))
         parents = tuple(sorted(row.uid for row in families))
         evidence = tuple(sorted({uid for row in families for uid in row.provenance.evidence}))
-        return cls(uid, relational, int(consequence_signature), DerivationProvenance(parents, evidence))
+        support: dict[str, int] = {}\n        for family in families:\n            for key, value in family.support_decomposition:\n                support[key] = support.get(key, 0) + int(value)\n        return cls(uid, relational, int(consequence_signature), DerivationProvenance(parents, evidence), tuple(sorted(support.items())))
