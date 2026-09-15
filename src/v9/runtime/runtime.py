@@ -328,6 +328,24 @@ class ContinuousMemoryRuntime:
             self._publish(CanonicalNode(candidate.uid, MemoryLevel.M7, MemoryType.STRATEGY, (outcome.uid.hi, outcome.uid.lo, int(environment_id), *native_actions), self._watermark), {"target_outcome": [outcome.uid.hi, outcome.uid.lo], "target_environment_id": int(environment_id), "native_actions": list(native_actions), "reliability_successes": 1, "reliability_trials": 1, "evidence_confidence": confidence, "primary_valence_sum": primary_valence, "realized_cost_sum": realized_cost, "parents": [[outcome.uid.hi, outcome.uid.lo]]}, candidate.provenance.evidence)
             return 1
 
+    def record_outcome_equivalence_evidence(self, outcome_uid: MemoryUid, *, equivalent: bool, context_scope_id: int, environment_id: int) -> None:
+        with self._lock:
+            outcome = self._m6.get(outcome_uid)
+            node = self.graph.nodes.get(outcome_uid)
+            payload = self.graph.payloads.get(outcome_uid)
+            if outcome is None or node is None or payload is None:
+                return
+            outcome = replace(
+                outcome,
+                equivalence_trials=outcome.equivalence_trials + 1,
+                equivalence_successes=outcome.equivalence_successes + int(bool(equivalent)),
+                contexts_observed=tuple(sorted(set((*outcome.contexts_observed, int(context_scope_id))))),
+                environments_observed=tuple(sorted(set((*outcome.environments_observed, int(environment_id))))),
+            )
+            self._m6[outcome_uid] = outcome
+            self._publish(node, {**payload, "equivalence_trials": outcome.equivalence_trials, "equivalence_successes": outcome.equivalence_successes, "contexts_observed": list(outcome.contexts_observed), "environments_observed": list(outcome.environments_observed), "primary_valence_sum": outcome.primary_valence_sum, "preference_trials": outcome.preference_trials}, outcome.provenance.evidence, proposal_class=ProposalClass.STATEFUL, mutation_kind=MutationKind.UPDATE_VALIDATION)
+            self.evidence.append("M6_OUTCOME_EQUIVALENCE", self._watermark, {"outcome_uid": outcome_uid.hex(), "equivalent": bool(equivalent), "context_scope_id": int(context_scope_id), "environment_id": int(environment_id)})
+
     def record_strategy_execution(self, strategy_uid: MemoryUid, *, success: bool, realized_cost: int, primary_valence: int = 0) -> None:
         with self._lock:
             strategy = self.__dict__.setdefault("_m7", {}).get(strategy_uid)
@@ -339,13 +357,30 @@ class ContinuousMemoryRuntime:
             self._m7[strategy_uid] = updated
             outcome = self._m6.get(strategy.target_outcome)
             if outcome is not None:
-                self._m6[outcome.uid] = replace(
+                outcome = replace(
                     outcome,
-                    equivalence_trials=outcome.equivalence_trials + 1,
-                    equivalence_successes=outcome.equivalence_successes + int(bool(success)),
                     primary_valence_sum=outcome.primary_valence_sum + int(primary_valence),
                     preference_trials=outcome.preference_trials + 1,
                 )
+                self._m6[outcome.uid] = outcome
+                outcome_node = self.graph.nodes.get(outcome.uid)
+                outcome_payload = self.graph.payloads.get(outcome.uid)
+                if outcome_node is not None and outcome_payload is not None:
+                    self._publish(
+                        outcome_node,
+                        {
+                            **outcome_payload,
+                            "equivalence_trials": outcome.equivalence_trials,
+                            "equivalence_successes": outcome.equivalence_successes,
+                            "contexts_observed": list(outcome.contexts_observed),
+                            "environments_observed": list(outcome.environments_observed),
+                            "primary_valence_sum": outcome.primary_valence_sum,
+                            "preference_trials": outcome.preference_trials,
+                        },
+                        outcome.provenance.evidence,
+                        proposal_class=ProposalClass.STATEFUL,
+                        mutation_kind=MutationKind.UPDATE_VALIDATION,
+                    )
             self._publish(
                 node,
                 {
@@ -1282,10 +1317,10 @@ class ContinuousMemoryRuntime:
             self.evidence.append("REPLAY", self._watermark, asdict(result))
             return result
 
-    def record_replanning_evidence(self, *, improved_efficiency: bool) -> None:
+    def record_replanning_evidence(self, *, recovered: bool, improved_efficiency: bool = False) -> None:
         self._replans_demonstrated += 1
-        self._efficient_replans += int(improved_efficiency)
-        self.evidence.append("REPLANNING", self._watermark, {"improved_efficiency": bool(improved_efficiency)})
+        self._efficient_replans += int(bool(recovered) and bool(improved_efficiency))
+        self.evidence.append("REPLANNING", self._watermark, {"recovered": bool(recovered), "improved_efficiency": bool(improved_efficiency)})
 
     def record_symbol_conditioned_prediction(self, *, baseline: float, conditioned: float, actual: float) -> float:
         from v9.cognition.prediction import PredictionComparison
@@ -1594,7 +1629,7 @@ class ContinuousMemoryRuntime:
                     self._m5[uid] = M5ConsequenceStructure(uid, tuple(int(value) for value in payload.get("descriptor", node.structural_key)), provenance, bool(payload.get("mature", False)))
                 elif node.level is MemoryLevel.M6 and provenance is not None:
                     members = tuple(parents)
-                    self._m6[uid] = M6Outcome(uid, tuple(int(value) for value in payload.get("class_signature", node.structural_key)), members, provenance, int(payload.get("class_version", 1)))
+                    self._m6[uid] = M6Outcome(uid, tuple(int(value) for value in payload.get("class_signature", node.structural_key)), members, provenance, int(payload.get("class_version", 1)), int(payload.get("equivalence_trials", 1)), int(payload.get("equivalence_successes", 1)), tuple(int(value) for value in payload.get("contexts_observed", ())), tuple(int(value) for value in payload.get("environments_observed", ())), int(payload.get("primary_valence_sum", 0)), int(payload.get("preference_trials", 0)))
                 elif node.level is MemoryLevel.M7 and provenance is not None:
                     target_raw = payload.get("target_outcome", parents[0] if parents else None)
                     if isinstance(target_raw, MemoryUid):
