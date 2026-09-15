@@ -67,4 +67,3 @@ class RelationEdge:
     @property
     def key(self) -> tuple[MemoryUid, str, MemoryUid]:
         return self.source, self.relation.value, self.target
-
