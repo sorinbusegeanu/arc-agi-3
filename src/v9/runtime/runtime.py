@@ -216,6 +216,29 @@ class ContinuousMemoryRuntime:
     def read_view(self) -> ReadView:
         return self.graph.read_view()
 
+    def apply_environment_evidence_confidence(self, confidence_by_environment: dict[int, float]) -> int:
+        """Apply confidence to memories indexed by environment."""
+        with self._lock:
+            confidence = {int(k): float(v) for k, v in confidence_by_environment.items()}
+            self._environment_evidence_confidence = confidence
+            if self._memory_uids_by_environment is None:
+                self._memory_uids_by_environment = {}
+                for uid, payload in self.graph.payloads.items():
+                    environment_id = payload.get("environment_instance_id")
+                    if environment_id is not None:
+                        self._memory_uids_by_environment.setdefault(int(environment_id), set()).add(uid)
+            changed = 0
+            for environment_id, value in confidence.items():
+                for uid in tuple(self._memory_uids_by_environment.get(environment_id, ())):
+                    payload = self.graph.payloads.get(uid)
+                    if payload is None:
+                        self._memory_uids_by_environment[environment_id].discard(uid)
+                        continue
+                    if float(payload.get("evidence_confidence", 1.0)) != value:
+                        payload["evidence_confidence"] = value
+                        changed += 1
+            return changed
+
     def set_hgt_action_scores(
         self,
         scores: dict[int, dict[int, float]],
@@ -1113,7 +1136,10 @@ class ContinuousMemoryRuntime:
                     self._publish(CanonicalNode(candidate.uid, MemoryLevel.M4, MemoryType.CONCEPT, candidate.invariant_descriptor, self._watermark), {"invariant_descriptor": list(candidate.invariant_descriptor), "compression_benefit": candidate.compression_benefit, "explanatory_reach": candidate.explanatory_reach, "transfer_prior": candidate.transfer_prior, "formation_scope": list(candidate.provenance.formation_scope), "held_out_targets": [], "validated": False, "concept_state": candidate.state.value, "parents": [[uid.hi, uid.lo] for uid in candidate.provenance.parents]}, candidate.provenance.evidence)
 
     def effective_state(self, uid: MemoryUid, *, lineage_uid: LineageUid | None = None, context_scope_id: ContextScopeId | None = None, target_environment_id: int | None = None) -> EffectiveCognitiveState:
-        return self.effective_states.resolve(self.graph.nodes[uid], lineage_uid=lineage_uid, context_scope_id=context_scope_id, target_environment_id=target_environment_id, target_trust=self.transfer_trust.score_map())
+        node = self.graph.nodes.get(uid)
+        if node is None:
+            raise KeyError(f"effective state requires live canonical memory {uid.hex()}")
+        return self.effective_states.resolve(node, lineage_uid=lineage_uid, context_scope_id=context_scope_id, target_environment_id=target_environment_id, target_trust=self.transfer_trust.score_map())
 
     def retrieve_structural_candidates(self, keys: tuple[StructuralIndexKey, ...], *, limit: int | None = None) -> tuple[MemoryUid, ...]:
         return self.structural_index.retrieve(keys, limit=limit or self.config.scientific.candidates_per_radius)
@@ -1404,9 +1430,12 @@ class ContinuousMemoryRuntime:
             row = M1GroundedContingency(uid, GroundedRelation(str(raw["relation"])), DerivationProvenance(parents, evidence), int(raw["environment_instance_id"]), int(raw["episode_id"]), int(raw["grounded_context_signature"]), None if raw.get("executable_action_token") is None else int(raw["executable_action_token"]), int(raw["realized_transition_signature"]), int(raw["grounded_next_context_signature"]), int(raw.get("support", 1)))
             self._latest_interaction_grounding[(int(raw["key"][0]), int(raw["key"][1]))] = row
         for level in (MemoryLevel.M2, MemoryLevel.M3, MemoryLevel.M4):
-            for uid in self.graph._uids_by_level[level]:
-                node = self.graph.nodes[uid]
-                payload = self.graph.payloads[uid]
+            for uid in tuple(self.graph._uids_by_level[level]):
+                node = self.graph.nodes.get(uid)
+                payload = self.graph.payloads.get(uid)
+                if node is None or payload is None:
+                    self.graph._uids_by_level[level].discard(uid)
+                    continue
                 parents = tuple(MemoryUid(int(raw[0]), int(raw[1])) for raw in payload.get("parents", []))
                 evidence_refs = tuple(MemoryUid(int(raw[0]), int(raw[1])) for raw in payload.get("evidence_refs", payload.get("parents", [])))
                 provenance = DerivationProvenance(parents, evidence_refs) if parents else None
