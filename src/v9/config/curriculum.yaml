@@ -188,7 +188,6 @@ steps:
           - CartPole-v1
           - MountainCar-v0
           - Acrobot-v1
-          - Blackjack-v1
 
   step10:
     title: ARC simple transfer
@@ -249,7 +248,7 @@ steps:
           - id_candidates: [Taxi-v4, Taxi-v3]
           - id_candidates: [CliffWalking-v1, CliffWalking-v0]
       - adapter: gym_structured
-        games: [CartPole-v1, MountainCar-v0, Acrobot-v1, Blackjack-v1]
+        games: [CartPole-v1, MountainCar-v0, Acrobot-v1]
       - adapter: sokoban
         games: [Sokoban-small-v0, Sokoban-v0]
       - adapter: chess
@@ -362,7 +361,6 @@ presets:
           - CartPole-v1
           - MountainCar-v0
           - Acrobot-v1
-          - Blackjack-v1
       - adapter: sokoban
         games:
           - Sokoban-small-v0
