@@ -115,6 +115,7 @@ class ContinuousMemoryRuntime:
         self._modality_events: dict[int, int] = {}
         self._similarity_entropy_by_radius: dict[int, list[float]] = {}
         self._replans_demonstrated = 0
+        self._recovered_replans = 0
         self._efficient_replans = 0
         self._symbol_prediction_delta_sum = 0.0
         self._prediction_error_sum = 0.0
@@ -1304,6 +1305,7 @@ class ContinuousMemoryRuntime:
 
     def record_replanning_evidence(self, *, recovered: bool, improved_efficiency: bool = False) -> None:
         self._replans_demonstrated += 1
+        self._recovered_replans += int(bool(recovered))
         self._efficient_replans += int(bool(recovered) and bool(improved_efficiency))
         self.evidence.append("REPLANNING", self._watermark, {"recovered": bool(recovered), "improved_efficiency": bool(improved_efficiency)})
 
@@ -1365,8 +1367,14 @@ class ContinuousMemoryRuntime:
             consequence = M5ConsequenceStructure.form((concept,), (role.consequence_signature,))
             concept_confidence = float(self.graph.payloads.get(concept.uid, {}).get("evidence_confidence", 1.0))
             self._publish(CanonicalNode(consequence.uid, MemoryLevel.M5, MemoryType.CONSEQUENCE, consequence.consequence_descriptor, self._watermark), {"descriptor": list(consequence.consequence_descriptor), "mature": consequence.mature, "evidence_confidence": concept_confidence, "parents": [[uid.hi, uid.lo] for uid in consequence.provenance.parents]}, consequence.provenance.evidence)
-            outcome = M6Outcome.form((consequence,), diameter_bound=0)
-            self._publish(CanonicalNode(outcome.uid, MemoryLevel.M6, MemoryType.OUTCOME, outcome.class_signature, self._watermark), {"class_signature": list(outcome.class_signature), "class_version": outcome.class_version, "evidence_confidence": concept_confidence, "parents": [[uid.hi, uid.lo] for uid in outcome.provenance.parents]}, outcome.provenance.evidence)
+            comparable = tuple(
+                row for row in self._m5.values()
+                if row.uid != consequence.uid
+                and row.mature
+                and row.consequence_descriptor == consequence.consequence_descriptor
+            )
+            outcome = M6Outcome.form(tuple(sorted((*comparable, consequence), key=lambda row: row.uid)), diameter_bound=0)
+            self._publish(CanonicalNode(outcome.uid, MemoryLevel.M6, MemoryType.OUTCOME, outcome.class_signature, self._watermark), {"class_signature": list(outcome.class_signature), "class_version": outcome.class_version, "equivalence_trials": outcome.equivalence_trials, "equivalence_successes": outcome.equivalence_successes, "contexts_observed": list(outcome.contexts_observed), "environments_observed": list(outcome.environments_observed), "primary_valence_sum": outcome.primary_valence_sum, "preference_trials": outcome.preference_trials, "evidence_confidence": concept_confidence, "parents": [[uid.hi, uid.lo] for uid in outcome.provenance.parents]}, outcome.provenance.evidence)
             action = int(admissible[-1]["target_native_action"])
             episode_rows: dict[int, list[tuple[int, dict[str, Any]]]] = {}
             for uid in tuple(self.graph._uids_by_level[MemoryLevel.M0]):
@@ -1770,7 +1778,8 @@ class ContinuousMemoryRuntime:
             "m7_multi_strategy_outcomes": multi_strategy_outcomes,
             "m7_replan_attempts": self._replans_demonstrated,
             "m7_replan_successes": self._efficient_replans,
-            "m7_replanning_recovery_rate": self._efficient_replans / max(1, self._replans_demonstrated),
+            "m7_replanning_recovery_rate": self._recovered_replans / max(1, self._replans_demonstrated),
+            "m7_replanning_efficiency_rate": self._efficient_replans / max(1, self._replans_demonstrated),
             "developmental_intervals": self.stage_tracker.interval_id,
             "isf_decisions_hot": len(self.isf.decisions),
             "replay": self.replay.state_dict(),
