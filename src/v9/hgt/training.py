@@ -525,6 +525,41 @@ class _HGTWrapper:
         self.model = Model()
 
 
+def _transition_features(rows: list[dict[str, Any]], torch: Any, *, input_dim: int = 64):
+    features = torch.zeros((len(rows), input_dim), dtype=torch.float32)
+    for index, row in enumerate(rows):
+        for offset, value in enumerate((int(row.get("context_signature", 0)), int(row.get("next_context_signature", 0)), int(row.get("action_id", 0)), int(row.get("global_step", 0)), int(row.get("episode_id", 0)))):
+            digest = hashlib.blake2b(str(value).encode("ascii"), digest_size=8, person=b"v9-hgt-row").digest()
+            features[index, int.from_bytes(digest, "little") % input_dim] += 2.0 if offset == 2 else 1.0
+    return features
+
+
+def _transition_batch_loss(model: Any, rows: list[dict[str, Any]], torch: Any, device: Any):
+    if not rows or NODE_TYPE not in model.encoders:
+        return None, 0, 0
+    hidden = model.encoders[NODE_TYPE](_transition_features(rows, torch).to(device)).relu()
+    values = model.value_heads[NODE_TYPE](hidden).squeeze(-1)
+    targets = torch.tensor([float(row["target_return"]) for row in rows], dtype=torch.float32, device=device)
+    regression = torch.nn.functional.smooth_l1_loss(values, targets)
+    groups: dict[tuple[str, int], list[int]] = {}
+    for index, row in enumerate(rows):
+        groups.setdefault((str(row["game_scenario"]), int(row["context_signature"])), []).append(index)
+    ranking_terms = []
+    correct = total = 0
+    for indices in groups.values():
+        if len(indices) < 2:
+            continue
+        best = max(indices, key=lambda i: float(rows[i]["target_return"]))
+        worst = min(indices, key=lambda i: float(rows[i]["target_return"]))
+        if float(rows[best]["target_return"]) <= float(rows[worst]["target_return"]):
+            continue
+        ranking_terms.append(torch.nn.functional.softplus(-(values[best] - values[worst])))
+        correct += int(float(values[best].detach().cpu()) > float(values[worst].detach().cpu()))
+        total += 1
+    ranking = torch.stack(ranking_terms).mean() if ranking_terms else regression.new_zeros(())
+    return regression + ranking, correct, total
+
+
 def _episode_rank(environment_id: int, episode_id: int) -> int:
     digest = hashlib.blake2b(
         f"{int(environment_id)}:{int(episode_id)}".encode("ascii"),
@@ -967,7 +1002,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         full_dataset_steps = math.ceil(len(epoch_transition_rows) / stream_batch_size)
         dynamic_training_steps = max(int(dynamic_training_steps), int(full_dataset_steps))
         runtime.set_telemetry_gauge("hgt_training_batches", int(full_dataset_steps))
-        runtime.set_telemetry_gauge("hgt_training_coverage", 1.0)
+        runtime.set_telemetry_gauge("hgt_training_coverage_planned", 1.0)
     runtime.set_telemetry_gauge("hgt_dynamic_training_steps", int(dynamic_training_steps))
     runtime.set_telemetry_gauge("hgt_training_examples_current", int(training_examples))
     runtime.set_telemetry_gauge("hgt_examples_per_training_step_target", 2048)
@@ -1055,7 +1090,11 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     last_grad_norm = 0.0
     model.train()
     try:
-        for _ in range(max(1, int(dynamic_training_steps))):
+        stream_batch_size = max(64, min(2048, int(getattr(config, "hgt_epoch_batch_size", 512))))
+        transition_batches = [epoch_transition_rows[i:i + stream_batch_size] for i in range(0, len(epoch_transition_rows), stream_batch_size)]
+        ranking_correct = ranking_total = transitions_trained = 0
+        loop_count = max(1, max(int(dynamic_training_steps), len(transition_batches)))
+        for step_index in range(loop_count):
             optimizer.zero_grad(set_to_none=True)
             logits, values, auxiliary = model(x_device, edges_device)
             loss, _, _ = _loss(
@@ -1073,6 +1112,13 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
                 log_vars=model.objective_log_vars,
                 dynamic_weighting=bool(config.hgt_dynamic_loss_weighting),
             )
+            batch = transition_batches[step_index] if step_index < len(transition_batches) else []
+            stream_loss, stream_correct, stream_total = _transition_batch_loss(model, batch, torch, device)
+            if stream_loss is not None:
+                loss = stream_loss if loss is None else loss + stream_loss
+                transitions_trained += len(batch)
+                ranking_correct += int(stream_correct)
+                ranking_total += int(stream_total)
             if loss is None:
                 break
             loss.backward()
@@ -1094,6 +1140,11 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             oom_retry=_oom_retry,
             exc=exc,
         )
+    runtime.set_telemetry_gauge("hgt_transitions_trained", int(locals().get("transitions_trained", 0)))
+    coverage = float(locals().get("transitions_trained", 0)) / max(1, len(epoch_transition_rows)) if epoch_transition_rows else 0.0
+    runtime.set_telemetry_gauge("hgt_training_coverage", coverage)
+    runtime.set_telemetry_gauge("hgt_action_ranking_accuracy", float(locals().get("ranking_correct", 0)) / max(1, locals().get("ranking_total", 0)))
+    runtime.set_telemetry_gauge("hgt_action_ranking_validation_pairs", int(locals().get("ranking_total", 0)))
     if training_steps <= 0:
         return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, parent_version, 0.0, parent_validation_loss if math.isfinite(parent_validation_loss) else 0.0, action_examples, 0, parent_checkpoint)
 
