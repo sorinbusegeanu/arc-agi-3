@@ -960,7 +960,8 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     epoch_dataset_path = getattr(runtime, "_hgt_training_dataset_path", None)
     epoch_transition_rows = transition_training_rows(epoch_dataset_path) if epoch_dataset_path and Path(epoch_dataset_path).exists() else []
     epoch_ranking_pairs = action_ranking_pairs(epoch_transition_rows) if epoch_transition_rows else []
-    transition_train_rows, transition_val_rows = _split_transition_rows(epoch_transition_rows)
+    transition_train_rows = list(epoch_transition_rows)
+    transition_val_rows: list[dict[str, Any]] = []
     runtime.set_telemetry_gauge("hgt_training_dataset_transitions", len(epoch_transition_rows))
     runtime.set_telemetry_gauge("hgt_action_ranking_pairs", len(epoch_ranking_pairs))
     training_view_builder = getattr(runtime.graph, "training_view", None)
@@ -1198,14 +1199,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     if training_steps <= 0:
         return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, parent_version, 0.0, parent_validation_loss if math.isfinite(parent_validation_loss) else 0.0, action_examples, 0, parent_checkpoint)
 
-    transition_validation_loss, transition_ranking_accuracy, transition_ranking_pairs = _transition_validation(
-        model, transition_val_rows, torch, device
-    )
-    runtime.set_telemetry_gauge("hgt_transition_validation_loss", transition_validation_loss)
-    runtime.set_telemetry_gauge("hgt_action_ranking_validation_accuracy", transition_ranking_accuracy)
-    runtime.set_telemetry_gauge("hgt_action_ranking_validation_pairs", transition_ranking_pairs)
     runtime.set_telemetry_gauge("hgt_transition_training_examples", len(transition_train_rows))
-    runtime.set_telemetry_gauge("hgt_transition_validation_examples", len(transition_val_rows))
     model.eval()
     inference_started = time.perf_counter()
     with torch.no_grad():
@@ -1326,9 +1320,6 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             "epoch_dataset_transitions": len(epoch_transition_rows),
             "action_ranking_pairs": len(epoch_ranking_pairs),
             "training_coverage": float(coverage),
-            "transition_validation_loss": float(transition_validation_loss),
-            "action_ranking_validation_accuracy": float(transition_ranking_accuracy),
-            "action_ranking_validation_pairs": int(transition_ranking_pairs),
             "training_examples": training_examples,
             "validation_examples": validation_examples,
             "action_scores": action_scores,
