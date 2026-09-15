@@ -71,6 +71,7 @@ class _Runtime:
         self._m5 = {}
         self._m6 = {}
         self._m7 = {}
+        self._transfer_trials = {}
         self._deferred_base_nodes = {}
         self._latest_interaction_grounding = {}
         self.unified_telemetry = SimpleNamespace(gauges={})
