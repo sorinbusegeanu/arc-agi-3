@@ -415,6 +415,8 @@ presets:
           - pick_two_obj_and_place
       - adapter: arc
         games:
+          - gp01
+          - gp02
           - ez01
           - ez02
           - ez03
