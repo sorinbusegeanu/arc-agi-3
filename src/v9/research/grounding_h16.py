@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import Enum
+import json
+from pathlib import Path
 from random import Random
 from typing import Callable
 
@@ -41,6 +43,15 @@ class H16Metrics:
 
 
 @dataclass(frozen=True, slots=True)
+class H16RunState:
+    scientific_config_id: str = ""
+    model_version: str = "untrained"
+    snapshot_id: int = 0
+    symbol_schema_version: int = 2
+    source_state_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class H16Trial:
     condition: GroundingCondition
     seed: int
@@ -50,6 +61,7 @@ class H16Trial:
     metrics: H16Metrics
     held_out_causal_effect: float
     trial_id: str = ""
+    run_state: H16RunState = H16RunState()
 
     @property
     def prediction_score(self) -> float:
@@ -75,66 +87,37 @@ def _mean(rows: tuple[H16Trial, ...], metric: str) -> float:
     return sum(float(getattr(row.metrics, metric)) for row in rows) / len(rows)
 
 
+def _match_key(row: H16Trial) -> tuple[int, int, int, int, str]:
+    return (
+        int(row.seed),
+        int(row.environment_config_id),
+        int(row.interaction_budget),
+        int(row.evaluation_id),
+        str(row.run_state.source_state_id),
+    )
+
+
 def evaluate_h16(
     trials: tuple[H16Trial, ...],
     *,
     advantage_threshold: float = 0.0,
     causal_threshold: float = 0.0,
 ) -> H16Report:
-    by_condition = {
-        condition: tuple(row for row in trials if row.condition is condition)
-        for condition in GroundingCondition
-    }
+    by_condition = {condition: tuple(row for row in trials if row.condition is condition) for condition in GroundingCondition}
     if any(not rows for rows in by_condition.values()):
-        return H16Report(
-            HypothesisResult("H16", HypothesisStatus.UNTESTED, None, len(trials), "all C0-C3 conditions are required"),
-            {},
-            False,
-            {},
-            0.0,
-        )
-
-    keys = lambda rows: {
-        (row.seed, row.environment_config_id, row.interaction_budget, row.evaluation_id)
-        for row in rows
-    }
-    matched = len({frozenset(keys(rows)) for rows in by_condition.values()}) == 1
-
+        return H16Report(HypothesisResult("H16", HypothesisStatus.UNTESTED, None, len(trials), "all C0-C3 conditions are required"), {}, False, {}, 0.0)
+    key_sets = [{_match_key(row) for row in rows} for rows in by_condition.values()]
+    matched = all(values == key_sets[0] for values in key_sets[1:])
     metric_names = tuple(H16Metrics.__dataclass_fields__)
-    metric_means = {
-        condition.value: {metric: _mean(rows, metric) for metric in metric_names}
-        for condition, rows in by_condition.items()
-    }
-    means = {
-        condition.value: sum(row.metrics.aggregate for row in rows) / len(rows)
-        for condition, rows in by_condition.items()
-    }
+    metric_means = {condition.value: {metric: _mean(rows, metric) for metric in metric_names} for condition, rows in by_condition.items()}
+    means = {condition.value: sum(row.metrics.aggregate for row in rows) / len(rows) for condition, rows in by_condition.items()}
     aligned = means[GroundingCondition.C2_ALIGNED.value]
-    control = max(
-        means[GroundingCondition.C0_INTERACTION_ONLY.value],
-        means[GroundingCondition.C1_SYMBOLS_ONLY.value],
-        means[GroundingCondition.C3_SHUFFLED.value],
-    )
-    causal = sum(
-        row.held_out_causal_effect
-        for row in by_condition[GroundingCondition.C2_ALIGNED]
-    ) / len(by_condition[GroundingCondition.C2_ALIGNED])
+    control = max(means[GroundingCondition.C0_INTERACTION_ONLY.value], means[GroundingCondition.C1_SYMBOLS_ONLY.value], means[GroundingCondition.C3_SHUFFLED.value])
+    causal = sum(row.held_out_causal_effect for row in by_condition[GroundingCondition.C2_ALIGNED]) / len(by_condition[GroundingCondition.C2_ALIGNED])
     effect = aligned - control
-    status = (
-        HypothesisStatus.SUPPORTED
-        if matched and effect > advantage_threshold and causal > causal_threshold
-        else HypothesisStatus.FALSIFIED
-    )
+    status = HypothesisStatus.SUPPORTED if matched and effect > advantage_threshold and causal > causal_threshold else HypothesisStatus.FALSIFIED
     return H16Report(
-        HypothesisResult(
-            "H16",
-            status,
-            effect,
-            len(trials),
-            "matched aligned advantage and held-out causal effect"
-            if status is HypothesisStatus.SUPPORTED
-            else "required matched advantage was not demonstrated",
-        ),
+        HypothesisResult("H16", status, effect, len(trials), "matched aligned advantage and held-out causal effect" if status is HypothesisStatus.SUPPORTED else "required matched advantage was not demonstrated"),
         means,
         matched,
         metric_means,
@@ -149,23 +132,14 @@ def run_matched_controls(
     environment_config_id: int,
     interaction_budget: int,
     evaluation_id: int = 1,
+    run_state: H16RunState | None = None,
 ) -> tuple[H16Trial, ...]:
+    state = run_state or H16RunState(source_state_id=f"h16:{environment_config_id}:{evaluation_id}")
     rows: list[H16Trial] = []
     for seed in seeds:
         for condition in GroundingCondition:
             metrics, causal = runner(condition, seed, interaction_budget)
-            rows.append(
-                H16Trial(
-                    condition=condition,
-                    seed=seed,
-                    environment_config_id=environment_config_id,
-                    interaction_budget=interaction_budget,
-                    evaluation_id=evaluation_id,
-                    metrics=metrics,
-                    held_out_causal_effect=causal,
-                    trial_id=f"h16:{environment_config_id}:{evaluation_id}:{seed}:{condition.value}",
-                )
-            )
+            rows.append(H16Trial(condition, seed, environment_config_id, interaction_budget, evaluation_id, metrics, causal, f"h16:{environment_config_id}:{evaluation_id}:{seed}:{condition.value}", state))
     return tuple(rows)
 
 
@@ -186,20 +160,14 @@ def run_synthetic_h16_controls(
     environment_config_id: int,
     interaction_budget: int,
     evaluation_id: int = 1,
+    run_state: H16RunState | None = None,
 ) -> tuple[H16Trial, ...]:
     """Execute deterministic arbitrary-symbol C0-C3 controls with matched budgets."""
     if interaction_budget < 6:
         raise ValueError("synthetic H16 requires at least six interactions")
 
     def runner(condition: GroundingCondition, seed: int, budget: int) -> tuple[H16Metrics, float]:
-        environment = SyntheticSymbolicEnvironment(
-            SyntheticSymbolicConfig(
-                seed=seed,
-                horizon=budget + 1,
-                aligned=True,
-                shuffled=condition is GroundingCondition.C3_SHUFFLED,
-            )
-        )
+        environment = SyntheticSymbolicEnvironment(SyntheticSymbolicConfig(seed=seed, horizon=budget + 1, aligned=True, shuffled=condition is GroundingCondition.C3_SHUFFLED))
         rng = Random(seed)
         transitions: list[tuple[int, int, int]] = []
         for _ in range(budget):
@@ -222,30 +190,17 @@ def run_synthetic_h16_controls(
         evaluation = transitions[split:]
         correct = sum(model.get(features(row, condition), fallback) == row[2] for row in evaluation)
         prediction = correct / len(evaluation)
-
-        ablated_model, ablated_fallback = _majority_model(
-            [((row[1],), row[2]) for row in transitions[:split]]
-        )
-        ablated_correct = sum(
-            ablated_model.get((row[1],), ablated_fallback) == row[2]
-            for row in evaluation
-        )
+        ablated_model, ablated_fallback = _majority_model([((row[1],), row[2]) for row in transitions[:split]])
+        ablated_correct = sum(ablated_model.get((row[1],), ablated_fallback) == row[2] for row in evaluation)
         persistence = ablated_correct / len(evaluation)
         causal = prediction - persistence if condition is GroundingCondition.C2_ALIGNED else 0.0
-
-        symbol_only_model, symbol_only_fallback = _majority_model(
-            [((row[0],), row[2]) for row in transitions[:split]]
-        )
-        symbol_only_correct = sum(
-            symbol_only_model.get((row[0],), symbol_only_fallback) == row[2]
-            for row in evaluation
-        )
+        symbol_only_model, symbol_only_fallback = _majority_model([((row[0],), row[2]) for row in transitions[:split]])
+        symbol_only_correct = sum(symbol_only_model.get((row[0],), symbol_only_fallback) == row[2] for row in evaluation)
         symbol_generalization = symbol_only_correct / len(evaluation)
-
         metrics = H16Metrics(
             interaction_prediction=prediction,
             action_success=prediction,
-            symbol_conditioned_transfer=prediction if condition in {GroundingCondition.C2_ALIGNED, GroundingCondition.C3_SHUFFLED} else 0.0,
+            symbol_conditioned_transfer=prediction if condition is GroundingCondition.C2_ALIGNED else 0.0,
             world_to_symbol_generalization=symbol_generalization if condition is not GroundingCondition.C0_INTERACTION_ONLY else 0.0,
             composition_success=prediction if condition is GroundingCondition.C2_ALIGNED else 0.0,
             persistence_without_symbols=persistence,
@@ -253,17 +208,58 @@ def run_synthetic_h16_controls(
         )
         return metrics, causal
 
-    return run_matched_controls(
-        runner,
-        seeds=seeds,
-        environment_config_id=environment_config_id,
-        interaction_budget=interaction_budget,
-        evaluation_id=evaluation_id,
-    )
+    return run_matched_controls(runner, seeds=seeds, environment_config_id=environment_config_id, interaction_budget=interaction_budget, evaluation_id=evaluation_id, run_state=run_state)
+
+
+def save_h16_evidence(path: str | Path, trials: tuple[H16Trial, ...], report: H16Report | None = None) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    report = report or evaluate_h16(trials)
+    payload = {
+        "schema_version": 1,
+        "trials": [
+            {**asdict(row), "condition": row.condition.value}
+            for row in trials
+        ],
+        "report": {
+            "status": report.result.status.value,
+            "effect": report.result.effect,
+            "samples": report.result.samples,
+            "reason": report.result.reason,
+            "means": report.means,
+            "matched": report.matched,
+            "metric_means": report.metric_means,
+            "causal_effect": report.causal_effect,
+        },
+    }
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(target)
+
+
+def load_h16_trials(path: str | Path) -> tuple[H16Trial, ...]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if int(payload.get("schema_version", 0)) != 1:
+        raise ValueError("unsupported H16 evidence schema")
+    rows: list[H16Trial] = []
+    for raw in payload.get("trials", []):
+        rows.append(
+            H16Trial(
+                condition=GroundingCondition(str(raw["condition"])),
+                seed=int(raw["seed"]),
+                environment_config_id=int(raw["environment_config_id"]),
+                interaction_budget=int(raw["interaction_budget"]),
+                evaluation_id=int(raw["evaluation_id"]),
+                metrics=H16Metrics(**dict(raw["metrics"])),
+                held_out_causal_effect=float(raw["held_out_causal_effect"]),
+                trial_id=str(raw.get("trial_id", "")),
+                run_state=H16RunState(**dict(raw.get("run_state", {}))),
+            )
+        )
+    return tuple(rows)
 
 
 def publish_h16_report(runtime: object, report: H16Report) -> None:
-    """Publish matched H16 evidence into the unified telemetry/dashboard path."""
     setter = getattr(runtime, "set_telemetry_gauge")
     for condition in GroundingCondition:
         setter(f"h16_{condition.value}_score", float(report.means.get(condition.value, 0.0)))
