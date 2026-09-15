@@ -7,6 +7,7 @@ from v9.memory.identity import MemoryUid
 from v9.memory.m1_grounded import M1GroundedContingency
 from v9.memory.m1_normalized import M1NormalizedRelation
 from v9.memory.model import CanonicalNode, MemoryLevel, MemoryType
+from v9.memory.symbolic_relations import derive_symbolic_relations
 from v9.modalities.contract import InteractionEvent, PassiveSymbolEvent
 
 from .memory_pipeline import DerivationTask, IngestionTask, PreparedIngestion, derive_memory, prepare_ingestion
@@ -41,12 +42,19 @@ class CanonicalWrite:
 @dataclass(frozen=True, slots=True)
 class SymbolCommitPlan:
     event: PassiveSymbolEvent
+    grounding: M1GroundedContingency
     relation: M1NormalizedRelation
     aligned_relation: M1NormalizedRelation | None
     base_writes: tuple[CanonicalWrite, ...]
     normalized_write: CanonicalWrite
     aligned_normalized_write: CanonicalWrite | None
     occurrence: Any | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DerivedRelationCommitPlan:
+    relation: M1NormalizedRelation
+    write: CanonicalWrite
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +73,7 @@ class CommitPlan:
     game_scenario: str
     isf_static: tuple[float, float, float, float, float] | None
     transition: Any | None = None
+    derived_relations: tuple[DerivedRelationCommitPlan, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,13 +107,7 @@ def _occurrence_payload(occurrence: Any | None) -> dict[str, Any]:
 
 def _m0_write(m0: Any, event: Any, transition: Any = None, occurrence: Any | None = None) -> CanonicalWrite:
     return CanonicalWrite(
-        CanonicalNode(
-            m0.uid,
-            MemoryLevel.M0,
-            MemoryType.EPISODE,
-            (event.identity.event_id.hi, event.identity.event_id.lo),
-            int(event.identity.causal_watermark),
-        ),
+        CanonicalNode(m0.uid, MemoryLevel.M0, MemoryType.EPISODE, (event.identity.event_id.hi, event.identity.event_id.lo), int(event.identity.causal_watermark)),
         {
             "modality_id": m0.modality_id,
             "environment_instance_id": m0.provenance.environment_instance_id,
@@ -133,13 +136,7 @@ def _m0_write(m0: Any, event: Any, transition: Any = None, occurrence: Any | Non
 
 def _m1g_write(m1g: Any, m0: Any, event: Any, transition: Any = None, occurrence: Any | None = None) -> CanonicalWrite:
     return CanonicalWrite(
-        CanonicalNode(
-            m1g.uid,
-            MemoryLevel.M1,
-            MemoryType.GROUNDED_CONTINGENCY,
-            (m1g.uid.hi, m1g.uid.lo),
-            int(event.identity.causal_watermark),
-        ),
+        CanonicalNode(m1g.uid, MemoryLevel.M1, MemoryType.GROUNDED_CONTINGENCY, (m1g.uid.hi, m1g.uid.lo), int(event.identity.causal_watermark)),
         {
             "relation": m1g.relation.value,
             "environment_instance_id": m1g.environment_instance_id,
@@ -158,36 +155,33 @@ def _m1g_write(m1g: Any, m0: Any, event: Any, transition: Any = None, occurrence
     )
 
 
-def _m1n_write(relation: M1NormalizedRelation, *, watermark: int, transition: Any = None, occurrence: Any | None = None) -> CanonicalWrite:
+def _m1n_write(relation: M1NormalizedRelation, *, watermark: int, transition: Any = None, occurrence: Any | None = None, payload_extra: dict[str, Any] | None = None) -> CanonicalWrite:
     parents = tuple(relation.provenance.parents)
     evidence = tuple(relation.provenance.evidence)
+    payload = {
+        "observable_relation": relation.observable_relation,
+        "channel": relation.channel.value,
+        "structural_signature": relation.structural_signature,
+        "family_signature": int(relation.family_signature or relation.structural_signature),
+        "support": float(relation.support),
+        "contradiction": float(relation.contradiction),
+        "temporal_offsets": list(relation.temporal_offsets),
+        "causal_watermark": int(relation.causal_watermark or watermark),
+        "heldout_transfer": bool(relation.heldout_transfer),
+        "evidence_confidence": 1.0,
+        **_occurrence_payload(occurrence),
+        "parents": [[uid.hi, uid.lo] for uid in parents],
+        **({"semantic_before": [list(row) for row in transition.semantic_before]} if transition is not None and transition.semantic_before else {}),
+        **({"semantic_action": [list(row) for row in transition.semantic_action]} if transition is not None and transition.semantic_action else {}),
+        **({"semantic_options": [list(row) for row in transition.semantic_options]} if transition is not None and transition.semantic_options else {}),
+        **({"semantic_after": [list(row) for row in transition.semantic_after]} if transition is not None and transition.semantic_after else {}),
+        **({"semantic_effects": [list(row) for row in transition.semantic_delta]} if transition is not None and transition.semantic_delta else {}),
+    }
+    if payload_extra:
+        payload.update(payload_extra)
     return CanonicalWrite(
-        CanonicalNode(
-            relation.uid,
-            MemoryLevel.M1,
-            MemoryType.NORMALIZED_RELATION,
-            (relation.structural_signature,),
-            int(watermark),
-        ),
-        {
-            "observable_relation": relation.observable_relation,
-            "channel": relation.channel.value,
-            "structural_signature": relation.structural_signature,
-            "family_signature": int(relation.family_signature or relation.structural_signature),
-            "support": float(relation.support),
-            "contradiction": float(relation.contradiction),
-            "temporal_offsets": list(relation.temporal_offsets),
-            "causal_watermark": int(relation.causal_watermark or watermark),
-            "heldout_transfer": bool(relation.heldout_transfer),
-            "evidence_confidence": 1.0,
-            **_occurrence_payload(occurrence),
-            "parents": [[uid.hi, uid.lo] for uid in parents],
-            **({"semantic_before": [list(row) for row in transition.semantic_before]} if transition is not None and transition.semantic_before else {}),
-            **({"semantic_action": [list(row) for row in transition.semantic_action]} if transition is not None and transition.semantic_action else {}),
-            **({"semantic_options": [list(row) for row in transition.semantic_options]} if transition is not None and transition.semantic_options else {}),
-            **({"semantic_after": [list(row) for row in transition.semantic_after]} if transition is not None and transition.semantic_after else {}),
-            **({"semantic_effects": [list(row) for row in transition.semantic_delta]} if transition is not None and transition.semantic_delta else {}),
-        },
+        CanonicalNode(relation.uid, MemoryLevel.M1, MemoryType.NORMALIZED_RELATION, (relation.structural_signature,), int(watermark)),
+        payload,
         evidence,
     )
 
@@ -199,64 +193,47 @@ def build_commit_plan(prepared: PreparedIngestion) -> CommitPlan:
     if prepared.event is not None:
         if prepared.m0 is None or prepared.m1g is None or prepared.m1n is None:
             raise RuntimeError("prepared interaction is incomplete")
-        base_writes = (
-            _m0_write(prepared.m0, prepared.event, prepared.transition),
-            _m1g_write(prepared.m1g, prepared.m0, prepared.event, prepared.transition),
-        )
-        normalized_write = _m1n_write(
-            prepared.m1n,
-            watermark=int(prepared.event.identity.causal_watermark),
-            transition=prepared.transition,
-        )
+        base_writes = (_m0_write(prepared.m0, prepared.event, prepared.transition), _m1g_write(prepared.m1g, prepared.m0, prepared.event, prepared.transition))
+        normalized_write = _m1n_write(prepared.m1n, watermark=int(prepared.event.identity.causal_watermark), transition=prepared.transition)
         experience = prepared.event.experience
         isf_static = (
-            abs(float(experience.primary_valence)),
-            abs(float(experience.future_option_delta)),
-            float(experience.prediction_error),
-            0.5 if experience.family_signature else 0.0,
-            min(1.0, float(experience.changed_cells) / 16.0),
+            abs(float(experience.primary_valence)), abs(float(experience.future_option_delta)), float(experience.prediction_error),
+            0.5 if experience.family_signature else 0.0, min(1.0, float(experience.changed_cells) / 16.0),
         )
 
     symbols: list[SymbolCommitPlan] = []
     for index, symbol in enumerate(prepared.symbols):
         occurrence = prepared.symbol_occurrences[index] if index < len(prepared.symbol_occurrences) else None
-        writes = (
-            _m0_write(symbol.m0, symbol.event, occurrence=occurrence),
-            _m1g_write(symbol.m1g, symbol.m0, symbol.event, occurrence=occurrence),
+        writes = (_m0_write(symbol.m0, symbol.event, occurrence=occurrence), _m1g_write(symbol.m1g, symbol.m0, symbol.event, occurrence=occurrence))
+        symbols.append(SymbolCommitPlan(
+            symbol.event, symbol.m1g, symbol.m1n, symbol.aligned_m1n, writes,
+            _m1n_write(symbol.m1n, watermark=int(symbol.event.identity.causal_watermark), occurrence=occurrence),
+            None if symbol.aligned_m1n is None else _m1n_write(symbol.aligned_m1n, watermark=int(symbol.event.identity.causal_watermark), occurrence=occurrence),
+            occurrence,
+        ))
+
+    derived_plans: list[DerivedRelationCommitPlan] = []
+    if prepared.symbols:
+        watermark = max(int(row.event.identity.causal_watermark) for row in prepared.symbols)
+        derived = derive_symbolic_relations(
+            prepared.symbols,
+            interaction_grounding=prepared.m1g,
+            previous_interaction_grounding=None,
+            transition=prepared.transition,
+            causal_watermark=watermark,
+            occurrences=prepared.symbol_occurrences,
         )
-        symbols.append(
-            SymbolCommitPlan(
-                symbol.event,
-                symbol.m1n,
-                symbol.aligned_m1n,
-                writes,
-                _m1n_write(symbol.m1n, watermark=int(symbol.event.identity.causal_watermark), occurrence=occurrence),
-                None
-                if symbol.aligned_m1n is None
-                else _m1n_write(
-                    symbol.aligned_m1n,
-                    watermark=int(symbol.event.identity.causal_watermark),
-                    occurrence=occurrence,
-                ),
-                occurrence,
-            )
-        )
+        for item in derived:
+            derived_plans.append(DerivedRelationCommitPlan(
+                item.relation,
+                _m1n_write(item.relation, watermark=watermark, payload_extra=item.payload()),
+            ))
 
     return CommitPlan(
-        int(prepared.sequence),
-        prepared.identity,
-        prepared.event,
-        prepared.m1g,
-        prepared.m1n,
-        base_writes,
-        normalized_write,
-        tuple(symbols),
-        prepared.symbol_codec_state,
-        prepared.symbol_occurrences,
-        prepared.transition.curriculum_step,
-        str(prepared.transition.game_scenario),
-        isf_static,
-        prepared.transition,
+        int(prepared.sequence), prepared.identity, prepared.event, prepared.m1g, prepared.m1n,
+        base_writes, normalized_write, tuple(symbols), prepared.symbol_codec_state, prepared.symbol_occurrences,
+        prepared.transition.curriculum_step, str(prepared.transition.game_scenario), isf_static, prepared.transition,
+        tuple(derived_plans),
     )
 
 
@@ -278,12 +255,7 @@ def ingest_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
             continue
         try:
             result = prepare_commit_batch(item)
-            descriptor = publish_shared_batch(
-                result,
-                start_sequence=result.start_sequence,
-                end_sequence=result.end_sequence,
-                rows=len(result.rows),
-            )
+            descriptor = publish_shared_batch(result, start_sequence=result.start_sequence, end_sequence=result.end_sequence, rows=len(result.rows))
             result_queue.put(("ingest_batch_shm", result.start_sequence, result.end_sequence, descriptor))
         except BaseException as exc:
             result_queue.put(("worker_error", "ingest", int(item.start_sequence), repr(exc)))
@@ -298,16 +270,7 @@ def derivation_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
             continue
         try:
             results = tuple(derive_memory(task) for task in item.tasks)
-            descriptor = publish_shared_batch(
-                results,
-                start_sequence=item.start_task_id,
-                end_sequence=item.end_task_id,
-                rows=len(results),
-            )
-            result_queue.put(
-                ("derivation_batch_shm", item.start_task_id, item.end_task_id, descriptor)
-            )
+            descriptor = publish_shared_batch(results, start_sequence=item.start_task_id, end_sequence=item.end_task_id, rows=len(results))
+            result_queue.put(("derivation_batch_shm", item.start_task_id, item.end_task_id, descriptor))
         except BaseException as exc:
-            result_queue.put(
-                ("worker_error", "derivation", int(item.start_task_id), repr(exc))
-            )
+            result_queue.put(("worker_error", "derivation", int(item.start_task_id), repr(exc)))
