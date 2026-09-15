@@ -1108,9 +1108,38 @@ class ContinuousMemoryRuntime:
             )
             key = (m1g.environment_instance_id, m1g.episode_id)
             self._latest_interaction_grounding[key] = m1g
+            if prepared.symbol_codec_state:
+                codec = DeterministicSymbolCodec.from_state_dict(dict(prepared.symbol_codec_state))
+                self.symbol_codecs[int(codec.vocabulary_id.value)] = codec
             for symbol_row in prepared.symbols:
+                symbol_m0 = symbol_row.m0
+                symbol_m1g = symbol_row.m1g
+                symbol_event = symbol_row.event
+                self._modality_events[int(symbol_event.identity.modality_id.value)] = self._modality_events.get(int(symbol_event.identity.modality_id.value), 0) + 1
+                symbol_payload = {
+                    "modality_id": symbol_m0.modality_id,
+                    "environment_instance_id": symbol_m0.provenance.environment_instance_id,
+                    "episode_id": symbol_m0.provenance.episode_id.value,
+                    "context_signature": symbol_m0.context_signature,
+                    "payload_digest": symbol_m0.payload_digest,
+                    "symbol_identity": symbol_m0.symbol_identity,
+                    "symbol_causal_watermark": int(symbol_event.identity.causal_watermark),
+                    "symbol_source_step": int(transition.global_step),
+                }
+                symbol_m0_node = CanonicalNode(symbol_m0.uid, MemoryLevel.M0, MemoryType.EPISODE, (symbol_event.identity.event_id.hi, symbol_event.identity.event_id.lo), self._watermark)
+                symbol_m1g_node = CanonicalNode(symbol_m1g.uid, MemoryLevel.M1, MemoryType.GROUNDED_CONTINGENCY, (symbol_m1g.uid.hi, symbol_m1g.uid.lo), self._watermark)
+                symbol_m1g_payload = {
+                    "relation": symbol_m1g.relation.value,
+                    "environment_instance_id": symbol_m1g.environment_instance_id,
+                    "episode_id": symbol_m1g.episode_id,
+                    "parents": [[symbol_m0.uid.hi, symbol_m0.uid.lo]],
+                    "symbol_identity": symbol_m0.symbol_identity,
+                }
+                self._defer_base_group(((symbol_m0_node, symbol_payload, (symbol_m0.uid,)), (symbol_m1g_node, symbol_m1g_payload, (symbol_m0.uid,))))
+                self._record_normalized(symbol_row.m1n, defer_publication=True, payload_extra={"symbol_identity": symbol_m0.symbol_identity})
                 if symbol_row.aligned_m1n is None:
                     continue
+                self._record_normalized(symbol_row.aligned_m1n, defer_publication=True, payload_extra={"symbol_identity": symbol_m0.symbol_identity, "aligned_interaction_uid": [m1g.uid.hi, m1g.uid.lo]})
                 grounding_key = (
                     int(symbol_row.m1g.uid.lo),
                     int(m1g.uid.lo),
