@@ -15,6 +15,7 @@ from random import Random
 
 from v9.cognition.action_selection import choose_action
 from v9.runtime.actor_policy import ActorPolicySnapshot
+from v9.cognition.planning import choose_strategy, replan
 from v9.memory.identity import stable_u64
 
 
@@ -56,6 +57,8 @@ class EncodedTransition:
     strategy_uid_lo: int | None = None
     strategy_terminal: bool = False
     strategy_realized_cost: int = 0
+    strategy_target_outcome_hi: int | None = None
+    strategy_target_outcome_lo: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +197,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
             active_strategy_actions: tuple[int, ...] = ()
             active_strategy_position = 0
             active_strategy_outcome = None
+            active_strategy_realized_cost = 0
             branching_total = 0
             branching_samples = 0
             max_branching_factor = 0
@@ -267,7 +271,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     current = next((row for row in strategy_rows if row.strategy_uid == active_strategy_uid), None)
                     if current is None or active_strategy_position >= len(active_strategy_actions) or int(active_strategy_actions[active_strategy_position]) not in actions:
                         alternatives = tuple(row for row in strategy_rows if row.target_outcome_uid == active_strategy_outcome and row.strategy_uid != active_strategy_uid and row.native_actions and int(row.native_actions[0]) in actions)
-                        current = min(alternatives, key=lambda row: (-row.reliability, -row.primary_valence, -(row.relative_efficiency if row.relative_efficiency is not None else -1.0), row.strategy_uid)) if alternatives else None
+                        current = replan(current, alternatives, target_environment_id=environment_instance_id, available_actions=actions) if current is not None else choose_strategy(alternatives, target_environment_id=environment_instance_id, available_actions=actions)
                         if current is None:
                             active_strategy_uid = None
                             active_strategy_actions = ()
@@ -277,14 +281,17 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                             active_strategy_uid = current.strategy_uid
                             active_strategy_actions = current.native_actions
                             active_strategy_position = 0
+                            active_strategy_outcome = current.target_outcome_uid
+                            active_strategy_realized_cost = 0
                 if active_strategy_uid is None and strategy_rows:
                     candidates = tuple(row for row in strategy_rows if row.native_actions and int(row.native_actions[0]) in actions)
                     if candidates:
-                        selected = min(candidates, key=lambda row: (-row.reliability, -row.primary_valence, -(row.relative_efficiency if row.relative_efficiency is not None else -1.0), row.strategy_uid))
+                        selected = choose_strategy(candidates, target_environment_id=environment_instance_id, available_actions=actions)
                         active_strategy_uid = selected.strategy_uid
                         active_strategy_actions = selected.native_actions
                         active_strategy_position = 0
                         active_strategy_outcome = selected.target_outcome_uid
+                        active_strategy_realized_cost = 0
                 planned_action = None
                 if active_strategy_uid is not None and active_strategy_position < len(active_strategy_actions):
                     candidate_action = int(active_strategy_actions[active_strategy_position])
@@ -312,6 +319,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                 executed_strategy_uid = active_strategy_uid if planned_action is not None and not explore_over_strategy else None
                 if planned_action is not None and not explore_over_strategy:
                     active_strategy_position += 1
+                    active_strategy_realized_cost += 1
                     # Keep the completed procedure active until environment
                     # feedback establishes whether its target outcome was reached.
                 semantic_action_fn = getattr(adapter, "semantic_action", None)
@@ -367,7 +375,9 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                         strategy_uid_hi=None if executed_strategy_uid is None else int(executed_strategy_uid.hi),
                         strategy_uid_lo=None if executed_strategy_uid is None else int(executed_strategy_uid.lo),
                         strategy_terminal=strategy_terminal,
-                        strategy_realized_cost=len(active_strategy_actions) if executed_strategy_uid is not None else 0,
+                        strategy_realized_cost=active_strategy_realized_cost if executed_strategy_uid is not None else 0,
+                        strategy_target_outcome_hi=None if active_strategy_outcome is None else int(active_strategy_outcome.hi),
+                        strategy_target_outcome_lo=None if active_strategy_outcome is None else int(active_strategy_outcome.lo),
                     )
                 )
                 completed += 1
