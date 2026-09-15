@@ -6,7 +6,7 @@ from pathlib import Path
 import time
 from typing import Any
 
-from v9.hgt import rollback_hgt_model, train_hgt_epoch
+from v9.hgt import resolve_hgt_behavior_test, train_hgt_epoch
 from v9.memory.m1_normalized import NormalizedChannel
 from v9.telemetry import HGTInferenceSample, OptimizationSample
 from .lifecycle import run_lifecycle_maintenance
@@ -452,14 +452,18 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         runtime.set_telemetry_gauge("symbol_prediction_samples_epoch", symbol_prediction_samples)
         runtime.set_telemetry_gauge("post_sampling_symbol_prediction_seconds", time.perf_counter() - symbol_prediction_started)
 
-        if behavioral_gain < -0.005:
-            rolled_back = rollback_hgt_model(runtime, root=args.root)
-            if rolled_back is not None:
-                print(
-                    f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} HGT rollback "
-                    f"to={rolled_back} behavioral_gain={behavioral_gain:.4f}",
-                    flush=True,
-                )
+        behavior_resolution = resolve_hgt_behavior_test(
+            runtime,
+            root=args.root,
+            accepted=bool(behavioral_gain >= -0.005),
+        )
+        if behavior_resolution is not None:
+            verdict = "PROMOTED" if behavioral_gain >= -0.005 else "REJECTED"
+            print(
+                f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} HGT behavior-test "
+                f"status={verdict} model={behavior_resolution} behavioral_gain={behavioral_gain:.4f}",
+                flush=True,
+            )
 
         replay_started = time.perf_counter()
         replay_result = runtime.replay_once()
