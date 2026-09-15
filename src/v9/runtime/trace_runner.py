@@ -9,7 +9,7 @@ from pathlib import Path
 from random import Random
 from typing import Any, Callable
 
-from v9.cognition.action_selection import adaptive_epsilon, action_scores, policy_uncertainty, scoped_action_key
+from v9.cognition.action_selection import adaptive_epsilon, action_scores, choose_action, policy_uncertainty, scoped_action_key
 from v9.runtime.actor_policy import ActorPolicySnapshot
 
 
@@ -191,6 +191,7 @@ def run_trace_bundle(
             identity = adapter.identity()
             rng = Random(game_seed)
             episode = 1
+            context_counts: dict[int, dict[int, int]] = {}
             for step in range(int(steps_per_game)):
                 actions = tuple(sorted(set(int(value) for value in adapter.available_actions())))
                 if not actions:
@@ -232,16 +233,23 @@ def run_trace_bundle(
                     combined = action_scores(policy, actions, learned_scores=enriched, target_environment_id=environment_instance_id, action_schema_id=action_schema_id, environment_type=identity.environment_type)
                     uncertainty = policy_uncertainty(actions, combined)
                     effective = adaptive_epsilon(float(epsilon), len(actions), coverage=0.0, uncertainty=uncertainty, stagnation=0.0)
-                    exploration = rng.random() < effective
+                    before_rng_state = rng.getstate()
+                    action = choose_action(
+                        policy, actions, rng=rng, epsilon=float(epsilon),
+                        learned_scores=enriched, target_environment_id=environment_instance_id,
+                        action_schema_id=action_schema_id, environment_type=identity.environment_type,
+                        context_action_counts=context_counts.setdefault(before_signature, {}), stagnation=0.0,
+                    )
+                    probe_rng = Random()
+                    probe_rng.setstate(before_rng_state)
+                    exploration = probe_rng.random() < effective
                     if exploration:
-                        unseen = tuple(a for a in actions if hydra_raw.get(int(a), 0.0) == 0.0 and enriched.get(int(a), 0.0) == 0.0)
-                        candidates = unseen or actions
-                        action = int(candidates[rng.randrange(len(candidates))])
                         source = "EXPLORATION"
                     else:
-                        action = min(actions, key=lambda a: (-combined[int(a)], int(a)))
                         parts = {"HGT": abs(float(learned_scores.get(int(action), 0.0))), "M7_STRATEGY": abs(float(grounded_scores.get(int(action), 0.0))), "HYDRA": abs(float(hydra_scores.get(int(action), 0.0)))}
                         source = max(parts, key=parts.get) if max(parts.values(), default=0.0) > 0.0 else "FALLBACK"
+                    trace_counts = context_counts.setdefault(before_signature, {})
+                    trace_counts[int(action)] = int(trace_counts.get(int(action), 0)) + 1
                     decision_trace = {
                         "source": source, "exploration": exploration, "effective_epsilon": effective, "policy_uncertainty": uncertainty,
                         "hydra_scores": {str(a): hydra_scores[int(a)] for a in actions},
