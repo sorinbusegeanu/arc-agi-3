@@ -961,7 +961,6 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     epoch_transition_rows = transition_training_rows(epoch_dataset_path) if epoch_dataset_path and Path(epoch_dataset_path).exists() else []
     epoch_ranking_pairs = action_ranking_pairs(epoch_transition_rows) if epoch_transition_rows else []
     transition_train_rows = list(epoch_transition_rows)
-    transition_val_rows: list[dict[str, Any]] = []
     runtime.set_telemetry_gauge("hgt_training_dataset_transitions", len(epoch_transition_rows))
     runtime.set_telemetry_gauge("hgt_action_ranking_pairs", len(epoch_ranking_pairs))
     training_view_builder = getattr(runtime.graph, "training_view", None)
@@ -974,8 +973,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         else runtime.read_view
     )
     transition_train_rows = _contextualize_transition_rows(transition_train_rows, read_view)
-    transition_val_rows = _contextualize_transition_rows(transition_val_rows, read_view)
-    runtime.set_telemetry_gauge("hgt_contextual_transition_rows", len(transition_train_rows) + len(transition_val_rows))
+    runtime.set_telemetry_gauge("hgt_contextual_transition_rows", len(transition_train_rows))
     if len(read_view.nodes) < 8:
         return HGTTrainingResult(epoch, "SKIPPED_INSUFFICIENT_DATA", runtime.unified_telemetry.model_version, None, 0.0, 0.0, len(read_view.nodes), 0, None)
     x_dict, edge_index_dict, y_dict, action_targets, action_masks, action_meta, task_targets, task_masks = build_hgt_graph(
