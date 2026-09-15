@@ -294,7 +294,7 @@ def run_continuous(args: argparse.Namespace) -> int:
         return 0
     if not args.games:
         raise ValueError("--games is required for a normal continuous run")
-    if args.actors <= 0 or args.steps_per_game <= 0 or args.epochs <= 0 or args.hgt_training_epochs <= 0 or args.hgt_learning_rate <= 0 or args.graph_check <= 0 or args.wait < 0 or args.progress_interval_seconds <= 0 or not 0 <= args.epsilon <= 1:
+    if args.actors <= 0 or args.steps_per_game <= 0 or args.min_episode_opportunities <= 0 or args.epochs <= 0 or args.hgt_training_epochs <= 0 or args.hgt_learning_rate <= 0 or args.graph_check <= 0 or args.wait < 0 or args.progress_interval_seconds <= 0 or not 0 <= args.epsilon <= 1:
         raise ValueError("actors, steps-per-game, graph-check and progress interval must be positive; wait and epsilon must be valid")
     if min(args.ingest_workers, args.derivation_workers, args.ingest_queue_capacity, args.derivation_queue_capacity, args.publication_queue_capacity, args.actor_view_refresh_steps) <= 0 or args.actor_view_refresh_ms <= 0:
         raise ValueError("memory worker counts, queue capacities and actor policy refresh controls must be positive")
@@ -404,7 +404,8 @@ def build_parser() -> argparse.ArgumentParser:
     trajectory = continuous.add_mutually_exclusive_group()
     trajectory.add_argument("--show-best-trajectory", metavar="GAME_ID", default=None)
     trajectory.add_argument("--save-best-trajectory", metavar="FILE", default=None)
-    continuous.add_argument("--steps-per-game", type=int, default=1000)
+    continuous.add_argument("--steps-per-game", type=int, default=1000, help="minimum per-game epoch step budget")
+    continuous.add_argument("--min-episode-opportunities", type=int, default=2, help="minimum complete episode horizons budgeted per game per epoch")
     continuous.add_argument("--epochs", type=int, default=1)
     continuous.add_argument("--hgt-training-epochs", type=int, default=1)
     continuous.add_argument("--hgt-learning-rate", type=float, default=0.0003)
