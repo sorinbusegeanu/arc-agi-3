@@ -59,6 +59,7 @@ class CommitPlan:
     normalized_write: CanonicalWrite | None
     symbols: tuple[SymbolCommitPlan, ...]
     symbol_codec_state: dict[str, Any] | None
+    symbol_occurrences: tuple[Any, ...]
     curriculum_step: str | None
     game_scenario: str
     isf_static: tuple[float, float, float, float, float] | None
@@ -216,6 +217,7 @@ def build_commit_plan(prepared: PreparedIngestion) -> CommitPlan:
         normalized_write,
         tuple(symbols),
         prepared.symbol_codec_state,
+        prepared.symbol_occurrences,
         prepared.transition.curriculum_step,
         str(prepared.transition.game_scenario),
         isf_static,
