@@ -335,6 +335,9 @@ class ContinuousMemoryRuntime:
             payload = self.graph.payloads.get(outcome_uid)
             if outcome is None or node is None or payload is None:
                 return
+            distinct_members = {uid for uid in outcome.members if uid in self._m5}
+            if len(distinct_members) < 2:
+                return
             outcome = replace(
                 outcome,
                 equivalence_trials=outcome.equivalence_trials + 1,
@@ -422,25 +425,7 @@ class ContinuousMemoryRuntime:
 
     def actor_policy_snapshot(self) -> ActorPolicySnapshot:
         with self._lock:
-            grounded_by_type: dict[str, dict[int, list[float]]] = {}
-            for strategy in getattr(self, "_m7", {}).values():
-                try:
-                    environment_type = self.environments.resolve(int(strategy.target_environment_id)).environment_type
-                except KeyError:
-                    continue
-                if not strategy.native_actions:
-                    continue
-                target = grounded_by_type.setdefault(str(environment_type), {})
-                for action in strategy.native_actions:
-                    target.setdefault(int(action), []).append(float(strategy.reliability))
-            grounded_scores = {
-                environment_type: {
-                    action: sum(scores) / len(scores)
-                    for action, scores in actions.items()
-                    if scores
-                }
-                for environment_type, actions in grounded_by_type.items()
-            }
+            grounded_scores: dict[str, dict[int, float]] = {}
             live_strategies = tuple(
                 strategy for uid, strategy in getattr(self, "_m7", {}).items()
                 if uid in self.graph.nodes and uid in self.graph.payloads
@@ -1427,12 +1412,13 @@ class ContinuousMemoryRuntime:
                 self._publish(CanonicalNode(strategy.uid, MemoryLevel.M7, MemoryType.STRATEGY, (outcome.uid.hi, outcome.uid.lo, target_environment_id, action), self._watermark), {"target_outcome": [outcome.uid.hi, outcome.uid.lo], "target_environment_id": int(target_environment_id), "native_actions": [action], "reliability_successes": strategy.reliability_successes, "reliability_trials": strategy.reliability_trials, "evidence_confidence": concept_confidence, "primary_valence_sum": 0, "realized_cost_sum": strategy.realized_cost_sum, "context_scope_id": int(context_scope_id), "parents": [[outcome.uid.hi, outcome.uid.lo]]}, strategy.provenance.evidence)
             self.__dict__.setdefault("_m5", {})[consequence.uid] = consequence
             self.__dict__.setdefault("_m6", {})[outcome.uid] = outcome
-            self.record_outcome_equivalence_evidence(
-                outcome.uid,
-                equivalent=True,
-                context_scope_id=int(context_scope_id),
-                environment_id=int(target_environment_id),
-            )
+            if len({uid for uid in outcome.members if uid in self._m5}) >= 2:
+                self.record_outcome_equivalence_evidence(
+                    outcome.uid,
+                    equivalent=True,
+                    context_scope_id=int(context_scope_id),
+                    environment_id=int(target_environment_id),
+                )
     
     def wait_quiescent(self, timeout: float = 300.0) -> None:
         del timeout
