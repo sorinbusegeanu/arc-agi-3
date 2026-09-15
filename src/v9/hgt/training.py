@@ -15,8 +15,18 @@ from v9.memory.relations import RelationType
 from v9.telemetry import HGTTrainingSample, ModelEvolutionSample, read_gpu_snapshot
 
 MODEL_SCHEMA_VERSION = 5
-NODE_TYPE = "M0"
-MEMORY_NODE_TYPES = tuple(f"M{level}" for level in range(8))
+MEMORY_NODE_TYPES = (
+    "M0_EPISODE",
+    "M1_GROUNDED_CONTINGENCY",
+    "M1_NORMALIZED_RELATION",
+    "M2_FAMILY",
+    "M3_ROLE",
+    "M4_CONCEPT",
+    "M5_CONSEQUENCE",
+    "M6_OUTCOME",
+    "M7_STRATEGY",
+)
+NODE_TYPE = "M0_EPISODE"
 OBJECTIVE_NAMES = ("transition", "consequence", "relevance", "correspondence", "similarity", "strategy", "grounding", "deliberation_improvement", "invariance")
 AUX_OBJECTIVES = ("transition", "relevance", "correspondence", "similarity", "grounding", "deliberation_improvement", "invariance")
 SEMANTIC_NODE_TYPES = ("ENTITY", "ACTION", "TEXT", "STATE", "EFFECT")
@@ -51,7 +61,17 @@ def _require_torch():
 
 
 def _memory_node_type(node: Any) -> str:
-    return f"M{int(node.level)}"
+    return {
+        1: "M0_EPISODE",
+        100: "M1_GROUNDED_CONTINGENCY",
+        150: "M1_NORMALIZED_RELATION",
+        200: "M2_FAMILY",
+        300: "M3_ROLE",
+        400: "M4_CONCEPT",
+        500: "M5_CONSEQUENCE",
+        600: "M6_OUTCOME",
+        700: "M7_STRATEGY",
+    }[int(node.memory_type)]
 
 
 def _stable_metadata() -> tuple[list[str], list[tuple[str, str, str]]]:
@@ -851,6 +871,15 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     runtime.set_telemetry_gauge("hgt_semantic_nodes", int(realized_nodes - memory_nodes))
     for node_type in MEMORY_NODE_TYPES:
         runtime.set_telemetry_gauge(f"hgt_{node_type.lower()}_nodes", int(x_dict[node_type].shape[0]) if node_type in x_dict else 0)
+    for level in range(8):
+        runtime.set_telemetry_gauge(
+            f"hgt_m{level}_nodes",
+            sum(
+                int(x_dict[node_type].shape[0])
+                for node_type in MEMORY_NODE_TYPES
+                if node_type.startswith(f"M{level}_") and node_type in x_dict
+            ),
+        )
     runtime.set_telemetry_gauge("hgt_oom_retry_count", int(_oom_retry))
     selected_examples = sum(int(v.numel()) for v in y_dict.values())
     action_examples = sum(int(mask.sum().item()) for mask in action_masks.values())
