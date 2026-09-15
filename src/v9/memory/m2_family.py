@@ -15,7 +15,8 @@ class M2TransformationFamily:
     provenance: DerivationProvenance
     recurrence: int
     compression_benefit: float
-    modality_support: tuple[tuple[str, int], ...] = ()\n    support_decomposition: tuple[tuple[str, int], ...] = ()
+    modality_support: tuple[tuple[str, int], ...] = ()
+    support_decomposition: tuple[tuple[str, int], ...] = ()
 
     @classmethod
     def form(cls, members: tuple[M1NormalizedRelation, ...], *, representation_cost: float = 1.0) -> "M2TransformationFamily":
@@ -37,4 +38,5 @@ class M2TransformationFamily:
         for row in members:
             key = row.channel.value
             channels[key] = channels.get(key, 0) + 1
-        decomposition = {"interaction_only": channels.get("WORLD", 0), "symbol_only": channels.get("SYMBOL", 0), "aligned_cross_modal": channels.get("CROSS_MODAL", 0), "heldout_transfer": sum(int(bool(getattr(row, "heldout_transfer", False))) for row in members)}\n        return cls(uid, signature, DerivationProvenance(parents, evidence), len(members), benefit, tuple(sorted(channels.items())), tuple(sorted(decomposition.items())))
+        decomposition = {"interaction_only": channels.get("WORLD", 0), "symbol_only": channels.get("SYMBOL", 0), "aligned_cross_modal": channels.get("CROSS_MODAL", 0), "heldout_transfer": sum(int(bool(getattr(row, "heldout_transfer", False))) for row in members)}
+        return cls(uid, signature, DerivationProvenance(parents, evidence), len(members), benefit, tuple(sorted(channels.items())), tuple(sorted(decomposition.items())))
