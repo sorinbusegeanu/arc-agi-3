@@ -1150,6 +1150,18 @@ class ContinuousMemoryRuntime:
         del timeout
         self._drain_timeline()
 
+    def capture_experiment_state(self) -> dict[str, Any]:
+        """Capture an in-memory scientific state cut for matched branch evaluation."""
+        with self._lock:
+            self.wait_quiescent()
+            self.flush_deferred_memory_updates()
+            return {"state": self.state_dict()}
+
+    def restore_experiment_state(self, captured: dict[str, Any]) -> None:
+        """Restore an in-memory scientific state cut without creating a disk snapshot."""
+        with self._lock:
+            self._restore(captured)
+
     def snapshot(self) -> SnapshotResult:
         with self._lock:
             self.wait_quiescent()
