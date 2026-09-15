@@ -193,7 +193,7 @@ class ContinuousMemoryRuntime:
                     continue
                 target = grounded_by_type.setdefault(str(environment_type), {})
                 for action in strategy.native_actions:
-                    target.setdefault(int(action), []).append(float(strategy.reliability))
+                    target.setdefault(int(action), []).append(float(strategy.reliability) * concept_confidence)
             grounded_scores = {
                 environment_type: {
                     action: sum(scores) / len(scores)
@@ -923,6 +923,7 @@ class ContinuousMemoryRuntime:
                     "structural_signature": family.structural_signature,
                     "recurrence": family.recurrence,
                     "compression_benefit": family.compression_benefit,
+                    "evidence_confidence": float(result.evidence_confidence),
                     "parents": [[uid.hi, uid.lo] for uid in family.provenance.parents],
                 },
                 family.provenance.evidence,
@@ -940,6 +941,7 @@ class ContinuousMemoryRuntime:
                     {
                         "relational_signature": role.relational_signature,
                         "consequence_signature": role.consequence_signature,
+                        "evidence_confidence": float(result.evidence_confidence),
                         "parents": [[uid.hi, uid.lo] for uid in role.provenance.parents],
                     },
                     role.provenance.evidence,
@@ -961,6 +963,7 @@ class ContinuousMemoryRuntime:
                         "compression_benefit": candidate.compression_benefit,
                         "explanatory_reach": candidate.explanatory_reach,
                         "transfer_prior": candidate.transfer_prior,
+                        "evidence_confidence": float(result.evidence_confidence),
                         "formation_scope": list(candidate.provenance.formation_scope),
                         "held_out_targets": [],
                         "validated": False,
@@ -1063,9 +1066,10 @@ class ContinuousMemoryRuntime:
             self.lifecycle.records[concept.uid] = replace(self.lifecycle.records[concept.uid], state=CognitiveState.VALIDATED, last_transition_watermark=self._watermark)
         role = self._m3[concept.provenance.parents[0]]
         consequence = M5ConsequenceStructure.form((concept,), (role.consequence_signature,))
-        self._publish(CanonicalNode(consequence.uid, MemoryLevel.M5, MemoryType.CONSEQUENCE, consequence.consequence_descriptor, self._watermark), {"descriptor": list(consequence.consequence_descriptor), "mature": consequence.mature, "parents": [[uid.hi, uid.lo] for uid in consequence.provenance.parents]}, consequence.provenance.evidence)
+        concept_confidence = float(self.graph.payloads.get(concept.uid, {}).get("evidence_confidence", 1.0))
+        self._publish(CanonicalNode(consequence.uid, MemoryLevel.M5, MemoryType.CONSEQUENCE, consequence.consequence_descriptor, self._watermark), {"descriptor": list(consequence.consequence_descriptor), "mature": consequence.mature, "evidence_confidence": concept_confidence, "parents": [[uid.hi, uid.lo] for uid in consequence.provenance.parents]}, consequence.provenance.evidence)
         outcome = M6Outcome.form((consequence,), diameter_bound=0)
-        self._publish(CanonicalNode(outcome.uid, MemoryLevel.M6, MemoryType.OUTCOME, outcome.class_signature, self._watermark), {"class_signature": list(outcome.class_signature), "class_version": outcome.class_version, "parents": [[uid.hi, uid.lo] for uid in outcome.provenance.parents]}, outcome.provenance.evidence)
+        self._publish(CanonicalNode(outcome.uid, MemoryLevel.M6, MemoryType.OUTCOME, outcome.class_signature, self._watermark), {"class_signature": list(outcome.class_signature), "class_version": outcome.class_version, "evidence_confidence": concept_confidence, "parents": [[uid.hi, uid.lo] for uid in outcome.provenance.parents]}, outcome.provenance.evidence)
         action = int(admissible[-1]["target_native_action"])
         grounded_payloads = [self.graph.payloads[uid] for uid in outcome.provenance.evidence if uid in self.graph.payloads and self.graph.nodes[uid].level is MemoryLevel.M0]
         primary_valence_sum = sum(int(payload.get("primary_valence", 0)) for payload in grounded_payloads)
@@ -1075,7 +1079,7 @@ class ContinuousMemoryRuntime:
         self._hgt_action_scores.setdefault(int(target_environment_id), {})[action] = max(float(self._hgt_action_scores.get(int(target_environment_id), {}).get(action, 0.0)), float(strategy.reliability))
         if hasattr(self, "_hgt_context_action_scores"):
             self._hgt_context_action_scores.setdefault(int(target_environment_id), {}).setdefault(int(context_scope_id), {})[action] = float(strategy.reliability)
-        self._publish(CanonicalNode(strategy.uid, MemoryLevel.M7, MemoryType.STRATEGY, (outcome.uid.hi, outcome.uid.lo, target_environment_id, action), self._watermark), {"target_outcome": [outcome.uid.hi, outcome.uid.lo], "target_environment_id": int(target_environment_id), "native_actions": [action], "reliability_successes": strategy.reliability_successes, "reliability_trials": strategy.reliability_trials, "primary_valence_sum": strategy.primary_valence_sum, "realized_cost_sum": strategy.realized_cost_sum, "context_scope_id": int(context_scope_id), "parents": [[outcome.uid.hi, outcome.uid.lo]]}, strategy.provenance.evidence)
+        self._publish(CanonicalNode(strategy.uid, MemoryLevel.M7, MemoryType.STRATEGY, (outcome.uid.hi, outcome.uid.lo, target_environment_id, action), self._watermark), {"target_outcome": [outcome.uid.hi, outcome.uid.lo], "target_environment_id": int(target_environment_id), "native_actions": [action], "reliability_successes": strategy.reliability_successes, "reliability_trials": strategy.reliability_trials, "evidence_confidence": concept_confidence, "primary_valence_sum": strategy.primary_valence_sum, "realized_cost_sum": strategy.realized_cost_sum, "context_scope_id": int(context_scope_id), "parents": [[outcome.uid.hi, outcome.uid.lo]]}, strategy.provenance.evidence)
 
     def wait_quiescent(self, timeout: float = 300.0) -> None:
         del timeout
