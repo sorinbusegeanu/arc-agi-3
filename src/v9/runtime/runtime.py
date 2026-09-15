@@ -448,7 +448,10 @@ class ContinuousMemoryRuntime:
             grounded_scores: dict[str, dict[int, float]] = {}
             live_strategies = tuple(
                 strategy for uid, strategy in getattr(self, "_m7", {}).items()
-                if uid in self.graph.nodes and uid in self.graph.payloads
+                if (
+                    (uid in self.graph.nodes and uid in self.graph.payloads)
+                    or getattr(strategy, "reliability_trials", 0) > 0
+                )
             )
             efficiencies = strategy_frontier(live_strategies)
             strategies_by_environment: dict[int, list[ActorStrategyPolicy]] = {}
