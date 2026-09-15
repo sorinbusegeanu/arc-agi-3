@@ -3,6 +3,7 @@ from __future__ import annotations
 from random import Random
 import math
 from dataclasses import dataclass
+from typing import Mapping
 
 from v9.cognition.grounding import GroundingMaturity
 from v9.memory.model import MemoryLevel
@@ -56,18 +57,34 @@ def action_scores(view: ReadView, actions: tuple[int, ...], *, grounded_signals:
     return scores
 
 
-def branching_aware_epsilon(base_epsilon: float, branching_factor: int) -> float:
-    """Scale exploration pressure with the number of currently legal choices."""
+def adaptive_epsilon(
+    base_epsilon: float,
+    branching_factor: int,
+    *,
+    coverage: float = 1.0,
+    uncertainty: float = 0.0,
+    stagnation: float = 0.0,
+) -> float:
     base = max(0.0, min(1.0, float(base_epsilon)))
     branches = max(1, int(branching_factor))
-    if branches <= 2:
-        return base
-    # Log scaling avoids making large combinatorial spaces almost purely random.
-    return min(0.50, base * (1.0 + math.log2(branches / 2.0)))
+    branch_scale = 1.0 if branches <= 2 else 1.0 + math.log2(branches / 2.0)
+    pressure = branch_scale + max(0.0, 1.0 - float(coverage)) + max(0.0, float(uncertainty)) + max(0.0, float(stagnation))
+    return min(0.50, base * pressure)
 
 
+def branching_aware_epsilon(base_epsilon: float, branching_factor: int) -> float:
+    return adaptive_epsilon(base_epsilon, branching_factor)
 
-def choose_action(view: ReadView, actions: tuple[int, ...], *, rng: Random, epsilon: float, grounded_signals: tuple[GroundedActionSignal, ...] = (), learned_scores: dict[int, float] | None = None, target_environment_id: int | None = None, action_schema_id: int | None = None, environment_type: str | None = None) -> int:
+
+def policy_uncertainty(actions: tuple[int, ...], scores: Mapping[int, float]) -> float:
+    if len(actions) <= 1:
+        return 0.0
+    ranked = sorted((float(scores.get(int(action), 0.0)) for action in actions), reverse=True)
+    margin = max(0.0, min(1.0, ranked[0] - ranked[1]))
+    return 1.0 - margin
+
+
+def choose_action(view: ReadView, actions: tuple[int, ...], *, rng: Random, epsilon: float, grounded_signals: tuple[GroundedActionSignal, ...] = (), learned_scores: dict[int, float] | None = None, target_environment_id: int | None = None, action_schema_id: int | None = None, environment_type: str | None = None, context_action_counts: Mapping[int, int] | None = None, stagnation: float = 0.0) -> int:
     if not actions:
         raise ValueError("cannot choose from an empty action set")
     if not 0.0 <= float(epsilon) <= 1.0:
@@ -90,8 +107,20 @@ def choose_action(view: ReadView, actions: tuple[int, ...], *, rng: Random, epsi
         ) == 0.0
         and (not learned_scores or float(learned_scores.get(int(action), 0.0)) == 0.0)
     )
-    effective_epsilon = branching_aware_epsilon(epsilon, len(actions))
+    counts = context_action_counts or {}
+    tried = sum(1 for action in actions if int(counts.get(int(action), 0)) > 0)
+    coverage = tried / max(1, len(actions))
+    effective_epsilon = adaptive_epsilon(
+        epsilon,
+        len(actions),
+        coverage=coverage,
+        uncertainty=policy_uncertainty(actions, scores),
+        stagnation=stagnation,
+    )
     if rng.random() < effective_epsilon:
         candidates = unseen or actions
+        minimum_count = min((int(counts.get(int(action), 0)) for action in candidates), default=0)
+        informative = tuple(action for action in candidates if int(counts.get(int(action), 0)) == minimum_count)
+        candidates = informative or candidates
         return int(candidates[rng.randrange(len(candidates))])
     return min(actions, key=lambda action: (-scores[action], action))
