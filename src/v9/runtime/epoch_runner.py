@@ -22,6 +22,40 @@ class EpochRunResult:
     metrics: dict[str, Any]
 
 
+def _episode_horizon(spec: Any) -> int:
+    options = dict(getattr(spec, "options", {}) or {})
+    kwargs = dict(getattr(spec, "kwargs", {}) or {})
+    for key in ("episode_horizon", "max_episode_steps", "horizon"):
+        if key in options:
+            return max(1, int(options[key]))
+        if key in kwargs:
+            return max(1, int(kwargs[key]))
+    adapter = str(getattr(spec, "adapter", "auto")).lower()
+    game = str(getattr(spec, "game_id", ""))
+    if adapter == "arc" or (adapter == "auto" and len(game) == 4 and game[:2].isalpha() and game[2:].isdigit()):
+        return 250  # ARC game horizon: up to five 50-action levels.
+    if adapter == "alfred":
+        return 200
+    if adapter in {"babyai", "minigrid", "sokoban", "chess", "sudoku"}:
+        return 200
+    if adapter.startswith("synthetic"):
+        return 50
+    if adapter.startswith("gym"):
+        try:
+            import gymnasium as gym
+            gym_spec = gym.spec(game)
+            if gym_spec.max_episode_steps:
+                return max(1, int(gym_spec.max_episode_steps))
+        except Exception:
+            pass
+    return 500
+
+
+def _game_step_budget(spec: Any, args: Any) -> int:
+    minimum_opportunities = max(1, int(getattr(args, "min_episode_opportunities", 2)))
+    return max(int(args.steps_per_game), _episode_horizon(spec) * minimum_opportunities)
+
+
 def build_epoch_jobs(specs: tuple[Any, ...], args: Any, *, epoch: int) -> list[tuple[int, Any, int, int]]:
     jobs = []
     actor_count = max(len(specs), int(args.actors))
@@ -33,13 +67,42 @@ def build_epoch_jobs(specs: tuple[Any, ...], args: Any, *, epoch: int) -> list[t
         lane_count = lanes[spec_index]
         lane = seen[spec_index]
         seen[spec_index] += 1
-        base_steps, extra_steps = divmod(int(args.steps_per_game), lane_count)
+        game_budget = _game_step_budget(spec, args)
+        base_steps, extra_steps = divmod(game_budget, lane_count)
         steps = base_steps + int(lane < extra_steps)
         if steps:
             actor_id = actor_index + 1
             seed = int(args.seed) + int(epoch) * 1_000_003 + actor_id * 1009
             jobs.append((actor_id, spec, steps, seed))
     return jobs
+
+
+def _append_game_results(root: str | Path, *, epoch: int, specs: tuple[Any, ...], rows: list[Any]) -> None:
+    by_game = _game_level_metrics(rows)["by_game"]
+    spec_by_name = {str(spec.display_name): spec for spec in specs}
+    target = Path(root) / "game_results.log"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as handle:
+        for game in sorted(by_game):
+            values = by_game[game]
+            spec = spec_by_name.get(game)
+            horizon = _episode_horizon(spec) if spec is not None else 0
+            episodes = int(values["episodes"])
+            wins = int(values["wins"])
+            handle.write(json.dumps({
+                "epoch": int(epoch),
+                "game": game,
+                "adapter": None if spec is None else str(spec.adapter),
+                "episode_horizon": int(horizon),
+                "steps": int(values["steps"]),
+                "episodes": episodes,
+                "wins": wins,
+                "failures": int(values["failures"]),
+                "truncations": int(values["truncations"]),
+                "success_rate": wins / episodes if episodes else 0.0,
+                "levels_completed": int(values["levels_completed"]),
+                "best_level": int(values["best_level"]),
+            }, sort_keys=True) + "\n")
 
 
 def _scenario_success(rows: list[Any]) -> tuple[dict[str, float], float]:
@@ -87,6 +150,7 @@ def _game_level_metrics(rows: list[Any]) -> dict[str, Any]:
     total_wins = sum(int(values["wins"]) for values in by_game.values())
     total_levels = sum(int(values["levels_completed"]) for values in by_game.values())
     return {
+        "by_game": by_game,
         "current_run_wins": total_wins / max(1, total_episodes),
         "current_run_solved_games": solved_games,
         "current_run_total_games": total_games,
@@ -208,6 +272,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         runtime.set_telemetry_gauge("behavioral_success_gain", behavioral_gain)
         runtime.set_telemetry_gauge("successful_scenarios", sum(rate > 0.0 for rate in scenario_success.values()))
         game_level = _game_level_metrics(process_results)
+        _append_game_results(args.root, epoch=epoch, specs=specs, rows=process_results)
         runtime.set_telemetry_gauge("current_run_wins", float(game_level["current_run_wins"]))
         runtime.set_telemetry_gauge("current_run_solved_games", int(game_level["current_run_solved_games"]))
         runtime.set_telemetry_gauge("current_run_total_games", int(game_level["current_run_total_games"]))
