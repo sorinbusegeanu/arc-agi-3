@@ -3,6 +3,20 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping
 
+from v9.memory.identity import MemoryUid
+
+
+@dataclass(frozen=True, slots=True)
+class ActorStrategyPolicy:
+    strategy_uid: MemoryUid
+    target_outcome_uid: MemoryUid
+    environment_id: int
+    native_actions: tuple[int, ...]
+    reliability: float
+    expected_cost: float | None
+    relative_efficiency: float | None
+    primary_valence: float
+
 
 @dataclass(frozen=True, slots=True)
 class ActorPolicySnapshot:
@@ -15,6 +29,7 @@ class ActorPolicySnapshot:
     model_version: str
     grounded_action_scores_by_type: dict[str, dict[int, float]] = field(default_factory=dict)
     grounded_context_action_scores_by_type: dict[str, dict[int, dict[int, float]]] = field(default_factory=dict)
+    strategies_by_environment: dict[int, tuple[ActorStrategyPolicy, ...]] = field(default_factory=dict)
 
     @classmethod
     def build(
@@ -29,6 +44,7 @@ class ActorPolicySnapshot:
         grounded_action_scores_by_type: Mapping[str, Mapping[int, float]] | None = None,
         grounded_context_action_scores_by_type: Mapping[str, Mapping[int, Mapping[int, float]]] | None = None,
         model_version: str,
+        strategies_by_environment: Mapping[int, tuple[ActorStrategyPolicy, ...]] | None = None,
     ) -> "ActorPolicySnapshot":
         learned = {
             int(environment): {
@@ -94,6 +110,7 @@ class ActorPolicySnapshot:
             str(model_version),
             grounded,
             grounded_contextual,
+            {int(environment): tuple(rows) for environment, rows in (strategies_by_environment or {}).items()},
         )
 
 
@@ -141,3 +158,7 @@ class ActorPolicySnapshot:
             int(action): float(source.get(int(action), 0.0))
             for action in actions
         }
+
+
+    def strategies(self, environment_id: int) -> tuple[ActorStrategyPolicy, ...]:
+        return self.strategies_by_environment.get(int(environment_id), ())
