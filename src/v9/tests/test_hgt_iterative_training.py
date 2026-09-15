@@ -47,6 +47,12 @@ class HGTIterativeTrainingTests(unittest.TestCase):
         on, off = matched_jobs(jobs)
         self.assertEqual([(x[0], x[2], x[3]) for x in on], [(x[0], x[2], x[3]) for x in off])
 
+    def test_matched_jobs_are_independent_lists(self):
+        jobs = [(1, object(), 500, 123)]
+        on, off = matched_jobs(jobs)
+        on.clear()
+        self.assertEqual(len(off), 1)
+
     def test_branch_selection_uses_macro_success_then_progress(self):
         self.assertEqual(select_matched_branch(.30, .20).selected_branch, "hgt_on")
         self.assertEqual(select_matched_branch(.20, .30).selected_branch, "hgt_off")
