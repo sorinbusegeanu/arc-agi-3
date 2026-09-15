@@ -309,7 +309,9 @@ class ContinuousMemoryRuntime:
                 generation=max(self.graph.generation, self._actor_policy_generation),
                 normalized_action_supports=self._actor_action_supports,
                 hgt_action_scores=self._hgt_action_scores,
+                hgt_context_action_scores=getattr(self, "_hgt_context_action_scores", {}),
                 hgt_action_scores_by_type=self._hgt_scores_by_environment_type(),
+                hgt_context_action_scores_by_type=self._hgt_context_scores_by_environment_type(),
                 grounded_action_scores_by_type=grounded_scores,
                 model_version=self.unified_telemetry.model_version,
             )
@@ -1245,6 +1247,13 @@ class ContinuousMemoryRuntime:
             "prediction_error_count": self._prediction_error_count,
             "unified_telemetry": self.unified_telemetry.state_dict(),
             "hgt_action_scores": {str(env): {str(action): score for action, score in actions.items()} for env, actions in self._hgt_action_scores.items()},
+            "hgt_context_action_scores": {
+                str(env): {
+                    str(context): {str(action): score for action, score in actions.items()}
+                    for context, actions in contexts.items()
+                }
+                for env, contexts in getattr(self, "_hgt_context_action_scores", {}).items()
+            },
             "in_flight_proposals": [],
             "m1n_occurrences": {str(key): len(value) for key, value in self._m1n_occurrences.items()},
             "m1n_supports": {str(key): value for key, value in self._m1n_supports.items()},
@@ -1308,6 +1317,13 @@ class ContinuousMemoryRuntime:
         self._prediction_error_count = int(state.get("prediction_error_count", 0))
         self.unified_telemetry = UnifiedTelemetry.from_state_dict(dict(state.get("unified_telemetry", UnifiedTelemetry(model_version=scientific.hgt_model_version).state_dict())))
         self._hgt_action_scores = {int(env): {int(action): float(score) for action, score in dict(actions).items()} for env, actions in dict(state.get("hgt_action_scores", {})).items()}
+        self._hgt_context_action_scores = {
+            int(env): {
+                int(context): {int(action): float(score) for action, score in dict(actions).items()}
+                for context, actions in dict(contexts).items()
+            }
+            for env, contexts in dict(state.get("hgt_context_action_scores", {})).items()
+        }
         if state.get("in_flight_proposals"):
             raise RuntimeError("native v9 snapshot contains unsupported in-flight proposals")
         for signature, count in dict(state.get("m1n_occurrences", {})).items():
