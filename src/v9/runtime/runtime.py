@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from v9.cognition.strategies import strategy_frontier
 from v9.cognition.compression import form_families
 from v9.cognition.action_selection import scoped_action_key
 from v9.cognition.developmental_stage import DevelopmentalStageTracker, StageEvidence
@@ -51,7 +52,7 @@ from v9.telemetry import (
     build_primary_dashboard,
 )
 
-from .actor_policy import ActorPolicySnapshot
+from .actor_policy import ActorPolicySnapshot, ActorStrategyPolicy
 from .config import RuntimeConfig, write_scientific_config_manifest
 from .lifecycle import LifecycleRegistry
 from .partitions import PartitionMap
@@ -341,6 +342,29 @@ class ContinuousMemoryRuntime:
                 }
                 for environment_type, actions in grounded_by_type.items()
             }
+            live_strategies = tuple(
+                strategy for uid, strategy in getattr(self, "_m7", {}).items()
+                if uid in self.graph.nodes and uid in self.graph.payloads
+            )
+            efficiencies = strategy_frontier(live_strategies)
+            strategies_by_environment: dict[int, list[ActorStrategyPolicy]] = {}
+            for strategy in live_strategies:
+                strategies_by_environment.setdefault(int(strategy.target_environment_id), []).append(
+                    ActorStrategyPolicy(
+                        strategy.uid,
+                        strategy.target_outcome,
+                        int(strategy.target_environment_id),
+                        tuple(strategy.native_actions),
+                        float(strategy.reliability),
+                        None if strategy.expected_cost is None else float(strategy.expected_cost),
+                        efficiencies.get(strategy.uid.lo),
+                        float(strategy.primary_valence_sum) / max(1, strategy.reliability_trials),
+                    )
+                )
+            published_strategies = {
+                environment: tuple(sorted(rows, key=lambda row: (-row.reliability, -row.primary_valence, float("inf") if row.expected_cost is None else row.expected_cost, row.strategy_uid))[:64])
+                for environment, rows in strategies_by_environment.items()
+            }
             return ActorPolicySnapshot.build(
                 generation=max(self.graph.generation, self._actor_policy_generation),
                 normalized_action_supports=self._actor_action_supports,
@@ -350,6 +374,7 @@ class ContinuousMemoryRuntime:
                 hgt_context_action_scores_by_type=self._hgt_context_scores_by_environment_type(),
                 grounded_action_scores_by_type=grounded_scores,
                 model_version=self.unified_telemetry.model_version,
+                strategies_by_environment=published_strategies,
             )
 
     def start(self) -> None:
