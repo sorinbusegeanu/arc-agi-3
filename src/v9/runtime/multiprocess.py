@@ -186,10 +186,10 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
             task_successes = task_failures = task_truncations = levels_completed = 0
             grounded_action_influence = 0
             context_action_counts: dict[int, dict[int, int]] = {}
-    active_strategy_uid = None
-    active_strategy_actions: tuple[int, ...] = ()
-    active_strategy_position = 0
-    active_strategy_outcome = None
+            active_strategy_uid = None
+            active_strategy_actions: tuple[int, ...] = ()
+            active_strategy_position = 0
+            active_strategy_outcome = None
             branching_total = 0
             branching_samples = 0
             max_branching_factor = 0
