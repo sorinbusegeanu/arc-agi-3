@@ -377,6 +377,28 @@ class CanonicalGraph:
                 key=lambda row: (row[2], int(row[1].created_watermark), row[0]),
             )
             selected: dict[MemoryUid, CanonicalNode] = {uid: node for uid, node, _ in seeds}
+            # Reserve representation capacity for every available Hydra level.
+            # HGT is heterogeneous; a behavior-heavy M0 reservoir must not crowd
+            # M2-M7 abstractions out of the bounded training cut.
+            remaining_budget = max(0, maximum_nodes - len(selected))
+            nonempty_levels = [level for level in MemoryLevel if self._uids_by_level[level]]
+            per_level = max(1, remaining_budget // max(1, len(nonempty_levels)))
+            for level in nonempty_levels:
+                level_rows = (
+                    (uid, self.nodes[uid])
+                    for uid in self._uids_by_level[level]
+                    if uid not in selected
+                    and uid in self.nodes
+                    and _cognitively_visible(self.payloads.get(uid, {}))
+                )
+                for uid, node in heapq.nlargest(
+                    per_level,
+                    level_rows,
+                    key=lambda row: (int(row[1].created_watermark), row[0]),
+                ):
+                    if len(selected) >= maximum_nodes:
+                        break
+                    selected[uid] = node
             historical_uids = {
                 uid
                 for uid, _, _ in seeds
