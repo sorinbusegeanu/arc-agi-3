@@ -121,15 +121,16 @@ def build_epoch_jobs(
     epoch: int,
     previous_game_results: dict[str, dict[str, int | float]] | None = None,
 ) -> list[tuple[int, Any, int, int]]:
-    # One actor owns one game for its complete dynamically allocated budget.
-    # If more actors than games are requested, extra actors remain unused.
+    # Every game is one job. The coordinator runs at most --actors jobs at a
+    # time and reuses a freed actor slot for the next pending game, so one actor
+    # process plays one game until that game's complete budget expires.
     budgets = _allocate_game_step_budgets(
         specs, args, previous_game_results=previous_game_results
     )
     jobs = []
-    for actor_index, spec in enumerate(specs[: max(1, int(args.actors))]):
+    for game_index, spec in enumerate(specs):
         steps = int(budgets[str(spec.display_name)])
-        actor_id = actor_index + 1
+        actor_id = game_index + 1
         seed = int(args.seed) + int(epoch) * 1_000_003 + actor_id * 1009
         jobs.append((actor_id, spec, steps, seed))
     return jobs
@@ -390,6 +391,14 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
 
     for epoch in range(1, int(args.epochs) + 1):
         jobs = build_epoch_jobs(specs, args, epoch=epoch, previous_game_results=previous_game_results)
+        epoch_budget = sum(int(job[2]) for job in jobs)
+        runtime.set_telemetry_gauge("sampling_epoch_step_budget", epoch_budget)
+        runtime.set_telemetry_gauge("sampling_game_jobs", len(jobs))
+        runtime.set_telemetry_gauge("sampling_actor_slots", min(int(args.actors), len(jobs)))
+        runtime.set_telemetry_gauge(
+            "sampling_game_budgets",
+            json.dumps({str(job[1].display_name): int(job[2]) for job in jobs}, sort_keys=True),
+        )
         print(f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} sampling start actors={len(jobs)}", flush=True)
         active_model = str(runtime.unified_telemetry.model_version or "untrained")
         is_bootstrap = active_model in {"None", "untrained", ""}
