@@ -37,6 +37,7 @@ class HGTRestoreTests(unittest.TestCase):
             self.assertEqual(runtime.unified_telemetry.model_version, "untrained")
             self.assertIsNone(runtime.scores)
 
+    @unittest.skipUnless(__import__('importlib').util.find_spec('torch'), 'torch not installed')
     def test_manifest_restores_accepted_checkpoint_policy(self):
         with tempfile.TemporaryDirectory() as root:
             model_dir = Path(root) / "models"
