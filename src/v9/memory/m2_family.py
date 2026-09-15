@@ -15,6 +15,7 @@ class M2TransformationFamily:
     provenance: DerivationProvenance
     recurrence: int
     compression_benefit: float
+    modality_support: tuple[tuple[str, int], ...] = ()
 
     @classmethod
     def form(cls, members: tuple[M1NormalizedRelation, ...], *, representation_cost: float = 1.0) -> "M2TransformationFamily":
@@ -32,4 +33,8 @@ class M2TransformationFamily:
         evidence = tuple(sorted({uid for row in members for uid in row.provenance.evidence}))
         if len(evidence) < 2:
             raise ValueError("M2 requires at least two distinct grounded evidence roots")
-        return cls(uid, signature, DerivationProvenance(parents, evidence), len(members), benefit)
+        channels: dict[str, int] = {}
+        for row in members:
+            key = row.channel.value
+            channels[key] = channels.get(key, 0) + 1
+        return cls(uid, signature, DerivationProvenance(parents, evidence), len(members), benefit, tuple(sorted(channels.items())))
