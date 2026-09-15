@@ -425,9 +425,8 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         scenario_success, behavioral_success = _scenario_success(process_results, specs)
         if baseline_success is None:
             baseline_success = behavioral_success
-        behavioral_gain = behavioral_success - baseline_success
         runtime.set_telemetry_gauge("behavioral_success_rate", behavioral_success)
-        runtime.set_telemetry_gauge("behavioral_success_gain", behavioral_gain)
+        runtime.set_telemetry_gauge("behavioral_success_gain", 0.0 if is_bootstrap else float(decision.gain))
         runtime.set_telemetry_gauge("successful_scenarios", sum(rate > 0.0 for rate in scenario_success.values()))
         game_level = _game_level_metrics(process_results)
         previous_game_results = dict(game_level["by_game"])
@@ -541,14 +540,14 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         runtime.set_telemetry_gauge("post_sampling_training_seconds", training_done - training_started)
 
         diagnostics = runtime.unified_telemetry.diagnostic_metrics()
-        training_accuracy = float(training.validation_accuracy)
+        training_accuracy = float(training.training_accuracy)
         subgraph_nodes = int(training.subgraph_nodes)
         subgraph_edges = int(training.subgraph_edges)
         runtime.record_hgt_inference(
             HGTInferenceSample(
                 consequence_error=float(training.training_loss),
                 strategy_ranking_correct=bool(training_accuracy >= 0.5),
-                candidate_refinement_success=str(training.status).upper() == "PROMOTED",
+                candidate_refinement_success=str(training.status).upper() == "TESTING_PENDING_BEHAVIOR",
                 subgraph_nodes=subgraph_nodes,
                 subgraph_edges=subgraph_edges,
                 inference_latency_ms=float(training.inference_latency_ms),
