@@ -15,8 +15,8 @@ class M6Outcome:
     members: tuple[MemoryUid, ...]
     provenance: DerivationProvenance
     class_version: int = 1
-    equivalence_trials: int = 1
-    equivalence_successes: int = 1
+    equivalence_trials: int = 0
+    equivalence_successes: int = 0
     contexts_observed: tuple[int, ...] = ()
     environments_observed: tuple[int, ...] = ()
     primary_valence_sum: int = 0
