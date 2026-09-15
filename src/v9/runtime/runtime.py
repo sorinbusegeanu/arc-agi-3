@@ -427,10 +427,11 @@ class ContinuousMemoryRuntime:
     def _hgt_context_scores_by_environment_type(self) -> dict[str, dict[int, dict[int, float]]]:
         grouped: dict[str, dict[int, dict[int, list[float]]]] = {}
         for environment_id, contexts in getattr(self, "_hgt_context_action_scores", {}).items():
-            record = self.environments.get(int(environment_id))
-            if record is None:
+            try:
+                identity = self.environments.resolve(int(environment_id))
+            except KeyError:
                 continue
-            environment_type = str(record.identity.environment_type)
+            environment_type = str(identity.environment_type)
             for context_signature, scores in contexts.items():
                 for action, score in scores.items():
                     grouped.setdefault(environment_type, {}).setdefault(int(context_signature), {}).setdefault(int(action), []).append(float(score))
