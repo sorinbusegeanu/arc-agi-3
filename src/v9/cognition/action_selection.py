@@ -123,4 +123,10 @@ def choose_action(view: ReadView, actions: tuple[int, ...], *, rng: Random, epsi
         informative = tuple(action for action in candidates if int(counts.get(int(action), 0)) == minimum_count)
         candidates = informative or candidates
         return int(candidates[rng.randrange(len(candidates))])
-    return min(actions, key=lambda action: (-scores[action], action))
+    best_score = max(float(scores[action]) for action in actions)
+    tied = tuple(action for action in actions if abs(float(scores[action]) - best_score) <= 1e-12)
+    if len(tied) > 1:
+        minimum_count = min(int(counts.get(int(action), 0)) for action in tied)
+        least_used = tuple(action for action in tied if int(counts.get(int(action), 0)) == minimum_count)
+        return int(least_used[rng.randrange(len(least_used))])
+    return int(tied[0])
