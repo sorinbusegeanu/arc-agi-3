@@ -58,7 +58,7 @@ from .partitions import PartitionMap
 from .publication import CanonicalGraph, edge_ref, node_ref
 from .read_view import ReadView
 from .rings import MultimodalTimeline
-from .snapshot_backend import SnapshotResult, assert_native_root, latest_snapshot, load_snapshot, load_snapshot_direct, decode_graph_shard, write_snapshot
+from .snapshot_backend import SnapshotResult, assert_native_root, latest_snapshot, load_snapshot, load_snapshot_direct, load_graph_shard, decode_graph_shard, write_snapshot
 
 
 class ContinuousMemoryRuntime:
@@ -146,7 +146,10 @@ class ContinuousMemoryRuntime:
                         for start in range(0, len(shard_specs), workers):
                             batch = shard_specs[start:start + workers]
                             decoded = list(pool.map(
-                                lambda row: decode_graph_shard(row[1], expected_partition=row[0]),
+                                lambda row: decode_graph_shard(
+                                    load_graph_shard(path, row[0], row[1]),
+                                    expected_partition=row[0],
+                                ),
                                 batch,
                             ))
                             graph.install_sharded_rows(decoded)
