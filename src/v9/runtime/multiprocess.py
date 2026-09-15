@@ -186,6 +186,10 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
             task_successes = task_failures = task_truncations = levels_completed = 0
             grounded_action_influence = 0
             context_action_counts: dict[int, dict[int, int]] = {}
+    active_strategy_uid = None
+    active_strategy_actions: tuple[int, ...] = ()
+    active_strategy_position = 0
+    active_strategy_outcome = None
             branching_total = 0
             branching_samples = 0
             max_branching_factor = 0
@@ -242,7 +246,35 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                 grounded_preference = min(actions, key=lambda value: (-float(enriched_scores.get(int(value), 0.0)), int(value)))
                 grounded_action_influence += int(base_preference != grounded_preference)
                 context_counts = context_action_counts.setdefault(before_signature, {})
-                action = choose_action(
+                strategy_rows = policy.strategies(environment_instance_id)
+                if active_strategy_uid is not None:
+                    current = next((row for row in strategy_rows if row.strategy_uid == active_strategy_uid), None)
+                    if current is None or active_strategy_position >= len(active_strategy_actions) or int(active_strategy_actions[active_strategy_position]) not in actions:
+                        alternatives = tuple(row for row in strategy_rows if row.target_outcome_uid == active_strategy_outcome and row.strategy_uid != active_strategy_uid and row.native_actions and int(row.native_actions[0]) in actions)
+                        current = alternatives[0] if alternatives else None
+                        if current is None:
+                            active_strategy_uid = None
+                            active_strategy_actions = ()
+                            active_strategy_position = 0
+                            active_strategy_outcome = None
+                        else:
+                            active_strategy_uid = current.strategy_uid
+                            active_strategy_actions = current.native_actions
+                            active_strategy_position = 0
+                if active_strategy_uid is None and strategy_rows:
+                    candidates = tuple(row for row in strategy_rows if row.native_actions and int(row.native_actions[0]) in actions)
+                    if candidates:
+                        selected = min(candidates, key=lambda row: (-row.reliability, -row.primary_valence, float("inf") if row.expected_cost is None else row.expected_cost, row.strategy_uid))
+                        active_strategy_uid = selected.strategy_uid
+                        active_strategy_actions = selected.native_actions
+                        active_strategy_position = 0
+                        active_strategy_outcome = selected.target_outcome_uid
+                planned_action = None
+                if active_strategy_uid is not None and active_strategy_position < len(active_strategy_actions):
+                    candidate_action = int(active_strategy_actions[active_strategy_position])
+                    if candidate_action in actions:
+                        planned_action = candidate_action
+                action = planned_action if planned_action is not None else choose_action(
                     policy,
                     actions,
                     rng=rng,
@@ -255,6 +287,13 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     stagnation=float(stagnation),
                 )
                 context_counts[int(action)] = int(context_counts.get(int(action), 0)) + 1
+                if planned_action is not None:
+                    active_strategy_position += 1
+                    if active_strategy_position >= len(active_strategy_actions):
+                        active_strategy_uid = None
+                        active_strategy_actions = ()
+                        active_strategy_position = 0
+                        active_strategy_outcome = None
                 semantic_action_fn = getattr(adapter, "semantic_action", None)
                 semantic_delta_fn = getattr(adapter, "semantic_delta", None)
                 semantic_action = tuple(semantic_action_fn(action)) if callable(semantic_action_fn) else ()
