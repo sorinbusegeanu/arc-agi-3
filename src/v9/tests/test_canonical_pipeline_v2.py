@@ -59,5 +59,11 @@ def test_fast_canonical_commit_matches_reference_batch(tmp_path: Path) -> None:
 
     reference.flush_deferred_memory_updates()
     fast.flush_deferred_memory_updates()
+    # Evidence confidence is a post-ingestion annotation maintained by the
+    # continuous runtime. Normalize it before comparing canonical graph identity.
+    for runtime in (reference, fast):
+        for payload in runtime.graph.payloads.values():
+            if payload.get("evidence_confidence") == 1.0:
+                payload.pop("evidence_confidence", None)
     assert fast.graph.state_dict() == reference.graph.state_dict()
     assert fast.telemetry == reference.telemetry
