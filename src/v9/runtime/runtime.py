@@ -122,6 +122,8 @@ class ContinuousMemoryRuntime:
         self._stage_interval_size = 256
         self.unified_telemetry = UnifiedTelemetry(model_version=scientific.hgt_model_version)
         self._hgt_action_scores: dict[int, dict[int, float]] = {}
+        self._hgt_context_action_scores: dict[int, dict[int, dict[int, float]]] = {}
+        self._environment_ids_by_game: dict[str, set[int]] = {}
         self.telemetry: dict[str, int] = {
             "events": 0, "proposals": 0, "accepted": 0, "stale": 0,
             "rejected": 0, "cross_partition_transactions": 0,
@@ -231,6 +233,10 @@ class ContinuousMemoryRuntime:
         with self._lock:
             return {
                 "scores": {int(env): dict(actions) for env, actions in self._hgt_action_scores.items()},
+                "context_scores": {
+                    int(env): {int(ctx): dict(actions) for ctx, actions in contexts.items()}
+                    for env, contexts in self._hgt_context_action_scores.items()
+                },
                 "model_version": self.unified_telemetry.model_version,
             }
 
@@ -296,7 +302,7 @@ class ContinuousMemoryRuntime:
                     continue
                 target = grounded_by_type.setdefault(str(environment_type), {})
                 for action in strategy.native_actions:
-                    target.setdefault(int(action), []).append(float(strategy.reliability) * concept_confidence)
+                    target.setdefault(int(action), []).append(float(strategy.reliability))
             grounded_scores = {
                 environment_type: {
                     action: sum(scores) / len(scores)
