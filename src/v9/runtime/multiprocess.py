@@ -69,6 +69,11 @@ class ActorDone:
     task_truncations: int = 0
     levels_completed: int = 0
     grounded_action_influence: int = 0
+    unique_contexts: int = 0
+    unique_context_actions: int = 0
+    mean_branching_factor: float = 0.0
+    max_branching_factor: int = 0
+    changed_transitions: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +186,10 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
             task_successes = task_failures = task_truncations = levels_completed = 0
             grounded_action_influence = 0
             context_action_counts: dict[int, dict[int, int]] = {}
+            branching_total = 0
+            branching_samples = 0
+            max_branching_factor = 0
+            changed_transitions = 0
             episode_ordinal = 1
             policy = initial_policy
             policy_refreshes = 0
@@ -191,6 +200,9 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
 
             for index in range(int(steps)):
                 actions = tuple(sorted(set(int(v) for v in adapter.available_actions())))
+                branching_total += len(actions)
+                branching_samples += 1
+                max_branching_factor = max(max_branching_factor, len(actions))
                 if not actions:
                     adapter.reset()
                     episode_ordinal += 1
@@ -290,6 +302,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     )
                 )
                 completed += 1
+                changed_transitions += int(before_signature != int(adapter.encode_observation(after)))
                 positives += int(boundary.primary_valence > 0)
                 negatives += int(boundary.primary_valence < 0)
                 episode_boundaries += int(not boundary.continuation)
@@ -308,7 +321,14 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
             # ActorDone is an end-of-stream marker. Ensure every transition this
             # actor produced has left its feeder before publishing completion.
             _flush_child_queue(stage_queue)
-            result_queue.put(ActorDone(actor_id, game_id, completed, positives, negatives, episode_boundaries, resets, policy_refreshes, task_successes, task_failures, task_truncations, levels_completed, grounded_action_influence))
+            result_queue.put(ActorDone(
+                actor_id, game_id, completed, positives, negatives, episode_boundaries, resets,
+                policy_refreshes, task_successes, task_failures, task_truncations, levels_completed,
+                grounded_action_influence, len(context_action_counts),
+                sum(len(counts) for counts in context_action_counts.values()),
+                float(branching_total) / max(1, branching_samples), max_branching_factor,
+                changed_transitions,
+            ))
             completion_sent = True
     except BaseException as exc:
         try:
