@@ -7,7 +7,15 @@ def choose_strategy(strategies: tuple[M7Strategy, ...], *, target_environment_id
     eligible = tuple(row for row in strategies if row.target_environment_id == int(target_environment_id) and row.reliability > 0)
     if not eligible:
         return None
-    return min(eligible, key=lambda row: (-row.reliability, float("inf") if row.expected_cost is None else row.expected_cost, row.uid))
+    return min(
+        eligible,
+        key=lambda row: (
+            -row.reliability,
+            -(row.primary_valence_sum / max(1, row.reliability_trials)),
+            float("inf") if row.expected_cost is None else row.expected_cost,
+            row.uid,
+        ),
+    )
 
 
 def replan(current: M7Strategy, alternatives: tuple[M7Strategy, ...], *, target_environment_id: int) -> M7Strategy | None:
