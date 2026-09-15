@@ -85,11 +85,12 @@ def build_epoch_jobs(
     return jobs
 
 
-def _environment_viability(rows: list[Any]) -> dict[str, dict[str, Any]]:
+def _environment_viability(rows: list[Any], previous: dict[str, dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
     grouped: dict[str, list[Any]] = {}
     for row in rows:
         grouped.setdefault(str(row.game_id), []).append(row)
     profiles: dict[str, dict[str, Any]] = {}
+    previous = previous or {}
     for game, game_rows in grouped.items():
         successes = sum(int(row.task_successes) for row in game_rows)
         failures = sum(int(row.task_failures) for row in game_rows)
@@ -107,13 +108,21 @@ def _environment_viability(rows: list[Any]) -> dict[str, dict[str, Any]]:
         coverage = min(1.0, context_actions / max(1.0, contexts * max(1.0, mean_branch)))
         action_influence = min(1.0, changed / max(1, steps))
         progress = successes + positives + levels
+        prior = previous.get(game, {})
+        prior_rate = float(prior.get("behavioral_rate", 0.0))
+        behavioral_rate = (successes + min(levels, 5)) / max(1, complete + 5)
+        improvement = behavioral_rate - prior_rate
         reasons: list[str] = []
         if complete < 3:
             state, confidence = "PROBING", min(1.0, complete / 3.0)
             reasons.append("insufficient complete episodes")
         elif progress > 0:
-            state, confidence = "VIABLE", min(1.0, 0.5 + complete / 20.0)
-            reasons.append("observed reachable progress")
+            if str(prior.get("state", "")) == "VIABILITY_ANOMALY":
+                state, confidence = "RECOVERING", min(1.0, 0.5 + complete / 20.0)
+                reasons.append("new reachable progress after viability anomaly")
+            else:
+                state, confidence = "VIABLE", min(1.0, 0.5 + complete / 20.0)
+                reasons.append("observed reachable progress")
         elif complete >= 10 and coverage >= 0.50 and action_influence >= 0.10:
             state, confidence = "VIABILITY_ANOMALY", min(1.0, (complete / 20.0) * (0.5 + 0.5 * coverage))
             reasons.append("10+ complete episodes with broad action coverage and no progress")
@@ -127,7 +136,9 @@ def _environment_viability(rows: list[Any]) -> dict[str, dict[str, Any]]:
             "failures": failures, "truncations": truncations, "positive_boundaries": positives,
             "negative_boundaries": negatives, "levels_completed": levels, "mean_branching_factor": mean_branch,
             "max_branching_factor": max_branch, "action_coverage": coverage,
-            "action_influence": action_influence, "reasons": reasons,
+            "action_influence": action_influence, "behavioral_rate": behavioral_rate,
+            "behavioral_improvement": improvement, "stagnation": float(improvement <= 0.0 and coverage >= 0.5),
+            "reasons": reasons,
         }
     return profiles
 
@@ -299,6 +310,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
     epoch_results = []
     baseline_success: float | None = None
     previous_game_results: dict[str, dict[str, int | float]] = {}
+    previous_viability_profiles: dict[str, dict[str, Any]] = {}
     previous_game_cost: dict[str, float] = {}
     previous_scenario_success: dict[str, float] = {}
     transfer_attempted = transfer_completed = transfer_passed = transfer_validated = 0
@@ -349,7 +361,8 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         runtime.set_telemetry_gauge("successful_scenarios", sum(rate > 0.0 for rate in scenario_success.values()))
         game_level = _game_level_metrics(process_results)
         previous_game_results = dict(game_level["by_game"])
-        viability_profiles = _environment_viability(process_results)
+        viability_profiles = _environment_viability(process_results, previous_viability_profiles)
+        previous_viability_profiles = viability_profiles
         _append_environment_viability(args.root, epoch=epoch, profiles=viability_profiles)
         runtime.set_telemetry_gauge("viability_anomalies", sum(1 for row in viability_profiles.values() if row["state"] == "VIABILITY_ANOMALY"))
         runtime.set_telemetry_gauge("viable_environments", sum(1 for row in viability_profiles.values() if row["state"] == "VIABLE"))
