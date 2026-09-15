@@ -456,7 +456,8 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         for game, confidence in confidence_by_game.items():
             for environment_id in environment_ids_by_game.get(game, ()):
                 environment_confidence[int(environment_id)] = float(confidence)
-        runtime.__dict__["_environment_evidence_confidence"] = environment_confidence
+        confidence_updates = runtime.apply_environment_evidence_confidence(environment_confidence)
+        runtime.set_telemetry_gauge("environment_confidence_memory_updates", int(confidence_updates))
         _append_environment_viability(args.root, epoch=epoch, profiles=viability_profiles)
         runtime.set_telemetry_gauge("viability_anomalies", sum(1 for row in viability_profiles.values() if row["state"] == "VIABILITY_ANOMALY"))
         runtime.set_telemetry_gauge("viable_environments", sum(1 for row in viability_profiles.values() if row["state"] == "VIABLE"))
