@@ -15,7 +15,7 @@ from v9.memory.m3_role import M3FunctionalRole
 from v9.memory.m4_concept import M4Concept
 from v9.memory.model import ExperienceEvent
 from v9.modalities.contract import InteractionEvent, PassiveSymbolEvent, SYMBOL_MODALITY, TimelineIdentity, WORLD_MODALITY
-from v9.modalities.symbols import DeterministicSymbolCodec
+from v9.modalities.symbols import DeterministicSymbolCodec, SymbolOccurrence
 
 from .multiprocess import EncodedTransition, WorkerStop
 
@@ -47,6 +47,7 @@ class PreparedIngestion:
     m1n: M1NormalizedRelation | None
     symbols: tuple[PreparedSymbolIngestion, ...] = ()
     symbol_codec_state: dict[str, Any] | None = None
+    symbol_occurrences: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,14 +81,15 @@ def _semantic_signature(rows: tuple[tuple[int, int, int, int, float], ...], fall
     return stable_u64(*parts, person=person)
 
 
-def _prepare_symbols(task: IngestionTask, transition: EncodedTransition, identity: EnvironmentIdentity, interaction_grounding: M1GroundedContingency | None) -> tuple[tuple[PreparedSymbolIngestion, ...], dict[str, Any] | None]:
+def _prepare_symbols(task: IngestionTask, transition: EncodedTransition, identity: EnvironmentIdentity, interaction_grounding: M1GroundedContingency | None) -> tuple[tuple[PreparedSymbolIngestion, ...], dict[str, Any] | None, tuple[SymbolOccurrence, ...]]:
     if not transition.symbols:
-        return (), None
+        return (), None, ()
     environment = int(identity.instance_id.value)
     episode_id = EpisodeId(int(transition.episode_id))
     codec = DeterministicSymbolCodec(f"{identity.family}-raw-symbols")
     observations = codec.encode_stream(transition.symbols, stream_name=f"{environment}:{episode_id.value}:{transition.producer_sequence}")
     prepared: list[PreparedSymbolIngestion] = []
+    occurrences: list[SymbolOccurrence] = []
     for index, row in enumerate(observations):
         event = PassiveSymbolEvent(
             TimelineIdentity(
@@ -104,6 +106,11 @@ def _prepare_symbols(task: IngestionTask, transition: EncodedTransition, identit
             row.symbol_id,
             row.position.value,
         )
+        occurrences.append(SymbolOccurrence(
+            event.identity.event_id, row.symbol_id, row.position.value, row.stream_id, row.vocabulary_id,
+            str(codec.codec_id), int(event.identity.causal_watermark), int(transition.global_step), index,
+            environment, episode_id, event.identity.event_id,
+        ))
         payload_digest = stable_u64(row.vocabulary_id.value, row.stream_id.value, row.symbol_id.value, row.position.value, person=b"v9-symbol-payload")
         m0 = M0Episode.from_event(event, context_signature=0, payload_digest=payload_digest)
         m1g = M1GroundedContingency.build(GroundedRelation.SYMBOL_OCCURRED, (m0,))
@@ -112,7 +119,7 @@ def _prepare_symbols(task: IngestionTask, transition: EncodedTransition, identit
         if interaction_grounding is not None:
             aligned = M1NormalizedRelation.build("SYMBOL_ALIGNED_WITH_INTERACTION", NormalizedChannel.CROSS_MODAL, (interaction_grounding, m1g))
         prepared.append(PreparedSymbolIngestion(event, m0, m1g, m1n, aligned))
-    return tuple(prepared), codec.state_dict()
+    return tuple(prepared), codec.state_dict(), tuple(occurrences)
 
 
 def prepare_ingestion(task: IngestionTask) -> PreparedIngestion:
@@ -157,8 +164,8 @@ def prepare_ingestion(task: IngestionTask) -> PreparedIngestion:
         observable = (f"ACTION:{transition.action_schema_id}:{identity.environment_type}:{experience.action_id}" f":SEM_ACTION:{semantic_action_signature}:SEM_DELTA:{semantic_delta_signature}" f":FAMILY:{experience.family_signature}:OUTCOME:{experience.outcome_signature}" f":OPTIONS:{transition.available_action_set_signature}:BOUNDARY:{transition.boundary_scope}" f":SUCCESS:{int(transition.task_success)}:FAILURE:{int(transition.task_failure)}" f":TRUNCATED:{int(transition.task_truncated)}:LEVEL:{transition.level_index}" f":LEVELS_COMPLETED:{transition.levels_completed}")
         m1n = M1NormalizedRelation.build(observable, NormalizedChannel.WORLD, (m1g,))
 
-    symbols, codec_state = _prepare_symbols(task, transition, identity, m1g)
-    return PreparedIngestion(task.sequence, transition, identity, event, m0, m1g, m1n, symbols, codec_state)
+    symbols, codec_state, occurrences = _prepare_symbols(task, transition, identity, m1g)
+    return PreparedIngestion(task.sequence, transition, identity, event, m0, m1g, m1n, symbols, codec_state, occurrences)
 
 
 def ingest_worker_main(task_queue: Any, result_queue: Any) -> None:
