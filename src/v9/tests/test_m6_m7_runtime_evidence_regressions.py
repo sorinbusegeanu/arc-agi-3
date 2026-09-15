@@ -31,7 +31,7 @@ def test_strategy_success_updates_preference_but_not_equivalence(tmp_path):
     runtime = _runtime(tmp_path)
     consequence = _validated_consequence("a")
     outcome = M6Outcome.form((consequence,), diameter_bound=0)
-    strategy = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1,), successes=1, trials=1)
+    strategy = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1,), successes=1, trials=1, primary_valence_sum=0, realized_cost_sum=1)
     runtime._m5[consequence.uid] = consequence
     runtime._m6[outcome.uid] = outcome
     runtime._m7[strategy.uid] = strategy
@@ -125,21 +125,21 @@ def test_restore_roundtrip_preserves_m6_scientific_fields(tmp_path):
 
 def test_m7_strategy_identity_distinguishes_action_sequences():
     outcome = M6Outcome.form((_validated_consequence("a"),), diameter_bound=0)
-    a = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1, 2))
-    b = M7Strategy.form(outcome, target_environment_id=7, native_actions=(2, 1))
+    a = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1, 2), successes=1, trials=1, primary_valence_sum=0, realized_cost_sum=2)
+    b = M7Strategy.form(outcome, target_environment_id=7, native_actions=(2, 1), successes=1, trials=1, primary_valence_sum=0, realized_cost_sum=2)
     assert a.uid != b.uid
 
 
 def test_m7_strategy_identity_distinguishes_target_environment():
     outcome = M6Outcome.form((_validated_consequence("a"),), diameter_bound=0)
     a = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1,))
-    b = M7Strategy.form(outcome, target_environment_id=8, native_actions=(1,))
+    b = M7Strategy.form(outcome, target_environment_id=8, native_actions=(1,), successes=1, trials=1, primary_valence_sum=0, realized_cost_sum=1)
     assert a.uid != b.uid
 
 
 def test_m7_strategy_identity_distinguishes_target_outcome():
     aout = M6Outcome.form((_validated_consequence("a"),), diameter_bound=0)
     bout = M6Outcome.form((_validated_consequence("b", (6,)),), diameter_bound=0)
-    a = M7Strategy.form(aout, target_environment_id=7, native_actions=(1,))
-    b = M7Strategy.form(bout, target_environment_id=7, native_actions=(1,))
+    a = M7Strategy.form(aout, target_environment_id=7, native_actions=(1,), successes=1, trials=1, primary_valence_sum=0, realized_cost_sum=1)
+    b = M7Strategy.form(bout, target_environment_id=7, native_actions=(1,), successes=1, trials=1, primary_valence_sum=0, realized_cost_sum=1)
     assert a.uid != b.uid
