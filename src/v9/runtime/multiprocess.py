@@ -211,6 +211,10 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     adapter.reset()
                     episode_ordinal += 1
                     resets += 1
+                    active_strategy_uid = None
+                    active_strategy_actions = ()
+                    active_strategy_position = 0
+                    active_strategy_outcome = None
                     actions = tuple(sorted(set(int(v) for v in adapter.available_actions())))
                     if not actions:
                         continue
@@ -287,7 +291,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     policy,
                     actions,
                     rng=rng,
-                    epsilon=float(epsilon),
+                    epsilon=1.0 if explore_over_strategy else float(epsilon),
                     learned_scores=enriched_scores,
                     target_environment_id=environment_instance_id,
                     action_schema_id=action_schema_id,
@@ -371,6 +375,10 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     adapter.reset()
                     episode_ordinal += 1
                     resets += 1
+                    active_strategy_uid = None
+                    active_strategy_actions = ()
+                    active_strategy_position = 0
+                    active_strategy_outcome = None
             if completed and adapter.boundary_event().continuation:
                 task_truncations += 1
                 episode_boundaries += 1
