@@ -467,7 +467,7 @@ def build_hgt_graph(
             break
         memory_type, memory_index = index_by_uid[uid]
         payload = dict(read_view.payloads.get(uid, {}))
-        facts = sorted(set(_semantic_rows(payload)), key=_semantic_priority)
+        facts = sorted(set(_semantic_rows(payload)) | ({(7, int(payload["symbol_identity"][2]), int(payload["symbol_identity"][1]), int(payload["symbol_identity"][0]), float(payload["symbol_identity"][3]))} if payload.get("symbol_identity") is not None else set()), key=_semantic_priority)
         for fact in facts[: max(1, int(max_semantic_facts_per_memory))]:
             if len(semantic_links) >= semantic_link_budget:
                 break
