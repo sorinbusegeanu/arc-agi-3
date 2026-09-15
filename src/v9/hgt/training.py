@@ -9,13 +9,14 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from .epoch_dataset import transition_training_rows, action_ranking_pairs
+from .grounding_objectives import GROUNDING_OBJECTIVES
 from typing import Any
 
 from v9.memory.model import MemoryLevel
 from v9.memory.relations import RelationType
 from v9.telemetry import HGTTrainingSample, ModelEvolutionSample, read_gpu_snapshot
 
-MODEL_SCHEMA_VERSION = 5
+MODEL_SCHEMA_VERSION = 6
 MEMORY_NODE_TYPES = (
     "M0_EPISODE",
     "M1_GROUNDED_CONTINGENCY",
@@ -28,8 +29,9 @@ MEMORY_NODE_TYPES = (
     "M7_STRATEGY",
 )
 NODE_TYPE = "M0_EPISODE"
-OBJECTIVE_NAMES = ("transition", "consequence", "relevance", "correspondence", "similarity", "strategy", "grounding", "deliberation_improvement", "invariance")
-AUX_OBJECTIVES = ("transition", "relevance", "correspondence", "similarity", "grounding", "deliberation_improvement", "invariance")
+BASE_OBJECTIVES = ("transition", "consequence", "relevance", "correspondence", "similarity", "strategy", "grounding", "deliberation_improvement", "invariance")
+OBJECTIVE_NAMES = BASE_OBJECTIVES + GROUNDING_OBJECTIVES
+AUX_OBJECTIVES = ("transition", "relevance", "correspondence", "similarity", "grounding", "deliberation_improvement", "invariance") + GROUNDING_OBJECTIVES
 SEMANTIC_NODE_TYPES = ("ENTITY", "ACTION", "SYMBOL", "STATE", "EFFECT")
 
 
@@ -373,6 +375,27 @@ def build_hgt_graph(
             grounding_positive = uid in relation_nodes.get(RelationType.GROUNDS.value, set()) or any(int(row[0]) == 7 for row in semantic_rows)
             targets["grounding"].append(float(grounding_positive))
             masks["grounding"].append(bool(semantic_rows) or node.level in {MemoryLevel.M0, MemoryLevel.M1})
+            has_symbol = any(int(row[0]) == 7 for row in semantic_rows)
+            cross_modal = uid in relation_nodes.get(RelationType.GROUNDS.value, set()) or uid in relation_nodes.get(RelationType.TRANSFER_CORRESPONDENCE.value, set())
+            prospective = bool(payload.get("symbol_prediction_gain", 0.0) > 0.0 or payload.get("prospective_prediction", False))
+            heldout = bool(payload.get("heldout_transfer", False))
+            composition = bool(payload.get("novel_composition", False))
+            calibrated = float(payload.get("grounding_confidence", 1.0 if grounding_positive else 0.0))
+            grounding_targets = {
+                "symbol_conditioned_interaction_prediction": float(has_symbol and transition_positive),
+                "symbol_conditioned_relevant_memory_retrieval": float(has_symbol and relevance_positive),
+                "world_to_symbol_generalization": float(cross_modal and has_symbol),
+                "heldout_symbol_composition": float(composition and heldout),
+                "symbol_conditioned_action_ranking": float(has_symbol and usable_action and int(payload.get("primary_valence", 0)) > 0),
+                "shuffled_alignment_discrimination": float(cross_modal and has_symbol),
+                "grounding_confidence_calibration": max(0.0, min(1.0, calibrated)),
+            }
+            causal_watermark = int(payload.get("grounding_causal_watermark", node.created_watermark))
+            target_watermark = int(node.created_watermark)
+            causal_ok = causal_watermark <= target_watermark
+            for grounding_objective, grounding_target in grounding_targets.items():
+                targets[grounding_objective].append(grounding_target)
+                masks[grounding_objective].append(bool(causal_ok and (has_symbol or cross_modal)))
             deliberation_target = 1.0 if bool(payload.get("task_success", False)) or int(payload.get("levels_completed", 0)) > 0 else (-1.0 if bool(payload.get("task_failure", False)) else 0.0)
             targets["deliberation_improvement"].append(deliberation_target)
             masks["deliberation_improvement"].append(bool(usable_action))
@@ -646,7 +669,10 @@ def _loss(
     if not raw_losses:
         return None, 0.0, {}
 
-    weight_map = {name: float(weight) for name, weight in zip(OBJECTIVE_NAMES, objective_weights)}
+    weights = list(float(weight) for weight in objective_weights)
+    if len(weights) < len(OBJECTIVE_NAMES):
+        weights.extend([0.5] * (len(OBJECTIVE_NAMES) - len(weights)))
+    weight_map = {name: float(weight) for name, weight in zip(OBJECTIVE_NAMES, weights)}
     total_loss = None
     active_weight = 0.0
     for objective, loss in raw_losses.items():
@@ -1224,6 +1250,12 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
                 "training_accuracy": train_accuracy,
                 "loss_by_head": dict(training_loss_by_head),
                 "objective_weights": list(config.hgt_loss_weights),
+            "objective_names": list(OBJECTIVE_NAMES),
+            "symbol_node_type": "SYMBOL",
+            "symbol_schema_version": 2,
+                "objective_names": list(OBJECTIVE_NAMES),
+                "symbol_node_type": "SYMBOL",
+                "symbol_schema_version": 2,
                 "dynamic_loss_weighting": bool(config.hgt_dynamic_loss_weighting),
                 "action_scores": action_scores,
                 "context_action_scores": context_action_scores,
