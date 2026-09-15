@@ -93,7 +93,7 @@ def test_step1_continuous_run_executes_curriculum(tmp_path) -> None:
     assert len(summary["actors"]) == 12
     assert summary["automatic_transfer_experiments"]["mode"] == "learning_only"
     counts = summary["metrics"]["telemetry_diagnostics"]["curriculum_counts"]
-    assert sum(counts.values()) == 12
+    assert sum(counts.values()) == 1200
     assert all(key.startswith("step1|synthetic|") for key in counts)
 
 
@@ -153,7 +153,7 @@ def test_broad_preset_spans_all_runnable_language_and_symbolic_families() -> Non
         "sudoku_clues_30",
     )
     arc_games = tuple(spec.game_id for spec in selection.specs if spec.adapter == "arc")
-    assert len(arc_games) == 40
+    assert len(arc_games) == 42
     assert arc_games[:4] == ("ez01", "ez02", "ez03", "ez04")
     assert arc_games[-4:] == ("wk01", "rf01", "mo01", "zq01")
 
