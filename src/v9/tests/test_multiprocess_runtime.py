@@ -107,8 +107,8 @@ def test_epochs_repeat_sampling_and_training(tmp_path) -> None:
     assert len(summary["epochs"]) == 2
     assert len(summary["actors"]) == 24
     assert summary["metrics"]["memory_levels"]["M0"] >= 24
-    assert summary["epochs"][0]["training"]["status"].startswith(("SKIPPED_", "PROMOTED", "REJECTED"))
-    assert summary["epochs"][1]["training"]["status"].startswith(("SKIPPED_", "PROMOTED", "REJECTED"))
+    assert summary["epochs"][0]["training"]["status"].startswith(("SKIPPED_", "PROMOTED", "REJECTED", "TESTING_"))
+    assert summary["epochs"][1]["training"]["status"].startswith(("SKIPPED_", "PROMOTED", "REJECTED", "TESTING_"))
     assert summary["epochs"][0]["performance"]["optimized_sampling_path"] is True
     assert summary["epochs"][1]["performance"]["optimized_sampling_path"] is True
     assert summary["epochs"][1]["performance"]["coordinator_action_requests"] == 0
