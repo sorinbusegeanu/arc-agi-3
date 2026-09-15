@@ -154,8 +154,10 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
     def record_transfer_validation(self, concept_uid: MemoryUid, **kwargs) -> None:
         with self._lock:
             concept = self._m4.get(concept_uid)
-            if concept is None:
-                raise KeyError("transfer validation requires an existing M4 concept candidate")
+            if concept is None or concept_uid not in self.graph.nodes or concept_uid not in self.graph.payloads:
+                self._m4.pop(concept_uid, None)
+                self._transfer_trials.pop(concept_uid, None)
+                return
 
             # Older broad runs recorded the global set of every seen environment
             # as each concept's formation scope. Replace that over-broad metadata
@@ -175,11 +177,14 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
 
             was_validated = bool(concept.validated)
             super().record_transfer_validation(concept_uid, **kwargs)
-            concept = self._m4[concept_uid]
-            if was_validated or not concept.validated:
+            concept = self._m4.get(concept_uid)
+            if concept is None or was_validated or not concept.validated:
                 return
 
-            role = self._m3[concept.provenance.parents[0]]
+            parent_uid = concept.provenance.parents[0] if concept.provenance.parents else None
+            role = None if parent_uid is None else self._m3.get(parent_uid)
+            if role is None or parent_uid not in self.graph.nodes or parent_uid not in self.graph.payloads:
+                return
             consequence = M5ConsequenceStructure.form((concept,), (role.consequence_signature,))
             outcome = M6Outcome.form((consequence,), diameter_bound=0)
             formation_scope = set(concept.provenance.formation_scope)
@@ -196,17 +201,26 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
                 return
             action = int(admissible[-1]["target_native_action"])
             target_environment_id = int(kwargs["target_environment_id"])
+            trajectory_actions = tuple(
+                int(payload["action_id"])
+                for uid in concept.provenance.evidence
+                for payload in [self._evidence_payload(uid)]
+                if payload is not None
+                and payload.get("action_id") is not None
+                and int(payload.get("environment_instance_id", target_environment_id)) == target_environment_id
+            )
+            native_actions = trajectory_actions or (action,)
             grounded_payloads = [
                 self.graph.payloads[uid]
                 for uid in outcome.provenance.evidence
-                if uid in self.graph.payloads and self.graph.nodes[uid].level is MemoryLevel.M0
+                if uid in self.graph.payloads and uid in self.graph.nodes and self.graph.nodes[uid].level is MemoryLevel.M0
             ]
             primary_valence_sum = sum(int(payload.get("primary_valence", 0)) for payload in grounded_payloads)
             realized_cost_sum = sum(max(1, int(payload.get("realized_cost", 0))) for payload in grounded_payloads) or len(admissible)
             strategy = M7Strategy.form(
                 outcome,
                 target_environment_id=target_environment_id,
-                native_actions=(action,),
+                native_actions=native_actions,
                 successes=len(admissible),
                 trials=len(admissible),
                 primary_valence_sum=primary_valence_sum,
