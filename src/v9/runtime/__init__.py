@@ -277,6 +277,8 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
     def _restore_higher_memory_objects(self) -> None:
         level_index = getattr(self.graph, "_uids_by_level", {})
         for uid in tuple(level_index.get(MemoryLevel.M5, ())):
+            if uid in self._m5:
+                continue
             payload = self.graph.payloads.get(uid, {})
             provenance = self._payload_provenance(payload)
             if provenance is None:
@@ -288,6 +290,8 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
                 bool(payload.get("mature", False)),
             )
         for uid in tuple(level_index.get(MemoryLevel.M6, ())):
+            if uid in self._m6:
+                continue
             payload = self.graph.payloads.get(uid, {})
             provenance = self._payload_provenance(payload)
             if provenance is None:
@@ -298,8 +302,16 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
                 provenance.parents,
                 provenance,
                 int(payload.get("class_version", 1)),
+                int(payload.get("equivalence_trials", 1)),
+                int(payload.get("equivalence_successes", 1)),
+                tuple(int(value) for value in payload.get("contexts_observed", ())),
+                tuple(int(value) for value in payload.get("environments_observed", ())),
+                int(payload.get("primary_valence_sum", 0)),
+                int(payload.get("preference_trials", 0)),
             )
         for uid in tuple(level_index.get(MemoryLevel.M7, ())):
+            if uid in self._m7:
+                continue
             payload = self.graph.payloads.get(uid, {})
             provenance = self._payload_provenance(payload)
             target = payload.get("target_outcome")
