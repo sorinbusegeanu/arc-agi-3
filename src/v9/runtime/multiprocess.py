@@ -529,7 +529,7 @@ class ProcessTopology:
             process.start()
             self.stage_processes.append(process)
 
-    def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, initial_policy: ActorPolicySnapshot, epsilon: float, stagnation: float, policy_refresh_steps: int, policy_refresh_ms: float) -> None:
+    def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, initial_policy: ActorPolicySnapshot, epsilon: float, stagnation: float = 0.0, policy_refresh_steps: int = 64, policy_refresh_ms: float = 250.0) -> None:
         process = self.actor_ctx.Process(
             target=actor_process_main,
             kwargs={
