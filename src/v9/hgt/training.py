@@ -1013,13 +1013,6 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
-    model = _HGTWrapper(
-        metadata,
-        input_dim=64,
-        hidden_dim=int(config.hgt_hidden_dim),
-        layers=int(config.hgt_layers),
-        heads=int(config.hgt_heads),
-    ).model.to(device)
     model_dir = Path(root) / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = model_dir / "hgt_manifest.json"
@@ -1028,17 +1021,45 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     parent_version = accepted_version
     parent_checkpoint = f"models/{accepted_version}.pt" if accepted_version else None
     checkpoint_state = None
+    parent_architecture = None
     if int(manifest.get("model_schema_version", 0)) != MODEL_SCHEMA_VERSION:
         parent_version = parent_checkpoint = None
+
+    model = _HGTWrapper(
+        metadata,
+        input_dim=64,
+        hidden_dim=int(config.hgt_hidden_dim),
+        layers=int(config.hgt_layers),
+        heads=int(config.hgt_heads),
+    ).model.to(device)
     if parent_checkpoint:
         checkpoint_path = Path(root) / str(parent_checkpoint)
         if checkpoint_path.exists():
             checkpoint_state = torch.load(checkpoint_path, map_location=device)
             try:
-                if int(checkpoint_state.get("model_schema_version", 0)) != MODEL_SCHEMA_VERSION:
-                    raise RuntimeError("HGT checkpoint schema changed")
-                model.load_state_dict(checkpoint_state["model_state"])
-            except (RuntimeError, KeyError) as exc:
+                parent_model, parent_architecture = _load_self_describing_model(checkpoint_state, device)
+                current_architecture = {
+                    "metadata": metadata,
+                    "input_dim": 64,
+                    "hidden_dim": int(config.hgt_hidden_dim),
+                    "layers": int(config.hgt_layers),
+                    "heads": int(config.hgt_heads),
+                }
+                same_architecture = all(
+                    parent_architecture[key] == current_architecture[key]
+                    for key in ("metadata", "input_dim", "hidden_dim", "layers", "heads")
+                )
+                if same_architecture:
+                    model.load_state_dict(parent_model.state_dict())
+                else:
+                    _migrate_model_state(parent_model, parent_architecture["metadata"], model, metadata)
+                    runtime.set_telemetry_gauge("hgt_architecture_evolved", 1)
+                    runtime.set_telemetry_gauge("hgt_parent_metadata_edge_types", len(parent_architecture["metadata"][1]))
+                    runtime.set_telemetry_gauge("hgt_current_metadata_edge_types", len(metadata[1]))
+                    checkpoint_state = dict(checkpoint_state)
+                    checkpoint_state["optimizer_state"] = None
+                del parent_model
+            except (RuntimeError, KeyError, TypeError, ValueError) as exc:
                 raise RuntimeError(f"accepted HGT checkpoint {checkpoint_path} is incompatible or corrupt: {exc}") from exc
     try:
         x_device = {key: value.to(device) for key, value in x_dict.items()}
@@ -1205,6 +1226,17 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             temporary_checkpoint,
         )
         os.replace(temporary_checkpoint, checkpoint_path)
+        _write_architecture_sidecar(
+            checkpoint_path,
+            {
+                "model_schema_version": MODEL_SCHEMA_VERSION,
+                "metadata": metadata,
+                "input_dim": 64,
+                "hidden_dim": int(config.hgt_hidden_dim),
+                "layers": int(config.hgt_layers),
+                "heads": int(config.hgt_heads),
+            },
+        )
         manifest = {
             "model_schema_version": MODEL_SCHEMA_VERSION,
             "version_index": version_index,
