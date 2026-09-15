@@ -85,6 +85,42 @@ def build_epoch_jobs(
     return jobs
 
 
+def _environment_viability(rows: list[Any]) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[Any]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.game_id), []).append(row)
+    profiles: dict[str, dict[str, Any]] = {}
+    for game, game_rows in grouped.items():
+        episodes = sum(int(row.episode_boundaries) for row in game_rows)
+        successes = sum(int(row.task_successes) for row in game_rows)
+        failures = sum(int(row.task_failures) for row in game_rows)
+        truncations = sum(int(row.task_truncations) for row in game_rows)
+        positives = sum(int(row.positive_boundaries) for row in game_rows)
+        negatives = sum(int(row.negative_boundaries) for row in game_rows)
+        levels = max((int(row.levels_completed) for row in game_rows), default=0)
+        steps = sum(int(row.steps) for row in game_rows)
+        progress = successes + positives + levels
+        complete = successes + failures + truncations
+        if complete < 3:
+            state, confidence, reasons = "PROBING", min(1.0, complete / 3.0), ["insufficient complete episodes"]
+        elif progress > 0:
+            state, confidence, reasons = "VIABLE", min(1.0, 0.5 + complete / 20.0), ["observed reachable progress"]
+        elif complete >= 10:
+            state, confidence, reasons = "VIABILITY_ANOMALY", min(1.0, complete / 20.0), ["10+ complete episodes with no observed progress"]
+        else:
+            state, confidence, reasons = "LOW_EVIDENCE", min(1.0, complete / 10.0), ["complete episodes observed without progress"]
+        profiles[game] = {"state": state, "confidence": confidence, "steps": steps, "complete_episodes": complete, "successes": successes, "failures": failures, "truncations": truncations, "positive_boundaries": positives, "negative_boundaries": negatives, "levels_completed": levels, "reasons": reasons}
+    return profiles
+
+
+def _append_environment_viability(root: str | Path, *, epoch: int, profiles: dict[str, dict[str, Any]]) -> None:
+    target = Path(root) / "environment_viability.log"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as handle:
+        for game in sorted(profiles):
+            handle.write(json.dumps({"epoch": int(epoch), "game": game, **profiles[game]}, sort_keys=True) + "\n")
+
+
 def _append_game_results(root: str | Path, *, epoch: int, specs: tuple[Any, ...], rows: list[Any]) -> None:
     by_game = _game_level_metrics(rows)["by_game"]
     spec_by_name = {str(spec.display_name): spec for spec in specs}
@@ -294,6 +330,11 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         runtime.set_telemetry_gauge("successful_scenarios", sum(rate > 0.0 for rate in scenario_success.values()))
         game_level = _game_level_metrics(process_results)
         previous_game_results = dict(game_level["by_game"])
+        viability_profiles = _environment_viability(process_results)
+        _append_environment_viability(args.root, epoch=epoch, profiles=viability_profiles)
+        runtime.set_telemetry_gauge("viability_anomalies", sum(1 for row in viability_profiles.values() if row["state"] == "VIABILITY_ANOMALY"))
+        runtime.set_telemetry_gauge("viable_environments", sum(1 for row in viability_profiles.values() if row["state"] == "VIABLE"))
+        runtime.set_telemetry_gauge("low_evidence_environments", sum(1 for row in viability_profiles.values() if row["state"] in {"PROBING", "LOW_EVIDENCE"}))
         _append_game_results(args.root, epoch=epoch, specs=specs, rows=process_results)
         runtime.set_telemetry_gauge("current_run_wins", float(game_level["current_run_wins"]))
         runtime.set_telemetry_gauge("current_run_solved_games", int(game_level["current_run_solved_games"]))
