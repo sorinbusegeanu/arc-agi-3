@@ -19,6 +19,14 @@ class ActorStrategyPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class ActorOutcomePolicy:
+    outcome_uid: MemoryUid
+    environment_id: int
+    equivalence_confidence: float
+    mean_primary_valence: float
+
+
+@dataclass(frozen=True, slots=True)
 class ActorPolicySnapshot:
     generation: int
     normalized_action_supports: dict[int, float]
@@ -30,6 +38,7 @@ class ActorPolicySnapshot:
     grounded_action_scores_by_type: dict[str, dict[int, float]] = field(default_factory=dict)
     grounded_context_action_scores_by_type: dict[str, dict[int, dict[int, float]]] = field(default_factory=dict)
     strategies_by_environment: dict[int, tuple[ActorStrategyPolicy, ...]] = field(default_factory=dict)
+    outcomes_by_environment: dict[int, tuple[ActorOutcomePolicy, ...]] = field(default_factory=dict)
 
     @classmethod
     def build(
@@ -45,6 +54,7 @@ class ActorPolicySnapshot:
         grounded_context_action_scores_by_type: Mapping[str, Mapping[int, Mapping[int, float]]] | None = None,
         model_version: str,
         strategies_by_environment: Mapping[int, tuple[ActorStrategyPolicy, ...]] | None = None,
+        outcomes_by_environment: Mapping[int, tuple[ActorOutcomePolicy, ...]] | None = None,
     ) -> "ActorPolicySnapshot":
         learned = {
             int(environment): {
@@ -111,6 +121,7 @@ class ActorPolicySnapshot:
             grounded,
             grounded_contextual,
             {int(environment): tuple(rows) for environment, rows in (strategies_by_environment or {}).items()},
+            {int(environment): tuple(rows) for environment, rows in (outcomes_by_environment or {}).items()},
         )
 
 
@@ -162,3 +173,6 @@ class ActorPolicySnapshot:
 
     def strategies(self, environment_id: int) -> tuple[ActorStrategyPolicy, ...]:
         return self.strategies_by_environment.get(int(environment_id), ())
+
+    def outcomes(self, environment_id: int) -> tuple[ActorOutcomePolicy, ...]:
+        return self.outcomes_by_environment.get(int(environment_id), ())
