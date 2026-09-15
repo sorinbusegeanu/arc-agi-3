@@ -434,9 +434,23 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             on_state = runtime.capture_experiment_state()
             # Restore the exact pre-evaluation Hydra/model state before OFF.
             runtime.restore_experiment_state(branch_base_state)
-            off_dataset = EpochTransitionDataset(dataset_path(args.root, epoch=epoch, branch="hgt_off"), epoch=epoch, branch="hgt_off", model_version=active_model)
+            manifest_path = Path(args.root) / "models" / "hgt_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+            parent_model = manifest.get("parent_model_version")
+            baseline_model = str(parent_model or "random")
+            off_dataset = EpochTransitionDataset(dataset_path(args.root, epoch=epoch, branch="hgt_parent"), epoch=epoch, branch="hgt_parent", model_version=baseline_model)
             try:
-                runtime.set_hgt_enabled(False)
+                if parent_model:
+                    # Evaluate the accepted parent from the exact same captured
+                    # state. rollback_hgt_model restores its action policy.
+                    restored_parent = rollback_hgt_model(runtime, root=args.root)
+                    if str(restored_parent) != str(parent_model):
+                        raise RuntimeError(f"failed to restore HGT parent {parent_model!r} for matched evaluation")
+                    runtime.set_hgt_enabled(True)
+                else:
+                    # The first candidate is compared with the pre-HGT random/
+                    # Hydra control policy.
+                    runtime.set_hgt_enabled(False)
                 off_results = run_parallel_memory_jobs(runtime, off_jobs, hgt_dataset=off_dataset, **common_kwargs)
             finally:
                 off_dataset.close()
@@ -459,12 +473,13 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             runtime.restore_experiment_state(on_state if decision.selected_branch == "hgt_on" else off_state)
             runtime.set_hgt_enabled(True)
             runtime.set_telemetry_gauge("hgt_on_behavioral_success", float(on_success))
-            runtime.set_telemetry_gauge("hgt_off_behavioral_success", float(off_success))
+            runtime.set_telemetry_gauge("hgt_parent_behavioral_success", float(off_success))
+            runtime.set_telemetry_gauge("hgt_baseline_model_version", baseline_model)
             runtime.set_telemetry_gauge("hgt_behavioral_gain", float(decision.gain))
             runtime.set_telemetry_gauge("hgt_evaluation_branch", decision.selected_branch)
             runtime.set_telemetry_gauge("hgt_branch_selection_reason", decision.reason)
             runtime.set_telemetry_gauge("hgt_on_dataset_transitions", int(on_dataset.count))
-            runtime.set_telemetry_gauge("hgt_off_dataset_transitions", int(off_dataset.count))
+            runtime.set_telemetry_gauge("hgt_parent_dataset_transitions", int(off_dataset.count))
         with open(selected_dataset_path, encoding="utf-8") as training_dataset_handle:
             sampled_training_transitions = sum(1 for _ in training_dataset_handle)
         runtime.set_telemetry_gauge("hgt_sampled_training_transitions", sampled_training_transitions)
