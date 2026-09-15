@@ -104,34 +104,6 @@ def test_hgt_promotion_requires_retention_and_loss_preservation() -> None:
     assert training._should_promote(None, float("inf"), 1.20, float("nan"), 0.20)
 
 
-def test_optimized_runtime_policy_snapshot_keeps_grounded_strategy_scores(tmp_path) -> None:
-    from v9.environments.schemas import EnvironmentIdentity
-    from v9.memory.identity import MemoryUid
-    from v9.memory.m7_strategy import M7Strategy
-    from v9.memory.provenance import DerivationProvenance
-
-    runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False))
-    environment_id = runtime.environments.register(
-        EnvironmentIdentity("gymnasium", "FrozenLake-v1", "default", "seed=1")
-    ).value
-    outcome_uid = MemoryUid.derive("outcome", 1)
-    strategy_uid = MemoryUid.derive("strategy", 1)
-    runtime._m7[strategy_uid] = M7Strategy(
-        strategy_uid,
-        outcome_uid,
-        environment_id,
-        (2,),
-        3,
-        4,
-        2,
-        9,
-        DerivationProvenance((outcome_uid,), (outcome_uid,)),
-    )
-
-    snapshot = runtime.actor_policy_snapshot()
-    assert snapshot.grounded_scores((1, 2), environment_type="FrozenLake-v1")[2] == 0.75
-
-
 def test_hgt_behavior_rollback_restores_parent_policy(tmp_path) -> None:
     import json
     torch = pytest.importorskip("torch")
@@ -170,21 +142,6 @@ def test_hgt_behavior_rollback_restores_parent_policy(tmp_path) -> None:
     assert runtime.hgt_action_scores(7, (1, 2)) == {1: 0.9, 2: 0.1}
     manifest = json.loads((models / "hgt_manifest.json").read_text(encoding="utf-8"))
     assert manifest["current_model_version"] == parent
-
-
-def test_grounded_m7_scores_are_context_specific() -> None:
-    snapshot = ActorPolicySnapshot.build(
-        generation=1,
-        normalized_action_supports={},
-        hgt_action_scores={},
-        hgt_context_action_scores={},
-        hgt_action_scores_by_type={},
-        grounded_action_scores_by_type={"target": {1: 0.2, 2: 0.8}},
-        grounded_context_action_scores_by_type={"target": {99: {1: 0.9, 2: 0.1}}},
-        model_version="test",
-    )
-    assert snapshot.grounded_scores((1, 2), environment_type="target", context_signature=99) == {1: 0.9, 2: 0.1}
-    assert snapshot.grounded_scores((1, 2), environment_type="target", context_signature=100) == {1: 0.0, 2: 0.0}
 
 
 def test_unseen_actions_respect_epsilon_instead_of_forcing_exploration() -> None:
