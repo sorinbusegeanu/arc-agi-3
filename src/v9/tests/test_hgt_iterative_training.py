@@ -7,6 +7,7 @@ from pathlib import Path
 from v9.hgt.epoch_dataset import EpochTransitionDataset, action_ranking_pairs, iter_epoch_transitions, transition_training_rows
 from v9.hgt.matched_evaluation import matched_jobs, select_matched_branch
 from v9.runtime.multiprocess import EncodedTransition
+from v9.runtime.runtime import ContinuousMemoryRuntime
 
 
 def transition(step: int, action: int, valence: int = 0, success: bool = False) -> EncodedTransition:
@@ -52,6 +53,25 @@ class HGTIterativeTrainingTests(unittest.TestCase):
         on, off = matched_jobs(jobs)
         on.clear()
         self.assertEqual(len(off), 1)
+
+
+    def test_experiment_state_restore_reinstates_branch_base(self):
+        class Fake:
+            capture_experiment_state = ContinuousMemoryRuntime.capture_experiment_state
+            restore_experiment_state = ContinuousMemoryRuntime.restore_experiment_state
+            def __init__(self):
+                import threading
+                self._lock = threading.RLock()
+                self.value = 1
+            def wait_quiescent(self): pass
+            def flush_deferred_memory_updates(self): pass
+            def state_dict(self): return {"value": self.value}
+            def _restore(self, snapshot): self.value = int(snapshot["state"]["value"])
+        runtime = Fake()
+        base = runtime.capture_experiment_state()
+        runtime.value = 9
+        runtime.restore_experiment_state(base)
+        self.assertEqual(runtime.value, 1)
 
     def test_branch_selection_uses_macro_success_then_progress(self):
         self.assertEqual(select_matched_branch(.30, .20).selected_branch, "hgt_on")
