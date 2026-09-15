@@ -65,6 +65,12 @@ class _Runtime:
         self.watermark = 1
         self.config = SimpleNamespace(enable_lifecycle=True)
         self._replay_pool = {}
+        self._m2 = {}
+        self._m3 = {}
+        self._m4 = {}
+        self._m5 = {}
+        self._m6 = {}
+        self._m7 = {}
         self._deferred_base_nodes = {}
         self._latest_interaction_grounding = {}
         self.unified_telemetry = SimpleNamespace(gauges={})
