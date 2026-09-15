@@ -59,6 +59,7 @@ def test_hgt_uses_symbol_not_text_node_type() -> None:
     assert "TEXT" not in SEMANTIC_NODE_TYPES
     assert _semantic_node_type(7) == "SYMBOL"
 
+
 def test_m2_retains_modality_support_decomposition() -> None:
     import inspect
     from v9.memory.m2_family import M2TransformationFamily
@@ -77,3 +78,46 @@ def test_grounding_graph_relations_are_explicit() -> None:
     from v9.memory.relations import RelationType
     required = {"OBSERVED_IN", "PRECEDES", "FOLLOWS", "TEMPORALLY_ALIGNED_WITH", "STRUCTURALLY_CORRESPONDS_TO", "PARTICIPATES_IN", "SUPPORTS", "CONTRADICTS", "GROUNDS", "TRANSFER_VALIDATES"}
     assert required <= {row.name for row in RelationType}
+
+
+def test_cognition_grounding_g3_becomes_behavior_eligible_and_round_trips() -> None:
+    from v9.cognition.grounding import GroundingEvidence as RuntimeGroundingEvidence
+    from v9.cognition.grounding import GroundingMaturity as RuntimeGroundingMaturity
+    from v9.cognition.grounding import GroundingRegistry
+
+    registry = GroundingRegistry()
+    state = registry.observe(RuntimeGroundingEvidence(11, 22, 3, 4, 5, 100, recurrent_symbol=True, cross_modal_association=True, prospective_prediction=True, validation_trial_id="trial-1", support=2.0))
+    assert state.maturity == RuntimeGroundingMaturity.G3
+    assert state.behavior_eligible
+    assert registry.authority(11, 22, 3, 4, 5) > 0.0
+
+    restored = GroundingRegistry.from_state_dict(registry.state_dict())
+    row = restored.states[(11, 22, 3, 4, 5)]
+    assert row.behavior_eligible
+    assert row.validation_trial_ids == ("trial-1",)
+    assert row.last_causal_watermark == 100
+
+
+def test_cognition_grounding_negative_evidence_suspends_behavior_authority() -> None:
+    from v9.cognition.grounding import GroundingEvidence as RuntimeGroundingEvidence
+    from v9.cognition.grounding import GroundingRegistry
+
+    registry = GroundingRegistry()
+    registry.observe(RuntimeGroundingEvidence(1, 2, 3, 0, 0, 1, recurrent_symbol=True, cross_modal_association=True, prospective_prediction=True, support=1.0))
+    state = registry.observe(RuntimeGroundingEvidence(1, 2, 3, 0, 0, 2, causal_intervention=True, positive=False, support=2.0, contradiction=2.0, validation_trial_id="negative"))
+    assert state.suspended
+    assert not state.behavior_eligible
+    assert registry.authority(1, 2, 3) == 0.0
+
+
+def test_h16_expanded_metrics_are_matched_and_reported() -> None:
+    from v9.research.grounding_h16 import GroundingCondition, H16Metrics, H16Trial, evaluate_h16
+
+    trials = []
+    for condition in GroundingCondition:
+        aligned = condition is GroundingCondition.C2_ALIGNED
+        trials.append(H16Trial(condition, 7, 1, 20, 1, H16Metrics(interaction_prediction=0.9 if aligned else 0.2, action_success=0.9 if aligned else 0.2, symbol_conditioned_transfer=0.9 if aligned else 0.1, world_to_symbol_generalization=0.8 if aligned else 0.1, composition_success=0.8 if aligned else 0.0, persistence_without_symbols=0.4, grounding_calibration=0.9), 0.3 if aligned else 0.0, f"trial:{condition.value}"))
+    report = evaluate_h16(tuple(trials))
+    assert report.matched
+    assert report.causal_effect == 0.3
+    assert report.metric_means["C2"]["composition_success"] == 0.8
