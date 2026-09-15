@@ -579,6 +579,13 @@ class CanonicalGraph:
         state["edges"] = ()
         result = cls.from_state_dict(state)
         result.install_sharded_rows(shard_rows)
+        # Header-owned metadata must survive direct-shard restoration exactly.
+        if result.generation != int(header.get("generation", 0)):
+            raise RuntimeError("direct graph restore generation mismatch")
+        if len(result.retired_tombstones) != len(header.get("retired_tombstones", [])):
+            raise RuntimeError("direct graph restore tombstone mismatch")
+        if len(result._applied_order) != min(len(header.get("applied_proposals", [])), result.applied_proposal_capacity):
+            raise RuntimeError("direct graph restore applied-proposal mismatch")
         return result
 
     @classmethod
