@@ -157,6 +157,27 @@ class ContinuousMemoryRuntime:
 
             self._actor_policy_generation += 1
 
+    def capture_hgt_policy_state(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "scores": {int(env): dict(actions) for env, actions in self._hgt_action_scores.items()},
+                "model_version": self.unified_telemetry.model_version,
+            }
+
+    def set_hgt_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            if enabled:
+                saved = getattr(self, "_hgt_disabled_state", None)
+                if saved is not None:
+                    self._hgt_action_scores = {int(env): dict(actions) for env, actions in saved["scores"].items()}
+                    self.unified_telemetry.model_version = saved["model_version"]
+                    self._hgt_disabled_state = None
+            else:
+                if getattr(self, "_hgt_disabled_state", None) is None:
+                    self._hgt_disabled_state = self.capture_hgt_policy_state()
+                self._hgt_action_scores = {}
+            self._actor_policy_generation += 1
+
     def hgt_action_scores(self, environment_id: int, actions: tuple[int, ...]) -> dict[int, float]:
         with self._lock:
             source = self._hgt_action_scores.get(int(environment_id), {})
