@@ -80,6 +80,12 @@ def publish_encoded_transition(runtime, transition: EncodedTransition) -> None:
 
     publish_transition_symbols(runtime, transition)
 
+    if transition.task_success:
+        runtime.record_successful_trajectory(
+            environment_id=int(environment),
+            episode_id=int(transition.episode_id),
+        )
+
     if (
         transition.strategy_terminal
         and transition.strategy_uid_hi is not None
