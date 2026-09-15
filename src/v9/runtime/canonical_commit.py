@@ -86,6 +86,11 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
 
                 if plan.isf_static is not None:
                     pvi, osi, explicit_pe, tp, ep = plan.isf_static
+                    evidence_confidence = float(runtime.__dict__.get("_environment_evidence_confidence", {}).get(environment_id, 1.0))
+                    if float(pvi) <= 0.0:
+                        explicit_pe *= evidence_confidence
+                        tp *= evidence_confidence
+                        ep *= evidence_confidence
                     recurrence = int(runtime._m1n_supports.get(signature, 0))
                     recurrence_pe = 1.0 / max(1.0, float(prior_support + 1))
                     pe = abs(float(explicit_pe)) if float(explicit_pe) != 0.0 else recurrence_pe
