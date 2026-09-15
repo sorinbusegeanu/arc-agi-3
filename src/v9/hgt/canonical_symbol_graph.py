@@ -25,7 +25,7 @@ def install(training_module: Any) -> None:
     if getattr(training_module, "_v978_symbol_graph_installed", False):
         return
     original_graph = training_module.build_hgt_graph
-    original_loss = training_module._multitask_loss
+    original_loss = training_module._loss
     original_train = training_module.train_hgt_epoch
 
     def build_hgt_graph(read_view: Any, **kwargs: Any):
@@ -124,7 +124,7 @@ def install(training_module: Any) -> None:
             return x_dict, edge_index_dict, y_dict, action_target_dict, action_mask_dict, action_meta, task_target_dict, task_mask_dict
         return x_dict, edge_index_dict, y_dict, action_target_dict, action_mask_dict, action_meta
 
-    def multitask_loss(*args: Any, **kwargs: Any):
+    def wrapped_loss(*args: Any, **kwargs: Any):
         result = original_loss(*args, **kwargs)
         training_module._v978_last_grounding_losses = {name: value for name, value in result[2].items() if name in training_module.GROUNDING_OBJECTIVES}
         return result
@@ -144,7 +144,7 @@ def install(training_module: Any) -> None:
         return result
 
     training_module.build_hgt_graph = build_hgt_graph
-    training_module._multitask_loss = multitask_loss
+    training_module._loss = wrapped_loss
     training_module.train_hgt_epoch = train_hgt_epoch
     training_module._v978_symbol_graph_installed = True
 
