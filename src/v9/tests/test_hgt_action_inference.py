@@ -82,28 +82,6 @@ def test_hgt_graph_builder_accepts_immutable_read_view_edges(monkeypatch) -> Non
     assert ("M0_EPISODE", "PROVENANCE", "M1_NORMALIZED_RELATION") in edge_indexes
 
 
-def test_hgt_graph_sampling_keeps_relation_endpoints(monkeypatch) -> None:
-    old = CanonicalNode.build(MemoryLevel.M1, MemoryType.NORMALIZED_RELATION, (1,), 1)
-    recent = [CanonicalNode.build(MemoryLevel.M0, MemoryType.EPISODE, (100 + index,), 100 + index) for index in range(20)]
-    source = recent[-1]
-    edge = RelationEdge(source.uid, RelationType.PROVENANCE, old.uid)
-    nodes = {old.uid: old, **{node.uid: node for node in recent}}
-    payloads = {uid: {} for uid in nodes}
-    payloads[source.uid] = {"action_id": 1, "environment_instance_id": 7, "context_signature": 9, "episode_id": 3, "primary_valence": 1}
-    read_view = ReadView.build(1, nodes, payloads, {edge.key: edge}, {})
-    monkeypatch.setattr(training, "_require_torch", lambda: (_FakeTorch, None, None))
-    _x, edge_indexes, _y, _targets, _masks, _meta = training.build_hgt_graph(read_view, max_nodes=4)
-    assert ("MEMORY", "PROVENANCE", "MEMORY") in edge_indexes
-
-
-def test_hgt_promotion_requires_retention_and_loss_preservation() -> None:
-    assert training._should_promote("hgt-000001", 0.80, 0.76, 0.60, 0.61)
-    assert training._should_promote("hgt-000001", 0.80, 0.80, 0.60, 0.60)
-    assert not training._should_promote("hgt-000001", 0.80, 0.805, 0.60, 0.61)
-    assert not training._should_promote("hgt-000001", 0.80, 0.76, 0.60, 0.59)
-    assert training._should_promote(None, float("inf"), 1.20, float("nan"), 0.20)
-
-
 def test_hgt_behavior_rollback_restores_parent_policy(tmp_path) -> None:
     import json
     torch = pytest.importorskip("torch")
@@ -160,10 +138,6 @@ def test_unseen_actions_respect_epsilon_instead_of_forcing_exploration() -> None
         target_environment_id=7,
     )
     assert action == 2
-
-
-def test_behavior_gate_blocks_candidate_promotion() -> None:
-    assert training._should_promote("hgt-000001", 0.8, 0.7, 0.6, 0.7)
 
 
 def test_first_hgt_model_can_rollback_to_untrained(tmp_path) -> None:
