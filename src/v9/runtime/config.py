@@ -24,7 +24,7 @@ class ScientificConfigId:
 class ScientificConfig:
     schema_version: int = 1
     research_contract_version: str = "0.7.0"
-    design_version: str = "9.7.6"
+    design_version: str = "9.7.8"
     random_seeds: tuple[int, ...] = (0,)
     symbol_budget_per_window: int = 8
     symbol_payload_bytes: int = 4096
@@ -177,7 +177,7 @@ class ScientificConfig:
         if self.hgt_min_free_vram_bytes < 0:
             raise ValueError("HGT free VRAM reserve must be non-negative")
         if len(self.hgt_loss_weights) != 9 or any(float(value) <= 0.0 for value in self.hgt_loss_weights):
-            raise ValueError("HGT requires nine positive objective weights")
+            raise ValueError("HGT requires nine positive base objective weights; grounding objectives use the default auxiliary weight")
 
     def as_dict(self, *, include_id: bool = True) -> dict[str, Any]:
         payload = asdict(self)
