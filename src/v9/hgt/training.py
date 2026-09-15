@@ -74,18 +74,14 @@ def _memory_node_type(node: Any) -> str:
     }[int(node.memory_type)]
 
 
-def _stable_metadata() -> tuple[list[str], list[tuple[str, str, str]]]:
-    node_types = [*MEMORY_NODE_TYPES, *SEMANTIC_NODE_TYPES]
-    edge_types = [
-        (source_type, relation.value, target_type)
-        for source_type in MEMORY_NODE_TYPES
-        for target_type in MEMORY_NODE_TYPES
-        for relation in RelationType
-    ]
-    for memory_type in MEMORY_NODE_TYPES:
-        for semantic_type in SEMANTIC_NODE_TYPES:
-            edge_types.append((memory_type, "SEMANTIC", semantic_type))
-            edge_types.append((semantic_type, "SEMANTIC_OF", memory_type))
+def _metadata_for_graph(
+    x_dict: dict[str, Any],
+    edge_index_dict: dict[tuple[str, str, str], Any],
+) -> tuple[list[str], list[tuple[str, str, str]]]:
+    # HGT only needs node/edge types realized in this training cut. Keeping the
+    # full Cartesian memory schema creates hundreds of empty relation modules.
+    node_types = sorted(x_dict)
+    edge_types = sorted(edge_index_dict)
     return node_types, edge_types
 
 
@@ -884,7 +880,9 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     selected_examples = sum(int(v.numel()) for v in y_dict.values())
     action_examples = sum(int(mask.sum().item()) for mask in action_masks.values())
     action_opportunities = sum(int(mask.numel()) for mask in action_masks.values())
-    metadata = _stable_metadata()
+    metadata = _metadata_for_graph(x_dict, edge_index_dict)
+    runtime.set_telemetry_gauge("hgt_metadata_node_types", len(metadata[0]))
+    runtime.set_telemetry_gauge("hgt_metadata_edge_types", len(metadata[1]))
     if not edge_index_dict:
         return HGTTrainingResult(epoch, "SKIPPED_NO_RELATIONS", runtime.unified_telemetry.model_version, None, 0.0, 0.0, action_examples, 0, None)
     if action_examples <= 0:
@@ -916,10 +914,11 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
 
     dynamic_training_steps = max(
         int(training_epochs),
-        min(64, max(1, int(math.ceil(training_examples / 512.0)))),
+        min(64, max(1, int(math.ceil(training_examples / 2048.0)))),
     )
     runtime.set_telemetry_gauge("hgt_dynamic_training_steps", int(dynamic_training_steps))
     runtime.set_telemetry_gauge("hgt_training_examples_current", int(training_examples))
+    runtime.set_telemetry_gauge("hgt_examples_per_training_step_target", 2048)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
