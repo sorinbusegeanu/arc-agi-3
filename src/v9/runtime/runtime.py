@@ -1236,7 +1236,7 @@ class ContinuousMemoryRuntime:
             hot_trial_limit = max(self.config.scientific.transfer_minimum_trials, self.config.scientific.transfer_validation_trials_per_interval)
             del trial_rows[:-hot_trial_limit]
             self.evidence.append("TRANSFER_TRIAL", self._watermark, {"concept_uid": concept_uid.hex(), **row})
-            formation_scope = set(self._m4[concept_uid].provenance.formation_scope)
+            formation_scope = set(concept.provenance.formation_scope)
             effect = float(enabled_metric) - float(ablated_metric)
             positive = bool(matched and held_out and int(target_environment_id) not in formation_scope and effect > self.config.scientific.transfer_effect_threshold)
             self.transfer_trust.observe(concept_uid, target_environment_id=target_environment_id, context_scope_id=context_scope_id, effect=effect, positive=positive)
@@ -1247,10 +1247,14 @@ class ContinuousMemoryRuntime:
                 return
             if was_validated:
                 return
-            concept = self._m4[concept_uid].with_validation(tuple(int(trial["target_environment_id"]) for trial in admissible))
+            concept = concept.with_validation(tuple(int(trial["target_environment_id"]) for trial in admissible))
             self._m4[concept.uid] = concept
-            concept_node = self.graph.nodes[concept.uid]
-            self._publish(concept_node, {**self.graph.payloads[concept.uid], "held_out_targets": list(concept.held_out_targets), "validated": concept.validated, "concept_state": concept.state.value}, concept.provenance.evidence, proposal_class=ProposalClass.STATEFUL, mutation_kind=MutationKind.UPDATE_VALIDATION)
+            concept_node = self.graph.nodes.get(concept.uid)
+            concept_payload = self.graph.payloads.get(concept.uid)
+            if concept_node is None or concept_payload is None:
+                self.evidence.append("TRANSFER_TRIAL_STALE_CONCEPT", self._watermark, {"concept_uid": concept.uid.hex(), "target_environment_id": int(target_environment_id)})
+                return
+            self._publish(concept_node, {**concept_payload, "held_out_targets": list(concept.held_out_targets), "validated": concept.validated, "concept_state": concept.state.value}, concept.provenance.evidence, proposal_class=ProposalClass.STATEFUL, mutation_kind=MutationKind.UPDATE_VALIDATION)
             if self.config.enable_lifecycle and concept.uid in self.lifecycle.records:
                 self.lifecycle.records[concept.uid] = replace(self.lifecycle.records[concept.uid], state=CognitiveState.VALIDATED, last_transition_watermark=self._watermark)
             parent_uid = concept.provenance.parents[0] if concept.provenance.parents else None
@@ -1264,26 +1268,50 @@ class ContinuousMemoryRuntime:
             outcome = M6Outcome.form((consequence,), diameter_bound=0)
             self._publish(CanonicalNode(outcome.uid, MemoryLevel.M6, MemoryType.OUTCOME, outcome.class_signature, self._watermark), {"class_signature": list(outcome.class_signature), "class_version": outcome.class_version, "evidence_confidence": concept_confidence, "parents": [[uid.hi, uid.lo] for uid in outcome.provenance.parents]}, outcome.provenance.evidence)
             action = int(admissible[-1]["target_native_action"])
-            grounded_payloads = [self.graph.payloads[uid] for uid in outcome.provenance.evidence if uid in self.graph.payloads and uid in self.graph.nodes and self.graph.nodes[uid].level is MemoryLevel.M0]
-            primary_valence_sum = sum(int(payload.get("primary_valence", 0)) for payload in grounded_payloads)
-            realized_cost_sum = sum(max(1, int(payload.get("realized_cost", 0))) for payload in grounded_payloads) or len(admissible)
-            trajectory_actions = tuple(
-                int(payload["action_id"])
-                for uid in concept.provenance.evidence
-                for payload in [self.graph.payloads.get(uid)]
-                if payload is not None
-                and payload.get("action_id") is not None
-                and int(payload.get("environment_instance_id", target_environment_id)) == int(target_environment_id)
-            )
-            native_actions = trajectory_actions or (action,)
-            strategy = M7Strategy.form(outcome, target_environment_id=int(target_environment_id), native_actions=native_actions, successes=len(admissible), trials=len(admissible), primary_valence_sum=primary_valence_sum, realized_cost_sum=realized_cost_sum)
+            episode_rows: dict[int, list[tuple[int, dict[str, Any]]]] = {}
+            for uid in tuple(self.graph._uids_by_level[MemoryLevel.M0]):
+                node = self.graph.nodes.get(uid)
+                payload = self.graph.payloads.get(uid)
+                if node is None or payload is None or int(payload.get("environment_instance_id", -1)) != int(target_environment_id):
+                    continue
+                if payload.get("action_id") is None or payload.get("episode_id") is None:
+                    continue
+                episode_rows.setdefault(int(payload["episode_id"]), []).append((int(node.created_watermark), payload))
+            formed = 0
+            for rows in episode_rows.values():
+                ordered = sorted(rows, key=lambda item: item[0])
+                if not any(bool(payload.get("task_success", False)) for _, payload in ordered):
+                    continue
+                native_actions = tuple(int(payload["action_id"]) for _, payload in ordered)
+                if not native_actions:
+                    continue
+                primary_valence_sum = sum(int(payload.get("primary_valence", 0)) for _, payload in ordered)
+                realized_cost_sum = sum(max(1, int(payload.get("realized_cost", 0))) for _, payload in ordered)
+                strategy = M7Strategy.form(
+                    outcome,
+                    target_environment_id=int(target_environment_id),
+                    native_actions=native_actions,
+                    successes=1,
+                    trials=1,
+                    primary_valence_sum=primary_valence_sum,
+                    realized_cost_sum=realized_cost_sum or len(native_actions),
+                )
+                existing = self.__dict__.setdefault("_m7", {}).get(strategy.uid)
+                if existing is not None:
+                    strategy = existing.observe(success=True, realized_cost=realized_cost_sum or len(native_actions), primary_valence=primary_valence_sum)
+                self.__dict__.setdefault("_m7", {})[strategy.uid] = strategy
+                self._publish(
+                    CanonicalNode(strategy.uid, MemoryLevel.M7, MemoryType.STRATEGY, (outcome.uid.hi, outcome.uid.lo, target_environment_id, *native_actions), self._watermark),
+                    {"target_outcome": [outcome.uid.hi, outcome.uid.lo], "target_environment_id": int(target_environment_id), "native_actions": list(native_actions), "reliability_successes": strategy.reliability_successes, "reliability_trials": strategy.reliability_trials, "evidence_confidence": concept_confidence, "primary_valence_sum": strategy.primary_valence_sum, "realized_cost_sum": strategy.realized_cost_sum, "context_scope_id": int(context_scope_id), "parents": [[outcome.uid.hi, outcome.uid.lo]]},
+                    strategy.provenance.evidence,
+                )
+                formed += 1
+            if not formed:
+                strategy = M7Strategy.form(outcome, target_environment_id=int(target_environment_id), native_actions=(action,), successes=len(admissible), trials=len(admissible), primary_valence_sum=0, realized_cost_sum=len(admissible))
+                self.__dict__.setdefault("_m7", {})[strategy.uid] = strategy
+                self._publish(CanonicalNode(strategy.uid, MemoryLevel.M7, MemoryType.STRATEGY, (outcome.uid.hi, outcome.uid.lo, target_environment_id, action), self._watermark), {"target_outcome": [outcome.uid.hi, outcome.uid.lo], "target_environment_id": int(target_environment_id), "native_actions": [action], "reliability_successes": strategy.reliability_successes, "reliability_trials": strategy.reliability_trials, "evidence_confidence": concept_confidence, "primary_valence_sum": 0, "realized_cost_sum": strategy.realized_cost_sum, "context_scope_id": int(context_scope_id), "parents": [[outcome.uid.hi, outcome.uid.lo]]}, strategy.provenance.evidence)
             self.__dict__.setdefault("_m5", {})[consequence.uid] = consequence
             self.__dict__.setdefault("_m6", {})[outcome.uid] = outcome
-            self.__dict__.setdefault("_m7", {})[strategy.uid] = strategy
-            self._hgt_action_scores.setdefault(int(target_environment_id), {})[action] = max(float(self._hgt_action_scores.get(int(target_environment_id), {}).get(action, 0.0)), float(strategy.reliability))
-            if hasattr(self, "_hgt_context_action_scores"):
-                self._hgt_context_action_scores.setdefault(int(target_environment_id), {}).setdefault(int(context_scope_id), {})[action] = float(strategy.reliability)
-            self._publish(CanonicalNode(strategy.uid, MemoryLevel.M7, MemoryType.STRATEGY, (outcome.uid.hi, outcome.uid.lo, target_environment_id, *native_actions), self._watermark), {"target_outcome": [outcome.uid.hi, outcome.uid.lo], "target_environment_id": int(target_environment_id), "native_actions": list(native_actions), "reliability_successes": strategy.reliability_successes, "reliability_trials": strategy.reliability_trials, "evidence_confidence": concept_confidence, "primary_valence_sum": strategy.primary_valence_sum, "realized_cost_sum": strategy.realized_cost_sum, "context_scope_id": int(context_scope_id), "parents": [[outcome.uid.hi, outcome.uid.lo]]}, strategy.provenance.evidence)
     
     def wait_quiescent(self, timeout: float = 300.0) -> None:
         del timeout
@@ -1465,7 +1493,7 @@ class ContinuousMemoryRuntime:
             evidence = tuple(MemoryUid(int(value[0]), int(value[1])) for value in raw["evidence"])
             row = M1GroundedContingency(uid, GroundedRelation(str(raw["relation"])), DerivationProvenance(parents, evidence), int(raw["environment_instance_id"]), int(raw["episode_id"]), int(raw["grounded_context_signature"]), None if raw.get("executable_action_token") is None else int(raw["executable_action_token"]), int(raw["realized_transition_signature"]), int(raw["grounded_next_context_signature"]), int(raw.get("support", 1)))
             self._latest_interaction_grounding[(int(raw["key"][0]), int(raw["key"][1]))] = row
-        for level in (MemoryLevel.M2, MemoryLevel.M3, MemoryLevel.M4):
+        for level in (MemoryLevel.M2, MemoryLevel.M3, MemoryLevel.M4, MemoryLevel.M5, MemoryLevel.M6, MemoryLevel.M7):
             for uid in tuple(self.graph._uids_by_level[level]):
                 node = self.graph.nodes.get(uid)
                 payload = self.graph.payloads.get(uid)
@@ -1482,6 +1510,22 @@ class ContinuousMemoryRuntime:
                 elif node.level is MemoryLevel.M4 and provenance is not None:
                     from v9.memory.m4_concept import ConceptState
                     self._m4[uid] = M4Concept(uid, tuple(int(value) for value in payload.get("invariant_descriptor", node.structural_key)), DerivationProvenance(parents, evidence_refs, tuple(int(value) for value in payload.get("formation_scope", []))), float(payload["compression_benefit"]), int(payload["explanatory_reach"]), float(payload["transfer_prior"]), tuple(int(value) for value in payload.get("held_out_targets", [])), bool(payload.get("validated", False)), ConceptState(str(payload.get("concept_state", "VALIDATED_CONCEPT" if payload.get("validated") else "TRANSFER_TEST_ELIGIBLE"))))
+                elif node.level is MemoryLevel.M5 and provenance is not None:
+                    self._m5[uid] = M5ConsequenceStructure(uid, tuple(int(value) for value in payload.get("descriptor", node.structural_key)), provenance, bool(payload.get("mature", False)))
+                elif node.level is MemoryLevel.M6 and provenance is not None:
+                    members = tuple(parents)
+                    self._m6[uid] = M6Outcome(uid, tuple(int(value) for value in payload.get("class_signature", node.structural_key)), int(payload.get("class_version", 1)), members, provenance)
+                elif node.level is MemoryLevel.M7 and provenance is not None:
+                    target_raw = payload.get("target_outcome", parents[0] if parents else None)
+                    if isinstance(target_raw, MemoryUid):
+                        target_uid = target_raw
+                    elif isinstance(target_raw, (list, tuple)) and len(target_raw) == 2:
+                        target_uid = MemoryUid(int(target_raw[0]), int(target_raw[1]))
+                    elif parents:
+                        target_uid = parents[0]
+                    else:
+                        continue
+                    self._m7[uid] = M7Strategy(uid, target_uid, int(payload["target_environment_id"]), tuple(int(value) for value in payload.get("native_actions", ())), int(payload.get("reliability_successes", 0)), int(payload.get("reliability_trials", 0)), int(payload.get("primary_valence_sum", 0)), int(payload.get("realized_cost_sum", 0)), provenance)
         for raw_uid, rows in dict(state.get("transfer_trials", {})).items():
             self._transfer_trials[MemoryUid(int(raw_uid[:16], 16), int(raw_uid[16:], 16))] = list(rows)
 
