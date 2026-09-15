@@ -1267,7 +1267,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             "examples": action_examples,
             "epoch_dataset_transitions": len(epoch_transition_rows),
             "action_ranking_pairs": len(epoch_ranking_pairs),
-            "training_coverage": 1.0 if epoch_transition_rows else 0.0,
+            "training_coverage": float(coverage),
             "training_examples": training_examples,
             "validation_examples": validation_examples,
             "action_scores": action_scores,
