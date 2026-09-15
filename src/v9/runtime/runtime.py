@@ -211,12 +211,24 @@ class ContinuousMemoryRuntime:
                 saved = getattr(self, "_hgt_disabled_state", None)
                 if saved is not None:
                     self._hgt_action_scores = {int(env): dict(actions) for env, actions in saved["scores"].items()}
+                    self._hgt_context_action_scores = {
+                        int(env): {int(ctx): dict(actions) for ctx, actions in contexts.items()}
+                        for env, contexts in saved.get("context_scores", {}).items()
+                    }
                     self.unified_telemetry.model_version = saved["model_version"]
                     self._hgt_disabled_state = None
             else:
                 if getattr(self, "_hgt_disabled_state", None) is None:
-                    self._hgt_disabled_state = self.capture_hgt_policy_state()
+                    self._hgt_disabled_state = {
+                        "scores": {int(env): dict(actions) for env, actions in self._hgt_action_scores.items()},
+                        "context_scores": {
+                            int(env): {int(ctx): dict(actions) for ctx, actions in contexts.items()}
+                            for env, contexts in getattr(self, "_hgt_context_action_scores", {}).items()
+                        },
+                        "model_version": self.unified_telemetry.model_version,
+                    }
                 self._hgt_action_scores = {}
+                self._hgt_context_action_scores = {}
             self._actor_policy_generation += 1
 
     def hgt_action_scores(self, environment_id: int, actions: tuple[int, ...]) -> dict[int, float]:
@@ -1152,13 +1164,15 @@ class ContinuousMemoryRuntime:
 
     def capture_experiment_state(self) -> dict[str, Any]:
         """Capture an in-memory scientific state cut for matched branch evaluation."""
+        # Quiesce before taking the runtime lock so drain/flush work can complete.
+        self.wait_quiescent()
+        self.flush_deferred_memory_updates()
         with self._lock:
-            self.wait_quiescent()
-            self.flush_deferred_memory_updates()
             return {"state": self.state_dict()}
 
     def restore_experiment_state(self, captured: dict[str, Any]) -> None:
         """Restore an in-memory scientific state cut without creating a disk snapshot."""
+        self.wait_quiescent()
         with self._lock:
             self._restore(captured)
 
