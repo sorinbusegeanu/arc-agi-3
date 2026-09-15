@@ -735,7 +735,7 @@ def rollback_hgt_model(runtime: Any, *, root: str | Path) -> str | None:
     if not manifest_path.exists():
         return None
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    parent_version = manifest.get("last_accepted_model_version")
+    parent_version = manifest.get("parent_model_version") or manifest.get("last_accepted_model_version")
     current_version = manifest.get("current_model_version")
     if not current_version:
         return None
