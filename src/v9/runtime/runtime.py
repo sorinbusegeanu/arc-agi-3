@@ -1412,7 +1412,7 @@ class ContinuousMemoryRuntime:
                 self._publish(CanonicalNode(strategy.uid, MemoryLevel.M7, MemoryType.STRATEGY, (outcome.uid.hi, outcome.uid.lo, target_environment_id, action), self._watermark), {"target_outcome": [outcome.uid.hi, outcome.uid.lo], "target_environment_id": int(target_environment_id), "native_actions": [action], "reliability_successes": strategy.reliability_successes, "reliability_trials": strategy.reliability_trials, "evidence_confidence": concept_confidence, "primary_valence_sum": 0, "realized_cost_sum": strategy.realized_cost_sum, "context_scope_id": int(context_scope_id), "parents": [[outcome.uid.hi, outcome.uid.lo]]}, strategy.provenance.evidence)
             self.__dict__.setdefault("_m5", {})[consequence.uid] = consequence
             self.__dict__.setdefault("_m6", {})[outcome.uid] = outcome
-            if len({uid for uid in outcome.members if uid in self._m5}) >= 2:
+            if len(outcome.members) >= 2:
                 self.record_outcome_equivalence_evidence(
                     outcome.uid,
                     equivalent=True,
@@ -1621,7 +1621,7 @@ class ContinuousMemoryRuntime:
                     self._m5[uid] = M5ConsequenceStructure(uid, tuple(int(value) for value in payload.get("descriptor", node.structural_key)), provenance, bool(payload.get("mature", False)))
                 elif node.level is MemoryLevel.M6 and provenance is not None:
                     members = tuple(parents)
-                    self._m6[uid] = M6Outcome(uid, tuple(int(value) for value in payload.get("class_signature", node.structural_key)), members, provenance, int(payload.get("class_version", 1)), int(payload.get("equivalence_trials", 1)), int(payload.get("equivalence_successes", 1)), tuple(int(value) for value in payload.get("contexts_observed", ())), tuple(int(value) for value in payload.get("environments_observed", ())), int(payload.get("primary_valence_sum", 0)), int(payload.get("preference_trials", 0)))
+                    self._m6[uid] = M6Outcome(uid, tuple(int(value) for value in payload.get("class_signature", node.structural_key)), members, provenance, int(payload.get("class_version", 1)), int(payload.get("equivalence_trials", 0)), int(payload.get("equivalence_successes", 0)), tuple(int(value) for value in payload.get("contexts_observed", ())), tuple(int(value) for value in payload.get("environments_observed", ())), int(payload.get("primary_valence_sum", 0)), int(payload.get("preference_trials", 0)))
                 elif node.level is MemoryLevel.M7 and provenance is not None:
                     target_raw = payload.get("target_outcome", parents[0] if parents else None)
                     if isinstance(target_raw, MemoryUid):
