@@ -439,21 +439,25 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             str(game): float(profile.get("evidence_confidence", 1.0))
             for game, profile in viability_profiles.items()
         }
-        # Bind confidence to the actual environment IDs recorded by actor-produced
-        # memories. This avoids assuming EnvironmentSpec owns runtime identity.
-        for uid, payload in tuple(runtime.graph.payloads.items()):
-            game = str(payload.get("game_scenario", ""))
-            environment_id = payload.get("environment_instance_id")
-            if environment_id is not None and game in confidence_by_game:
-                environment_confidence[int(environment_id)] = confidence_by_game[game]
+        # Maintain a compact game->environment index from the current epoch's
+        # transition dataset, avoiding repeated scans over the full memory graph.
+        environment_ids_by_game = runtime.__dict__.setdefault("_environment_ids_by_game", {})
+        try:
+            with open(selected_dataset_path, encoding="utf-8") as dataset_handle:
+                for line in dataset_handle:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    game = str(row.get("game_scenario", ""))
+                    environment_id = row.get("environment_instance_id")
+                    if game and environment_id is not None:
+                        environment_ids_by_game.setdefault(game, set()).add(int(environment_id))
+        except (OSError, ValueError, TypeError):
+            pass
+        for game, confidence in confidence_by_game.items():
+            for environment_id in environment_ids_by_game.get(game, ()):
+                environment_confidence[int(environment_id)] = float(confidence)
         runtime.__dict__["_environment_evidence_confidence"] = environment_confidence
-        for uid, payload in tuple(runtime.graph.payloads.items()):
-            environment_id = payload.get("environment_instance_id")
-            if environment_id is None or int(environment_id) not in environment_confidence:
-                continue
-            confidence = float(environment_confidence[int(environment_id)])
-            if float(payload.get("evidence_confidence", 1.0)) != confidence:
-                payload["evidence_confidence"] = confidence
         _append_environment_viability(args.root, epoch=epoch, profiles=viability_profiles)
         runtime.set_telemetry_gauge("viability_anomalies", sum(1 for row in viability_profiles.values() if row["state"] == "VIABILITY_ANOMALY"))
         runtime.set_telemetry_gauge("viable_environments", sum(1 for row in viability_profiles.values() if row["state"] == "VIABLE"))
