@@ -424,6 +424,24 @@ class ContinuousMemoryRuntime:
             for environment_type, actions in grouped.items()
         }
 
+    def _hgt_context_scores_by_environment_type(self) -> dict[str, dict[int, dict[int, float]]]:
+        grouped: dict[str, dict[int, dict[int, list[float]]]] = {}
+        for environment_id, contexts in getattr(self, "_hgt_context_action_scores", {}).items():
+            record = self.environments.get(int(environment_id))
+            if record is None:
+                continue
+            environment_type = str(record.identity.environment_type)
+            for context_signature, scores in contexts.items():
+                for action, score in scores.items():
+                    grouped.setdefault(environment_type, {}).setdefault(int(context_signature), {}).setdefault(int(action), []).append(float(score))
+        return {
+            environment_type: {
+                context: {action: sum(values) / len(values) for action, values in actions.items()}
+                for context, actions in contexts.items()
+            }
+            for environment_type, contexts in grouped.items()
+        }
+
     def actor_policy_snapshot(self) -> ActorPolicySnapshot:
         with self._lock:
             grounded_scores: dict[str, dict[int, float]] = {}
