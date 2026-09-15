@@ -80,11 +80,19 @@ def publish_encoded_transition(runtime, transition: EncodedTransition) -> None:
 
     publish_transition_symbols(runtime, transition)
 
-    if transition.task_success:
-        runtime.record_successful_trajectory(
-            environment_id=int(environment),
-            episode_id=int(transition.episode_id),
-        )
+    if transition.task_success and not transition.symbols_only:
+        # submit() may use deferred ingestion; force this terminal experience
+        # through the canonical commit before reading the complete episode.
+        runtime.wait_quiescent()
+        if transition.strategy_target_outcome_hi is not None and transition.strategy_target_outcome_lo is not None:
+            runtime.record_successful_trajectory(
+                environment_id=int(environment),
+                episode_id=int(transition.episode_id),
+                target_outcome_uid=MemoryUid(
+                    int(transition.strategy_target_outcome_hi),
+                    int(transition.strategy_target_outcome_lo),
+                ),
+            )
 
     if (
         transition.strategy_terminal
