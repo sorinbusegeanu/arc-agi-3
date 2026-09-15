@@ -22,6 +22,10 @@ class M1NormalizedRelation:
     channel: NormalizedChannel
     structural_signature: int
     provenance: DerivationProvenance
+    support: float = 1.0
+    contradiction: float = 0.0
+    temporal_offsets: tuple[int, ...] = ()
+    causal_watermark: int = 0
 
     @classmethod
     def build(cls, observable_relation: str, channel: NormalizedChannel, parents: tuple[M1GroundedContingency, ...]) -> "M1NormalizedRelation":
@@ -31,5 +35,6 @@ class M1NormalizedRelation:
         uid = MemoryUid.from_key(MemoryLevel.M1, MemoryType.NORMALIZED_RELATION, (signature,))
         parent_ids = tuple(row.uid for row in parents)
         evidence = tuple(uid for row in parents for uid in row.provenance.evidence)
-        watermark = max((int(getattr(row, "created_watermark", 0)) for row in parents), default=0)\n        return cls(uid, observable_relation, channel, signature, DerivationProvenance(parent_ids, evidence), float(len(parents)), 0.0, (), watermark)
+        watermark = max((int(getattr(row, "created_watermark", 0)) for row in parents), default=0)
+        return cls(uid, observable_relation, channel, signature, DerivationProvenance(parent_ids, evidence), float(len(parents)), 0.0, (), watermark)
 
