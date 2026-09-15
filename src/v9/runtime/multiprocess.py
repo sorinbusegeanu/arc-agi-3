@@ -202,6 +202,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
             active_strategy_outcome = None
             active_strategy_realized_cost = 0
             active_replanning_baseline_cost: float | None = None
+            active_replanned = False
             branching_total = 0
             branching_samples = 0
             max_branching_factor = 0
@@ -227,6 +228,8 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     active_strategy_actions = ()
                     active_strategy_position = 0
                     active_strategy_outcome = None
+                    active_replanning_baseline_cost = None
+                    active_replanned = False
                     actions = tuple(sorted(set(int(v) for v in adapter.available_actions())))
                     if not actions:
                         continue
@@ -249,6 +252,8 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                             active_strategy_actions = ()
                             active_strategy_position = 0
                             active_strategy_outcome = None
+                    active_replanning_baseline_cost = None
+                    active_replanned = False
                     next_refresh_time = now + refresh_seconds
 
                 before = adapter.observe()
@@ -291,6 +296,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                             active_strategy_outcome = current.target_outcome_uid
                             active_strategy_realized_cost = 0
                             active_replanning_baseline_cost = displaced_expected_cost
+                            active_replanned = True
                 if active_strategy_uid is None and strategy_rows:
                     outcome_rows = policy.outcomes(environment_instance_id)
                     target = select_target_outcome(outcome_rows)
@@ -307,6 +313,8 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                         active_strategy_position = 0
                         active_strategy_outcome = selected.target_outcome_uid
                         active_strategy_realized_cost = 0
+                        active_replanning_baseline_cost = None
+                        active_replanned = False
                 planned_action = None
                 if active_strategy_uid is not None and active_strategy_position < len(active_strategy_actions):
                     candidate_action = int(active_strategy_actions[active_strategy_position])
@@ -331,6 +339,8 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     active_strategy_actions = ()
                     active_strategy_position = 0
                     active_strategy_outcome = None
+                    active_replanning_baseline_cost = None
+                    active_replanned = False
                 executed_strategy_uid = active_strategy_uid if planned_action is not None and not explore_over_strategy else None
                 if planned_action is not None and not explore_over_strategy:
                     active_strategy_position += 1
@@ -393,7 +403,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                         strategy_realized_cost=active_strategy_realized_cost if executed_strategy_uid is not None else 0,
                         strategy_target_outcome_hi=None if active_strategy_outcome is None else int(active_strategy_outcome.hi),
                         strategy_target_outcome_lo=None if active_strategy_outcome is None else int(active_strategy_outcome.lo),
-                        strategy_replanned=strategy_replanned,
+                        strategy_replanned=active_replanned,
                         replanning_baseline_cost=active_replanning_baseline_cost if executed_strategy_uid is not None else None,
                     )
                 )
@@ -412,6 +422,8 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                         active_strategy_actions = ()
                         active_strategy_position = 0
                         active_strategy_outcome = None
+                    active_replanning_baseline_cost = None
+                    active_replanned = False
                 if not boundary.continuation:
                     adapter.reset()
                     episode_ordinal += 1
@@ -420,6 +432,8 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     active_strategy_actions = ()
                     active_strategy_position = 0
                     active_strategy_outcome = None
+                    active_replanning_baseline_cost = None
+                    active_replanned = False
             if completed and adapter.boundary_event().continuation:
                 task_truncations += 1
                 episode_boundaries += 1
