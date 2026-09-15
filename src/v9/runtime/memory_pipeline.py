@@ -57,6 +57,7 @@ class DerivationTask:
     support: int
     formation_scope: tuple[int, ...]
     causal_watermark: int
+    evidence_confidence: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,12 +183,14 @@ def derive_memory(task: DerivationTask) -> DerivationResult:
         (family,),
         consequence_by_family={family.uid.lo: family.structural_signature},
     )
+    confidence = max(0.10, min(1.0, float(task.evidence_confidence)))
+    family = replace(family, compression_benefit=family.compression_benefit * confidence)
     concepts = tuple(
         M4Concept.candidate(
             (role,),
             compression_benefit=family.compression_benefit,
-            explanatory_reach=max(1, len(role.provenance.evidence)),
-            transfer_prior=0.5,
+            explanatory_reach=max(1, round(len(role.provenance.evidence) * confidence)),
+            transfer_prior=0.5 * confidence,
             formation_scope=task.formation_scope,
         )
         for role in roles
