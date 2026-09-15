@@ -734,6 +734,35 @@ def _should_promote(
     return bool(loss_ok and accuracy_ok)
 
 
+
+def resolve_hgt_behavior_test(runtime: Any, *, root: str | Path, accepted: bool) -> str | None:
+    """Resolve the candidate that was actually exercised during the just-finished sampling epoch."""
+    manifest_path = Path(root) / "models" / "hgt_manifest.json"
+    if not manifest_path.exists():
+        return None
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    candidate = manifest.get("candidate_model_version")
+    if not candidate or manifest.get("candidate_status") != "TESTING_PENDING_BEHAVIOR":
+        return None
+    if accepted:
+        manifest["candidate_status"] = "PROMOTED"
+        manifest["last_accepted_model_version"] = str(candidate)
+        manifest["candidate_model_version"] = None
+        temporary_manifest = manifest_path.with_suffix(".json.tmp")
+        temporary_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary_manifest, manifest_path)
+        runtime.set_telemetry_gauge("hgt_behavior_test_result", "PROMOTED")
+        return str(candidate)
+    rolled_back = rollback_hgt_model(runtime, root=root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+    manifest["candidate_status"] = "REJECTED_BEHAVIOR_GATE"
+    manifest["candidate_model_version"] = None
+    temporary_manifest = manifest_path.with_suffix(".json.tmp")
+    temporary_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary_manifest, manifest_path)
+    runtime.set_telemetry_gauge("hgt_behavior_test_result", "REJECTED_BEHAVIOR_GATE")
+    return rolled_back
+
 def rollback_hgt_model(runtime: Any, *, root: str | Path) -> str | None:
     """Restore the parent checkpoint after a measured behavioral regression."""
     model_dir = Path(root) / "models"
@@ -1129,7 +1158,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         parent_validation_accuracy,
         val_accuracy,
     )
-    status = "PROMOTED" if promote else ("REJECTED_BEHAVIOR_GATE" if not allow_promotion else "REJECTED")
+    status = "TESTING_PENDING_BEHAVIOR" if promote else ("REJECTED_BEHAVIOR_GATE" if not allow_promotion else "REJECTED")
     if promote:
         temporary_checkpoint = checkpoint_path.with_suffix(".pt.tmp")
         torch.save(
@@ -1159,6 +1188,8 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             "version_index": version_index,
             "current_model_version": candidate_version,
             "current_checkpoint": checkpoint_rel,
+            "candidate_model_version": candidate_version,
+            "candidate_status": "TESTING_PENDING_BEHAVIOR",
             "parent_model_version": parent_version,
             "validation_loss": validation_loss,
             "validation_accuracy": val_accuracy,
