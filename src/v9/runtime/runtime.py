@@ -1264,15 +1264,26 @@ class ContinuousMemoryRuntime:
             outcome = M6Outcome.form((consequence,), diameter_bound=0)
             self._publish(CanonicalNode(outcome.uid, MemoryLevel.M6, MemoryType.OUTCOME, outcome.class_signature, self._watermark), {"class_signature": list(outcome.class_signature), "class_version": outcome.class_version, "evidence_confidence": concept_confidence, "parents": [[uid.hi, uid.lo] for uid in outcome.provenance.parents]}, outcome.provenance.evidence)
             action = int(admissible[-1]["target_native_action"])
-            grounded_payloads = [self.graph.payloads[uid] for uid in outcome.provenance.evidence if uid in self.graph.payloads and self.graph.nodes[uid].level is MemoryLevel.M0]
+            grounded_payloads = [self.graph.payloads[uid] for uid in outcome.provenance.evidence if uid in self.graph.payloads and uid in self.graph.nodes and self.graph.nodes[uid].level is MemoryLevel.M0]
             primary_valence_sum = sum(int(payload.get("primary_valence", 0)) for payload in grounded_payloads)
             realized_cost_sum = sum(max(1, int(payload.get("realized_cost", 0))) for payload in grounded_payloads) or len(admissible)
-            strategy = M7Strategy.form(outcome, target_environment_id=int(target_environment_id), native_actions=(action,), successes=len(admissible), trials=len(admissible), primary_valence_sum=primary_valence_sum, realized_cost_sum=realized_cost_sum)
+            trajectory_actions = tuple(
+                int(payload["action_id"])
+                for uid in concept.provenance.evidence
+                for payload in [self.graph.payloads.get(uid)]
+                if payload is not None
+                and payload.get("action_id") is not None
+                and int(payload.get("environment_instance_id", target_environment_id)) == int(target_environment_id)
+            )
+            native_actions = trajectory_actions or (action,)
+            strategy = M7Strategy.form(outcome, target_environment_id=int(target_environment_id), native_actions=native_actions, successes=len(admissible), trials=len(admissible), primary_valence_sum=primary_valence_sum, realized_cost_sum=realized_cost_sum)
+            self.__dict__.setdefault("_m5", {})[consequence.uid] = consequence
+            self.__dict__.setdefault("_m6", {})[outcome.uid] = outcome
             self.__dict__.setdefault("_m7", {})[strategy.uid] = strategy
             self._hgt_action_scores.setdefault(int(target_environment_id), {})[action] = max(float(self._hgt_action_scores.get(int(target_environment_id), {}).get(action, 0.0)), float(strategy.reliability))
             if hasattr(self, "_hgt_context_action_scores"):
                 self._hgt_context_action_scores.setdefault(int(target_environment_id), {}).setdefault(int(context_scope_id), {})[action] = float(strategy.reliability)
-            self._publish(CanonicalNode(strategy.uid, MemoryLevel.M7, MemoryType.STRATEGY, (outcome.uid.hi, outcome.uid.lo, target_environment_id, action), self._watermark), {"target_outcome": [outcome.uid.hi, outcome.uid.lo], "target_environment_id": int(target_environment_id), "native_actions": [action], "reliability_successes": strategy.reliability_successes, "reliability_trials": strategy.reliability_trials, "evidence_confidence": concept_confidence, "primary_valence_sum": strategy.primary_valence_sum, "realized_cost_sum": strategy.realized_cost_sum, "context_scope_id": int(context_scope_id), "parents": [[outcome.uid.hi, outcome.uid.lo]]}, strategy.provenance.evidence)
+            self._publish(CanonicalNode(strategy.uid, MemoryLevel.M7, MemoryType.STRATEGY, (outcome.uid.hi, outcome.uid.lo, target_environment_id, *native_actions), self._watermark), {"target_outcome": [outcome.uid.hi, outcome.uid.lo], "target_environment_id": int(target_environment_id), "native_actions": list(native_actions), "reliability_successes": strategy.reliability_successes, "reliability_trials": strategy.reliability_trials, "evidence_confidence": concept_confidence, "primary_valence_sum": strategy.primary_valence_sum, "realized_cost_sum": strategy.realized_cost_sum, "context_scope_id": int(context_scope_id), "parents": [[outcome.uid.hi, outcome.uid.lo]]}, strategy.provenance.evidence)
     
     def wait_quiescent(self, timeout: float = 300.0) -> None:
         del timeout
