@@ -560,6 +560,30 @@ def _transition_batch_loss(model: Any, rows: list[dict[str, Any]], torch: Any, d
     return regression + ranking, correct, total
 
 
+def _split_transition_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Deterministic episode-level split for direct transition supervision."""
+    episodes = sorted({(str(r["game_scenario"]), int(r["actor_id"]), int(r["episode_id"])) for r in rows})
+    if len(episodes) < 2:
+        return list(rows), []
+    validation = {key for key in episodes if int.from_bytes(hashlib.blake2b(repr(key).encode(), digest_size=8, person=b"v9-hgt-tval").digest(), "little") % 5 == 0}
+    if not validation:
+        validation = {episodes[0]}
+    if len(validation) == len(episodes):
+        validation.remove(episodes[-1])
+    train = [r for r in rows if (str(r["game_scenario"]), int(r["actor_id"]), int(r["episode_id"])) not in validation]
+    val = [r for r in rows if (str(r["game_scenario"]), int(r["actor_id"]), int(r["episode_id"])) in validation]
+    return train, val
+
+
+def _transition_validation(model: Any, rows: list[dict[str, Any]], torch: Any, device: Any) -> tuple[float, float, int]:
+    if not rows:
+        return 0.0, 0.0, 0
+    model.eval()
+    with torch.no_grad():
+        loss, correct, total = _transition_batch_loss(model, rows, torch, device)
+    return (float(loss.detach().cpu()) if loss is not None else 0.0, float(correct) / max(1, total), int(total))
+
+
 def _episode_rank(environment_id: int, episode_id: int) -> int:
     digest = hashlib.blake2b(
         f"{int(environment_id)}:{int(episode_id)}".encode("ascii"),
@@ -914,6 +938,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     epoch_dataset_path = getattr(runtime, "_hgt_training_dataset_path", None)
     epoch_transition_rows = transition_training_rows(epoch_dataset_path) if epoch_dataset_path and Path(epoch_dataset_path).exists() else []
     epoch_ranking_pairs = action_ranking_pairs(epoch_transition_rows) if epoch_transition_rows else []
+    transition_train_rows, transition_val_rows = _split_transition_rows(epoch_transition_rows)
     runtime.set_telemetry_gauge("hgt_training_dataset_transitions", len(epoch_transition_rows))
     runtime.set_telemetry_gauge("hgt_action_ranking_pairs", len(epoch_ranking_pairs))
     training_view_builder = getattr(runtime.graph, "training_view", None)
@@ -1091,7 +1116,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     model.train()
     try:
         stream_batch_size = max(64, min(2048, int(getattr(config, "hgt_epoch_batch_size", 512))))
-        transition_batches = [epoch_transition_rows[i:i + stream_batch_size] for i in range(0, len(epoch_transition_rows), stream_batch_size)]
+        transition_batches = [transition_train_rows[i:i + stream_batch_size] for i in range(0, len(transition_train_rows), stream_batch_size)]
         ranking_correct = ranking_total = transitions_trained = 0
         loop_count = max(1, max(int(dynamic_training_steps), len(transition_batches)))
         for step_index in range(loop_count):
@@ -1141,13 +1166,21 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             exc=exc,
         )
     runtime.set_telemetry_gauge("hgt_transitions_trained", int(locals().get("transitions_trained", 0)))
-    coverage = float(locals().get("transitions_trained", 0)) / max(1, len(epoch_transition_rows)) if epoch_transition_rows else 0.0
+    coverage = float(locals().get("transitions_trained", 0)) / max(1, len(transition_train_rows)) if transition_train_rows else 0.0
     runtime.set_telemetry_gauge("hgt_training_coverage", coverage)
     runtime.set_telemetry_gauge("hgt_action_ranking_accuracy", float(locals().get("ranking_correct", 0)) / max(1, locals().get("ranking_total", 0)))
     runtime.set_telemetry_gauge("hgt_action_ranking_validation_pairs", int(locals().get("ranking_total", 0)))
     if training_steps <= 0:
         return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, parent_version, 0.0, parent_validation_loss if math.isfinite(parent_validation_loss) else 0.0, action_examples, 0, parent_checkpoint)
 
+    transition_validation_loss, transition_ranking_accuracy, transition_ranking_pairs = _transition_validation(
+        model, transition_val_rows, torch, device
+    )
+    runtime.set_telemetry_gauge("hgt_transition_validation_loss", transition_validation_loss)
+    runtime.set_telemetry_gauge("hgt_action_ranking_validation_accuracy", transition_ranking_accuracy)
+    runtime.set_telemetry_gauge("hgt_action_ranking_validation_pairs", transition_ranking_pairs)
+    runtime.set_telemetry_gauge("hgt_transition_training_examples", len(transition_train_rows))
+    runtime.set_telemetry_gauge("hgt_transition_validation_examples", len(transition_val_rows))
     model.eval()
     inference_started = time.perf_counter()
     with torch.no_grad():
@@ -1268,6 +1301,9 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             "epoch_dataset_transitions": len(epoch_transition_rows),
             "action_ranking_pairs": len(epoch_ranking_pairs),
             "training_coverage": float(coverage),
+            "transition_validation_loss": float(transition_validation_loss),
+            "action_ranking_validation_accuracy": float(transition_ranking_accuracy),
+            "action_ranking_validation_pairs": int(transition_ranking_pairs),
             "training_examples": training_examples,
             "validation_examples": validation_examples,
             "action_scores": action_scores,
