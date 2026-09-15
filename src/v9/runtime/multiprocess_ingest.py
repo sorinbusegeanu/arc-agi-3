@@ -94,6 +94,11 @@ def publish_encoded_transition(runtime, transition: EncodedTransition) -> None:
                 ),
             )
 
+    if transition.strategy_replanned and transition.strategy_terminal:
+        runtime.record_replanning_evidence(
+            improved_efficiency=bool(transition.task_success),
+        )
+
     if (
         transition.strategy_terminal
         and transition.strategy_uid_hi is not None
