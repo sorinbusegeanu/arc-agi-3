@@ -6,7 +6,7 @@ from pathlib import Path
 import time
 from typing import Any
 
-from v9.hgt import resolve_hgt_behavior_test, train_hgt_epoch
+from v9.hgt import resolve_hgt_behavior_test, rollback_hgt_model, train_hgt_epoch
 from v9.hgt.epoch_dataset import EpochTransitionDataset, dataset_path
 from v9.hgt.matched_evaluation import matched_jobs, select_matched_branch
 from v9.memory.m1_normalized import NormalizedChannel
