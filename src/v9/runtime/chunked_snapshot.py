@@ -270,9 +270,19 @@ def load_snapshot_parts(path: Path, *, expected_config_id: str) -> tuple[dict[st
         partition = int(spec["partition"])
         if partition != expected_partition:
             raise RuntimeError("snapshot graph shard sequence mismatch")
-        payload = _checked_chunks(root, list(spec.get("chunks", [])), str(spec.get("sha256", "")), f"graph shard {partition}")
-        shards.append((partition, payload))
+        shards.append((partition, dict(spec)))
     return state, graph_header, shards
+
+
+def load_graph_shard(path: Path, partition: int, spec: dict[str, Any]) -> bytes:
+    """Read and verify one graph shard on demand for bounded-memory restore."""
+    root = path.parent.parent
+    return _checked_chunks(
+        root,
+        list(spec.get("chunks", [])),
+        str(spec.get("sha256", "")),
+        f"graph shard {int(partition)}",
+    )
 
 
 def load_snapshot(path: Path, *, expected_config_id: str) -> dict[str, Any]:
