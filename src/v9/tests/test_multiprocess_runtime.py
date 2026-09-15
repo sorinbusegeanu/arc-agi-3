@@ -29,7 +29,7 @@ def test_process_topology_is_reported(tmp_path) -> None:
     assert metrics["shard_worker_processes"] == 2
     assert metrics["ingest_worker_processes"] == 4
     assert metrics["derivation_worker_processes"] == 4
-    assert metrics["multiprocess_transitions_published"] == 12
+    assert metrics["multiprocess_transitions_published"] == 1200
     assert metrics["sampling_backlog"] == 0
     assert metrics["coordinator_action_requests"] == 0
     assert metrics["policy_snapshot_generation"] >= 0
@@ -52,8 +52,8 @@ def test_progress_is_written_to_stdout(tmp_path, capsys) -> None:
     assert run_continuous(args) == 0
     output = capsys.readouterr().out
     assert re.search(r"\[\d{2}:\d{2}\]\s+100\.0%", output)
-    assert "sampled=12/12" in output
-    assert "ingested=12" in output
+    assert "sampled=1200/1200" in output
+    assert "ingested=1200" in output
     assert "backlog=0" in output
     assert "M0=" not in output
     assert "M7=" not in output
