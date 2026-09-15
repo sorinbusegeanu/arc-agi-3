@@ -363,6 +363,19 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         previous_game_results = dict(game_level["by_game"])
         viability_profiles = _environment_viability(process_results, previous_viability_profiles)
         previous_viability_profiles = viability_profiles
+        runtime.__dict__["_environment_viability_profiles"] = dict(viability_profiles)
+        environment_confidence = {
+            int(spec.instance_id.value): float(viability_profiles.get(str(spec.display_name), {}).get("evidence_confidence", 1.0))
+            for spec in specs
+        }
+        runtime.__dict__["_environment_evidence_confidence"] = environment_confidence
+        for uid, payload in tuple(runtime.graph.payloads.items()):
+            environment_id = payload.get("environment_instance_id")
+            if environment_id is None or int(environment_id) not in environment_confidence:
+                continue
+            confidence = float(environment_confidence[int(environment_id)])
+            if float(payload.get("evidence_confidence", 1.0)) != confidence:
+                payload["evidence_confidence"] = confidence
         _append_environment_viability(args.root, epoch=epoch, profiles=viability_profiles)
         runtime.set_telemetry_gauge("viability_anomalies", sum(1 for row in viability_profiles.values() if row["state"] == "VIABILITY_ANOMALY"))
         runtime.set_telemetry_gauge("viable_environments", sum(1 for row in viability_profiles.values() if row["state"] == "VIABLE"))
