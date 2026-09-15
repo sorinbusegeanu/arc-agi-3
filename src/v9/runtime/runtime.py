@@ -138,13 +138,21 @@ class ContinuousMemoryRuntime:
                 if direct is None:
                     self._restore(load_snapshot(path, expected_config_id=scientific.config_id.value))
                 else:
-                    runtime_state, graph_header, encoded_shards = direct
+                    runtime_state, graph_header, shard_specs = direct
+                    graph = CanonicalGraph.from_sharded_state(graph_header, ())
                     from concurrent.futures import ThreadPoolExecutor
-                    workers = max(1, min(len(encoded_shards), 8))
+                    workers = max(1, min(len(shard_specs), 4))
                     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="v9-restore") as pool:
-                        shard_rows = list(pool.map(lambda row: decode_graph_shard(row[1], expected_partition=row[0]), encoded_shards))
+                        for start in range(0, len(shard_specs), workers):
+                            batch = shard_specs[start:start + workers]
+                            decoded = list(pool.map(
+                                lambda row: decode_graph_shard(row[1], expected_partition=row[0]),
+                                batch,
+                            ))
+                            graph.install_sharded_rows(decoded)
+                            del decoded
                     runtime_state["graph"] = graph_header
-                    self._restore({"state": runtime_state}, graph_override=CanonicalGraph.from_sharded_state(graph_header, shard_rows))
+                    self._restore({"state": runtime_state}, graph_override=graph)
             self._restore_hgt_checkpoint()
 
     def _restore_hgt_checkpoint(self) -> None:
@@ -179,10 +187,7 @@ class ContinuousMemoryRuntime:
             }
             for environment, contexts in dict(checkpoint.get("context_action_scores", {})).items()
         }
-        try:
-            self.set_hgt_action_scores(action_scores, context_action_scores=context_scores)
-        except TypeError:
-            self.set_hgt_action_scores(action_scores)
+        self.set_hgt_action_scores(action_scores, context_action_scores=context_scores)
         self.unified_telemetry.model_version = str(version)
         self.set_telemetry_gauge("hgt_restored_on_startup", 1)
         self.set_telemetry_gauge("hgt_restored_model", str(version))
@@ -199,13 +204,24 @@ class ContinuousMemoryRuntime:
     def read_view(self) -> ReadView:
         return self.graph.read_view()
 
-    def set_hgt_action_scores(self, scores: dict[int, dict[int, float]]) -> None:
+    def set_hgt_action_scores(
+        self,
+        scores: dict[int, dict[int, float]],
+        *,
+        context_action_scores: dict[int, dict[int, dict[int, float]]] | None = None,
+    ) -> None:
         with self._lock:
             self._hgt_action_scores = {
                 int(environment): {int(action): float(score) for action, score in actions.items()}
                 for environment, actions in scores.items()
             }
-
+            self._hgt_context_action_scores = {
+                int(environment): {
+                    int(context): {int(action): float(score) for action, score in actions.items()}
+                    for context, actions in contexts.items()
+                }
+                for environment, contexts in (context_action_scores or {}).items()
+            }
             self._actor_policy_generation += 1
 
     def capture_hgt_policy_state(self) -> dict[str, Any]:
