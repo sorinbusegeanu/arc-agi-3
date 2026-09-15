@@ -252,8 +252,8 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                             active_strategy_actions = ()
                             active_strategy_position = 0
                             active_strategy_outcome = None
-                    active_replanning_baseline_cost = None
-                    active_replanned = False
+                            active_replanning_baseline_cost = None
+                            active_replanned = False
                     next_refresh_time = now + refresh_seconds
 
                 before = adapter.observe()
@@ -422,8 +422,8 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                         active_strategy_actions = ()
                         active_strategy_position = 0
                         active_strategy_outcome = None
-                    active_replanning_baseline_cost = None
-                    active_replanned = False
+                        active_replanning_baseline_cost = None
+                        active_replanned = False
                 if not boundary.continuation:
                     adapter.reset()
                     episode_ordinal += 1
