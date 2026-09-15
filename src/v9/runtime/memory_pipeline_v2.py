@@ -46,6 +46,7 @@ class SymbolCommitPlan:
     base_writes: tuple[CanonicalWrite, ...]
     normalized_write: CanonicalWrite
     aligned_normalized_write: CanonicalWrite | None
+    occurrence: Any | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +64,7 @@ class CommitPlan:
     curriculum_step: str | None
     game_scenario: str
     isf_static: tuple[float, float, float, float, float] | None
+    transition: Any | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +74,29 @@ class PreparedCommitBatch:
     rows: tuple[CommitPlan, ...]
 
 
-def _m0_write(m0: Any, event: Any, transition: Any = None) -> CanonicalWrite:
+def _occurrence_payload(occurrence: Any | None) -> dict[str, Any]:
+    if occurrence is None:
+        return {}
+    return {
+        "symbol_occurrence_id": [int(occurrence.occurrence_id.hi), int(occurrence.occurrence_id.lo)],
+        "symbol_id": int(occurrence.symbol_id.value),
+        "symbol_position": int(occurrence.position),
+        "symbol_stream_id": int(occurrence.stream_id.value),
+        "symbol_vocabulary_id": int(occurrence.vocabulary_id.value),
+        "symbol_codec_id": str(occurrence.codec_id),
+        "symbol_causal_watermark": int(occurrence.causal_watermark),
+        "symbol_macro_step": int(occurrence.macro_step),
+        "symbol_micro_step": int(occurrence.micro_step),
+        "symbol_environment_instance_id": int(occurrence.environment_instance_id),
+        "symbol_episode_id": int(occurrence.episode_id.value),
+        "symbol_provenance_id": [int(occurrence.provenance_id.hi), int(occurrence.provenance_id.lo)],
+        "symbol_modality_id": int(occurrence.modality_id),
+        "symbol_temporal_phase": str(occurrence.temporal_phase),
+        "symbol_source_sequence": int(occurrence.source_sequence),
+    }
+
+
+def _m0_write(m0: Any, event: Any, transition: Any = None, occurrence: Any | None = None) -> CanonicalWrite:
     return CanonicalWrite(
         CanonicalNode(
             m0.uid,
@@ -95,6 +119,7 @@ def _m0_write(m0: Any, event: Any, transition: Any = None) -> CanonicalWrite:
             "future_option_delta": m0.future_option_delta,
             "realized_cost": m0.realized_cost,
             "evidence_confidence": 1.0,
+            **_occurrence_payload(occurrence),
             **({"task_success": bool(transition.task_success), "task_failure": bool(transition.task_failure), "task_truncated": bool(transition.task_truncated), "level_index": int(transition.level_index), "levels_completed": int(transition.levels_completed)} if transition is not None else {}),
             **({"semantic_before": [list(row) for row in transition.semantic_before]} if transition is not None and transition.semantic_before else {}),
             **({"semantic_action": [list(row) for row in transition.semantic_action]} if transition is not None and transition.semantic_action else {}),
@@ -106,7 +131,7 @@ def _m0_write(m0: Any, event: Any, transition: Any = None) -> CanonicalWrite:
     )
 
 
-def _m1g_write(m1g: Any, m0: Any, event: Any, transition: Any = None) -> CanonicalWrite:
+def _m1g_write(m1g: Any, m0: Any, event: Any, transition: Any = None, occurrence: Any | None = None) -> CanonicalWrite:
     return CanonicalWrite(
         CanonicalNode(
             m1g.uid,
@@ -124,6 +149,7 @@ def _m1g_write(m1g: Any, m0: Any, event: Any, transition: Any = None) -> Canonic
             "realized_transition_signature": m1g.realized_transition_signature,
             "grounded_next_context_signature": m1g.grounded_next_context_signature,
             "evidence_confidence": 1.0,
+            **_occurrence_payload(occurrence),
             **({"semantic_action": [list(row) for row in transition.semantic_action]} if transition is not None and transition.semantic_action else {}),
             **({"semantic_effects": [list(row) for row in transition.semantic_delta]} if transition is not None and transition.semantic_delta else {}),
             "parents": [[m0.uid.hi, m0.uid.lo]],
@@ -132,7 +158,7 @@ def _m1g_write(m1g: Any, m0: Any, event: Any, transition: Any = None) -> Canonic
     )
 
 
-def _m1n_write(relation: M1NormalizedRelation, *, watermark: int, transition: Any = None) -> CanonicalWrite:
+def _m1n_write(relation: M1NormalizedRelation, *, watermark: int, transition: Any = None, occurrence: Any | None = None) -> CanonicalWrite:
     parents = tuple(relation.provenance.parents)
     evidence = tuple(relation.provenance.evidence)
     return CanonicalWrite(
@@ -147,8 +173,14 @@ def _m1n_write(relation: M1NormalizedRelation, *, watermark: int, transition: An
             "observable_relation": relation.observable_relation,
             "channel": relation.channel.value,
             "structural_signature": relation.structural_signature,
-            "support": 1,
+            "family_signature": int(relation.family_signature or relation.structural_signature),
+            "support": float(relation.support),
+            "contradiction": float(relation.contradiction),
+            "temporal_offsets": list(relation.temporal_offsets),
+            "causal_watermark": int(relation.causal_watermark or watermark),
+            "heldout_transfer": bool(relation.heldout_transfer),
             "evidence_confidence": 1.0,
+            **_occurrence_payload(occurrence),
             "parents": [[uid.hi, uid.lo] for uid in parents],
             **({"semantic_before": [list(row) for row in transition.semantic_before]} if transition is not None and transition.semantic_before else {}),
             **({"semantic_action": [list(row) for row in transition.semantic_action]} if transition is not None and transition.semantic_action else {}),
@@ -186,10 +218,11 @@ def build_commit_plan(prepared: PreparedIngestion) -> CommitPlan:
         )
 
     symbols: list[SymbolCommitPlan] = []
-    for symbol in prepared.symbols:
+    for index, symbol in enumerate(prepared.symbols):
+        occurrence = prepared.symbol_occurrences[index] if index < len(prepared.symbol_occurrences) else None
         writes = (
-            _m0_write(symbol.m0, symbol.event),
-            _m1g_write(symbol.m1g, symbol.m0, symbol.event),
+            _m0_write(symbol.m0, symbol.event, occurrence=occurrence),
+            _m1g_write(symbol.m1g, symbol.m0, symbol.event, occurrence=occurrence),
         )
         symbols.append(
             SymbolCommitPlan(
@@ -197,13 +230,15 @@ def build_commit_plan(prepared: PreparedIngestion) -> CommitPlan:
                 symbol.m1n,
                 symbol.aligned_m1n,
                 writes,
-                _m1n_write(symbol.m1n, watermark=int(symbol.event.identity.causal_watermark)),
+                _m1n_write(symbol.m1n, watermark=int(symbol.event.identity.causal_watermark), occurrence=occurrence),
                 None
                 if symbol.aligned_m1n is None
                 else _m1n_write(
                     symbol.aligned_m1n,
                     watermark=int(symbol.event.identity.causal_watermark),
+                    occurrence=occurrence,
                 ),
+                occurrence,
             )
         )
 
@@ -221,6 +256,7 @@ def build_commit_plan(prepared: PreparedIngestion) -> CommitPlan:
         prepared.transition.curriculum_step,
         str(prepared.transition.game_scenario),
         isf_static,
+        prepared.transition,
     )
 
 
