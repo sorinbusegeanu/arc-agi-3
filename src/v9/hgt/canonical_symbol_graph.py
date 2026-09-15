@@ -117,6 +117,9 @@ def install(training_module: Any) -> None:
                         edge_index_dict[("SYMBOL", "PRECEDES", "SYMBOL")] = _append_edge(torch, edge_index_dict.get(("SYMBOL", "PRECEDES", "SYMBOL")), symbol_idx, next_idx)
                         edge_index_dict[("SYMBOL", "FOLLOWS", "SYMBOL")] = _append_edge(torch, edge_index_dict.get(("SYMBOL", "FOLLOWS", "SYMBOL")), next_idx, symbol_idx)
 
+        training_module._v978_last_symbol_nodes = int(x_dict["SYMBOL"].shape[0]) if "SYMBOL" in x_dict else 0
+        training_module._v978_last_symbol_edges = sum(int(value.shape[1]) for key, value in edge_index_dict.items() if "SYMBOL" in (key[0], key[2]))
+        training_module._v978_last_context_nodes = int(x_dict["CONTEXT"].shape[0]) if "CONTEXT" in x_dict else 0
         if include_objectives:
             return x_dict, edge_index_dict, y_dict, action_target_dict, action_mask_dict, action_meta, task_target_dict, task_mask_dict
         return x_dict, edge_index_dict, y_dict, action_target_dict, action_mask_dict, action_meta
@@ -135,7 +138,9 @@ def install(training_module: Any) -> None:
             runtime.set_telemetry_gauge("hgt_grounding_loss", sum(losses.values()) / len(losses))
             calibration = float(losses.get("grounding_confidence_calibration", 1.0))
             runtime.set_telemetry_gauge("hgt_grounding_calibration", max(0.0, 1.0 - calibration))
-        runtime.set_telemetry_gauge("hgt_symbol_nodes", int(getattr(result, "subgraph_nodes", 0)))
+        runtime.set_telemetry_gauge("hgt_symbol_nodes", int(getattr(training_module, "_v978_last_symbol_nodes", 0)))
+        runtime.set_telemetry_gauge("hgt_symbol_edges", int(getattr(training_module, "_v978_last_symbol_edges", 0)))
+        runtime.set_telemetry_gauge("hgt_context_nodes", int(getattr(training_module, "_v978_last_context_nodes", 0)))
         return result
 
     training_module.build_hgt_graph = build_hgt_graph
