@@ -199,8 +199,33 @@ def _recent_behavior_nodes(read_view: Any, limit: int) -> list[tuple[Any, Any]]:
 def _select_connected_nodes(read_view: Any, max_nodes: int) -> tuple[Any, ...]:
     maximum = max(1, int(max_nodes))
     selected: dict[Any, Any] = {}
-    for uid, node in _recent_behavior_nodes(read_view, maximum // 2):
+
+    # Preserve action supervision while guaranteeing that every available Hydra
+    # memory level participates in the HGT graph. A recency-only graph otherwise
+    # becomes dominated by M0/M1 and higher abstractions contribute no messages.
+    behavior_budget = max(1, maximum // 2)
+    for uid, node in _recent_behavior_nodes(read_view, behavior_budget):
         selected[uid] = node
+
+    available_levels = {
+        MemoryLevel(level): []
+        for level in range(8)
+    }
+    for uid, node in read_view.nodes.items():
+        available_levels[node.level].append((uid, node))
+    abstraction_budget = max(0, maximum - len(selected))
+    nonempty_levels = [level for level, rows in available_levels.items() if rows]
+    per_level = max(1, abstraction_budget // max(1, len(nonempty_levels)))
+    for level in nonempty_levels:
+        rows = heapq.nlargest(
+            per_level,
+            available_levels[level],
+            key=lambda row: (int(row[1].created_watermark), row[0]),
+        )
+        for uid, node in rows:
+            if len(selected) >= maximum:
+                break
+            selected.setdefault(uid, node)
 
     def edge_recency(edge: Any) -> tuple[int, int, int]:
         source = read_view.nodes.get(edge.source)
