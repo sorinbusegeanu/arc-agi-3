@@ -169,7 +169,7 @@ def _flush_child_queue(queue_obj: Any) -> None:
         pass
 
 
-def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, initial_policy: ActorPolicySnapshot, policy_updates: Any, epsilon: float, policy_refresh_steps: int, policy_refresh_ms: float, stage_queue: Any, result_queue: Any, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int) -> None:
+def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, initial_policy: ActorPolicySnapshot, policy_updates: Any, epsilon: float, stagnation: float, policy_refresh_steps: int, policy_refresh_ms: float, stage_queue: Any, result_queue: Any, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int) -> None:
     game_id = str(getattr(spec, "display_name", getattr(spec, "game_id", "unknown")))
     adapter = None
     devnull = open(os.devnull, "w", encoding="utf-8")
@@ -252,6 +252,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     action_schema_id=action_schema_id,
                     environment_type=identity.environment_type,
                     context_action_counts=context_counts,
+                    stagnation=float(stagnation),
                 )
                 context_counts[int(action)] = int(context_counts.get(int(action), 0)) + 1
                 semantic_action_fn = getattr(adapter, "semantic_action", None)
@@ -409,7 +410,7 @@ class ProcessTopology:
             process.start()
             self.stage_processes.append(process)
 
-    def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, initial_policy: ActorPolicySnapshot, epsilon: float, policy_refresh_steps: int, policy_refresh_ms: float) -> None:
+    def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, initial_policy: ActorPolicySnapshot, epsilon: float, stagnation: float, policy_refresh_steps: int, policy_refresh_ms: float) -> None:
         process = self.actor_ctx.Process(
             target=actor_process_main,
             kwargs={
@@ -421,6 +422,7 @@ class ProcessTopology:
                 "initial_policy": initial_policy,
                 "policy_updates": self.policy_updates[index],
                 "epsilon": float(epsilon),
+                "stagnation": float(stagnation),
                 "policy_refresh_steps": int(policy_refresh_steps),
                 "policy_refresh_ms": float(policy_refresh_ms),
                 "stage_queue": self.stage_queue,
