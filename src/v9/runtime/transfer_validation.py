@@ -340,6 +340,10 @@ def run_transfer_validation_interval(
         if len(tasks) >= budget:
             break
         concept_uid = candidate["concept_uid"]
+        concept_confidence = float(runtime.graph.payloads.get(concept_uid, {}).get("evidence_confidence", 1.0))
+        if concept_confidence < 0.25:
+            blocked_concepts.setdefault(concept_uid, []).append("source evidence viability confidence below transfer threshold")
+            continue
         source_types = set(str(value) for value in candidate["source_environment_types"])
         target_specs = _eligible_target_specs(tuple(specs), source_types)
         if not target_specs:
