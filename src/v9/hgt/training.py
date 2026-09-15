@@ -14,8 +14,9 @@ from v9.memory.model import MemoryLevel
 from v9.memory.relations import RelationType
 from v9.telemetry import HGTTrainingSample, ModelEvolutionSample, read_gpu_snapshot
 
-MODEL_SCHEMA_VERSION = 4
-NODE_TYPE = "MEMORY"
+MODEL_SCHEMA_VERSION = 5
+NODE_TYPE = "M0"
+MEMORY_NODE_TYPES = tuple(f"M{level}" for level in range(8))
 OBJECTIVE_NAMES = ("transition", "consequence", "relevance", "correspondence", "similarity", "strategy", "grounding", "deliberation_improvement", "invariance")
 AUX_OBJECTIVES = ("transition", "relevance", "correspondence", "similarity", "grounding", "deliberation_improvement", "invariance")
 SEMANTIC_NODE_TYPES = ("ENTITY", "ACTION", "TEXT", "STATE", "EFFECT")
@@ -49,12 +50,22 @@ def _require_torch():
     return torch, nn, HGTConv
 
 
+def _memory_node_type(node: Any) -> str:
+    return f"M{int(node.level)}"
+
+
 def _stable_metadata() -> tuple[list[str], list[tuple[str, str, str]]]:
-    node_types = [NODE_TYPE, *SEMANTIC_NODE_TYPES]
-    edge_types = [(NODE_TYPE, relation.value, NODE_TYPE) for relation in RelationType]
-    for semantic_type in SEMANTIC_NODE_TYPES:
-        edge_types.append((NODE_TYPE, "SEMANTIC", semantic_type))
-        edge_types.append((semantic_type, "SEMANTIC_OF", NODE_TYPE))
+    node_types = [*MEMORY_NODE_TYPES, *SEMANTIC_NODE_TYPES]
+    edge_types = [
+        (source_type, relation.value, target_type)
+        for source_type in MEMORY_NODE_TYPES
+        for target_type in MEMORY_NODE_TYPES
+        for relation in RelationType
+    ]
+    for memory_type in MEMORY_NODE_TYPES:
+        for semantic_type in SEMANTIC_NODE_TYPES:
+            edge_types.append((memory_type, "SEMANTIC", semantic_type))
+            edge_types.append((semantic_type, "SEMANTIC_OF", memory_type))
     return node_types, edge_types
 
 
@@ -243,129 +254,127 @@ def build_hgt_graph(
     torch, _, _ = _require_torch()
     selected_uids = _select_connected_nodes(read_view, max_nodes)
     ordered_uids = sorted(selected_uids, key=lambda uid: (int(read_view.nodes[uid].created_watermark), uid))
-    index_by_uid = {uid: index for index, uid in enumerate(ordered_uids)}
+
+    uids_by_type: dict[str, list[Any]] = {node_type: [] for node_type in MEMORY_NODE_TYPES}
+    for uid in ordered_uids:
+        uids_by_type[_memory_node_type(read_view.nodes[uid])].append(uid)
+    index_by_uid = {
+        uid: (node_type, index)
+        for node_type, uids in uids_by_type.items()
+        for index, uid in enumerate(uids)
+    }
+
     relation_nodes: dict[str, set[Any]] = {}
     for edge in read_view.edges:
         if edge.source not in index_by_uid or edge.target not in index_by_uid:
             continue
         relation_nodes.setdefault(str(edge.relation.value), set()).update((edge.source, edge.target))
-    features = []
-    labels = []
-    action_targets = [0.0] * len(ordered_uids)
-    action_masks = []
-    action_rows: list[tuple[int, int, int, int, int] | None] = []
-    task_targets: dict[str, list[float]] = {name: [] for name in AUX_OBJECTIVES}
-    task_masks: dict[str, list[bool]] = {name: [] for name in AUX_OBJECTIVES}
-    episode_rows: dict[tuple[int, int], list[tuple[int, int, int, bool, bool, bool, int]]] = {}
-    for index, uid in enumerate(ordered_uids):
-        node = read_view.nodes[uid]
-        payload = dict(read_view.payloads.get(uid, {}))
-        features.append(_node_feature(node, payload, input_dim, torch))
-        valence = int(payload.get("primary_valence", 0)) if node.level is MemoryLevel.M0 else 0
-        labels.append(max(0, min(2, valence + 1)))
-        action_id = payload.get("action_id")
-        environment_id = payload.get("environment_instance_id")
-        context_signature = payload.get("context_signature")
-        episode_id = payload.get("episode_id")
-        usable_action = (
-            node.level is MemoryLevel.M0
-            and action_id is not None
-            and environment_id is not None
-            and context_signature is not None
-            and episode_id is not None
-        )
-        semantic_rows = _semantic_rows(payload)
-        transition_positive = bool(payload.get("semantic_effects")) or (
-            payload.get("context_signature") is not None
-            and payload.get("next_context_signature") is not None
-            and int(payload.get("context_signature")) != int(payload.get("next_context_signature"))
-        )
-        task_targets["transition"].append(float(transition_positive))
-        task_masks["transition"].append(bool(usable_action))
 
-        relevance_positive = bool(
-            abs(int(payload.get("primary_valence", 0))) > 0
-            or int(payload.get("support", 0)) > 1
-            or int(payload.get("recurrence", 0)) > 1
-            or bool(payload.get("validated", False))
-            or int(payload.get("explanatory_reach", 0)) > 0
-        )
-        task_targets["relevance"].append(float(relevance_positive))
-        task_masks["relevance"].append(True)
+    x_dict: dict[str, Any] = {}
+    y_dict: dict[str, Any] = {}
+    action_target_dict: dict[str, Any] = {}
+    action_mask_dict: dict[str, Any] = {}
+    action_meta: dict[str, list[Any]] = {}
+    task_target_dict: dict[str, dict[str, Any]] = {name: {} for name in AUX_OBJECTIVES}
+    task_mask_dict: dict[str, dict[str, Any]] = {name: {} for name in AUX_OBJECTIVES}
+    episode_rows: dict[tuple[int, int], list[tuple[str, int, int, int, bool, bool, bool, int]]] = {}
 
-        correspondence_positive = uid in relation_nodes.get(RelationType.TRANSFER_CORRESPONDENCE.value, set())
-        task_targets["correspondence"].append(float(correspondence_positive))
-        task_masks["correspondence"].append(node.level in {MemoryLevel.M3, MemoryLevel.M4})
+    for node_type, uids in uids_by_type.items():
+        if not uids:
+            continue
+        features = []
+        labels = []
+        action_targets = [0.0] * len(uids)
+        action_masks: list[bool] = []
+        rows_meta: list[Any] = []
+        targets: dict[str, list[float]] = {name: [] for name in AUX_OBJECTIVES}
+        masks: dict[str, list[bool]] = {name: [] for name in AUX_OBJECTIVES}
+        for index, uid in enumerate(uids):
+            node = read_view.nodes[uid]
+            payload = dict(read_view.payloads.get(uid, {}))
+            features.append(_node_feature(node, payload, input_dim, torch))
+            valence = int(payload.get("primary_valence", 0)) if node.level is MemoryLevel.M0 else 0
+            labels.append(max(0, min(2, valence + 1)))
+            action_id = payload.get("action_id")
+            environment_id = payload.get("environment_instance_id")
+            context_signature = payload.get("context_signature")
+            episode_id = payload.get("episode_id")
+            usable_action = (
+                node.level is MemoryLevel.M0
+                and action_id is not None
+                and environment_id is not None
+                and context_signature is not None
+                and episode_id is not None
+            )
+            semantic_rows = _semantic_rows(payload)
+            transition_positive = bool(payload.get("semantic_effects")) or (
+                payload.get("context_signature") is not None
+                and payload.get("next_context_signature") is not None
+                and int(payload.get("context_signature")) != int(payload.get("next_context_signature"))
+            )
+            targets["transition"].append(float(transition_positive))
+            masks["transition"].append(bool(usable_action))
+            relevance_positive = bool(
+                abs(int(payload.get("primary_valence", 0))) > 0
+                or int(payload.get("support", 0)) > 1
+                or int(payload.get("recurrence", 0)) > 1
+                or bool(payload.get("validated", False))
+                or int(payload.get("explanatory_reach", 0)) > 0
+            )
+            targets["relevance"].append(float(relevance_positive))
+            masks["relevance"].append(True)
+            targets["correspondence"].append(float(uid in relation_nodes.get(RelationType.TRANSFER_CORRESPONDENCE.value, set())))
+            masks["correspondence"].append(node.level in {MemoryLevel.M3, MemoryLevel.M4})
+            targets["similarity"].append(float(uid in relation_nodes.get(RelationType.SIMILAR_TO.value, set())))
+            masks["similarity"].append(node.level in {MemoryLevel.M2, MemoryLevel.M3, MemoryLevel.M4})
+            grounding_positive = uid in relation_nodes.get(RelationType.GROUNDS.value, set()) or any(int(row[0]) == 7 for row in semantic_rows)
+            targets["grounding"].append(float(grounding_positive))
+            masks["grounding"].append(bool(semantic_rows) or node.level in {MemoryLevel.M0, MemoryLevel.M1})
+            deliberation_target = 1.0 if bool(payload.get("task_success", False)) or int(payload.get("levels_completed", 0)) > 0 else (-1.0 if bool(payload.get("task_failure", False)) else 0.0)
+            targets["deliberation_improvement"].append(deliberation_target)
+            masks["deliberation_improvement"].append(bool(usable_action))
+            invariance_positive = bool(payload.get("validated", False)) or uid in relation_nodes.get(RelationType.OUTCOME_EQUIVALENT.value, set())
+            targets["invariance"].append(float(invariance_positive))
+            masks["invariance"].append(node.level in {MemoryLevel.M4, MemoryLevel.M5, MemoryLevel.M6})
+            action_masks.append(bool(usable_action))
+            if usable_action:
+                env, context, action, episode = int(environment_id), int(context_signature), int(action_id), int(episode_id)
+                rows_meta.append((env, context, action, episode, int(node.created_watermark)))
+                episode_rows.setdefault((env, episode), []).append((
+                    node_type, index, int(node.created_watermark), valence,
+                    bool(payload.get("task_success", False)),
+                    bool(payload.get("task_failure", False)),
+                    bool(payload.get("task_truncated", False)),
+                    int(payload.get("levels_completed", 0)),
+                ))
+            else:
+                rows_meta.append(None)
+        x_dict[node_type] = torch.stack(features, dim=0)
+        y_dict[node_type] = torch.tensor(labels, dtype=torch.long)
+        action_target_dict[node_type] = torch.tensor(action_targets, dtype=torch.float32)
+        action_mask_dict[node_type] = torch.tensor(action_masks, dtype=torch.bool)
+        action_meta[node_type] = rows_meta
+        for name in AUX_OBJECTIVES:
+            task_target_dict[name][node_type] = torch.tensor(targets[name], dtype=torch.float32)
+            task_mask_dict[name][node_type] = torch.tensor(masks[name], dtype=torch.bool)
 
-        similarity_positive = uid in relation_nodes.get(RelationType.SIMILAR_TO.value, set())
-        task_targets["similarity"].append(float(similarity_positive))
-        task_masks["similarity"].append(node.level in {MemoryLevel.M2, MemoryLevel.M3, MemoryLevel.M4})
-
-        grounding_positive = (
-            uid in relation_nodes.get(RelationType.GROUNDS.value, set())
-            or any(int(row[0]) == 7 for row in semantic_rows)
-        )
-        task_targets["grounding"].append(float(grounding_positive))
-        task_masks["grounding"].append(bool(semantic_rows) or node.level in {MemoryLevel.M0, MemoryLevel.M1})
-
-        deliberation_target = 1.0 if bool(payload.get("task_success", False)) or int(payload.get("levels_completed", 0)) > 0 else (-1.0 if bool(payload.get("task_failure", False)) else 0.0)
-        task_targets["deliberation_improvement"].append(deliberation_target)
-        task_masks["deliberation_improvement"].append(bool(usable_action))
-
-        invariance_positive = bool(payload.get("validated", False)) or uid in relation_nodes.get(RelationType.OUTCOME_EQUIVALENT.value, set())
-        task_targets["invariance"].append(float(invariance_positive))
-        task_masks["invariance"].append(node.level in {MemoryLevel.M4, MemoryLevel.M5, MemoryLevel.M6})
-
-        action_masks.append(bool(usable_action))
-        if usable_action:
-            env, context, action, episode = int(environment_id), int(context_signature), int(action_id), int(episode_id)
-            action_rows.append((env, context, action, episode, int(node.created_watermark)))
-            episode_rows.setdefault((env, episode), []).append((
-                index,
-                int(node.created_watermark),
-                valence,
-                bool(payload.get("task_success", False)),
-                bool(payload.get("task_failure", False)),
-                bool(payload.get("task_truncated", False)),
-                int(payload.get("levels_completed", 0)),
-            ))
-        else:
-            action_rows.append(None)
     gamma = float(return_discount)
     for rows in episode_rows.values():
-        ordered = sorted(rows, key=lambda row: row[1])
+        ordered = sorted(rows, key=lambda row: row[2])
         previous_levels = 0
-        immediate: list[tuple[int, int, float]] = []
-        for index, watermark, valence, task_success, task_failure, task_truncated, levels_completed in ordered:
+        immediate = []
+        for node_type, index, watermark, valence, task_success, task_failure, task_truncated, levels_completed in ordered:
             level_gain = max(0, int(levels_completed) - int(previous_levels))
             previous_levels = max(int(previous_levels), int(levels_completed))
-            outcome_signal = float(valence)
-            if task_success:
-                outcome_signal += 1.0
-            if task_failure:
-                outcome_signal -= 1.0
-            if task_truncated:
-                outcome_signal -= 0.10
+            signal = float(valence) + float(task_success) - float(task_failure) - (0.10 if task_truncated else 0.0)
             if level_gain:
-                outcome_signal += min(1.0, 0.5 * float(level_gain))
-            immediate.append((index, watermark, max(-1.0, min(1.0, outcome_signal))))
+                signal += min(1.0, 0.5 * float(level_gain))
+            immediate.append((node_type, index, max(-1.0, min(1.0, signal))))
         running = 0.0
-        for index, _, signal in reversed(immediate):
+        for node_type, index, signal in reversed(immediate):
             running = max(-1.0, min(1.0, float(signal) + gamma * running))
-            action_targets[index] = running
-    x_dict = {NODE_TYPE: torch.stack(features, dim=0)}
-    y_dict = {NODE_TYPE: torch.tensor(labels, dtype=torch.long)}
-    action_target_dict = {NODE_TYPE: torch.tensor(action_targets, dtype=torch.float32)}
-    action_mask_dict = {NODE_TYPE: torch.tensor(action_masks, dtype=torch.bool)}
-    task_target_dict = {
-        name: {NODE_TYPE: torch.tensor(values, dtype=torch.float32)}
-        for name, values in task_targets.items()
-    }
-    task_mask_dict = {
-        name: {NODE_TYPE: torch.tensor(values, dtype=torch.bool)}
-        for name, values in task_masks.items()
-    }
-    action_meta = {NODE_TYPE: action_rows}
+            action_target_dict[node_type][index] = running
+
     eligible = (edge for edge in read_view.edges if edge.source in index_by_uid and edge.target in index_by_uid)
     selected_edges = heapq.nlargest(
         max(1, min(int(max_edges), int(max_total_edges))),
@@ -375,49 +384,54 @@ def build_hgt_graph(
             int(read_view.nodes[edge.target].created_watermark),
         ),
     )
+    edges: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
+    for edge in selected_edges:
+        source_type, source_index = index_by_uid[edge.source]
+        target_type, target_index = index_by_uid[edge.target]
+        edges.setdefault((source_type, str(edge.relation.value), target_type), []).append((source_index, target_index))
+
     semantic_links = []
-    semantic_tables = {}
-    semantic_features = {}
+    semantic_tables: dict[str, dict[Any, int]] = {}
+    semantic_features: dict[str, list[Any]] = {}
     semantic_node_budget = max(0, int(max_total_nodes) - len(ordered_uids))
     semantic_link_budget = max(0, (int(max_total_edges) - len(selected_edges)) // 2)
     semantic_node_count = 0
-    for memory_index, uid in enumerate(ordered_uids):
+    for uid in ordered_uids:
         if len(semantic_links) >= semantic_link_budget:
             break
+        memory_type, memory_index = index_by_uid[uid]
         payload = dict(read_view.payloads.get(uid, {}))
         facts = sorted(set(_semantic_rows(payload)), key=_semantic_priority)
         for fact in facts[: max(1, int(max_semantic_facts_per_memory))]:
             if len(semantic_links) >= semantic_link_budget:
                 break
-            node_type = _semantic_node_type(int(fact[0]))
-            table = semantic_tables.setdefault(node_type, {})
+            semantic_type = _semantic_node_type(int(fact[0]))
+            table = semantic_tables.setdefault(semantic_type, {})
             semantic_index = table.get(fact)
             if semantic_index is None:
                 if semantic_node_count >= semantic_node_budget:
                     continue
                 semantic_index = len(table)
                 table[fact] = semantic_index
-                semantic_features.setdefault(node_type, []).append(_semantic_node_feature(fact, input_dim, torch))
+                semantic_features.setdefault(semantic_type, []).append(_semantic_node_feature(fact, input_dim, torch))
                 semantic_node_count += 1
-            semantic_links.append((memory_index, node_type, semantic_index))
-    for node_type, rows in semantic_features.items():
-        x_dict[node_type] = torch.stack(rows, dim=0)
+            semantic_links.append((memory_type, memory_index, semantic_type, semantic_index))
+
+    for semantic_type, rows in semantic_features.items():
+        x_dict[semantic_type] = torch.stack(rows, dim=0)
         count = len(rows)
-        y_dict[node_type] = torch.zeros(count, dtype=torch.long)
-        action_target_dict[node_type] = torch.zeros(count, dtype=torch.float32)
-        action_mask_dict[node_type] = torch.zeros(count, dtype=torch.bool)
+        y_dict[semantic_type] = torch.zeros(count, dtype=torch.long)
+        action_target_dict[semantic_type] = torch.zeros(count, dtype=torch.float32)
+        action_mask_dict[semantic_type] = torch.zeros(count, dtype=torch.bool)
+        action_meta[semantic_type] = [None] * count
         for name in AUX_OBJECTIVES:
-            task_target_dict[name][node_type] = torch.zeros(count, dtype=torch.float32)
-            task_mask_dict[name][node_type] = torch.zeros(count, dtype=torch.bool)
-        action_meta[node_type] = [None] * count
-    edges: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
-    for edge in selected_edges:
-        edges.setdefault((NODE_TYPE, str(edge.relation.value), NODE_TYPE), []).append(
-            (index_by_uid[edge.source], index_by_uid[edge.target])
-        )
-    for memory_index, node_type, semantic_index in semantic_links:
-        edges.setdefault((NODE_TYPE, "SEMANTIC", node_type), []).append((memory_index, semantic_index))
-        edges.setdefault((node_type, "SEMANTIC_OF", NODE_TYPE), []).append((semantic_index, memory_index))
+            task_target_dict[name][semantic_type] = torch.zeros(count, dtype=torch.float32)
+            task_mask_dict[name][semantic_type] = torch.zeros(count, dtype=torch.bool)
+
+    for memory_type, memory_index, semantic_type, semantic_index in semantic_links:
+        edges.setdefault((memory_type, "SEMANTIC", semantic_type), []).append((memory_index, semantic_index))
+        edges.setdefault((semantic_type, "SEMANTIC_OF", memory_type), []).append((semantic_index, memory_index))
+
     edge_index_dict = {
         key: torch.tensor(pairs, dtype=torch.long).t().contiguous()
         for key, pairs in edges.items()
@@ -541,7 +555,7 @@ def _split_masks(
                     validation[index] = True
                 else:
                     train[index] = True
-        if node_type == NODE_TYPE:
+        if node_type in MEMORY_NODE_TYPES:
             for index, row in enumerate(rows):
                 if row is not None:
                     continue
