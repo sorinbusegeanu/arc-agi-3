@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from v9.hgt import resolve_hgt_behavior_test, train_hgt_epoch
+from v9.hgt.epoch_dataset import EpochTransitionDataset, dataset_path
 from v9.memory.m1_normalized import NormalizedChannel
 from v9.telemetry import HGTInferenceSample, OptimizationSample
 from .lifecycle import run_lifecycle_maintenance
@@ -341,9 +342,18 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
     for epoch in range(1, int(args.epochs) + 1):
         jobs = build_epoch_jobs(specs, args, epoch=epoch, previous_game_results=previous_game_results)
         print(f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} sampling start actors={len(jobs)}", flush=True)
-        process_results = run_parallel_memory_jobs(
-            runtime,
-            jobs,
+        active_model = str(runtime.unified_telemetry.model_version or "untrained")
+        branch = "bootstrap" if active_model in {"None", "untrained", ""} else "hgt_on"
+        epoch_dataset = EpochTransitionDataset(
+            dataset_path(args.root, epoch=epoch, branch=branch),
+            epoch=epoch,
+            branch=branch,
+            model_version=active_model,
+        )
+        try:
+            process_results = run_parallel_memory_jobs(
+                runtime,
+                jobs,
             actor_limit=args.actors,
             stage_workers=args.stage_workers,
             shards=args.shards,
@@ -360,8 +370,13 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             derivation_queue_capacity=args.derivation_queue_capacity,
             publication_queue_capacity=args.publication_queue_capacity,
             actor_view_refresh_steps=args.actor_view_refresh_steps,
-            actor_view_refresh_ms=args.actor_view_refresh_ms,
-        )
+                actor_view_refresh_ms=args.actor_view_refresh_ms,
+                hgt_dataset=epoch_dataset,
+            )
+        finally:
+            epoch_dataset.close()
+        runtime.set_telemetry_gauge("hgt_sampled_training_transitions", int(epoch_dataset.count))
+        runtime.set_telemetry_gauge("hgt_training_dataset_path", str(epoch_dataset.path))
         actor_results.extend(process_results)
         post_sampling_started = time.perf_counter()
         runtime.wait_quiescent(args.drain_timeout)
