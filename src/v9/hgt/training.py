@@ -847,7 +847,10 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     runtime.set_telemetry_gauge("hgt_total_edge_budget", int(total_edge_budget))
     runtime.set_telemetry_gauge("hgt_realized_total_nodes", int(realized_nodes))
     runtime.set_telemetry_gauge("hgt_realized_total_edges", int(realized_edges))
-    runtime.set_telemetry_gauge("hgt_semantic_nodes", int(realized_nodes - len(x_dict[NODE_TYPE])))
+    memory_nodes = sum(int(x_dict[node_type].shape[0]) for node_type in MEMORY_NODE_TYPES if node_type in x_dict)
+    runtime.set_telemetry_gauge("hgt_semantic_nodes", int(realized_nodes - memory_nodes))
+    for node_type in MEMORY_NODE_TYPES:
+        runtime.set_telemetry_gauge(f"hgt_{node_type.lower()}_nodes", int(x_dict[node_type].shape[0]) if node_type in x_dict else 0)
     runtime.set_telemetry_gauge("hgt_oom_retry_count", int(_oom_retry))
     selected_examples = sum(int(v.numel()) for v in y_dict.values())
     action_examples = sum(int(mask.sum().item()) for mask in action_masks.values())
