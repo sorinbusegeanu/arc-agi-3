@@ -651,7 +651,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                 training={
                     **asdict(training),
                     "behavioral_success_rate": behavioral_success,
-                    "behavioral_success_gain": behavioral_gain,
+                    "behavioral_success_gain": 0.0 if is_bootstrap else float(decision.gain),
                     "scenario_success_rate": scenario_success,
                     "game_level_metrics": game_level,
                     "transfer_validation": asdict(transfer),
