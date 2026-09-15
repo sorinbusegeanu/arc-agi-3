@@ -124,6 +124,7 @@ class ContinuousMemoryRuntime:
         self._hgt_action_scores: dict[int, dict[int, float]] = {}
         self._hgt_context_action_scores: dict[int, dict[int, dict[int, float]]] = {}
         self._environment_ids_by_game: dict[str, set[int]] = {}
+        self._memory_uids_by_environment: dict[int, set[MemoryUid]] | None = None
         self.telemetry: dict[str, int] = {
             "events": 0, "proposals": 0, "accepted": 0, "stale": 0,
             "rejected": 0, "cross_partition_transactions": 0,
