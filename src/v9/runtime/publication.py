@@ -540,37 +540,45 @@ class CanonicalGraph:
                 "applied_proposals": list(self._applied_order),
             }
 
-    @classmethod
-    def from_sharded_state(cls, header: dict[str, object], shard_rows: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]]) -> "CanonicalGraph":
-        """Restore graph directly from partition shards without global row lists."""
-        state = dict(header)
-        state["nodes"] = ()
-        state["edges"] = ()
-        result = cls.from_state_dict(state)
+    def install_sharded_rows(self, shard_rows: Any) -> None:
+        """Install decoded partition rows incrementally, preserving graph indexes."""
         recent_m0: list[tuple[int, MemoryUid]] = []
-        reservoir_limit = result._training_m0_reservoir.maxlen or 65_536
+        reservoir_limit = self._training_m0_reservoir.maxlen or 65_536
         for nodes, edges in shard_rows:
             for raw in nodes:
                 uid = MemoryUid(int(raw["hi"]), int(raw["lo"]))
                 node = CanonicalNode(uid, MemoryLevel(int(raw["level"])), MemoryType(int(raw["memory_type"])), tuple(int(v) for v in raw["structural_key"]), int(raw["created_watermark"]))
-                result.nodes[uid] = node
+                self.nodes[uid] = node
                 payload = dict(raw.get("payload", {}))
-                result.payloads[uid] = payload
-                owner = uid.shard(result.partition_count)
-                result._node_counts_by_partition[owner] += 1
-                result._node_uids_by_partition[owner].add(uid)
-                result._uids_by_level[node.level].add(uid)
+                self.payloads[uid] = payload
+                owner = uid.shard(self.partition_count)
+                self._node_counts_by_partition[owner] += 1
+                self._node_uids_by_partition[owner].add(uid)
+                self._uids_by_level[node.level].add(uid)
                 if node.level is MemoryLevel.M0 and payload.get("action_id") is not None:
                     recent_m0.append((node.created_watermark, uid))
             for raw in edges:
                 edge = RelationEdge(MemoryUid(int(raw["source_hi"]), int(raw["source_lo"])), RelationType(str(raw["relation"])), MemoryUid(int(raw["target_hi"]), int(raw["target_lo"])), tuple(MemoryUid(int(v[0]), int(v[1])) for v in raw.get("evidence", [])), EdgeAuthority(str(raw["authority"])), int(raw.get("object_version", 0)))
-                result.edges[edge.key] = edge
-                owner = edge.source.shard(result.partition_count)
-                result._edge_counts_by_partition[owner] += 1
-                result._edge_keys_by_partition[owner].add(edge.key)
-                result._index_edge(edge)
-        for _, uid in sorted(recent_m0, key=lambda row: row[0])[-reservoir_limit:]:
-            result._training_m0_reservoir.append(uid)
+                self.edges[edge.key] = edge
+                owner = edge.source.shard(self.partition_count)
+                self._edge_counts_by_partition[owner] += 1
+                self._edge_keys_by_partition[owner].add(edge.key)
+                self._index_edge(edge)
+        if recent_m0:
+            merged = list((self.nodes[uid].created_watermark, uid) for uid in self._training_m0_reservoir if uid in self.nodes)
+            merged.extend(recent_m0)
+            self._training_m0_reservoir.clear()
+            for _, uid in sorted(merged, key=lambda row: row[0])[-reservoir_limit:]:
+                self._training_m0_reservoir.append(uid)
+
+    @classmethod
+    def from_sharded_state(cls, header: dict[str, object], shard_rows: Any) -> "CanonicalGraph":
+        """Restore graph incrementally from partition shards."""
+        state = dict(header)
+        state["nodes"] = ()
+        state["edges"] = ()
+        result = cls.from_state_dict(state)
+        result.install_sharded_rows(shard_rows)
         return result
 
     @classmethod
