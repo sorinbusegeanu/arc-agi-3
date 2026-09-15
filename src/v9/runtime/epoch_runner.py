@@ -367,13 +367,16 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             runtime.set_telemetry_gauge("hgt_evaluation_branch", "bootstrap")
         else:
             on_jobs, off_jobs = matched_jobs(jobs)
+            branch_base_state = runtime.capture_experiment_state()
             on_dataset = EpochTransitionDataset(dataset_path(args.root, epoch=epoch, branch="hgt_on"), epoch=epoch, branch="hgt_on", model_version=active_model)
             try:
                 runtime.set_hgt_enabled(True)
                 on_results = run_parallel_memory_jobs(runtime, on_jobs, hgt_dataset=on_dataset, **common_kwargs)
             finally:
                 on_dataset.close()
-            # OFF uses the same actor/spec/budget/seed tuples. HGT contribution alone is removed.
+            on_state = runtime.capture_experiment_state()
+            # Restore the exact pre-evaluation Hydra/model state before OFF.
+            runtime.restore_experiment_state(branch_base_state)
             off_dataset = EpochTransitionDataset(dataset_path(args.root, epoch=epoch, branch="hgt_off"), epoch=epoch, branch="hgt_off", model_version=active_model)
             try:
                 runtime.set_hgt_enabled(False)
@@ -392,8 +395,12 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                 on_solved_games=int(on_game["current_run_solved_games"]),
                 off_solved_games=int(off_game["current_run_solved_games"]),
             )
+            off_state = runtime.capture_experiment_state()
             process_results = on_results if decision.selected_branch == "hgt_on" else off_results
             selected_dataset_path = on_dataset.path if decision.selected_branch == "hgt_on" else off_dataset.path
+            # Continue the scientific runtime from the branch whose behavior won.
+            runtime.restore_experiment_state(on_state if decision.selected_branch == "hgt_on" else off_state)
+            runtime.set_hgt_enabled(True)
             runtime.set_telemetry_gauge("hgt_on_behavioral_success", float(on_success))
             runtime.set_telemetry_gauge("hgt_off_behavioral_success", float(off_success))
             runtime.set_telemetry_gauge("hgt_behavioral_gain", float(decision.gain))
