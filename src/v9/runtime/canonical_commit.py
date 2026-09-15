@@ -36,6 +36,8 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
         timeline_events_delta = 0
         timeline_actions_delta = 0
         telemetry_events_delta = 0
+        symbol_occurrences_delta = 0
+        unique_symbols: set[int] = set()
         last_ordering_key = runtime.timeline.last_ordering_key
         last_step = "none"
         last_family = ""
@@ -107,6 +109,8 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                     runtime._prediction_error_sum += abs(float(pe))
                     runtime._prediction_error_count += 1
 
+            symbol_occurrences_delta += len(plan.symbol_occurrences)
+            unique_symbols.update(int(row.symbol_id.value) for row in plan.symbol_occurrences)
             if plan.symbol_codec_state:
                 codec = DeterministicSymbolCodec.from_state_dict(dict(plan.symbol_codec_state))
                 if codec.vocabulary_id.value not in runtime.symbol_codecs:
@@ -183,6 +187,11 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
         runtime.timeline.actions_committed += timeline_actions_delta
         runtime.timeline.last_ordering_key = last_ordering_key
         runtime.telemetry["events"] += telemetry_events_delta
+        runtime.telemetry["symbol_occurrences"] = int(runtime.telemetry.get("symbol_occurrences", 0)) + symbol_occurrences_delta
+        runtime.set_telemetry_gauge("symbol_occurrences_ingested", runtime.telemetry["symbol_occurrences"])
+        runtime.set_telemetry_gauge("unique_symbols_batch", len(unique_symbols))
+        runtime.set_telemetry_gauge("symbolic_m1n_batch", sum(len(plan.symbols) for plan in plans))
+        runtime.set_telemetry_gauge("cross_modal_m1n_batch", sum(sum(1 for row in plan.symbols if row.aligned_relation is not None) for plan in plans))
         for modality, count in modality_deltas.items():
             runtime._modality_events[modality] = runtime._modality_events.get(modality, 0) + count
 
