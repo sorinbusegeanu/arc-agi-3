@@ -95,7 +95,7 @@ def test_target_outcome_stability_measures_modal_fraction() -> None:
 def _strategy(uid_label: str, outcome: MemoryUid, actions: tuple[int, ...], reliability: float, valence: float, efficiency: float | None) -> ActorStrategyPolicy:
     trials = 100
     successes = int(reliability * trials)
-    return ActorStrategyPolicy(_uid(uid_label), outcome, 7, actions, successes, trials, valence * trials, None, efficiency, None)
+    return ActorStrategyPolicy(_uid(uid_label), outcome, 7, actions, reliability, None, efficiency, valence)
 
 
 def test_planner_requires_matching_environment() -> None:
@@ -155,7 +155,7 @@ def test_replan_excludes_current_strategy() -> None:
 
 def test_m7_observe_updates_trials_and_successes() -> None:
     outcome = _outcome(_consequence("a"))
-    strategy = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1, 2), successes=1, trials=2)
+    strategy = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1, 2), successes=1, trials=2, primary_valence_sum=0, realized_cost_sum=0)
     updated = strategy.observe(success=True, realized_cost=2)
     assert updated.reliability_trials == 3
     assert updated.reliability_successes == 2
@@ -163,7 +163,7 @@ def test_m7_observe_updates_trials_and_successes() -> None:
 
 def test_m7_failed_observation_does_not_add_realized_success_cost() -> None:
     outcome = _outcome(_consequence("a"))
-    strategy = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1,), successes=0, trials=0)
+    strategy = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1,), successes=0, trials=1, primary_valence_sum=0, realized_cost_sum=0)
     updated = strategy.observe(success=False, realized_cost=9)
     assert updated.realized_cost_sum == 0
     assert updated.reliability_trials == 1
@@ -171,7 +171,7 @@ def test_m7_failed_observation_does_not_add_realized_success_cost() -> None:
 
 def test_m7_success_observation_adds_realized_cost() -> None:
     outcome = _outcome(_consequence("a"))
-    strategy = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1,), successes=0, trials=0)
+    strategy = M7Strategy.form(outcome, target_environment_id=7, native_actions=(1,), successes=0, trials=1, primary_valence_sum=0, realized_cost_sum=0)
     updated = strategy.observe(success=True, realized_cost=3)
     assert updated.realized_cost_sum == 3
 
@@ -186,8 +186,8 @@ def test_actor_policy_snapshot_pickles_outcomes_and_strategies() -> None:
 
 
 def test_actor_policy_empty_environment_returns_empty_outcomes() -> None:
-    assert ActorPolicySnapshot.empty().outcomes(99) == ()
+    assert ActorPolicySnapshot.build(generation=0, normalized_action_supports={}, hgt_action_scores={}, model_version='test').outcomes(99) == ()
 
 
 def test_actor_policy_empty_environment_returns_empty_strategies() -> None:
-    assert ActorPolicySnapshot.empty().strategies(99) == ()
+    assert ActorPolicySnapshot.build(generation=0, normalized_action_supports={}, hgt_action_scores={}, model_version='test').strategies(99) == ()
