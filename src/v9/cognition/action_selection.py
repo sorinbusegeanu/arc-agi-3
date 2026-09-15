@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from random import Random
+import math
 from dataclasses import dataclass
 
 from v9.cognition.grounding import GroundingMaturity
@@ -55,6 +56,17 @@ def action_scores(view: ReadView, actions: tuple[int, ...], *, grounded_signals:
     return scores
 
 
+def branching_aware_epsilon(base_epsilon: float, branching_factor: int) -> float:
+    """Scale exploration pressure with the number of currently legal choices."""
+    base = max(0.0, min(1.0, float(base_epsilon)))
+    branches = max(1, int(branching_factor))
+    if branches <= 2:
+        return base
+    # Log scaling avoids making large combinatorial spaces almost purely random.
+    return min(0.50, base * (1.0 + math.log2(branches / 2.0)))
+
+
+
 def choose_action(view: ReadView, actions: tuple[int, ...], *, rng: Random, epsilon: float, grounded_signals: tuple[GroundedActionSignal, ...] = (), learned_scores: dict[int, float] | None = None, target_environment_id: int | None = None, action_schema_id: int | None = None, environment_type: str | None = None) -> int:
     if not actions:
         raise ValueError("cannot choose from an empty action set")
@@ -78,7 +90,8 @@ def choose_action(view: ReadView, actions: tuple[int, ...], *, rng: Random, epsi
         ) == 0.0
         and (not learned_scores or float(learned_scores.get(int(action), 0.0)) == 0.0)
     )
-    if rng.random() < epsilon:
+    effective_epsilon = branching_aware_epsilon(epsilon, len(actions))
+    if rng.random() < effective_epsilon:
         candidates = unseen or actions
         return int(candidates[rng.randrange(len(candidates))])
     return min(actions, key=lambda action: (-scores[action], action))
