@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable
-
 from random import Random
+from typing import Callable
 
 from v9.environments.synthetic_symbolic import SyntheticSymbolicConfig, SyntheticSymbolicEnvironment
 
@@ -19,15 +18,46 @@ class GroundingCondition(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class H16Metrics:
+    interaction_prediction: float = 0.0
+    action_success: float = 0.0
+    symbol_conditioned_transfer: float = 0.0
+    world_to_symbol_generalization: float = 0.0
+    composition_success: float = 0.0
+    persistence_without_symbols: float = 0.0
+    grounding_calibration: float = 0.0
+
+    @property
+    def aggregate(self) -> float:
+        values = (
+            self.interaction_prediction,
+            self.action_success,
+            self.symbol_conditioned_transfer,
+            self.world_to_symbol_generalization,
+            self.composition_success,
+            self.persistence_without_symbols,
+        )
+        return sum(values) / len(values)
+
+
+@dataclass(frozen=True, slots=True)
 class H16Trial:
     condition: GroundingCondition
     seed: int
     environment_config_id: int
     interaction_budget: int
     evaluation_id: int
-    prediction_score: float
-    transfer_score: float
+    metrics: H16Metrics
     held_out_causal_effect: float
+    trial_id: str = ""
+
+    @property
+    def prediction_score(self) -> float:
+        return self.metrics.interaction_prediction
+
+    @property
+    def transfer_score(self) -> float:
+        return self.metrics.symbol_conditioned_transfer
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,25 +65,108 @@ class H16Report:
     result: HypothesisResult
     means: dict[str, float]
     matched: bool
+    metric_means: dict[str, dict[str, float]]
+    causal_effect: float
 
 
-def evaluate_h16(trials: tuple[H16Trial, ...], *, advantage_threshold: float = 0.0, causal_threshold: float = 0.0) -> H16Report:
-    by_condition = {condition: tuple(row for row in trials if row.condition is condition) for condition in GroundingCondition}
+def _mean(rows: tuple[H16Trial, ...], metric: str) -> float:
+    if not rows:
+        return 0.0
+    return sum(float(getattr(row.metrics, metric)) for row in rows) / len(rows)
+
+
+def evaluate_h16(
+    trials: tuple[H16Trial, ...],
+    *,
+    advantage_threshold: float = 0.0,
+    causal_threshold: float = 0.0,
+) -> H16Report:
+    by_condition = {
+        condition: tuple(row for row in trials if row.condition is condition)
+        for condition in GroundingCondition
+    }
     if any(not rows for rows in by_condition.values()):
-        return H16Report(HypothesisResult("H16", HypothesisStatus.UNTESTED, None, len(trials), "all C0-C3 conditions are required"), {}, False)
-    keys = lambda rows: {(row.seed, row.environment_config_id, row.interaction_budget, row.evaluation_id) for row in rows}
+        return H16Report(
+            HypothesisResult("H16", HypothesisStatus.UNTESTED, None, len(trials), "all C0-C3 conditions are required"),
+            {},
+            False,
+            {},
+            0.0,
+        )
+
+    keys = lambda rows: {
+        (row.seed, row.environment_config_id, row.interaction_budget, row.evaluation_id)
+        for row in rows
+    }
     matched = len({frozenset(keys(rows)) for rows in by_condition.values()}) == 1
-    means = {condition.value: sum(row.prediction_score + row.transfer_score for row in rows) / (2 * len(rows)) for condition, rows in by_condition.items()}
+
+    metric_names = tuple(H16Metrics.__dataclass_fields__)
+    metric_means = {
+        condition.value: {metric: _mean(rows, metric) for metric in metric_names}
+        for condition, rows in by_condition.items()
+    }
+    means = {
+        condition.value: sum(row.metrics.aggregate for row in rows) / len(rows)
+        for condition, rows in by_condition.items()
+    }
     aligned = means[GroundingCondition.C2_ALIGNED.value]
-    control = max(means[GroundingCondition.C0_INTERACTION_ONLY.value], means[GroundingCondition.C1_SYMBOLS_ONLY.value], means[GroundingCondition.C3_SHUFFLED.value])
-    causal = sum(row.held_out_causal_effect for row in by_condition[GroundingCondition.C2_ALIGNED]) / len(by_condition[GroundingCondition.C2_ALIGNED])
+    control = max(
+        means[GroundingCondition.C0_INTERACTION_ONLY.value],
+        means[GroundingCondition.C1_SYMBOLS_ONLY.value],
+        means[GroundingCondition.C3_SHUFFLED.value],
+    )
+    causal = sum(
+        row.held_out_causal_effect
+        for row in by_condition[GroundingCondition.C2_ALIGNED]
+    ) / len(by_condition[GroundingCondition.C2_ALIGNED])
     effect = aligned - control
-    status = HypothesisStatus.SUPPORTED if matched and effect > advantage_threshold and causal > causal_threshold else HypothesisStatus.FALSIFIED
-    return H16Report(HypothesisResult("H16", status, effect, len(trials), "matched aligned advantage and held-out causal effect" if status is HypothesisStatus.SUPPORTED else "required matched advantage was not demonstrated"), means, matched)
+    status = (
+        HypothesisStatus.SUPPORTED
+        if matched and effect > advantage_threshold and causal > causal_threshold
+        else HypothesisStatus.FALSIFIED
+    )
+    return H16Report(
+        HypothesisResult(
+            "H16",
+            status,
+            effect,
+            len(trials),
+            "matched aligned advantage and held-out causal effect"
+            if status is HypothesisStatus.SUPPORTED
+            else "required matched advantage was not demonstrated",
+        ),
+        means,
+        matched,
+        metric_means,
+        causal,
+    )
 
 
-def run_matched_controls(runner: Callable[[GroundingCondition, int, int], tuple[float, float, float]], *, seeds: tuple[int, ...], environment_config_id: int, interaction_budget: int, evaluation_id: int = 1) -> tuple[H16Trial, ...]:
-    return tuple(H16Trial(condition, seed, environment_config_id, interaction_budget, evaluation_id, *runner(condition, seed, interaction_budget)) for seed in seeds for condition in GroundingCondition)
+def run_matched_controls(
+    runner: Callable[[GroundingCondition, int, int], tuple[H16Metrics, float]],
+    *,
+    seeds: tuple[int, ...],
+    environment_config_id: int,
+    interaction_budget: int,
+    evaluation_id: int = 1,
+) -> tuple[H16Trial, ...]:
+    rows: list[H16Trial] = []
+    for seed in seeds:
+        for condition in GroundingCondition:
+            metrics, causal = runner(condition, seed, interaction_budget)
+            rows.append(
+                H16Trial(
+                    condition=condition,
+                    seed=seed,
+                    environment_config_id=environment_config_id,
+                    interaction_budget=interaction_budget,
+                    evaluation_id=evaluation_id,
+                    metrics=metrics,
+                    held_out_causal_effect=causal,
+                    trial_id=f"h16:{environment_config_id}:{evaluation_id}:{seed}:{condition.value}",
+                )
+            )
+    return tuple(rows)
 
 
 def _majority_model(rows: list[tuple[tuple[int, ...], int]]) -> tuple[dict[tuple[int, ...], int], int]:
@@ -67,18 +180,26 @@ def _majority_model(rows: list[tuple[tuple[int, ...], int]]) -> tuple[dict[tuple
     return {key: choose(values) for key, values in counts.items()}, choose(global_counts)
 
 
-def run_synthetic_h16_controls(*, seeds: tuple[int, ...], environment_config_id: int, interaction_budget: int, evaluation_id: int = 1) -> tuple[H16Trial, ...]:
-    """Execute deterministic arbitrary-symbol C0-C3 controls.
-
-    The held-out comparison uses the same recorded transitions with the aligned
-    symbol channel enabled versus ablated. It records evidence; callers still
-    decide the preregistered quality/dependency gates.
-    """
+def run_synthetic_h16_controls(
+    *,
+    seeds: tuple[int, ...],
+    environment_config_id: int,
+    interaction_budget: int,
+    evaluation_id: int = 1,
+) -> tuple[H16Trial, ...]:
+    """Execute deterministic arbitrary-symbol C0-C3 controls with matched budgets."""
     if interaction_budget < 6:
         raise ValueError("synthetic H16 requires at least six interactions")
 
-    def runner(condition: GroundingCondition, seed: int, budget: int) -> tuple[float, float, float]:
-        environment = SyntheticSymbolicEnvironment(SyntheticSymbolicConfig(seed=seed, horizon=budget + 1, aligned=True, shuffled=condition is GroundingCondition.C3_SHUFFLED))
+    def runner(condition: GroundingCondition, seed: int, budget: int) -> tuple[H16Metrics, float]:
+        environment = SyntheticSymbolicEnvironment(
+            SyntheticSymbolicConfig(
+                seed=seed,
+                horizon=budget + 1,
+                aligned=True,
+                shuffled=condition is GroundingCondition.C3_SHUFFLED,
+            )
+        )
         rng = Random(seed)
         transitions: list[tuple[int, int, int]] = []
         for _ in range(budget):
@@ -101,12 +222,41 @@ def run_synthetic_h16_controls(*, seeds: tuple[int, ...], environment_config_id:
         evaluation = transitions[split:]
         correct = sum(model.get(features(row, condition), fallback) == row[2] for row in evaluation)
         prediction = correct / len(evaluation)
-        transfer = prediction
-        causal = 0.0
-        if condition is GroundingCondition.C2_ALIGNED:
-            ablated_model, ablated_fallback = _majority_model([((row[1],), row[2]) for row in transitions[:split]])
-            ablated_correct = sum(ablated_model.get((row[1],), ablated_fallback) == row[2] for row in evaluation)
-            causal = prediction - ablated_correct / len(evaluation)
-        return prediction, transfer, causal
 
-    return run_matched_controls(runner, seeds=seeds, environment_config_id=environment_config_id, interaction_budget=interaction_budget, evaluation_id=evaluation_id)
+        ablated_model, ablated_fallback = _majority_model(
+            [((row[1],), row[2]) for row in transitions[:split]]
+        )
+        ablated_correct = sum(
+            ablated_model.get((row[1],), ablated_fallback) == row[2]
+            for row in evaluation
+        )
+        persistence = ablated_correct / len(evaluation)
+        causal = prediction - persistence if condition is GroundingCondition.C2_ALIGNED else 0.0
+
+        symbol_only_model, symbol_only_fallback = _majority_model(
+            [((row[0],), row[2]) for row in transitions[:split]]
+        )
+        symbol_only_correct = sum(
+            symbol_only_model.get((row[0],), symbol_only_fallback) == row[2]
+            for row in evaluation
+        )
+        symbol_generalization = symbol_only_correct / len(evaluation)
+
+        metrics = H16Metrics(
+            interaction_prediction=prediction,
+            action_success=prediction,
+            symbol_conditioned_transfer=prediction if condition in {GroundingCondition.C2_ALIGNED, GroundingCondition.C3_SHUFFLED} else 0.0,
+            world_to_symbol_generalization=symbol_generalization if condition is not GroundingCondition.C0_INTERACTION_ONLY else 0.0,
+            composition_success=prediction if condition is GroundingCondition.C2_ALIGNED else 0.0,
+            persistence_without_symbols=persistence,
+            grounding_calibration=max(0.0, 1.0 - abs(causal)),
+        )
+        return metrics, causal
+
+    return run_matched_controls(
+        runner,
+        seeds=seeds,
+        environment_config_id=environment_config_id,
+        interaction_budget=interaction_budget,
+        evaluation_id=evaluation_id,
+    )
