@@ -260,3 +260,16 @@ def run_synthetic_h16_controls(
         interaction_budget=interaction_budget,
         evaluation_id=evaluation_id,
     )
+
+
+def publish_h16_report(runtime: object, report: H16Report) -> None:
+    """Publish matched H16 evidence into the unified telemetry/dashboard path."""
+    setter = getattr(runtime, "set_telemetry_gauge")
+    for condition in GroundingCondition:
+        setter(f"h16_{condition.value}_score", float(report.means.get(condition.value, 0.0)))
+    setter("h16_aligned_advantage", float(report.result.effect or 0.0))
+    setter("h16_heldout_causal_effect", float(report.causal_effect))
+    setter("h16_matched", int(report.matched))
+    aligned = report.metric_means.get(GroundingCondition.C2_ALIGNED.value, {})
+    for metric, value in aligned.items():
+        setter(f"h16_aligned_{metric}", float(value))

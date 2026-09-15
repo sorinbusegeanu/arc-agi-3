@@ -446,9 +446,47 @@ class ContinuousMemoryRuntime:
             for environment_type, contexts in grouped.items()
         }
 
+    def _grounded_policy_scores(self) -> tuple[dict[str, dict[int, float]], dict[str, dict[int, dict[int, float]]]]:
+        """Project causally validated G3+ grounding into actor-visible action scores."""
+        by_type: dict[str, dict[int, list[float]]] = {}
+        by_context: dict[str, dict[int, dict[int, list[float]]]] = {}
+        payload_by_low_uid: dict[int, dict[str, Any]] = {
+            int(uid.lo): payload for uid, payload in self.graph.payloads.items()
+        }
+        for key, state in self.grounding.eligible_states():
+            _symbol_uid, interaction_uid, environment_id, context_scope_id, _lineage_uid = key
+            payload = payload_by_low_uid.get(int(interaction_uid))
+            if payload is None or payload.get("action_id") is None:
+                continue
+            try:
+                environment_type = str(self.environments.resolve(int(environment_id)).environment_type)
+            except KeyError:
+                continue
+            action = int(payload["action_id"])
+            confidence = state.support / max(1e-9, state.support + state.contradiction)
+            maturity = max(0.0, min(1.0, (int(state.maturity) - 2) / 3.0))
+            score = confidence * maturity
+            by_type.setdefault(environment_type, {}).setdefault(action, []).append(score)
+            context = payload.get("context_signature")
+            if context is not None:
+                by_context.setdefault(environment_type, {}).setdefault(int(context), {}).setdefault(action, []).append(score)
+        return (
+            {
+                environment_type: {action: sum(values) / len(values) for action, values in actions.items()}
+                for environment_type, actions in by_type.items()
+            },
+            {
+                environment_type: {
+                    context: {action: sum(values) / len(values) for action, values in actions.items()}
+                    for context, actions in contexts.items()
+                }
+                for environment_type, contexts in by_context.items()
+            },
+        )
+
     def actor_policy_snapshot(self) -> ActorPolicySnapshot:
         with self._lock:
-            grounded_scores: dict[str, dict[int, float]] = {}
+            grounded_scores, grounded_context_scores = self._grounded_policy_scores()
             live_strategies = tuple(
                 strategy for uid, strategy in getattr(self, "_m7", {}).items()
                 if (
@@ -495,6 +533,7 @@ class ContinuousMemoryRuntime:
                 hgt_action_scores_by_type=self._hgt_scores_by_environment_type(),
                 hgt_context_action_scores_by_type=self._hgt_context_scores_by_environment_type(),
                 grounded_action_scores_by_type=grounded_scores,
+                grounded_context_action_scores_by_type=grounded_context_scores,
                 model_version=self.unified_telemetry.model_version,
                 strategies_by_environment=published_strategies,
                 outcomes_by_environment=published_outcomes,
@@ -1792,6 +1831,13 @@ class ContinuousMemoryRuntime:
             "cross_family_transfer": validated_transfers / max(1, len(self.transfer_trust.records)),
             "grounding_relations": len(self.grounding.states),
             "grounding_counts": grounding_counts,
+            **{f"grounding_G{level}_count": grounding_counts[f"G{level}"] for level in range(6)},
+            "grounding_active_count": sum(int(row.behavior_eligible) for row in self.grounding.states.values()),
+            "grounding_suspended_count": sum(int(row.suspended) for row in self.grounding.states.values()),
+            "grounding_mean_confidence": (
+                sum(row.support / max(1e-9, row.support + row.contradiction) for row in self.grounding.states.values())
+                / max(1, len(self.grounding.states))
+            ),
             "lineage_overlays": len(self.lineages.overlays),
             "lineage_dependencies": len(self.lineages.dependencies),
             "context_scopes": len(self.contexts.records),
@@ -1809,6 +1855,7 @@ class ContinuousMemoryRuntime:
             "isf_decisions_hot": len(self.isf.decisions),
             "replay": self.replay.state_dict(),
             "symbol_conditioned_prediction_delta": self._symbol_prediction_delta_sum / max(1, prediction_observations),
+            "symbol_prediction_gain": self._symbol_prediction_delta_sum / max(1, prediction_observations),
             "prediction_error": self._prediction_error_sum / max(1, self._prediction_error_count),
             "persistent_consolidated_bytes": persistent_bytes,
             "persistent_memory_growth_ratio": total_memories / max(1, self.telemetry["events"]),
