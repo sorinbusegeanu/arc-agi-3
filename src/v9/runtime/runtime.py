@@ -1514,7 +1514,7 @@ class ContinuousMemoryRuntime:
                     self._m5[uid] = M5ConsequenceStructure(uid, tuple(int(value) for value in payload.get("descriptor", node.structural_key)), provenance, bool(payload.get("mature", False)))
                 elif node.level is MemoryLevel.M6 and provenance is not None:
                     members = tuple(parents)
-                    self._m6[uid] = M6Outcome(uid, tuple(int(value) for value in payload.get("class_signature", node.structural_key)), int(payload.get("class_version", 1)), members, provenance)
+                    self._m6[uid] = M6Outcome(uid, tuple(int(value) for value in payload.get("class_signature", node.structural_key)), members, provenance, int(payload.get("class_version", 1)))
                 elif node.level is MemoryLevel.M7 and provenance is not None:
                     target_raw = payload.get("target_outcome", parents[0] if parents else None)
                     if isinstance(target_raw, MemoryUid):
