@@ -583,115 +583,6 @@ def _transition_batch_loss(model: Any, rows: list[dict[str, Any]], torch: Any, d
     return regression + ranking, correct, total
 
 
-def _split_transition_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Deterministic episode-level split for direct transition supervision."""
-    episodes = sorted({(str(r["game_scenario"]), int(r["actor_id"]), int(r["episode_id"])) for r in rows})
-    if len(episodes) < 2:
-        return list(rows), []
-    validation = {key for key in episodes if int.from_bytes(hashlib.blake2b(repr(key).encode(), digest_size=8, person=b"v9-hgt-tval").digest(), "little") % 5 == 0}
-    if not validation:
-        validation = {episodes[0]}
-    if len(validation) == len(episodes):
-        validation.remove(episodes[-1])
-    train = [r for r in rows if (str(r["game_scenario"]), int(r["actor_id"]), int(r["episode_id"])) not in validation]
-    val = [r for r in rows if (str(r["game_scenario"]), int(r["actor_id"]), int(r["episode_id"])) in validation]
-    return train, val
-
-
-def _transition_validation(model: Any, rows: list[dict[str, Any]], torch: Any, device: Any) -> tuple[float, float, int]:
-    if not rows:
-        return 0.0, 0.0, 0
-    model.eval()
-    with torch.no_grad():
-        loss, correct, total = _transition_batch_loss(model, rows, torch, device)
-    return (float(loss.detach().cpu()) if loss is not None else 0.0, float(correct) / max(1, total), int(total))
-
-
-def _episode_rank(environment_id: int, episode_id: int) -> int:
-    digest = hashlib.blake2b(
-        f"{int(environment_id)}:{int(episode_id)}".encode("ascii"),
-        digest_size=8,
-        person=b"v9-hgt-split",
-    ).digest()
-    return int.from_bytes(digest, "little")
-
-
-def _split_masks(
-    action_meta: dict[str, list[Any]],
-    action_masks: dict[str, Any],
-    torch: Any,
-    *,
-    environment_families: dict[int, str] | None = None,
-):
-    """Prefer held-out environment families; fall back to held-out episodes."""
-    train_masks: dict[str, Any] = {}
-    val_masks: dict[str, Any] = {}
-    families = environment_families or {}
-    for node_type, action_mask in action_masks.items():
-        rows = action_meta[node_type]
-        count = int(action_mask.numel())
-        present_families = sorted({
-            families.get(int(row[0]), "")
-            for row in rows
-            if row is not None and families.get(int(row[0]), "")
-        })
-        validation_families: set[str] = set()
-        if len(present_families) >= 2:
-            family_count = min(len(present_families) - 1, max(1, int(math.ceil(len(present_families) * 0.2))))
-            validation_families = set(
-                sorted(
-                    present_families,
-                    key=lambda family: hashlib.blake2b(
-                        family.encode("utf-8"),
-                        digest_size=8,
-                        person=b"v9-hgt-family",
-                    ).digest(),
-                )[:family_count]
-            )
-
-        train = torch.zeros(count, dtype=torch.bool)
-        validation = torch.zeros(count, dtype=torch.bool)
-        if validation_families:
-            for index, row in enumerate(rows):
-                if row is None:
-                    continue
-                family = families.get(int(row[0]), "")
-                if family in validation_families:
-                    validation[index] = True
-                else:
-                    train[index] = True
-        else:
-            episodes = sorted(
-                {(int(row[0]), int(row[3])) for row in rows if row is not None},
-                key=lambda key: (_episode_rank(*key), key),
-            )
-            if len(episodes) < 2:
-                train_masks[node_type] = action_mask.clone()
-                val_masks[node_type] = torch.zeros(count, dtype=torch.bool)
-                continue
-            val_count = min(len(episodes) - 1, max(1, int(math.ceil(len(episodes) * 0.2))))
-            validation_episodes = set(episodes[:val_count])
-            for index, row in enumerate(rows):
-                if row is None:
-                    continue
-                key = (int(row[0]), int(row[3]))
-                if key in validation_episodes:
-                    validation[index] = True
-                else:
-                    train[index] = True
-        if node_type in MEMORY_NODE_TYPES:
-            for index, row in enumerate(rows):
-                if row is not None:
-                    continue
-                if index % 5 == 0:
-                    validation[index] = True
-                else:
-                    train[index] = True
-        train_masks[node_type] = train
-        val_masks[node_type] = validation
-    return train_masks, val_masks
-
-
 def _masked_count(masks: dict[str, Any], action_masks: dict[str, Any]) -> int:
     return sum(int((masks[key] & action_masks[key]).sum().item()) for key in masks)
 
@@ -1158,7 +1049,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     coverage = float(locals().get("transitions_trained", 0)) / max(1, len(transition_train_rows)) if transition_train_rows else 0.0
     runtime.set_telemetry_gauge("hgt_training_coverage", coverage)
     runtime.set_telemetry_gauge("hgt_action_ranking_accuracy", float(locals().get("ranking_correct", 0)) / max(1, locals().get("ranking_total", 0)))
-    runtime.set_telemetry_gauge("hgt_action_ranking_validation_pairs", int(locals().get("ranking_total", 0)))
+    runtime.set_telemetry_gauge("hgt_action_ranking_training_pairs", int(locals().get("ranking_total", 0)))
     if training_steps <= 0:
         return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, parent_version, 0.0, 0.0, action_examples, 0, parent_checkpoint)
 
@@ -1229,8 +1120,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
                 "heads": int(config.hgt_heads),
                 "training_loss": training_loss,
                 "training_accuracy": train_accuracy,
-                "training_loss": training_loss,
-                "loss_by_head": dict(validation_loss_by_head),
+                "loss_by_head": dict(training_loss_by_head),
                 "objective_weights": list(config.hgt_loss_weights),
                 "dynamic_loss_weighting": bool(config.hgt_dynamic_loss_weighting),
                 "action_scores": action_scores,
@@ -1251,7 +1141,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             "parent_model_version": parent_version,
             "training_loss": training_loss,
             "training_accuracy": train_accuracy,
-            "loss_by_head": dict(validation_loss_by_head),
+            "loss_by_head": dict(training_loss_by_head),
             "objective_weights": list(config.hgt_loss_weights),
             "dynamic_loss_weighting": bool(config.hgt_dynamic_loss_weighting),
             "graph_generation": int(read_view.generation),
@@ -1291,7 +1181,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         historical_retention=0.0,
         current_curriculum_gain=max(0.0, train_accuracy - (1.0 / 3.0)),
         cross_family_validation_gain=0.0,
-        loss_by_head=dict(validation_loss_by_head),
+        loss_by_head=dict(training_loss_by_head),
     )
     runtime.record_hgt_training(sample)
     retention_delta = 0.0
@@ -1314,7 +1204,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         model_version=model_version,
         parent_model_version=parent_version,
         training_loss=training_loss,
-        validation_loss=validation_loss,
+        validation_loss=0.0,
         examples=action_examples,
         training_steps=training_steps,
         checkpoint=checkpoint_rel if promote else parent_checkpoint,
