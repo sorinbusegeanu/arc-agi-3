@@ -14,6 +14,15 @@ def ensure_fast_state(runtime: Any) -> None:
         runtime._fast_stable_contingencies = sum(
             int(len(rows) >= 2) for rows in runtime._m1n_occurrences.values()
         )
+    if not hasattr(runtime, "_m1n_family_occurrences"):
+        runtime._m1n_family_occurrences = {}
+        for rows in runtime._m1n_occurrences.values():
+            for row in rows:
+                family = int(getattr(row, "family_signature", 0) or row.structural_signature)
+                bucket = runtime._m1n_family_occurrences.setdefault(family, [])
+                identity = (row.uid, row.channel.value, tuple(row.provenance.evidence))
+                if all((existing.uid, existing.channel.value, tuple(existing.provenance.evidence)) != identity for existing in bucket):
+                    bucket.append(row)
 
 
 def stage_evidence_fast(runtime: Any) -> StageEvidence:
@@ -53,6 +62,15 @@ def record_normalized_fast(runtime: Any, relation: Any, initial_write: Canonical
     ensure_fast_state(runtime)
     signature = int(relation.structural_signature)
     occurrences = runtime._m1n_occurrences.setdefault(signature, [])
+    family = int(getattr(relation, "family_signature", 0) or signature)
+    family_rows = runtime._m1n_family_occurrences.setdefault(family, [])
+    identity = (relation.uid, relation.channel.value, tuple(relation.provenance.evidence))
+    if all((existing.uid, existing.channel.value, tuple(existing.provenance.evidence)) != identity for existing in family_rows):
+        family_rows.append(relation)
+        family_limit = max(4, int(runtime.config.scientific.m1n_facts_per_channel) * 4)
+        if len(family_rows) > family_limit:
+            del family_rows[:-family_limit]
+
     if getattr(relation, "channel", None) is not None and str(relation.channel.value) == "CROSS_MODAL":
         runtime._cross_modal_signatures.pop(signature, None)
         runtime._cross_modal_signatures[signature] = None

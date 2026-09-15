@@ -24,7 +24,15 @@ def select_target_outcome(outcomes: tuple[T, ...], *, reachable: set[MemoryUid] 
     eligible = tuple(row for row in outcomes if reachable is None or _uid(row) in reachable)
     if not eligible:
         return None
-    return min(eligible, key=lambda row: (-float(row.mean_primary_valence), -float(row.equivalence_confidence), _uid(row)))
+    return min(
+        eligible,
+        key=lambda row: (
+            -float(getattr(row, "grounding_authority", 0.0)),
+            -float(row.mean_primary_valence),
+            -float(row.equivalence_confidence),
+            _uid(row),
+        ),
+    )
 
 
 def target_outcome_stability(selections: tuple[MemoryUid, ...]) -> float:

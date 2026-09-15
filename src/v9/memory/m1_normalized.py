@@ -26,15 +26,50 @@ class M1NormalizedRelation:
     contradiction: float = 0.0
     temporal_offsets: tuple[int, ...] = ()
     causal_watermark: int = 0
+    family_signature: int = 0
+    heldout_transfer: bool = False
 
     @classmethod
-    def build(cls, observable_relation: str, channel: NormalizedChannel, parents: tuple[M1GroundedContingency, ...]) -> "M1NormalizedRelation":
+    def build(
+        cls,
+        observable_relation: str,
+        channel: NormalizedChannel,
+        parents: tuple[M1GroundedContingency, ...],
+        *,
+        support: float = 1.0,
+        contradiction: float = 0.0,
+        temporal_offsets: tuple[int, ...] = (),
+        causal_watermark: int = 0,
+        structural_key: tuple[object, ...] | None = None,
+        family_key: tuple[object, ...] | None = None,
+        heldout_transfer: bool = False,
+    ) -> "M1NormalizedRelation":
         if not parents:
             raise ValueError("normalized relation requires grounded parents")
-        signature = stable_u64(observable_relation, channel.value, person=b"v9-m1-normalized")
+        if support < 0.0 or contradiction < 0.0:
+            raise ValueError("normalized relation evidence must be non-negative")
+        if structural_key is None:
+            signature = stable_u64(observable_relation, channel.value, person=b"v9-m1-normalized")
+        else:
+            signature = stable_u64(*structural_key, person=b"v9-m1-structure")
+        family_signature = (
+            int(signature)
+            if family_key is None
+            else stable_u64(*family_key, person=b"v9-m1-family")
+        )
         uid = MemoryUid.from_key(MemoryLevel.M1, MemoryType.NORMALIZED_RELATION, (signature,))
         parent_ids = tuple(row.uid for row in parents)
         evidence = tuple(uid for row in parents for uid in row.provenance.evidence)
-        watermark = max((int(getattr(row, "created_watermark", 0)) for row in parents), default=0)
-        return cls(uid, observable_relation, channel, signature, DerivationProvenance(parent_ids, evidence), float(len(parents)), 0.0, (), watermark)
-
+        return cls(
+            uid,
+            observable_relation,
+            channel,
+            signature,
+            DerivationProvenance(parent_ids, evidence),
+            float(support),
+            float(contradiction),
+            tuple(int(value) for value in temporal_offsets),
+            int(causal_watermark),
+            int(family_signature),
+            bool(heldout_transfer),
+        )

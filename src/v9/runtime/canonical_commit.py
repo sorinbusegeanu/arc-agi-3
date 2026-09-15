@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Iterable
 
 from v9.cognition.isf import ISFComponents
 from v9.cognition.grounding import GroundingEvidence
+from v9.memory.symbolic_relations import shuffled_alignment_control
 from v9.modalities.symbols import DeterministicSymbolCodec
 
 from .canonical_commit_derivation import derivation_candidates
 from .canonical_commit_isf import score_isf_batch
 from .canonical_commit_state import advance_stage_fast, record_normalized_fast, trim_replay_pool
 from .memory_pipeline import DerivationTask
-from .memory_pipeline_v2 import CommitPlan
+from .memory_pipeline_v2 import CommitPlan, _m1n_write
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +49,11 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
         for plan in plans:
             signatures: list[int] = []
             event = plan.event
+            previous_interaction = None
+            if plan.interaction_grounding is not None:
+                g = plan.interaction_grounding
+                previous_interaction = runtime._latest_interaction_grounding.get((int(g.environment_instance_id), int(g.episode_id)))
+
             if event is not None:
                 environment_id = int(event.identity.environment_instance_id)
                 previous_identity = registered_identities.get(environment_id)
@@ -76,12 +83,7 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                     raise RuntimeError("interaction commit plan is incomplete")
 
                 prior_support = int(runtime._m1n_supports.get(int(plan.relation.structural_signature), 0))
-                signature = record_normalized_fast(
-                    runtime,
-                    plan.relation,
-                    plan.normalized_write,
-                    deferred_rows,
-                )
+                signature = record_normalized_fast(runtime, plan.relation, plan.normalized_write, deferred_rows)
                 signatures.append(signature)
                 touched_signatures.add(signature)
                 next_stage = advance_stage_fast(runtime)
@@ -96,21 +98,15 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                     recurrence = int(runtime._m1n_supports.get(signature, 0))
                     recurrence_pe = 1.0 / max(1.0, float(prior_support + 1))
                     pe = abs(float(explicit_pe)) if float(explicit_pe) != 0.0 else recurrence_pe
-                    isf_rows.append(
-                        (
-                            ISFComponents(pvi, osi, pe, 1.0 / max(1, recurrence), tp, ep),
-                            int(runtime._watermark),
-                            int(event.identity.causal_watermark),
-                            stage_before,
-                            next_stage,
-                            int(runtime.graph.generation),
-                        )
-                    )
+                    isf_rows.append((ISFComponents(pvi, osi, pe, 1.0 / max(1, recurrence), tp, ep), int(runtime._watermark), int(event.identity.causal_watermark), stage_before, next_stage, int(runtime.graph.generation)))
                     runtime._prediction_error_sum += abs(float(pe))
                     runtime._prediction_error_count += 1
 
             symbol_occurrences_delta += len(plan.symbol_occurrences)
             unique_symbols.update(int(row.symbol_id.value) for row in plan.symbol_occurrences)
+            index_occurrences = getattr(runtime, "_index_symbol_occurrences", None)
+            if callable(index_occurrences):
+                index_occurrences(plan.symbol_occurrences)
             if plan.symbol_codec_state:
                 codec = DeterministicSymbolCodec.from_state_dict(dict(plan.symbol_codec_state))
                 if codec.vocabulary_id.value not in runtime.symbol_codecs:
@@ -126,51 +122,40 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                 formation_environments.add(int(symbol_event.identity.environment_instance_id))
                 deferred_rows.extend(write.runtime_row() for write in symbol.base_writes)
 
-                signature = record_normalized_fast(
-                    runtime,
-                    symbol.relation,
-                    symbol.normalized_write,
-                    deferred_rows,
-                )
+                signature = record_normalized_fast(runtime, symbol.relation, symbol.normalized_write, deferred_rows)
                 signatures.append(signature)
                 touched_signatures.add(signature)
                 if symbol.aligned_relation is not None:
                     if symbol.aligned_normalized_write is None:
                         raise RuntimeError("aligned symbol commit plan is incomplete")
-                    aligned_signature = record_normalized_fast(
-                        runtime,
-                        symbol.aligned_relation,
-                        symbol.aligned_normalized_write,
-                        deferred_rows,
-                    )
+                    aligned_signature = record_normalized_fast(runtime, symbol.aligned_relation, symbol.aligned_normalized_write, deferred_rows)
                     signatures.append(aligned_signature)
                     touched_signatures.add(aligned_signature)
                     if plan.interaction_grounding is not None:
                         g = plan.interaction_grounding
                         symbol_grounding_uid = symbol.base_writes[1].node.uid
-                        grounding_key = (
-                            int(symbol_grounding_uid.lo),
-                            int(g.uid.lo),
-                            int(g.environment_instance_id),
-                            0,
-                            0,
-                        )
+                        grounding_key = (int(symbol_grounding_uid.lo), int(g.uid.lo), int(g.environment_instance_id), 0, 0)
                         before_grounding = runtime.grounding.states.get(grounding_key)
-                        after_grounding = runtime.grounding.observe(
-                            GroundingEvidence(
-                                int(symbol_grounding_uid.lo),
-                                int(g.uid.lo),
-                                int(g.environment_instance_id),
-                                0,
-                                0,
-                                int(runtime._watermark),
-                                recurrent_symbol=True,
-                                cross_modal_association=True,
-                            )
-                        )
+                        after_grounding = runtime.grounding.observe(GroundingEvidence(int(symbol_grounding_uid.lo), int(g.uid.lo), int(g.environment_instance_id), 0, 0, int(runtime._watermark), recurrent_symbol=True, cross_modal_association=True))
                         if before_grounding is None or int(after_grounding.maturity) > int(before_grounding.maturity):
                             runtime.telemetry["grounding_promotions"] += 1
                 advance_stage_fast(runtime)
+
+            for derived in plan.derived_relations:
+                signature = record_normalized_fast(runtime, derived.relation, derived.write, deferred_rows)
+                signatures.append(signature)
+                touched_signatures.add(signature)
+
+            # A symbol paired with a prior interaction is an explicit deterministic
+            # mismatch control. It never grants grounding authority.
+            if previous_interaction is not None:
+                for symbol in plan.symbols:
+                    proxy = SimpleNamespace(m1g=symbol.grounding, base_writes=symbol.base_writes, occurrence=symbol.occurrence)
+                    control = shuffled_alignment_control(proxy, previous_interaction, causal_watermark=int(runtime._watermark), occurrence=symbol.occurrence)
+                    write = _m1n_write(control.relation, watermark=int(runtime._watermark), occurrence=symbol.occurrence, payload_extra=control.payload())
+                    signature = record_normalized_fast(runtime, control.relation, write, deferred_rows)
+                    signatures.append(signature)
+                    touched_signatures.add(signature)
 
             last_step = plan.curriculum_step or "none"
             last_family = str(plan.identity.family)
@@ -190,7 +175,7 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
         runtime.telemetry["symbol_occurrences"] = int(runtime.telemetry.get("symbol_occurrences", 0)) + symbol_occurrences_delta
         runtime.set_telemetry_gauge("symbol_occurrences_ingested", runtime.telemetry["symbol_occurrences"])
         runtime.set_telemetry_gauge("unique_symbols_batch", len(unique_symbols))
-        runtime.set_telemetry_gauge("symbolic_m1n_batch", sum(len(plan.symbols) for plan in plans))
+        runtime.set_telemetry_gauge("symbolic_m1n_batch", sum(len(plan.symbols) + len(plan.derived_relations) for plan in plans))
         runtime.set_telemetry_gauge("cross_modal_m1n_batch", sum(sum(1 for row in plan.symbols if row.aligned_relation is not None) for plan in plans))
         for modality, count in modality_deltas.items():
             runtime._modality_events[modality] = runtime._modality_events.get(modality, 0) + count
