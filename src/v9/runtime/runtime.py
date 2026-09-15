@@ -135,6 +135,47 @@ class ContinuousMemoryRuntime:
             path = latest_snapshot(self.root)
             if path is not None:
                 self._restore(load_snapshot(path, expected_config_id=scientific.config_id.value))
+            self._restore_hgt_checkpoint()
+
+    def _restore_hgt_checkpoint(self) -> None:
+        """Restore the active accepted/candidate HGT policy from its manifest."""
+        manifest_path = self.root / "models" / "hgt_manifest.json"
+        if not manifest_path.exists():
+            return
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        version = manifest.get("current_model_version")
+        checkpoint_rel = manifest.get("current_checkpoint")
+        if not version or not checkpoint_rel:
+            return
+        checkpoint_path = self.root / str(checkpoint_rel)
+        if not checkpoint_path.exists():
+            return
+        try:
+            import torch
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        except (ImportError, OSError, RuntimeError, ValueError):
+            return
+        action_scores = {
+            int(environment): {int(action): float(score) for action, score in actions.items()}
+            for environment, actions in dict(checkpoint.get("action_scores", {})).items()
+        }
+        context_scores = {
+            int(environment): {
+                int(context): {int(action): float(score) for action, score in actions.items()}
+                for context, actions in contexts.items()
+            }
+            for environment, contexts in dict(checkpoint.get("context_action_scores", {})).items()
+        }
+        try:
+            self.set_hgt_action_scores(action_scores, context_action_scores=context_scores)
+        except TypeError:
+            self.set_hgt_action_scores(action_scores)
+        self.unified_telemetry.model_version = str(version)
+        self.set_telemetry_gauge("hgt_restored_on_startup", 1)
+        self.set_telemetry_gauge("hgt_restored_model", str(version))
 
     @property
     def watermark(self) -> int:
