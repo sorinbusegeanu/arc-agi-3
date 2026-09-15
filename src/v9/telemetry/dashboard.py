@@ -5,6 +5,7 @@ from typing import Any
 
 PRIMARY_KEYS = (
     "current_run_wins",
+    "current_run_levels_solved",
     "behavioral_success_rate",
     "behavioral_success_gain",
     "trajectory_efficiency",
@@ -55,6 +56,7 @@ def build_primary_dashboard(runtime_metrics: dict[str, Any], diagnostic: dict[st
     training_reports = int(diagnostic.get("hgt_training_reports", 0))
     dashboard = {
         "current_run_wins": float(runtime_metrics.get("current_run_wins", 0.0)),
+        "current_run_levels_solved": int(runtime_metrics.get("current_run_levels_completed", 0)),
         "behavioral_success_rate": float(diagnostic.get("behavioral_success_rate", 0.0)),
         "behavioral_success_gain": float(diagnostic.get("behavioral_success_gain", 0.0)),
         "trajectory_efficiency": float(runtime_metrics.get("trajectory_efficiency", 0.0)),
