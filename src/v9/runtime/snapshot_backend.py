@@ -34,3 +34,5 @@ def load_snapshot_direct(path: Path, *, expected_config_id: str):
     return chunked_snapshot.load_snapshot_parts(path, expected_config_id=expected_config_id)
 
 decode_graph_shard = chunked_snapshot._decode_graph_shard
+
+load_graph_shard = chunked_snapshot.load_graph_shard
