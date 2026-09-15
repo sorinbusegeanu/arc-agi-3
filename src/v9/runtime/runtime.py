@@ -297,6 +297,42 @@ class ContinuousMemoryRuntime:
                 self._hgt_context_action_scores = {}
             self._actor_policy_generation += 1
 
+    def record_successful_trajectory(self, *, environment_id: int, episode_id: int) -> int:
+        with self._lock:
+            rows: list[tuple[int, dict[str, Any]]] = []
+            for uid in tuple(self.graph._uids_by_level[MemoryLevel.M0]):
+                node = self.graph.nodes.get(uid)
+                payload = self.graph.payloads.get(uid)
+                if node is None or payload is None:
+                    continue
+                if int(payload.get("environment_instance_id", -1)) != int(environment_id) or int(payload.get("episode_id", -1)) != int(episode_id):
+                    continue
+                if payload.get("action_id") is not None:
+                    rows.append((int(node.created_watermark), payload))
+            ordered = sorted(rows, key=lambda item: item[0])
+            native_actions = tuple(int(payload["action_id"]) for _, payload in ordered)
+            if not native_actions:
+                return 0
+            primary_valence = sum(int(payload.get("primary_valence", 0)) for _, payload in ordered)
+            realized_cost = sum(max(1, int(payload.get("realized_cost", 0))) for _, payload in ordered) or len(native_actions)
+            outcomes = {
+                strategy.target_outcome: self._m6.get(strategy.target_outcome)
+                for strategy in self.__dict__.setdefault("_m7", {}).values()
+                if int(strategy.target_environment_id) == int(environment_id)
+            }
+            formed = 0
+            for outcome_uid, outcome in outcomes.items():
+                if outcome is None:
+                    continue
+                candidate = M7Strategy.form(outcome, target_environment_id=int(environment_id), native_actions=native_actions, successes=1, trials=1, primary_valence_sum=primary_valence, realized_cost_sum=realized_cost)
+                if candidate.uid in self._m7:
+                    continue
+                self._m7[candidate.uid] = candidate
+                confidence = float(self.graph.payloads.get(outcome_uid, {}).get("evidence_confidence", 1.0))
+                self._publish(CanonicalNode(candidate.uid, MemoryLevel.M7, MemoryType.STRATEGY, (outcome.uid.hi, outcome.uid.lo, int(environment_id), *native_actions), self._watermark), {"target_outcome": [outcome.uid.hi, outcome.uid.lo], "target_environment_id": int(environment_id), "native_actions": list(native_actions), "reliability_successes": 1, "reliability_trials": 1, "evidence_confidence": confidence, "primary_valence_sum": primary_valence, "realized_cost_sum": realized_cost, "parents": [[outcome.uid.hi, outcome.uid.lo]]}, candidate.provenance.evidence)
+                formed += 1
+            return formed
+
     def record_strategy_execution(self, strategy_uid: MemoryUid, *, success: bool, realized_cost: int, primary_valence: int = 0) -> None:
         with self._lock:
             strategy = self.__dict__.setdefault("_m7", {}).get(strategy_uid)
