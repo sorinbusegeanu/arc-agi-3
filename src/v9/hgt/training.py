@@ -8,6 +8,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from .epoch_dataset import transition_training_rows, action_ranking_pairs
 from typing import Any
 
 from v9.memory.model import MemoryLevel
@@ -875,6 +876,11 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             total_node_budget = max(memory_node_budget, int(total_node_budget * pressure))
             total_edge_budget = max(canonical_edge_budget, int(total_edge_budget * pressure))
             runtime.set_telemetry_gauge("hgt_vram_preflight_shedding_factor", float(pressure))
+    epoch_dataset_path = getattr(runtime, "_hgt_training_dataset_path", None)
+    epoch_transition_rows = transition_training_rows(epoch_dataset_path) if epoch_dataset_path and Path(epoch_dataset_path).exists() else []
+    epoch_ranking_pairs = action_ranking_pairs(epoch_transition_rows) if epoch_transition_rows else []
+    runtime.set_telemetry_gauge("hgt_training_dataset_transitions", len(epoch_transition_rows))
+    runtime.set_telemetry_gauge("hgt_action_ranking_pairs", len(epoch_ranking_pairs))
     training_view_builder = getattr(runtime.graph, "training_view", None)
     read_view = (
         training_view_builder(
@@ -956,6 +962,12 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         int(training_epochs),
         min(64, max(1, int(math.ceil(training_examples / 2048.0)))),
     )
+    if epoch_transition_rows:
+        stream_batch_size = max(64, min(2048, int(getattr(config, "hgt_epoch_batch_size", 512))))
+        full_dataset_steps = math.ceil(len(epoch_transition_rows) / stream_batch_size)
+        dynamic_training_steps = max(int(dynamic_training_steps), int(full_dataset_steps))
+        runtime.set_telemetry_gauge("hgt_training_batches", int(full_dataset_steps))
+        runtime.set_telemetry_gauge("hgt_training_coverage", 1.0)
     runtime.set_telemetry_gauge("hgt_dynamic_training_steps", int(dynamic_training_steps))
     runtime.set_telemetry_gauge("hgt_training_examples_current", int(training_examples))
     runtime.set_telemetry_gauge("hgt_examples_per_training_step_target", 2048)
@@ -1202,6 +1214,9 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             "graph_generation": int(read_view.generation),
             "selected_nodes": selected_examples,
             "examples": action_examples,
+            "epoch_dataset_transitions": len(epoch_transition_rows),
+            "action_ranking_pairs": len(epoch_ranking_pairs),
+            "training_coverage": 1.0 if epoch_transition_rows else 0.0,
             "training_examples": training_examples,
             "validation_examples": validation_examples,
             "action_scores": action_scores,
