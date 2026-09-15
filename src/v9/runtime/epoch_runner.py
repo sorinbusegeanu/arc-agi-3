@@ -243,6 +243,7 @@ def _game_level_metrics(rows: list[Any]) -> dict[str, Any]:
         "current_run_solved_games": solved_games,
         "current_run_total_games": total_games,
         "current_run_levels_completed": total_levels,
+        "current_run_levels_solved": total_levels,
         "current_run_best_level_by_game": {
             game_id: int(values["best_level"]) for game_id, values in sorted(by_game.items())
         },
@@ -408,7 +409,9 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             runtime.set_telemetry_gauge("hgt_branch_selection_reason", decision.reason)
             runtime.set_telemetry_gauge("hgt_on_dataset_transitions", int(on_dataset.count))
             runtime.set_telemetry_gauge("hgt_off_dataset_transitions", int(off_dataset.count))
-        runtime.set_telemetry_gauge("hgt_sampled_training_transitions", sum(1 for _ in open(selected_dataset_path, encoding="utf-8")))
+        with open(selected_dataset_path, encoding="utf-8") as training_dataset_handle:
+            sampled_training_transitions = sum(1 for _ in training_dataset_handle)
+        runtime.set_telemetry_gauge("hgt_sampled_training_transitions", sampled_training_transitions)
         runtime.set_telemetry_gauge("hgt_training_dataset_path", str(selected_dataset_path))
         runtime.__dict__["_hgt_training_dataset_path"] = str(selected_dataset_path)
         actor_results.extend(process_results)
@@ -451,8 +454,8 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                     environment_id = row.get("environment_instance_id")
                     if game and environment_id is not None:
                         environment_ids_by_game.setdefault(game, set()).add(int(environment_id))
-        except (OSError, ValueError, TypeError):
-            pass
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError(f"failed to index selected HGT training dataset {selected_dataset_path}: {exc}") from exc
         for game, confidence in confidence_by_game.items():
             for environment_id in environment_ids_by_game.get(game, ()):
                 environment_confidence[int(environment_id)] = float(confidence)
@@ -467,6 +470,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         runtime.set_telemetry_gauge("current_run_solved_games", int(game_level["current_run_solved_games"]))
         runtime.set_telemetry_gauge("current_run_total_games", int(game_level["current_run_total_games"]))
         runtime.set_telemetry_gauge("current_run_levels_completed", int(game_level["current_run_levels_completed"]))
+        runtime.set_telemetry_gauge("current_run_levels_solved", int(game_level["current_run_levels_solved"]))
         runtime.set_telemetry_gauge(
             "current_run_best_level_by_game",
             json.dumps(game_level["current_run_best_level_by_game"], sort_keys=True),
