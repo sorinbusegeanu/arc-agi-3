@@ -1166,7 +1166,7 @@ class ContinuousMemoryRuntime:
 
     def record_transfer_validation(self, concept_uid: MemoryUid, *, target_environment_id: int, target_native_action: int, enabled_metric: float, ablated_metric: float, matched: bool = True, held_out: bool = True, context_scope_id: int = 0) -> None:
         with self._lock:
-                concept = self._m4.get(concept_uid)
+            concept = self._m4.get(concept_uid)
             if concept is None or concept_uid not in self.graph.nodes or concept_uid not in self.graph.payloads:
                 # Transfer trials run concurrently with lifecycle/compaction. A concept
                 # selected for a trial may be retired before the result is recorded.
