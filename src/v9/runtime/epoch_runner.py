@@ -8,6 +8,7 @@ from typing import Any
 
 from v9.hgt import resolve_hgt_behavior_test, train_hgt_epoch
 from v9.hgt.epoch_dataset import EpochTransitionDataset, dataset_path
+from v9.hgt.matched_evaluation import matched_jobs, select_matched_branch
 from v9.memory.m1_normalized import NormalizedChannel
 from v9.telemetry import HGTInferenceSample, OptimizationSample
 from .lifecycle import run_lifecycle_maintenance
@@ -343,40 +344,66 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         jobs = build_epoch_jobs(specs, args, epoch=epoch, previous_game_results=previous_game_results)
         print(f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} sampling start actors={len(jobs)}", flush=True)
         active_model = str(runtime.unified_telemetry.model_version or "untrained")
-        branch = "bootstrap" if active_model in {"None", "untrained", ""} else "hgt_on"
-        epoch_dataset = EpochTransitionDataset(
-            dataset_path(args.root, epoch=epoch, branch=branch),
-            epoch=epoch,
-            branch=branch,
-            model_version=active_model,
-        )
-        try:
-            process_results = run_parallel_memory_jobs(
-                runtime,
-                jobs,
-            actor_limit=args.actors,
-            stage_workers=args.stage_workers,
-            shards=args.shards,
-            queue_capacity=max(args.stage_ring_capacity, args.shard_ring_capacity),
-            epsilon=args.epsilon,
+        is_bootstrap = active_model in {"None", "untrained", ""}
+        common_kwargs = dict(
+            actor_limit=args.actors, stage_workers=args.stage_workers, shards=args.shards,
+            queue_capacity=max(args.stage_ring_capacity, args.shard_ring_capacity), epsilon=args.epsilon,
             stagnation_by_game={game: float(profile.get("stagnation", 0.0)) for game, profile in previous_viability_profiles.items()},
-            env_root=args.env_root,
-            alfred_backend_factory=getattr(args, "alfred_backend_factory", None),
+            env_root=args.env_root, alfred_backend_factory=getattr(args, "alfred_backend_factory", None),
             start_method=runtime.config.multiprocessing_start_method,
-            progress_interval_seconds=args.progress_interval_seconds,
-            ingest_workers=args.ingest_workers,
-            derivation_workers=args.derivation_workers,
-            ingest_queue_capacity=args.ingest_queue_capacity,
+            progress_interval_seconds=args.progress_interval_seconds, ingest_workers=args.ingest_workers,
+            derivation_workers=args.derivation_workers, ingest_queue_capacity=args.ingest_queue_capacity,
             derivation_queue_capacity=args.derivation_queue_capacity,
             publication_queue_capacity=args.publication_queue_capacity,
-            actor_view_refresh_steps=args.actor_view_refresh_steps,
-                actor_view_refresh_ms=args.actor_view_refresh_ms,
-                hgt_dataset=epoch_dataset,
+            actor_view_refresh_steps=args.actor_view_refresh_steps, actor_view_refresh_ms=args.actor_view_refresh_ms,
+        )
+        if is_bootstrap:
+            epoch_dataset = EpochTransitionDataset(dataset_path(args.root, epoch=epoch, branch="bootstrap"), epoch=epoch, branch="bootstrap", model_version=active_model)
+            try:
+                process_results = run_parallel_memory_jobs(runtime, jobs, hgt_dataset=epoch_dataset, **common_kwargs)
+            finally:
+                epoch_dataset.close()
+            selected_dataset_path = epoch_dataset.path
+            runtime.set_telemetry_gauge("hgt_evaluation_branch", "bootstrap")
+        else:
+            on_jobs, off_jobs = matched_jobs(jobs)
+            on_dataset = EpochTransitionDataset(dataset_path(args.root, epoch=epoch, branch="hgt_on"), epoch=epoch, branch="hgt_on", model_version=active_model)
+            try:
+                runtime.set_hgt_enabled(True)
+                on_results = run_parallel_memory_jobs(runtime, on_jobs, hgt_dataset=on_dataset, **common_kwargs)
+            finally:
+                on_dataset.close()
+            # OFF uses the same actor/spec/budget/seed tuples. HGT contribution alone is removed.
+            off_dataset = EpochTransitionDataset(dataset_path(args.root, epoch=epoch, branch="hgt_off"), epoch=epoch, branch="hgt_off", model_version=active_model)
+            try:
+                runtime.set_hgt_enabled(False)
+                off_results = run_parallel_memory_jobs(runtime, off_jobs, hgt_dataset=off_dataset, **common_kwargs)
+            finally:
+                off_dataset.close()
+                runtime.set_hgt_enabled(True)
+            on_scenario, on_success = _scenario_success(on_results, specs)
+            off_scenario, off_success = _scenario_success(off_results, specs)
+            on_game = _game_level_metrics(on_results)
+            off_game = _game_level_metrics(off_results)
+            decision = select_matched_branch(
+                on_success, off_success,
+                on_levels=sum(int(r.levels_completed) for r in on_results),
+                off_levels=sum(int(r.levels_completed) for r in off_results),
+                on_solved_games=int(on_game["current_run_solved_games"]),
+                off_solved_games=int(off_game["current_run_solved_games"]),
             )
-        finally:
-            epoch_dataset.close()
-        runtime.set_telemetry_gauge("hgt_sampled_training_transitions", int(epoch_dataset.count))
-        runtime.set_telemetry_gauge("hgt_training_dataset_path", str(epoch_dataset.path))
+            process_results = on_results if decision.selected_branch == "hgt_on" else off_results
+            selected_dataset_path = on_dataset.path if decision.selected_branch == "hgt_on" else off_dataset.path
+            runtime.set_telemetry_gauge("hgt_on_behavioral_success", float(on_success))
+            runtime.set_telemetry_gauge("hgt_off_behavioral_success", float(off_success))
+            runtime.set_telemetry_gauge("hgt_behavioral_gain", float(decision.gain))
+            runtime.set_telemetry_gauge("hgt_evaluation_branch", decision.selected_branch)
+            runtime.set_telemetry_gauge("hgt_branch_selection_reason", decision.reason)
+            runtime.set_telemetry_gauge("hgt_on_dataset_transitions", int(on_dataset.count))
+            runtime.set_telemetry_gauge("hgt_off_dataset_transitions", int(off_dataset.count))
+        runtime.set_telemetry_gauge("hgt_sampled_training_transitions", sum(1 for _ in open(selected_dataset_path, encoding="utf-8")))
+        runtime.set_telemetry_gauge("hgt_training_dataset_path", str(selected_dataset_path))
+        runtime.__dict__["_hgt_training_dataset_path"] = str(selected_dataset_path)
         actor_results.extend(process_results)
         post_sampling_started = time.perf_counter()
         runtime.wait_quiescent(args.drain_timeout)
