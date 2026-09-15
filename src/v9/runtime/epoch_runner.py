@@ -573,11 +573,11 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             final_score=float(behavioral_success),
             best_score=max(float(baseline_success or 0.0), float(behavioral_success)),
             changed=bool(changed_scenarios),
-            behavior_improved=bool(behavioral_gain > 0.0),
+            behavior_improved=bool((0.0 if is_bootstrap else decision.gain) > 0.0),
             reasoning_cost=float(max(1, training.training_steps)),
             stop_reason=str(training.status),
             candidate_changes=int(changed_scenarios),
-            prediction_improvement=max(0.0, float(behavioral_gain)),
+            prediction_improvement=max(0.0, float(0.0 if is_bootstrap else decision.gain)),
             strategy_changes=int(changed_scenarios),
         )
         prior_scenario_success = dict(previous_scenario_success)
