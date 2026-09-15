@@ -443,7 +443,11 @@ def run_lifecycle_maintenance(
         if len(pending_plans) >= effective_retirement_limit:
             registry.mark_urgent(uid)
             return False
-        if uid in runtime._replay_pool or not _validation_preserved(row, runtime, tolerance=validation_tolerance):
+        authoritative_grounding = any(
+            state.behavior_eligible and (int(key[0]) == int(uid.lo) or int(key[1]) == int(uid.lo))
+            for key, state in getattr(runtime.grounding, "states", {}).items()
+        )
+        if authoritative_grounding or uid in runtime._replay_pool or not _validation_preserved(row, runtime, tolerance=validation_tolerance):
             blocked += 1
             registry.mark_urgent(uid)
             return False
