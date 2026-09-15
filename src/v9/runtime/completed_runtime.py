@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, Iterable
 
 from v9.cognition.grounding import GroundingEvidence, GroundingMaturity
 from v9.memory.identity import MemoryUid
+from v9.memory.m0_episode import M0Episode
+from v9.memory.m1_grounded import GroundedRelation, M1GroundedContingency
 from v9.memory.model import MemoryLevel, MemoryType
 from v9.memory.relations import RelationEdge, RelationType
 from v9.memory.symbolic_relations import derive_symbolic_relations, shuffled_alignment_control
+from v9.modalities.contract import PassiveSymbolEvent
 from v9.mutation.proposals import MutationKind, MutationProposal, MutationWrite, ProposalClass
 from v9.mutation.read_sets import ReadDependency, ReadSet
 from v9.telemetry import build_primary_dashboard
@@ -16,14 +20,11 @@ from .publication import edge_ref
 
 
 class CompletedContinuousMemoryRuntime(_PublicContinuousMemoryRuntime):
-    """v9.7.8 completion layer for symbolic/cross-modal grounding.
+    """v9.7.8 completion layer for symbolic/cross-modal grounding."""
 
-    The existing optimized runtime remains responsible for ordered publication and
-    batching. This layer derives the structural symbolic relations required by the
-    scientific design, creates explicit negative controls, exposes matched
-    validation hooks, and makes validated grounding visible to retrieval and the
-    graph without assigning semantic meaning to symbol identities.
-    """
+    def __init__(self, config: Any) -> None:
+        super().__init__(config)
+        self._direct_symbol_rows: dict[tuple[int, int], list[Any]] = {}
 
     def _previous_interactions(self, prepared_rows: tuple[Any, ...]) -> dict[tuple[int, int], Any]:
         previous: dict[tuple[int, int], Any] = {}
@@ -36,11 +37,7 @@ class CompletedContinuousMemoryRuntime(_PublicContinuousMemoryRuntime):
                 previous[key] = self._latest_interaction_grounding.get(key)
         return previous
 
-    def _derive_prepared_symbolic_relations(
-        self,
-        prepared: Any,
-        previous_interaction: Any,
-    ) -> tuple[int, ...]:
+    def _derive_prepared_symbolic_relations(self, prepared: Any, previous_interaction: Any) -> tuple[int, ...]:
         rows = tuple(getattr(prepared, "symbols", ()) or ())
         if not rows:
             return ()
@@ -56,28 +53,12 @@ class CompletedContinuousMemoryRuntime(_PublicContinuousMemoryRuntime):
                 causal_watermark=watermark,
             )
         )
-        # Every aligned example gets a causally timestamped shuffled negative.
-        # The negative is training/control evidence only and never promotes
-        # behavioral grounding.
         if current is not None and len(rows) >= 2:
-            shuffled = tuple(reversed(rows))
-            for row in shuffled:
-                derived.append(
-                    shuffled_alignment_control(
-                        row,
-                        current,
-                        causal_watermark=watermark,
-                    )
-                )
+            for row in reversed(rows):
+                derived.append(shuffled_alignment_control(row, current, causal_watermark=watermark))
         signatures: list[int] = []
         for item in derived:
-            signatures.append(
-                self._record_normalized(
-                    item.relation,
-                    defer_publication=True,
-                    payload_extra=item.payload(),
-                )
-            )
+            signatures.append(self._record_normalized(item.relation, defer_publication=True, payload_extra=item.payload()))
         return tuple(signatures)
 
     def apply_prepared_ingestion_batch(self, rows: Iterable[Any]) -> tuple[tuple[int, ...], ...]:
@@ -96,22 +77,78 @@ class CompletedContinuousMemoryRuntime(_PublicContinuousMemoryRuntime):
         return tuple(completed)
 
     def apply_prepared_ingestion(self, prepared: Any) -> tuple[int, ...]:
-        # Route single-row ingestion through the same complete implementation so
-        # passive/symbols-only rows and batched rows have identical semantics.
         rows = self.apply_prepared_ingestion_batch((prepared,))
         return rows[0] if rows else ()
+
+    def _ingest(self, event: Any) -> tuple[int, ...]:
+        if not isinstance(event, PassiveSymbolEvent):
+            return super()._ingest(event)
+        key = (int(event.identity.environment_instance_id), int(event.identity.episode_id.value))
+        latest_interaction = self._latest_interaction_grounding.get(key)
+        signatures = list(super()._ingest(event))
+        m0 = M0Episode.from_event(event, context_signature=0, payload_digest=self._payload_digest(event))
+        m1g = M1GroundedContingency.build(GroundedRelation.SYMBOL_OCCURRED, (m0,))
+        current = SimpleNamespace(m0=m0, m1g=m1g, event=event)
+        history = self._direct_symbol_rows.setdefault(key, [])
+        relation_rows = tuple(history[-1:] + [current])
+        transition = SimpleNamespace(
+            before_signature=0,
+            after_signature=0,
+            boundary_scope="NONE",
+            task_success=False,
+            task_failure=False,
+            task_truncated=False,
+            levels_completed=0,
+            primary_valence=0,
+        )
+        for item in derive_symbolic_relations(
+            relation_rows,
+            interaction_grounding=None,
+            previous_interaction_grounding=latest_interaction,
+            transition=transition,
+            causal_watermark=int(event.identity.causal_watermark),
+        ):
+            signatures.append(self._record_normalized(item.relation, payload_extra=item.payload()))
+        history.append(current)
+        del history[:-8]
+        return tuple(signatures)
+
+    def apply_derivation_results_batch(self, results: Iterable[Any]) -> None:
+        result_rows = tuple(results)
+        super().apply_derivation_results_batch(result_rows)
+        with self._lock:
+            for result in result_rows:
+                family = result.family
+                payload = self.graph.payloads.get(family.uid)
+                if payload is not None:
+                    payload["modality_support"] = [list(row) for row in family.modality_support]
+                    payload["support_decomposition"] = [list(row) for row in family.support_decomposition]
+                for role in result.roles:
+                    role_payload = self.graph.payloads.get(role.uid)
+                    if role_payload is not None:
+                        role_payload["support_decomposition"] = [list(row) for row in role.support_decomposition]
+
+    def _develop(self, signatures: tuple[int, ...] = ()) -> None:
+        super()._develop(signatures)
+        with self._lock:
+            wanted = {int(value) for value in signatures}
+            for family in self._m2.values():
+                if wanted and int(family.structural_signature) not in wanted:
+                    continue
+                payload = self.graph.payloads.get(family.uid)
+                if payload is not None:
+                    payload["modality_support"] = [list(row) for row in family.modality_support]
+                    payload["support_decomposition"] = [list(row) for row in family.support_decomposition]
+            for role in self._m3.values():
+                payload = self.graph.payloads.get(role.uid)
+                if payload is not None:
+                    payload["support_decomposition"] = [list(row) for row in role.support_decomposition]
 
     def _uid_by_low(self, low: int) -> MemoryUid | None:
         candidates = [uid for uid in self.graph.nodes if int(uid.lo) == int(low)]
         return min(candidates) if candidates else None
 
-    def _publish_validated_grounding_edge(
-        self,
-        symbol_structure_uid: int,
-        interaction_structure_uid: int,
-        *,
-        heldout: bool,
-    ) -> bool:
+    def _publish_validated_grounding_edge(self, symbol_structure_uid: int, interaction_structure_uid: int, *, heldout: bool) -> bool:
         symbol_uid = self._uid_by_low(symbol_structure_uid)
         interaction_uid = self._uid_by_low(interaction_structure_uid)
         if symbol_uid is None or interaction_uid is None:
@@ -122,10 +159,7 @@ class CompletedContinuousMemoryRuntime(_PublicContinuousMemoryRuntime):
         proposal = MutationProposal.build(
             MutationKind.UPSERT_EDGE,
             target_partitions=tuple(sorted({self.partitions.owner(symbol_uid), self.partitions.owner(interaction_uid)})),
-            read_set=ReadSet.build(
-                (ReadDependency(ref, self.graph.versions.get(ref)),),
-                maximum_size=self.config.scientific.maximum_read_set_size,
-            ),
+            read_set=ReadSet.build((ReadDependency(ref, self.graph.versions.get(ref)),), maximum_size=self.config.scientific.maximum_read_set_size),
             evidence_refs=(symbol_uid, interaction_uid),
             causal_watermark=self._watermark,
             writes=(MutationWrite(edge=edge),),
@@ -147,26 +181,15 @@ class CompletedContinuousMemoryRuntime(_PublicContinuousMemoryRuntime):
         context_scope_id: int = 0,
         lineage_uid: int = 0,
     ):
-        """Record prospective/held-out/compositional grounding evidence.
-
-        `validation_kind` is one of prediction, generalization, heldout_transfer,
-        composition, or symbol_mediated_learning. Negative effects become explicit
-        contradiction evidence and suspend behavioral authority when warranted.
-        """
         allowed = {"prediction", "generalization", "heldout_transfer", "composition", "symbol_mediated_learning"}
         if validation_kind not in allowed:
             raise ValueError(f"unsupported symbolic validation kind: {validation_kind}")
         positive = float(effect) > 0.0
         evidence = GroundingEvidence(
-            int(symbol_structure_uid),
-            int(interaction_structure_uid),
-            int(environment_instance_id),
-            int(context_scope_id),
-            int(lineage_uid),
-            int(self._watermark),
+            int(symbol_structure_uid), int(interaction_structure_uid), int(environment_instance_id), int(context_scope_id), int(lineage_uid), int(self._watermark),
             recurrent_symbol=True,
             cross_modal_association=True,
-            prospective_prediction=validation_kind in {"prediction", "generalization", "heldout_transfer", "composition", "symbol_mediated_learning"},
+            prospective_prediction=True,
             heldout_transfer=validation_kind in {"heldout_transfer", "composition", "symbol_mediated_learning"},
             novel_composition=validation_kind == "composition",
             symbol_mediated_learning=validation_kind == "symbol_mediated_learning",
@@ -176,20 +199,16 @@ class CompletedContinuousMemoryRuntime(_PublicContinuousMemoryRuntime):
             positive=positive,
         )
         with self._lock:
-            before = self.grounding.states.get((int(symbol_structure_uid), int(interaction_structure_uid), int(environment_instance_id), int(context_scope_id), int(lineage_uid)))
+            key = (int(symbol_structure_uid), int(interaction_structure_uid), int(environment_instance_id), int(context_scope_id), int(lineage_uid))
+            before = self.grounding.states.get(key)
             state = self.grounding.observe(evidence)
             if before is None or int(state.maturity) > int(before.maturity):
                 self.telemetry["grounding_promotions"] += 1
             if state.suspended and (before is None or not before.suspended):
                 self.telemetry["grounding_suspensions"] += 1
             if state.behavior_eligible and positive:
-                self._publish_validated_grounding_edge(
-                    symbol_structure_uid,
-                    interaction_structure_uid,
-                    heldout=validation_kind in {"heldout_transfer", "composition", "symbol_mediated_learning"},
-                )
-                # Publish GROUNDS as the behavioral edge once the relation reaches
-                # prospective maturity, even if the validating trial was held out.
+                if validation_kind in {"heldout_transfer", "composition", "symbol_mediated_learning"}:
+                    self._publish_validated_grounding_edge(symbol_structure_uid, interaction_structure_uid, heldout=True)
                 self._publish_validated_grounding_edge(symbol_structure_uid, interaction_structure_uid, heldout=False)
             self.evidence.append(
                 "SYMBOLIC_GROUNDING_VALIDATION",
@@ -213,17 +232,12 @@ class CompletedContinuousMemoryRuntime(_PublicContinuousMemoryRuntime):
 
     def retrieve_structural_candidates(self, keys, *, limit: int | None = None):
         rows = tuple(super().retrieve_structural_candidates(keys, limit=limit))
-        grounded = {
-            value
-            for key, state in self.grounding.eligible_states()
-            for value in (int(key[0]), int(key[1]))
-            if state.behavior_eligible
-        }
+        grounded = {value for key, state in self.grounding.eligible_states() for value in (int(key[0]), int(key[1])) if state.behavior_eligible}
         return tuple(sorted(rows, key=lambda uid: (int(uid.lo) not in grounded, uid)))
 
     def metrics(self) -> dict[str, Any]:
         result = dict(super().metrics())
-        symbol_nodes = []
+        symbol_nodes: list[MemoryUid] = []
         symbol_m1n = 0
         cross_modal = 0
         windows: set[tuple[int, int, int]] = set()
@@ -242,22 +256,19 @@ class CompletedContinuousMemoryRuntime(_PublicContinuousMemoryRuntime):
                 cross_modal += int(channel == "CROSS_MODAL")
         transfer_trials = sum(len(state.validation_trial_ids) for state in self.grounding.states.values() if state.maturity >= GroundingMaturity.G3)
         compositions = sum(int(state.maturity >= GroundingMaturity.G4 and state.behavior_eligible) for state in self.grounding.states.values())
-        result.update(
-            {
-                "symbol_occurrences": len(symbol_nodes),
-                "unique_symbols": len(unique_symbols),
-                "symbol_windows": len(windows),
-                "symbolic_M0_count": len(symbol_nodes),
-                "symbolic_M1N_count": symbol_m1n,
-                "cross_modal_correspondences": cross_modal,
-                "symbol_transfer_trials": transfer_trials,
-                "symbol_composition_successes": compositions,
-            }
-        )
+        result.update({
+            "symbol_occurrences": len(symbol_nodes),
+            "unique_symbols": len(unique_symbols),
+            "symbol_windows": len(windows),
+            "symbolic_M0_count": len(symbol_nodes),
+            "symbolic_M1N_count": symbol_m1n,
+            "cross_modal_correspondences": cross_modal,
+            "symbol_transfer_trials": transfer_trials,
+            "symbol_composition_successes": compositions,
+        })
         diagnostic = dict(self.unified_telemetry.diagnostic_metrics())
         result["primary_dashboard"] = build_primary_dashboard(result, diagnostic)
         return result
 
     def dashboard_metrics(self) -> dict[str, Any]:
-        # Symbolic metrics are scientific evidence and must not be stale zeros.
         return self.metrics()
