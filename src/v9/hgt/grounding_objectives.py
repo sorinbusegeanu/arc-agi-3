@@ -54,3 +54,6 @@ def publish_objective_metrics(runtime: object, rows: Iterable[GroundingObjective
     for key, value in metrics.items():
         setter(key, value)
     return metrics
+
+
+def validate_objective_evidence(rows: Iterable[GroundingObjectiveEvidence]) -> dict[str, int]:\n    rows = tuple(rows)\n    counts = {name: [0, 0] for name in GROUNDING_OBJECTIVES}\n    controls: set[str] = set()\n    for row in rows:\n        counts[row.objective][int(float(row.target) >= 0.5)] += 1\n        controls.add(str(row.control))\n    for objective, (negative, positive) in counts.items():\n        if negative + positive and (negative == 0 or positive == 0):\n            raise ValueError(f"{objective} requires positive and negative evidence")\n    return {"examples": len(rows), "positive_examples": sum(v[1] for v in counts.values()), "negative_examples": sum(v[0] for v in counts.values()), "control_groups": len(controls)}\n

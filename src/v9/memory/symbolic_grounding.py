@@ -27,7 +27,7 @@ class SymbolicRelation:
     SYMBOL_NEAR_BOUNDARY = "SYMBOL_NEAR_BOUNDARY"
     SYMBOL_COINCIDENT_WITH_PROGRESS = "SYMBOL_COINCIDENT_WITH_PROGRESS"
     SYMBOL_COINCIDENT_WITH_OUTCOME = "SYMBOL_COINCIDENT_WITH_OUTCOME"
-    CROSS_MODAL_CORRESPONDENCE = "CROSS_MODAL_CORRESPONDENCE"
+    CROSS_MODAL_CORRESPONDENCE = "CROSS_MODAL_CORRESPONDENCE"\n    SYMBOL_INTERACTION_ALIGNMENT = "SYMBOL_INTERACTION_ALIGNMENT"\n    SYMBOL_TO_INTERACTION_PREDICTION = "SYMBOL_TO_INTERACTION_PREDICTION"\n    INTERACTION_TO_SYMBOL_GENERALIZATION = "INTERACTION_TO_SYMBOL_GENERALIZATION"\n    CROSS_MODAL_HELDOUT_TRANSFER = "CROSS_MODAL_HELDOUT_TRANSFER"\n    CROSS_MODAL_COMPOSITION = "CROSS_MODAL_COMPOSITION"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,7 +40,7 @@ class GroundingEvidence:
     validation_trial_ids: tuple[str, ...] = ()
     heldout_transfer: bool = False
     novel_composition: bool = False
-    symbol_mediated_learning: bool = False
+    symbol_mediated_learning: bool = False\n    interaction_only_support: float = 0.0\n    symbol_only_support: float = 0.0\n    aligned_cross_modal_support: float = 0.0\n    heldout_transfer_support: float = 0.0\n    causal_watermark: int = 0\n    temporal_offsets: tuple[int, ...] = ()\n\n    @property\n    def support_decomposition(self) -> dict[str, float]:\n        return {"interaction_only": float(self.interaction_only_support), "symbol_only": float(self.symbol_only_support), "aligned_cross_modal": float(self.aligned_cross_modal_support), "heldout_transfer": float(self.heldout_transfer_support)}
 
     @property
     def maturity(self) -> GroundingMaturity:
