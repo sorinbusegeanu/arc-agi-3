@@ -169,8 +169,13 @@ class ContinuousMemoryRuntime:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return
-        version = manifest.get("current_model_version")
-        checkpoint_rel = manifest.get("current_checkpoint")
+        pending = manifest.get("candidate_status") == "TESTING_PENDING_BEHAVIOR" and manifest.get("candidate_model_version")
+        version = manifest.get("candidate_model_version") if pending else (manifest.get("last_accepted_model_version") or manifest.get("current_model_version"))
+        checkpoint_rel = (
+            manifest.get("current_checkpoint")
+            if pending
+            else (manifest.get("accepted_checkpoint") or manifest.get("current_checkpoint"))
+        )
         if not version or not checkpoint_rel:
             return
         checkpoint_path = self.root / str(checkpoint_rel)
@@ -194,6 +199,7 @@ class ContinuousMemoryRuntime:
         }
         self.set_hgt_action_scores(action_scores, context_action_scores=context_scores)
         self.unified_telemetry.model_version = str(version)
+        self.set_telemetry_gauge("hgt_pending_behavior_evaluation", bool(pending))
         self.set_telemetry_gauge("hgt_restored_on_startup", 1)
         self.set_telemetry_gauge("hgt_restored_model", str(version))
 
