@@ -51,6 +51,8 @@ def build_primary_dashboard(runtime_metrics: dict[str, Any], diagnostic: dict[st
     reasoning_cycles = int(diagnostic.get("reasoning_cycles", 0))
     initial_sum = float(diagnostic.get("initial_candidate_score", 0.0))
     best_sum = float(diagnostic.get("best_candidate_score", 0.0))
+    hgt_samples = int(diagnostic.get("hgt_inference_samples", 0))
+    training_reports = int(diagnostic.get("hgt_training_reports", 0))
     dashboard = {
         "success_rate": float(runtime_metrics.get("success_rate", 0.0)),
         "behavioral_success_rate": float(diagnostic.get("behavioral_success_rate", 0.0)),
@@ -69,18 +71,18 @@ def build_primary_dashboard(runtime_metrics: dict[str, Any], diagnostic: dict[st
         "compression_ratio": float(runtime_metrics.get("compression_ratio", 0.0)),
         "prediction_error": float(runtime_metrics.get("prediction_error", 0.0)),
         "cross_family_transfer": float(runtime_metrics.get("cross_family_transfer", 0.0)),
-        "false_transfer_rate": (false_transfers / transfer_scopes) if transfer_scopes else 0.0,
-        "reasoning_cycles": (reasoning_cycles / deliberation_decisions) if deliberation_decisions else 0.0,
-        "final_vs_initial_candidate_improvement": ((best_sum - initial_sum) / deliberation_decisions) if deliberation_decisions else 0.0,
-        "deliberation_behavior_improvement": float(diagnostic.get("changed_decisions_with_better_outcome_rate", 0.0)),
-        "HGT_consequence_error": float(diagnostic.get("hgt_consequence_error", 0.0)),
-        "HGT_strategy_ranking_accuracy": float(diagnostic.get("hgt_strategy_ranking_accuracy", 0.0)),
-        "HGT_candidate_refinement_success": float(diagnostic.get("hgt_candidate_refinement_success", 0.0)),
-        "HGT_training_loss": float(diagnostic.get("hgt_training_loss", 0.0)),
-        "HGT_validation_loss": float(diagnostic.get("hgt_validation_loss", 0.0)),
-        "historical_retention": float(diagnostic.get("historical_retention", 0.0)),
-        "current_curriculum_gain": float(diagnostic.get("current_curriculum_gain", 0.0)),
-        "cross_family_validation_gain": float(diagnostic.get("cross_family_validation_gain", 0.0)),
+        "false_transfer_rate": (false_transfers / transfer_scopes) if transfer_scopes else None,
+        "reasoning_cycles": (reasoning_cycles / deliberation_decisions) if deliberation_decisions else None,
+        "final_vs_initial_candidate_improvement": ((best_sum - initial_sum) / deliberation_decisions) if deliberation_decisions else None,
+        "deliberation_behavior_improvement": float(diagnostic.get("changed_decisions_with_better_outcome_rate", 0.0)) if deliberation_decisions else None,
+        "HGT_consequence_error": float(diagnostic.get("hgt_consequence_error", 0.0)) if hgt_samples else None,
+        "HGT_strategy_ranking_accuracy": float(diagnostic.get("hgt_strategy_ranking_accuracy", 0.0)) if hgt_samples else None,
+        "HGT_candidate_refinement_success": float(diagnostic.get("hgt_candidate_refinement_success", 0.0)) if hgt_samples else None,
+        "HGT_training_loss": float(diagnostic.get("hgt_training_loss", 0.0)) if training_reports else None,
+        "HGT_validation_loss": float(diagnostic.get("hgt_validation_loss", 0.0)) if training_reports else None,
+        "historical_retention": float(diagnostic.get("historical_retention", 0.0)) if training_reports else None,
+        "current_curriculum_gain": float(diagnostic.get("current_curriculum_gain", 0.0)) if training_reports else None,
+        "cross_family_validation_gain": float(diagnostic.get("cross_family_validation_gain", 0.0)) if training_reports else None,
         "ModelVersion": str(diagnostic.get("model_version", "untrained")),
         "GPU_memory_GB": round(float(diagnostic.get("gpu_memory_current_bytes", diagnostic.get("gpu_memory_bytes", 0))) / (1024.0 ** 3), 2),
         "inference_latency": float(diagnostic.get("inference_latency_ms", 0.0)),
