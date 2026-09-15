@@ -1136,7 +1136,7 @@ class ContinuousMemoryRuntime:
                     "symbol_identity": symbol_m0.symbol_identity,
                 }
                 self._defer_base_group(((symbol_m0_node, symbol_payload, (symbol_m0.uid,)), (symbol_m1g_node, symbol_m1g_payload, (symbol_m0.uid,))))
-                self._record_normalized(symbol_row.m1n, defer_publication=True, payload_extra={"symbol_identity": symbol_m0.symbol_identity})
+                self._record_normalized(symbol_row.m1n, defer_publication=True, payload_extra={"symbol_identity": symbol_m0.symbol_identity, "symbol_relations": ["SYMBOL_PRECEDES_ACTION", "SYMBOL_PRECEDES_NORMALIZED_CHANGE", "SYMBOL_NEAR_BOUNDARY" if bool(transition.done) else "SYMBOL_COINCIDENT_WITH_PROGRESS", "SYMBOL_COINCIDENT_WITH_OUTCOME" if int(transition.primary_valence) != 0 else "SYMBOL_COINCIDENT_WITH_PROGRESS"], "temporal_offsets": [0], "causal_watermark": int(symbol_event.identity.causal_watermark), "support": 1.0, "contradiction": 0.0})
                 if symbol_row.aligned_m1n is None:
                     continue
                 self._record_normalized(symbol_row.aligned_m1n, defer_publication=True, payload_extra={"symbol_identity": symbol_m0.symbol_identity, "aligned_interaction_uid": [m1g.uid.hi, m1g.uid.lo]})
