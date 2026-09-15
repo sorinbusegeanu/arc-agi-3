@@ -100,7 +100,7 @@ def test_step1_continuous_run_executes_curriculum(tmp_path) -> None:
 def test_broad_preset_spans_all_runnable_language_and_symbolic_families() -> None:
     selection = resolve_curriculum_selector("broad")
     assert selection is not None
-    assert len(selection.specs) == 110
+    assert len(selection.specs) == 111
     assert {spec.adapter for spec in selection.specs} == {
         "synthetic_causal",
         "synthetic_symbolic",
