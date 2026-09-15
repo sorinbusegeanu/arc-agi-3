@@ -13,6 +13,13 @@ import v9.runtime as _runtime_package
 ContinuousMemoryRuntime = CompletedContinuousMemoryRuntime
 _runtime_package.ContinuousMemoryRuntime = CompletedContinuousMemoryRuntime
 
+# HGT uses canonical SymbolOccurrence payloads as the only SYMBOL authority.
+# Legacy semantic tuples are filtered before graph construction and CONTEXT plus
+# explicit symbol temporal/co-occurrence relations are added to the HGT graph.
+from v9.hgt import training as _hgt_training
+from v9.hgt.canonical_symbol_graph import install as _install_canonical_symbol_graph
+_install_canonical_symbol_graph(_hgt_training)
+
 __all__ = [
     "ContinuousMemoryRuntime",
     "EnvironmentCognitionAdapter",
