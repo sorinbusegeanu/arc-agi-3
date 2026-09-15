@@ -297,6 +297,30 @@ class ContinuousMemoryRuntime:
                 self._hgt_context_action_scores = {}
             self._actor_policy_generation += 1
 
+    def record_strategy_execution(self, strategy_uid: MemoryUid, *, success: bool, realized_cost: int, primary_valence: int = 0) -> None:
+        with self._lock:
+            strategy = self.__dict__.setdefault("_m7", {}).get(strategy_uid)
+            node = self.graph.nodes.get(strategy_uid)
+            payload = self.graph.payloads.get(strategy_uid)
+            if strategy is None or node is None or payload is None:
+                return
+            updated = strategy.observe(success=bool(success), realized_cost=max(1, int(realized_cost)), primary_valence=int(primary_valence))
+            self._m7[strategy_uid] = updated
+            self._publish(
+                node,
+                {
+                    **payload,
+                    "reliability_successes": updated.reliability_successes,
+                    "reliability_trials": updated.reliability_trials,
+                    "primary_valence_sum": updated.primary_valence_sum,
+                    "realized_cost_sum": updated.realized_cost_sum,
+                },
+                updated.provenance.evidence,
+                proposal_class=ProposalClass.STATEFUL,
+                mutation_kind=MutationKind.UPDATE_VALIDATION,
+            )
+            self.evidence.append("M7_STRATEGY_EXECUTION", self._watermark, {"strategy_uid": strategy_uid.hex(), "success": bool(success), "realized_cost": int(realized_cost), "primary_valence": int(primary_valence)})
+
     def hgt_action_scores(self, environment_id: int, actions: tuple[int, ...]) -> dict[int, float]:
         with self._lock:
             source = self._hgt_action_scores.get(int(environment_id), {})
