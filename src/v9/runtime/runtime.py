@@ -52,7 +52,7 @@ from v9.telemetry import (
     build_primary_dashboard,
 )
 
-from .actor_policy import ActorPolicySnapshot, ActorStrategyPolicy
+from .actor_policy import ActorPolicySnapshot, ActorStrategyPolicy, ActorOutcomePolicy
 from .config import RuntimeConfig, write_scientific_config_manifest
 from .lifecycle import LifecycleRegistry
 from .partitions import PartitionMap
@@ -337,6 +337,15 @@ class ContinuousMemoryRuntime:
                 return
             updated = strategy.observe(success=bool(success), realized_cost=max(1, int(realized_cost)), primary_valence=int(primary_valence))
             self._m7[strategy_uid] = updated
+            outcome = self._m6.get(strategy.target_outcome)
+            if outcome is not None:
+                self._m6[outcome.uid] = replace(
+                    outcome,
+                    equivalence_trials=outcome.equivalence_trials + 1,
+                    equivalence_successes=outcome.equivalence_successes + int(bool(success)),
+                    primary_valence_sum=outcome.primary_valence_sum + int(primary_valence),
+                    preference_trials=outcome.preference_trials + 1,
+                )
             self._publish(
                 node,
                 {
@@ -420,6 +429,18 @@ class ContinuousMemoryRuntime:
                 environment: tuple(sorted(rows, key=lambda row: (-row.reliability, -row.primary_valence, float("inf") if row.expected_cost is None else row.expected_cost, row.strategy_uid))[:64])
                 for environment, rows in strategies_by_environment.items()
             }
+            outcomes_by_environment: dict[int, list[ActorOutcomePolicy]] = {}
+            for environment, rows in published_strategies.items():
+                seen: set[MemoryUid] = set()
+                for row in rows:
+                    outcome = self._m6.get(row.target_outcome_uid)
+                    if outcome is None or outcome.uid in seen:
+                        continue
+                    seen.add(outcome.uid)
+                    outcomes_by_environment.setdefault(environment, []).append(
+                        ActorOutcomePolicy(outcome.uid, environment, outcome.equivalence_confidence, outcome.mean_primary_valence)
+                    )
+            published_outcomes = {environment: tuple(rows) for environment, rows in outcomes_by_environment.items()}
             return ActorPolicySnapshot.build(
                 generation=max(self.graph.generation, self._actor_policy_generation),
                 normalized_action_supports=self._actor_action_supports,
@@ -430,6 +451,7 @@ class ContinuousMemoryRuntime:
                 grounded_action_scores_by_type=grounded_scores,
                 model_version=self.unified_telemetry.model_version,
                 strategies_by_environment=published_strategies,
+                outcomes_by_environment=published_outcomes,
             )
 
     def start(self) -> None:
@@ -568,9 +590,12 @@ class ContinuousMemoryRuntime:
             structural_abstractions=len(self._m3),
             held_out_transfer_successes=sum(bool(row.validated) for row in self._m4.values()),
             mature_consequences=sum(bool(self.graph.payloads[uid].get("mature")) for uid in self.graph.uids_at_level(MemoryLevel.M5)),
-            outcome_equivalences=self.graph.memory_count(MemoryLevel.M6),
-            learned_preferences=sum(int(row.get("primary_valence_sum", 0)) != 0 for row in strategies),
-            alternative_strategies=max(0, len(strategies) - 1),
+            outcome_equivalences=sum(row.equivalence_trials >= 2 and row.equivalence_confidence > 0.5 for row in self._m6.values()),
+            learned_preferences=sum(row.preference_trials >= 2 and row.mean_primary_valence != 0.0 for row in self._m6.values()),
+            alternative_strategies=sum(
+                len({strategy.native_actions for strategy in self._m7.values() if strategy.target_outcome == outcome.uid}) >= 2
+                for outcome in self._m6.values()
+            ),
             demonstrated_replans=self._replans_demonstrated,
             efficient_replans=self._efficient_replans,
         )
@@ -1674,6 +1699,9 @@ class ContinuousMemoryRuntime:
         strategy_successes = sum(int(row.get("reliability_successes", 0)) for row in strategy_payloads)
         realized_cost_total = sum(float(row.get("realized_cost_sum", 0.0)) for row in strategy_payloads)
         failed_transfer_scopes = sum(getattr(row.state, "name", str(row.state)) == "FAILED" for row in self.transfer_trust.records.values())
+        multi_strategy_outcomes = sum(len({s.native_actions for s in self._m7.values() if s.target_outcome == o.uid}) >= 2 for o in self._m6.values())
+        equivalence_confidences = [o.equivalence_confidence for o in self._m6.values()]
+        preference_outcomes = [o for o in self._m6.values() if o.preference_trials > 0]
         validated_m4 = sum(bool(row.validated) for row in self._m4.values())
         diagnostic = self.unified_telemetry.diagnostic_metrics()
         retired = int(diagnostic.get("hydra_nodes_retired", 0))
@@ -1710,6 +1738,12 @@ class ContinuousMemoryRuntime:
             "probation_records": sum(row.state.name == "PROBATION" for row in self.lifecycle.records.values()),
             "probation_transitions": self.lifecycle.transitions,
             "developmental_stage": int(self.stage_tracker.stage),
+            "m6_equivalence_confidence": sum(equivalence_confidences) / max(1, len(equivalence_confidences)),
+            "m6_preference_relations": len(preference_outcomes),
+            "m7_multi_strategy_outcomes": multi_strategy_outcomes,
+            "m7_replan_attempts": self._replans_demonstrated,
+            "m7_replan_successes": self._efficient_replans,
+            "m7_replanning_recovery_rate": self._efficient_replans / max(1, self._replans_demonstrated),
             "developmental_intervals": self.stage_tracker.interval_id,
             "isf_decisions_hot": len(self.isf.decisions),
             "replay": self.replay.state_dict(),
