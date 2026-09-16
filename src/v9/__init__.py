@@ -6,6 +6,7 @@ from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig,
 from v9.runtime.multiprocess import EncodedTransition
 from v9.runtime.residency import install_bounded_residency
 from v9.runtime.reset_memory import install_reset_memory
+from v9.runtime.runtime import ContinuousMemoryRuntime as _ReferenceContinuousMemoryRuntime
 
 # v9.7.9 exposes a full-metrics alias for residency diagnostics while preserving
 # the existing metrics() API used by the runtime and dashboard.
@@ -20,6 +21,23 @@ if not hasattr(EncodedTransition, "done"):
     EncodedTransition.done = property(
         lambda self: bool(self.task_success or self.task_failure or self.task_truncated)
     )
+
+# The reference ingestion path already applies passive symbols. Keep the
+# optimized public single-event entry point mutation-equivalent to the true
+# batch path without applying the same symbol evidence a second time.
+_single_ingest = ContinuousMemoryRuntime.apply_prepared_ingestion
+if not getattr(_single_ingest, "_v979_symbol_once", False):
+    def _v979_single_ingest(self, prepared):
+        result = tuple(_ReferenceContinuousMemoryRuntime.apply_prepared_ingestion(self, prepared))
+        extra = []
+        for row in getattr(prepared, "symbols", ()):
+            extra.append(int(row.m1n.structural_signature))
+            if row.aligned_m1n is not None:
+                extra.append(int(row.aligned_m1n.structural_signature))
+        return result + tuple(extra)
+
+    _v979_single_ingest._v979_symbol_once = True
+    ContinuousMemoryRuntime.apply_prepared_ingestion = _v979_single_ingest
 
 # Keep the reference prepared-batch path telemetry-equivalent to the optimized
 # canonical commit path for passive symbolic observations.
