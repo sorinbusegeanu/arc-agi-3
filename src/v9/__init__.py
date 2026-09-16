@@ -34,6 +34,12 @@ install_viability_confidence(ContinuousMemoryRuntime)
 install_actor_policy_cache(ContinuousMemoryRuntime)
 _runtime_package.ContinuousMemoryRuntime = ContinuousMemoryRuntime
 
+# --actors is sampler-process parallelism, not merely a cap on one-job-per-game
+# scheduling. Split per-game budgets when fewer jobs than actor slots exist.
+from v9.runtime import parallel_memory_coordinator_v2 as _parallel_memory_coordinator_v2
+from v9.runtime.actor_job_parallelism import install_actor_job_parallelism as _install_actor_job_parallelism
+_install_actor_job_parallelism(_parallel_memory_coordinator_v2)
+
 # Terminal status is derived from the three authoritative boundary fields.
 if not hasattr(EncodedTransition, "done"):
     EncodedTransition.done = property(
