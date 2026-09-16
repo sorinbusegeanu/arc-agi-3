@@ -76,6 +76,7 @@ class _Runtime:
         self._latest_interaction_grounding = {}
         self.unified_telemetry = SimpleNamespace(gauges={})
         self.transfer_trust = SimpleNamespace(records={})
+        self.grounding = SimpleNamespace(states={})
         self.telemetry = {"symbol_conditioned_prediction_observations": 0}
         self._symbol_prediction_delta_sum = 0.0
         self.consolidation = []
@@ -131,7 +132,7 @@ def test_low_pressure_dormancy_does_not_physically_compact() -> None:
     assert episode.uid in graph.nodes
 
 
-def test_dependency_safe_retirement_preserves_representative_and_tombstone() -> None:
+def test_dependency_safe_retirement_physically_deletes_redundant_episode() -> None:
     graph, episode, witness, abstraction = _covered_episode_graph(pressure=True)
     lifecycle = LifecycleRegistry()
     lifecycle.observe(episode.uid, support_delta=1, relevant_opportunity=True, watermark=1)
@@ -155,13 +156,13 @@ def test_dependency_safe_retirement_preserves_representative_and_tombstone() -> 
     assert episode.uid not in graph.nodes
     assert episode.uid not in lifecycle.records
     assert witness.uid in graph.nodes
-    assert episode.uid in graph.retired_tombstones
-    assert graph.retired_tombstones[episode.uid].replacement_uid == abstraction.uid
+    assert episode.uid not in graph.retired_tombstones
     assert not any(edge.source == episode.uid or edge.target == episode.uid for edge in graph.edges.values())
     assert graph.provenance_replacement(witness.uid) == abstraction.uid
 
     restored = CanonicalGraph.from_state_dict(graph.state_dict())
-    assert restored.retired_tombstones[episode.uid].replacement_uid == abstraction.uid
+    assert episode.uid not in restored.nodes
+    assert episode.uid not in restored.retired_tombstones
     assert restored.provenance_replacement(witness.uid) == abstraction.uid
 
 
