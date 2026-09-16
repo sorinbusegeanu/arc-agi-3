@@ -24,7 +24,7 @@ class ScientificConfigId:
 class ScientificConfig:
     schema_version: int = 2
     research_contract_version: str = "0.7.0"
-    design_version: str = "9.7.8"
+    design_version: str = "9.7.9"
     random_seeds: tuple[int, ...] = (0,)
 
     # Symbolic-grounding scientific identity and bounded ingestion contract.
@@ -119,6 +119,22 @@ class ScientificConfig:
     hgt_examples_per_train_trigger: int = 5000
     hgt_training_duty_cycle: float = 0.50
     hgt_target_inference_latency_ms: float = 50.0
+
+    # v9.7.9 bounded resident-memory contract.
+    resident_m0_limit: int = 250_000
+    resident_m1_grounded_limit: int = 250_000
+    resident_low_level_target_ratio: float = 0.85
+    resident_compaction_check_interval: int = 25_000
+    resident_m0_representative_floor: int = 8
+    resident_m1_grounded_representative_floor: int = 2
+    resident_max_delete_batch: int = 262_144
+    resident_max_scan_batch: int = 524_288
+    memory_rss_high_watermark_bytes: int = 48 * 1024 * 1024 * 1024
+    memory_rss_hard_watermark_bytes: int = 56 * 1024 * 1024 * 1024
+    memory_swap_high_watermark_bytes: int = 512 * 1024 * 1024
+    hgt_transition_chunk_rows: int = 8192
+    hgt_active_episode_limit: int = 128
+
     enabled_structural_relations: tuple[str, ...] = (
         "TEMPORAL", "CO_OCCURS", "DEPENDS_ON", "ENABLES", "BLOCKS",
         "EXPLAINS", "SIMILAR_TO", "OUTCOME_EQUIVALENT", "LEADS_TO", "PREFERENCE",
@@ -134,10 +150,10 @@ class ScientificConfig:
             self.proposal_queue_depth, self.maximum_read_set_size,
             self.candidates_per_radius, self.equivalence_set_size,
             self.replay_candidates, self.normalization_bootstrap_samples,
-            self.normalization_reservoir_limit, self.normalization_minimum_generation_span, self.probation_evidence_opportunities,
-            self.transfer_minimum_trials,
-            self.provisional_sample_bound, self.transfer_validation_trials_per_interval, self.transfer_validation_workers,
-            self.transfer_trust_scope_limit,
+            self.normalization_reservoir_limit, self.normalization_minimum_generation_span,
+            self.probation_evidence_opportunities, self.transfer_minimum_trials,
+            self.provisional_sample_bound, self.transfer_validation_trials_per_interval,
+            self.transfer_validation_workers, self.transfer_trust_scope_limit,
             self.replay_candidates_per_interval, self.structural_index_bucket_scan_limit,
             self.descriptor_component_limit, self.context_scope_limit,
             self.isf_score_schema_version, self.isf_decision_hot_limit,
@@ -150,8 +166,16 @@ class ScientificConfig:
             self.hgt_hidden_dim, self.hgt_layers, self.hgt_heads, self.hgt_ffn_dim,
             self.hgt_target_subgraph_nodes, self.hgt_max_subgraph_nodes,
             self.hgt_max_subgraph_edges, self.hgt_max_total_nodes, self.hgt_max_total_edges,
-            self.hgt_max_semantic_facts_per_memory, self.hgt_oom_retry_limit, self.hgt_training_microbatch,
-            self.hgt_gradient_accumulation, self.hgt_examples_per_train_trigger,
+            self.hgt_max_semantic_facts_per_memory, self.hgt_oom_retry_limit,
+            self.hgt_training_microbatch, self.hgt_gradient_accumulation,
+            self.hgt_examples_per_train_trigger,
+            self.resident_m0_limit, self.resident_m1_grounded_limit,
+            self.resident_compaction_check_interval,
+            self.resident_m0_representative_floor, self.resident_m1_grounded_representative_floor,
+            self.resident_max_delete_batch, self.resident_max_scan_batch,
+            self.memory_rss_high_watermark_bytes, self.memory_rss_hard_watermark_bytes,
+            self.memory_swap_high_watermark_bytes, self.hgt_transition_chunk_rows,
+            self.hgt_active_episode_limit,
         )
         if min(int(value) for value in positive) <= 0:
             raise ValueError("scientific budgets and thresholds must be positive")
@@ -163,6 +187,14 @@ class ScientificConfig:
             raise ValueError("max_symbol_facts_per_window cannot exceed symbol_budget_per_window")
         if min(self.allocation_unsolved_weight, self.allocation_optimizing_weight, self.allocation_stable_weight) <= 0:
             raise ValueError("allocation weights must be positive")
+        if not 0.0 < float(self.resident_low_level_target_ratio) < 1.0:
+            raise ValueError("resident low-level target ratio must be in (0, 1)")
+        if self.resident_m0_limit <= self.resident_m0_representative_floor:
+            raise ValueError("resident M0 limit must exceed representative floor")
+        if self.resident_m1_grounded_limit <= self.resident_m1_grounded_representative_floor:
+            raise ValueError("resident M1-grounded limit must exceed representative floor")
+        if self.memory_rss_high_watermark_bytes >= self.memory_rss_hard_watermark_bytes:
+            raise ValueError("RSS high watermark must be below hard watermark")
         radii = tuple(int(value) for value in self.structural_radii)
         if not radii or tuple(sorted(set(radii))) != radii or any(r <= 0 or r & (r - 1) for r in radii):
             raise ValueError("structural radii must be unique ascending powers of two")
@@ -248,13 +280,61 @@ class RuntimeConfig:
             raise ValueError("runtime intervals must be positive")
 
 
+_V979_ADDITIVE_FIELDS = {
+    "resident_m0_limit",
+    "resident_m1_grounded_limit",
+    "resident_low_level_target_ratio",
+    "resident_compaction_check_interval",
+    "resident_m0_representative_floor",
+    "resident_m1_grounded_representative_floor",
+    "resident_max_delete_batch",
+    "resident_max_scan_batch",
+    "memory_rss_high_watermark_bytes",
+    "memory_rss_hard_watermark_bytes",
+    "memory_swap_high_watermark_bytes",
+    "hgt_transition_chunk_rows",
+    "hgt_active_episode_limit",
+}
+
+
+def _v978_manifest_compatible(existing: dict[str, Any], config: ScientificConfig) -> bool:
+    if str(existing.get("design_version", "")) != "9.7.8" or config.design_version != "9.7.9":
+        return False
+    target = config.as_dict()
+    ignored = {"scientific_config_id", "design_version"} | _V979_ADDITIVE_FIELDS
+    for key, value in existing.items():
+        if key in ignored:
+            continue
+        if key in target and target[key] != value:
+            return False
+    return True
+
+
 def write_scientific_config_manifest(root: str | Path, config: ScientificConfig) -> Path:
     target = Path(root) / "scientific_config.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         existing = json.loads(target.read_text(encoding="utf-8"))
-        if existing.get("scientific_config_id") != config.config_id.value:
+        if existing.get("scientific_config_id") == config.config_id.value:
+            return target
+        if not _v978_manifest_compatible(existing, config):
             raise RuntimeError("run root contains a different immutable ScientificConfig")
+        migration = target.parent / "scientific_config.migration.json"
+        migration.write_text(
+            json.dumps(
+                {
+                    "source_design_version": "9.7.8",
+                    "source_scientific_config_id": str(existing.get("scientific_config_id", "")),
+                    "target_design_version": "9.7.9",
+                    "target_scientific_config_id": config.config_id.value,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        target.write_text(json.dumps(config.as_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return target
     target.write_text(json.dumps(config.as_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return target
