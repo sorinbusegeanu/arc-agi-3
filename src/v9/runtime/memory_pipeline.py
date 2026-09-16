@@ -28,6 +28,11 @@ class IngestionTask:
     transition: EncodedTransition
     symbol_budget_per_window: int = 8
     symbol_payload_bytes: int = 4096
+    max_cross_modal_facts_per_macro_event: int = 16
+    symbol_deduplication_policy: str = "token_phase_time"
+    symbol_window_time_span: int = 64
+    symbol_codec_name: str = "deterministic-opaque"
+    symbol_codec_version: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,11 +90,10 @@ def _semantic_signature(rows: tuple[tuple[int, int, int, int, float], ...], fall
 
 
 def _interaction_family_key(row: M1GroundedContingency) -> tuple[object, ...]:
+    """Modality-neutral transformation descriptor used by WORLD/SYMBOL/CROSS_MODAL M1N."""
     return (
-        "INTERACTION_TRANSITION",
-        int(row.environment_instance_id),
+        "INTERACTION_TRANSFORMATION",
         int(row.grounded_context_signature),
-        -1 if row.executable_action_token is None else int(row.executable_action_token),
         int(row.realized_transition_signature),
         int(row.grounded_next_context_signature),
     )
@@ -144,25 +148,42 @@ def _symbol_size(token: str | bytes | int) -> int:
     return 16
 
 
+def _dedup_key(row: tuple[str | bytes | int, str, int, int, int, int], policy: str, index: int) -> tuple[object, ...]:
+    token, phase, watermark, macro_step, micro_step, _source_sequence = row
+    if policy == "none":
+        return (index,)
+    if policy == "token":
+        return (token,)
+    if policy == "token_phase":
+        return token, phase
+    if policy == "token_phase_time":
+        return token, phase, watermark, macro_step, micro_step
+    raise ValueError(f"unsupported symbol deduplication policy: {policy}")
+
+
 def _prepare_symbols(task: IngestionTask, transition: EncodedTransition, identity: EnvironmentIdentity, interaction_grounding: M1GroundedContingency | None) -> tuple[tuple[PreparedSymbolIngestion, ...], dict[str, Any] | None, tuple[SymbolOccurrence, ...]]:
     if not transition.symbols:
         return (), None, ()
     environment = int(identity.instance_id.value)
     episode_id = EpisodeId(int(transition.episode_id))
-    codec = DeterministicSymbolCodec(f"{identity.family}-raw-symbols")
+    codec = DeterministicSymbolCodec(f"{task.symbol_codec_name}-v{int(task.symbol_codec_version)}")
 
     timed: list[tuple[str | bytes | int, str, int, int, int, int]] = []
     used_bytes = 0
     seen: set[tuple[object, ...]] = set()
-    for index, raw in enumerate(tuple(transition.symbols)[: max(1, int(task.symbol_budget_per_window))]):
+    limit = max(1, int(task.symbol_budget_per_window))
+    span = max(1, int(task.symbol_window_time_span))
+    for index, raw in enumerate(tuple(transition.symbols)[:limit]):
         row = _symbol_input(raw, task=task, transition=transition, index=index)
+        if abs(int(row[2]) - int(task.causal_watermark)) > span or abs(int(row[3]) - int(transition.global_step)) > span:
+            continue
         size = _symbol_size(row[0])
         if used_bytes + size > max(1, int(task.symbol_payload_bytes)):
             break
-        dedup_key = (row[0], row[1], row[2], row[3], row[4])
-        if dedup_key in seen:
+        key = _dedup_key(row, str(task.symbol_deduplication_policy), index)
+        if key in seen:
             continue
-        seen.add(dedup_key)
+        seen.add(key)
         used_bytes += size
         timed.append(row)
     if not timed:
@@ -175,6 +196,7 @@ def _prepare_symbols(task: IngestionTask, transition: EncodedTransition, identit
     prepared: list[PreparedSymbolIngestion] = []
     occurrences: list[SymbolOccurrence] = []
     family_key = None if interaction_grounding is None else _interaction_family_key(interaction_grounding)
+    cross_modal_budget = max(0, int(task.max_cross_modal_facts_per_macro_event))
     for index, (row, timing) in enumerate(zip(observations, timed)):
         _token, phase, watermark, macro_step, micro_step, source_sequence = timing
         producer_sequence = transition.producer_sequence * 10_000 + index
@@ -224,7 +246,7 @@ def _prepare_symbols(task: IngestionTask, transition: EncodedTransition, identit
             family_key=family_key or symbol_key,
         )
         aligned = None
-        if interaction_grounding is not None:
+        if interaction_grounding is not None and index < cross_modal_budget:
             aligned = M1NormalizedRelation.build(
                 "SYMBOL_ALIGNED_WITH_INTERACTION",
                 NormalizedChannel.CROSS_MODAL,
