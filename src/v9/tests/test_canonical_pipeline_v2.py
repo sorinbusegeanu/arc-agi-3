@@ -46,6 +46,10 @@ def test_fast_canonical_commit_matches_reference_batch(tmp_path: Path) -> None:
 
     expected_signatures = reference.apply_prepared_ingestion_batch(rows)
     reference.record_curriculum_events_batch(rows)
+    # The public runtime performs the viability pre-pass before canonical commit.
+    # Reproduce that caller contract when exercising the low-level commit directly.
+    for row in rows:
+        fast.observe_environment_transition(row.transition, watermark=int(fast.watermark) + 1)
     result = apply_canonical_commit_batch(fast, tuple(build_commit_plan(row) for row in rows))
 
     assert result.signature_rows == expected_signatures
