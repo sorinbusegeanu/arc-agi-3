@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping
 
 from .identity import stable_u64
@@ -62,4 +63,6 @@ def modality_neutral_descriptor(relation: Any, payload: Mapping[str, Any] | None
 
 
 def modality_neutral_family_signature(relation: Any, payload: Mapping[str, Any] | None = None) -> int:
-    return stable_u64(*modality_neutral_descriptor(relation, payload), person=b"v978-family")
+    descriptor = modality_neutral_descriptor(relation, payload)
+    encoded = json.dumps(descriptor, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return stable_u64(encoded, person=b"v978-family")
