@@ -29,6 +29,19 @@ class ActorOutcomePolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class ActorViabilityPolicy:
+    environment_id: int
+    state: str
+    confidence: float
+    mean_branching_factor: float
+    action_coverage: float
+    policy_uncertainty: float
+    learning_progress: float
+    effective_exploration_rate: float
+    anomaly_reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ActorPolicySnapshot:
     generation: int
     normalized_action_supports: dict[int, float]
@@ -41,6 +54,7 @@ class ActorPolicySnapshot:
     grounded_context_action_scores_by_type: dict[str, dict[int, dict[int, float]]] = field(default_factory=dict)
     strategies_by_environment: dict[int, tuple[ActorStrategyPolicy, ...]] = field(default_factory=dict)
     outcomes_by_environment: dict[int, tuple[ActorOutcomePolicy, ...]] = field(default_factory=dict)
+    viability_by_environment: dict[int, ActorViabilityPolicy] = field(default_factory=dict)
 
     @classmethod
     def build(
@@ -57,6 +71,7 @@ class ActorPolicySnapshot:
         model_version: str,
         strategies_by_environment: Mapping[int, tuple[ActorStrategyPolicy, ...]] | None = None,
         outcomes_by_environment: Mapping[int, tuple[ActorOutcomePolicy, ...]] | None = None,
+        viability_by_environment: Mapping[int, ActorViabilityPolicy] | None = None,
     ) -> "ActorPolicySnapshot":
         learned = {
             int(environment): {int(action): max(-1.0, min(1.0, float(score))) for action, score in actions.items()}
@@ -103,6 +118,7 @@ class ActorPolicySnapshot:
             grounded_contextual,
             {int(environment): tuple(rows) for environment, rows in (strategies_by_environment or {}).items()},
             {int(environment): tuple(rows) for environment, rows in (outcomes_by_environment or {}).items()},
+            {int(environment): row for environment, row in (viability_by_environment or {}).items()},
         )
 
     def grounded_scores(self, actions: tuple[int, ...], *, environment_type: str | None = None, context_signature: int | None = None) -> dict[int, float]:
@@ -133,3 +149,6 @@ class ActorPolicySnapshot:
 
     def outcomes(self, environment_id: int) -> tuple[ActorOutcomePolicy, ...]:
         return self.outcomes_by_environment.get(int(environment_id), ())
+
+    def viability(self, environment_id: int) -> ActorViabilityPolicy | None:
+        return self.viability_by_environment.get(int(environment_id))

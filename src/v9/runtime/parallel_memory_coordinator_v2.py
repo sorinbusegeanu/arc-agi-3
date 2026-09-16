@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import queue
 import time
 from typing import Any
@@ -36,8 +37,9 @@ def run_parallel_memory_jobs(
     actor_view_refresh_ms: float = 250.0,
     hgt_dataset: Any | None = None,
 ) -> list[ProcessActorResult]:
+    target_actor_slots = min(int(actor_limit), len(jobs))
     topology = ProcessTopology(
-        actors=min(int(actor_limit), len(jobs)),
+        actors=target_actor_slots,
         stage_workers=int(stage_workers),
         shards=int(shards),
         queue_capacity=max(int(queue_capacity), int(publication_queue_capacity)),
@@ -60,12 +62,13 @@ def run_parallel_memory_jobs(
         ingest_queue_capacity=int(ingest_queue_capacity),
     )
 
-    pending = list(jobs)
+    pending = deque(jobs)
     active: dict[int, tuple[int, Any]] = {}
     free_slots = list(range(topology.actors))
     results: list[ProcessActorResult] = []
     clean_exit_without_done: dict[int, float] = {}
     grounded_influence_total = 0
+    peak_active_actors = 0
     initial_policy = runtime.actor_policy_snapshot()
     published_policy_generation = int(initial_policy.generation)
     next_policy_publish = time.monotonic() + max(0.01, float(actor_view_refresh_ms) / 1000.0)
@@ -76,10 +79,23 @@ def run_parallel_memory_jobs(
     clean_shutdown = False
     dataset_start_count = int(getattr(hgt_dataset, "count", 0)) if hgt_dataset is not None else 0
 
+    runtime.set_telemetry_gauge("actor_slots_target", target_actor_slots)
+    runtime.set_telemetry_gauge("actor_process_start_method", topology.actor_start_method)
+
+    def _publish_actor_process_telemetry() -> None:
+        runtime.set_telemetry_gauge("active_actor_processes", len(active))
+        runtime.set_telemetry_gauge("peak_active_actor_processes", peak_active_actors)
+        runtime.set_telemetry_gauge("actor_processes_total_launched", len(topology.actor_processes))
+        runtime.set_telemetry_gauge("actor_slots_filled", len(active))
+        runtime.set_telemetry_gauge("actor_process_pids", ",".join(
+            str(process.pid) for process in topology.actor_processes if process.pid is not None
+        ))
+
     def launch_one() -> bool:
+        nonlocal peak_active_actors
         if not pending or not free_slots:
             return False
-        actor_id, spec, steps, seed = pending.pop(0)
+        actor_id, spec, steps, seed = pending.popleft()
         slot = free_slots.pop(0)
         launch_started = time.perf_counter()
         game_name = str(getattr(spec, "display_name", getattr(spec, "game_id", "")))
@@ -100,7 +116,11 @@ def run_parallel_memory_jobs(
             policy_refresh_steps=int(actor_view_refresh_steps),
             policy_refresh_ms=float(actor_view_refresh_ms),
         )
-        active[actor_id] = (slot, topology.actor_processes[-1])
+        process = topology.actor_processes[-1]
+        if process.pid is None:
+            raise RuntimeError(f"actor {actor_id} failed to start an OS process")
+        active[actor_id] = (slot, process)
+        peak_active_actors = max(peak_active_actors, len(active))
         runtime.set_telemetry_gauge(
             "actor_launch_latency_ms", 1000.0 * (time.perf_counter() - launch_started)
         )
@@ -108,7 +128,16 @@ def run_parallel_memory_jobs(
         runtime.set_telemetry_gauge("live_environment_instances", len(active))
         runtime.set_telemetry_gauge("available_actor_slots", len(free_slots))
         runtime.set_telemetry_gauge("pending_environment_jobs", len(pending))
+        _publish_actor_process_telemetry()
         return True
+
+    def launch_available_slots() -> int:
+        launched = 0
+        while pending and free_slots:
+            if not launch_one():
+                break
+            launched += 1
+        return launched
 
     def drain_publication_queue() -> bool:
         if pipeline.sampled - pipeline.ingested >= pipeline.ingest_local_high_water:
@@ -173,6 +202,7 @@ def run_parallel_memory_jobs(
             runtime.set_telemetry_gauge("live_environment_instances", len(active))
             runtime.set_telemetry_gauge("available_actor_slots", len(free_slots))
             runtime.set_telemetry_gauge("pending_environment_jobs", len(pending))
+            _publish_actor_process_telemetry()
             progressed = True
         return progressed
 
@@ -187,6 +217,10 @@ def run_parallel_memory_jobs(
         gauges.update(
             {
                 "active_actor_processes": len(active),
+                "peak_active_actor_processes": peak_active_actors,
+                "actor_slots_target": target_actor_slots,
+                "actor_slots_filled": len(active),
+                "actor_processes_total_launched": len(topology.actor_processes),
                 "live_environment_instances": len(active),
                 "available_actor_slots": len(free_slots),
                 "pending_environment_jobs": len(pending),
@@ -203,6 +237,7 @@ def run_parallel_memory_jobs(
         )
         for key, value in gauges.items():
             runtime.set_telemetry_gauge(key, value)
+        _publish_actor_process_telemetry()
 
     def progress() -> None:
         telemetry()
@@ -210,8 +245,9 @@ def run_parallel_memory_jobs(
         pct = 100.0 * pipeline.ingested / requested_steps if requested_steps else 100.0
         print(
             f"{time.strftime('[%H:%M]')} {pct:5.1f}% sampled={pipeline.sampled}/{requested_steps} "
-            f"games_finished={len(results)}/{len(jobs)} actors_active={len(active)} "
-            f"ingested={pipeline.ingested} rate={float(diag.get('ingestion_rate', 0.0)):.0f}/s "
+            f"games_finished={len(results)}/{len(jobs)} actors_active={len(active)}/{target_actor_slots} "
+            f"actors_peak={peak_active_actors} ingested={pipeline.ingested} "
+            f"rate={float(diag.get('ingestion_rate', 0.0)):.0f}/s "
             f"backlog={max(0, pipeline.sampled - pipeline.ingested)}",
             flush=True,
         )
@@ -240,11 +276,27 @@ def run_parallel_memory_jobs(
                 time.sleep(0.001)
 
     try:
+        # Fill every configured actor slot before doing any coordinator work.
+        # This prevents canonical ingestion/derivation from serializing process
+        # startup and makes requested sampling parallelism an explicit invariant.
+        initial_launched = launch_available_slots()
+        if target_actor_slots > 0 and len(active) != target_actor_slots:
+            raise RuntimeError(
+                f"failed to prefill actor slots: target={target_actor_slots} active={len(active)} "
+                f"launched={initial_launched}"
+            )
+        if target_actor_slots > 1 and len({process.pid for _, process in active.values()}) != target_actor_slots:
+            raise RuntimeError("actor slots did not produce distinct OS processes")
+        runtime.set_telemetry_gauge("actor_prefill_complete", 1)
+        runtime.set_telemetry_gauge("actor_prefill_processes", len(active))
+        _publish_actor_process_telemetry()
+
         while active or pending:
-            progressed = launch_one()
-            progressed = drain_publication_queue() or progressed
+            progressed = drain_publication_queue()
             progressed = pipeline.service() or progressed
             progressed = drain_actor_results() or progressed
+            launched = launch_available_slots()
+            progressed = bool(launched) or progressed
             missing = _reconcile_actor_liveness(active, clean_exit_without_done)
             runtime.set_telemetry_gauge("actors_exited_without_done", missing)
             now = time.monotonic()
@@ -333,7 +385,9 @@ def run_parallel_memory_jobs(
                 f"ingestion count mismatch at epoch boundary: expected={expected_transitions} ingested={pipeline.ingested}"
             )
         for key, value in {
-            "actor_processes": min(int(actor_limit), len(jobs)),
+            "actor_processes": target_actor_slots,
+            "peak_active_actor_processes": peak_active_actors,
+            "actor_processes_total_launched": len(topology.actor_processes),
             "stage_worker_processes": int(stage_workers),
             "shard_worker_processes": int(shards),
             "ingest_worker_processes": int(ingest_workers),
