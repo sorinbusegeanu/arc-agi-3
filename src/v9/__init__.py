@@ -11,7 +11,7 @@ from v9.runtime.bounded_indexes import install_bounded_indexes
 from v9.runtime.bounded_index_cleanup import install_bounded_index_cleanup
 from v9.runtime.reset_memory import install_reset_memory
 from v9.runtime.integration_repairs import install_integration_repairs
-from v9.runtime.pipeline_service_v2 import MemoryPipelineServiceV2
+from v9.runtime.parallel_memory_coordinator import MemoryPipelineService
 from v9.runtime.environment_viability import install_environment_viability
 from v9.runtime.viability_confidence import install_viability_confidence
 from v9.runtime.grounding_action_index import install_grounding_action_index
@@ -30,7 +30,7 @@ install_bounded_indexes(ContinuousMemoryRuntime)
 install_bounded_index_cleanup(CanonicalGraph)
 install_reset_memory(ContinuousMemoryRuntime)
 install_integration_repairs(ContinuousMemoryRuntime)
-install_environment_viability(ContinuousMemoryRuntime, MemoryPipelineServiceV2)
+install_environment_viability(ContinuousMemoryRuntime, MemoryPipelineService)
 install_viability_confidence(ContinuousMemoryRuntime)
 install_grounding_action_index(ContinuousMemoryRuntime)
 install_actor_policy_cache(ContinuousMemoryRuntime)
@@ -38,9 +38,9 @@ _runtime_package.ContinuousMemoryRuntime = ContinuousMemoryRuntime
 
 # --actors is sampler-process parallelism, not merely a cap on one-job-per-game
 # scheduling. Split per-game budgets when fewer jobs than actor slots exist.
-from v9.runtime import parallel_memory_coordinator_v2 as _parallel_memory_coordinator_v2
+from v9.runtime import parallel_memory_coordinator as _parallel_memory_coordinator
 from v9.runtime.actor_job_parallelism import install_actor_job_parallelism as _install_actor_job_parallelism
-_install_actor_job_parallelism(_parallel_memory_coordinator_v2)
+_install_actor_job_parallelism(_parallel_memory_coordinator)
 
 # Terminal status is derived from the three authoritative boundary fields.
 if not hasattr(EncodedTransition, "done"):
@@ -74,7 +74,7 @@ _install_pressure_control(
     CanonicalGraph,
     ResidentMemoryManager,
     _hgt_training,
-    MemoryPipelineServiceV2,
+    MemoryPipelineService,
 )
 
 # Final correctness layer runs after every prior compatibility/performance
@@ -85,11 +85,11 @@ from v9.runtime.runtime_integrity import install_runtime_integrity as _install_r
 _install_runtime_integrity(
     ContinuousMemoryRuntime,
     CanonicalGraph,
-    MemoryPipelineServiceV2,
+    MemoryPipelineService,
     _hgt_training,
 )
 from v9.runtime.runtime_integrity_followup import install as _install_runtime_integrity_followup
-_install_runtime_integrity_followup(_runtime_integrity_module, MemoryPipelineServiceV2)
+_install_runtime_integrity_followup(_runtime_integrity_module, MemoryPipelineService)
 
 # Unique M0/grounded-M1 and first-seen normalized M1 rows are append-only.
 # Publish them continuously in bounded canonical batches instead of accumulating
@@ -108,7 +108,7 @@ _install_metrics_concurrency(ContinuousMemoryRuntime)
 # coordinator's queue-draining loop so actor publication and worker preparation
 # continue while the authoritative graph mutation is in progress.
 from v9.runtime.publication_throughput import install_publication_throughput as _install_publication_throughput
-_install_publication_throughput(MemoryPipelineServiceV2)
+_install_publication_throughput(MemoryPipelineService)
 
 _hgt_package.train_hgt_epoch = _hgt_training.train_hgt_epoch
 from v9.runtime import epoch_runner as _epoch_runner
