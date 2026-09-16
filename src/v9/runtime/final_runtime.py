@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, Iterable
 
 from v9.cognition.grounding import GroundingMaturity
 from v9.memory.identity import MemoryUid, stable_u64
+from v9.memory.m0_episode import M0Episode
 from v9.memory.symbolic_relations import derive_symbolic_relations, shuffled_alignment_control
+from v9.modalities.contract import PassiveSymbolEvent
+from v9.modalities.symbols import SymbolOccurrence, SymbolTemporalPhase
 
 from .completed_runtime import CompletedContinuousMemoryRuntime
+from .memory_pipeline import DerivationTask, IngestionTask, derive_memory, prepare_ingestion
+from .multiprocess import EncodedTransition
 
 
 class FinalContinuousMemoryRuntime(CompletedContinuousMemoryRuntime):
@@ -118,13 +124,7 @@ class FinalContinuousMemoryRuntime(CompletedContinuousMemoryRuntime):
         contextual = {
             "nearby_context_signature": int(getattr(transition, "before_signature", 0)),
             "nearby_action_id": int(getattr(transition, "action_id", 0)),
-            "nearby_transformation_signature": int(
-                stable_u64(
-                    int(getattr(transition, "before_signature", 0)),
-                    int(getattr(transition, "after_signature", 0)),
-                    person=b"v9-symbol-nearby",
-                )
-            ),
+            "nearby_transformation_signature": int(stable_u64(int(getattr(transition, "before_signature", 0)), int(getattr(transition, "after_signature", 0)), person=b"v9-symbol-nearby")),
             "nearby_progress": bool(getattr(transition, "task_success", False) or int(getattr(transition, "levels_completed", 0)) > 0),
             "nearby_outcome": int(getattr(transition, "primary_valence", 0)),
             "nearby_boundary": str(getattr(transition, "boundary_scope", "NONE")),
@@ -140,6 +140,136 @@ class FinalContinuousMemoryRuntime(CompletedContinuousMemoryRuntime):
                 merged = dict(payload)
                 merged.update(contextual)
                 self._deferred_base_nodes[uid] = (node, merged, evidence)
+
+    def _configured_task(self, sequence: int, transition: EncodedTransition) -> IngestionTask:
+        scientific = self.config.scientific
+        return IngestionTask(
+            int(sequence),
+            int(self._watermark) + 1,
+            transition,
+            min(int(scientific.symbol_budget_per_window), int(scientific.max_symbol_facts_per_window)),
+            int(scientific.symbol_payload_bytes),
+            int(scientific.max_cross_modal_facts_per_macro_event),
+            str(scientific.symbol_deduplication_policy),
+            int(scientific.symbol_window_time_span),
+            str(scientific.symbol_codec_name),
+            int(scientific.symbol_codec_version),
+        )
+
+    @staticmethod
+    def _semantic_rows(adapter: Any, name: str, *args: Any) -> tuple[Any, ...]:
+        fn = getattr(adapter, name, None)
+        return tuple(fn(*args)) if callable(fn) else ()
+
+    def record_interaction(self, adapter: Any, *, producer_id: int, producer_sequence: int, global_step: int, native_action: int, before_observation: Any, after_observation: Any, episode_id: Any, symbol_codec: Any | None = None):
+        """Direct callers use the same prepared-ingestion contract as worker actors."""
+        sequence = self.reserve_producer_sequence(int(producer_id), int(producer_sequence))
+        identity = adapter.identity()
+        boundary = adapter.boundary_event()
+        progress_fn = getattr(adapter, "task_progress", None)
+        progress = progress_fn() if callable(progress_fn) else SimpleNamespace(success=False, failure=False, truncated=False, level_index=0, levels_completed=0)
+        before_signature = int(adapter.encode_observation(before_observation))
+        after_signature = int(adapter.encode_observation(after_observation))
+        action_schema_id = int(adapter.action_schema().schema_id)
+        actions_after = tuple(sorted(set(int(value) for value in adapter.available_actions())))
+        symbols: tuple[object, ...] = ()
+        if bool(self.config.scientific.symbolic_grounding_enabled):
+            raw_symbols = tuple(adapter.optional_symbol_stream())
+            phase = SymbolTemporalPhase.AFTER_OUTCOME.value if int(boundary.primary_valence) != 0 or bool(progress.success) or bool(progress.failure) else SymbolTemporalPhase.AFTER_ACTION.value
+            symbols = tuple({"token": value, "phase": phase, "macro_step": int(global_step), "micro_step": index} for index, value in enumerate(raw_symbols))
+        semantic_before = self._semantic_rows(adapter, "semantic_observation", before_observation)
+        semantic_after = self._semantic_rows(adapter, "semantic_observation", after_observation)
+        semantic_action = self._semantic_rows(adapter, "semantic_action", native_action)
+        semantic_delta = self._semantic_rows(adapter, "semantic_delta", semantic_before, semantic_after)
+        transition = EncodedTransition(
+            actor_id=int(producer_id), producer_sequence=sequence, global_step=int(global_step),
+            environment_identity=(identity.family, identity.environment_type, identity.config, identity.instance),
+            episode_id=int(episode_id.value), observation_schema_id=int(adapter.observation_schema().schema_id),
+            before_signature=before_signature, action_id=int(adapter.encode_action(native_action)), after_signature=after_signature,
+            available_actions_after=len(actions_after), primary_valence=int(boundary.primary_valence), symbols=symbols,
+            curriculum_step=None, game_scenario=str(identity.environment_type), symbols_only=False,
+            action_schema_id=action_schema_id,
+            available_action_set_signature=int(stable_u64(action_schema_id, *actions_after, person=b"v9-action-set")),
+            boundary_scope=str(boundary.scope.value), task_success=bool(progress.success), task_failure=bool(progress.failure),
+            task_truncated=bool(progress.truncated), level_index=int(progress.level_index), levels_completed=int(progress.levels_completed),
+            semantic_before=semantic_before, semantic_action=semantic_action, semantic_after=semantic_after, semantic_delta=semantic_delta,
+        )
+        prepared = prepare_ingestion(self._configured_task(sequence, transition))
+        signatures = self.apply_prepared_ingestion(prepared)
+        self._develop(signatures)
+        if prepared.event is None:
+            raise RuntimeError("interaction preparation unexpectedly omitted world event")
+        return prepared.event.experience
+
+    def record_symbol_stream(self, adapter: Any, *, producer_id: int, producer_sequence: int, episode_id: Any, symbol_codec: Any | None = None) -> int:
+        if not bool(self.config.scientific.symbolic_grounding_enabled):
+            return 0
+        raw_symbols = tuple(adapter.optional_symbol_stream())
+        if not raw_symbols:
+            return 0
+        sequence = self.reserve_producer_sequence(int(producer_id), int(producer_sequence))
+        identity = adapter.identity()
+        symbols = tuple({"token": value, "phase": SymbolTemporalPhase.COINCIDENT.value, "macro_step": sequence, "micro_step": index} for index, value in enumerate(raw_symbols))
+        transition = EncodedTransition(
+            actor_id=int(producer_id), producer_sequence=sequence, global_step=sequence,
+            environment_identity=(identity.family, identity.environment_type, identity.config, identity.instance), episode_id=int(episode_id.value),
+            observation_schema_id=int(adapter.observation_schema().schema_id), before_signature=0, action_id=0, after_signature=0,
+            available_actions_after=len(tuple(adapter.available_actions())), primary_valence=0, symbols=symbols,
+            curriculum_step=None, game_scenario=str(identity.environment_type), symbols_only=True,
+        )
+        prepared = prepare_ingestion(self._configured_task(sequence, transition))
+        signatures = self.apply_prepared_ingestion(prepared)
+        self._develop(signatures)
+        return len(prepared.symbol_occurrences)
+
+    def _ingest(self, event: Any) -> tuple[int, ...]:
+        signatures = super()._ingest(event)
+        if not isinstance(event, PassiveSymbolEvent):
+            return signatures
+        occurrence = SymbolOccurrence(
+            event.identity.event_id,
+            event.symbol_id,
+            int(event.position),
+            event.stream_id,
+            event.vocabulary_id,
+            f"external-passive:{int(self.config.scientific.symbol_grounding_schema_version)}",
+            int(event.identity.causal_watermark),
+            int(event.identity.producer_sequence),
+            int(event.position),
+            int(event.identity.environment_instance_id),
+            event.identity.episode_id,
+            event.identity.event_id,
+            int(event.identity.modality_id.value),
+            SymbolTemporalPhase.COINCIDENT.value,
+            int(event.identity.producer_sequence),
+        )
+        self._index_symbol_occurrences((occurrence,))
+        m0 = M0Episode.from_event(event, context_signature=0, payload_digest=self._payload_digest(event))
+        payload = {
+            "symbol_occurrence_id": [int(occurrence.occurrence_id.hi), int(occurrence.occurrence_id.lo)],
+            "symbol_id": int(occurrence.symbol_id.value),
+            "symbol_position": int(occurrence.position),
+            "symbol_stream_id": int(occurrence.stream_id.value),
+            "symbol_vocabulary_id": int(occurrence.vocabulary_id.value),
+            "symbol_codec_id": str(occurrence.codec_id),
+            "symbol_causal_watermark": int(occurrence.causal_watermark),
+            "symbol_macro_step": int(occurrence.macro_step),
+            "symbol_micro_step": int(occurrence.micro_step),
+            "symbol_environment_instance_id": int(occurrence.environment_instance_id),
+            "symbol_episode_id": int(occurrence.episode_id.value),
+            "symbol_provenance_id": [int(occurrence.provenance_id.hi), int(occurrence.provenance_id.lo)],
+            "symbol_modality_id": int(occurrence.modality_id),
+            "symbol_temporal_phase": str(occurrence.temporal_phase),
+            "symbol_source_sequence": int(occurrence.source_sequence),
+        }
+        if m0.uid in self.graph.payloads:
+            self.graph.payloads[m0.uid].update(payload)
+        elif m0.uid in self._deferred_base_nodes:
+            node, current, evidence = self._deferred_base_nodes[m0.uid]
+            merged = dict(current)
+            merged.update(payload)
+            self._deferred_base_nodes[m0.uid] = (node, merged, evidence)
+        return signatures
 
     def _derive_prepared_symbolic_relations(self, prepared: Any, previous_interaction: Any) -> tuple[tuple[int, ...], set[int]]:
         rows = tuple(getattr(prepared, "symbols", ()) or ())
@@ -175,6 +305,24 @@ class FinalContinuousMemoryRuntime(CompletedContinuousMemoryRuntime):
             self._register_family_relation(item.relation)
             families.add(int(item.relation.family_signature or item.relation.structural_signature))
         return tuple(signatures), families
+
+    def _develop_shared_families(self, family_ids: set[int]) -> None:
+        for family_id in sorted(family_ids):
+            rows = tuple(
+                row for row in self._m1n_family_occurrences.get(int(family_id), ())
+                if float(getattr(row, "support", 1.0)) > float(getattr(row, "contradiction", 0.0))
+                and float(getattr(row, "support", 1.0)) > 0.0
+            )
+            channels = {row.channel.value for row in rows}
+            evidence = {uid for row in rows for uid in row.provenance.evidence}
+            if len(rows) < 2 or len(evidence) < 2 or "WORLD" not in channels or not ({"SYMBOL", "CROSS_MODAL"} & channels):
+                continue
+            support = len(rows)
+            if support <= int(self._shared_family_support.get(int(family_id), 0)):
+                continue
+            result = derive_memory(DerivationTask(0, int(family_id), rows, support, tuple(sorted(self._formation_environments)), int(self._watermark)))
+            super().apply_derivation_results_batch((result,))
+            self._shared_family_support[int(family_id)] = support
 
     def _grounded_policy_scores(self) -> tuple[dict[str, dict[int, float]], dict[str, dict[int, dict[int, float]]]]:
         by_type: dict[str, dict[int, list[float]]] = {}
@@ -324,11 +472,7 @@ class FinalContinuousMemoryRuntime(CompletedContinuousMemoryRuntime):
                 next_frontier = set()
                 for uid in self.graph.uids_at_level(memory_level):
                     payload = self.graph.payloads.get(uid, {})
-                    parent_keys = {
-                        (int(raw[0]), int(raw[1]))
-                        for raw in payload.get("parents", ())
-                        if isinstance(raw, (list, tuple)) and len(raw) == 2
-                    }
+                    parent_keys = {(int(raw[0]), int(raw[1])) for raw in payload.get("parents", ()) if isinstance(raw, (list, tuple)) and len(raw) == 2}
                     if any((int(parent.hi), int(parent.lo)) in parent_keys for parent in frontier):
                         payload.update(metadata)
                         next_frontier.add(uid)
