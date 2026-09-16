@@ -14,6 +14,8 @@ if __name__ == "__main__":
 
     ensure_process_server_ready()
 
-    from v9.cli import main
+    import v9.cli as cli
+    from v9.environments.passive_capture import install_cli_adapter_factory
 
-    raise SystemExit(main())
+    install_cli_adapter_factory(cli)
+    raise SystemExit(cli.main())
