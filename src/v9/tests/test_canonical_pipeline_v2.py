@@ -2,8 +2,7 @@ from pathlib import Path
 
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
 from v9.runtime.canonical_commit import apply_canonical_commit_batch
-from v9.runtime.memory_pipeline import IngestionTask, prepare_ingestion
-from v9.runtime.memory_pipeline_v2 import build_commit_plan
+from v9.runtime.memory_pipeline import IngestionTask, build_commit_plan, prepare_ingestion
 from v9.runtime.multiprocess import EncodedTransition
 
 
@@ -46,8 +45,6 @@ def test_fast_canonical_commit_matches_reference_batch(tmp_path: Path) -> None:
 
     expected_signatures = reference.apply_prepared_ingestion_batch(rows)
     reference.record_curriculum_events_batch(rows)
-    # The public runtime performs the viability pre-pass before canonical commit.
-    # Reproduce that caller contract when exercising the low-level commit directly.
     for row in rows:
         fast.observe_environment_transition(row.transition, watermark=int(fast.watermark) + 1)
     result = apply_canonical_commit_batch(fast, tuple(build_commit_plan(row) for row in rows))
@@ -63,8 +60,6 @@ def test_fast_canonical_commit_matches_reference_batch(tmp_path: Path) -> None:
 
     reference.flush_deferred_memory_updates()
     fast.flush_deferred_memory_updates()
-    # Evidence confidence is a post-ingestion annotation maintained by the
-    # continuous runtime. Normalize it before comparing canonical graph identity.
     for runtime in (reference, fast):
         for payload in runtime.graph.payloads.values():
             if payload.get("evidence_confidence") == 1.0:
