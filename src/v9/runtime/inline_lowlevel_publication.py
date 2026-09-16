@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections import Counter
 from typing import Any
 
 from v9.memory.identity import MemoryUid
@@ -40,6 +41,25 @@ def _publication_chunks(rows: tuple[Any, ...]) -> int:
     if not rows:
         return 0
     return (len(rows) + _INLINE_ROW_CHUNK - 1) // _INLINE_ROW_CHUNK
+
+
+def _version_ref_counts(groups: tuple[tuple[Any, ...], ...]) -> Counter[Any]:
+    counts: Counter[Any] = Counter()
+    for group in groups:
+        for offset in range(0, len(group), _INLINE_ROW_CHUNK):
+            node_refs: set[Any] = set()
+            edge_refs: set[Any] = set()
+            for node, payload, raw_evidence in group[offset : offset + _INLINE_ROW_CHUNK]:
+                node_refs.add(node_ref(node.uid))
+                evidence = tuple(raw_evidence)
+                for raw_parent in payload.get("parents", []):
+                    if not isinstance(raw_parent, (list, tuple)) or len(raw_parent) != 2:
+                        continue
+                    parent = MemoryUid(int(raw_parent[0]), int(raw_parent[1]))
+                    edge_refs.add(edge_ref(RelationEdge(node.uid, RelationType.PROVENANCE, parent, evidence)))
+            counts.update(node_refs)
+            counts.update(edge_refs)
+    return counts
 
 
 def _logical_cross_partition_transactions(graph: Any, groups: tuple[tuple[Any, ...], ...]) -> int:
@@ -204,12 +224,23 @@ def install_inline_lowlevel_publication(runtime_cls: type) -> None:
         physical_batches = 0
         logical_batches = sum(_publication_chunks(group) for group in logical_groups)
         logical_cross = _logical_cross_partition_transactions(self.graph, logical_groups)
+        logical_version_counts = _version_ref_counts(logical_groups)
+        physical_groups = tuple(
+            tuple(rows[offset : offset + _INLINE_ROW_CHUNK])
+            for offset in range(0, len(rows), _INLINE_ROW_CHUNK)
+        )
+        physical_version_counts = _version_ref_counts(physical_groups)
         with self._lock:
             cross_before = int(self.telemetry.get("cross_partition_transactions", 0))
-            for offset in range(0, len(rows), _INLINE_ROW_CHUNK):
-                chunk = tuple(rows[offset : offset + _INLINE_ROW_CHUNK])
+            for chunk in physical_groups:
                 inserted += _publish_chunk(self, chunk)
                 physical_batches += 1
+            # Physical batching coalesces repeated writes to the same object.
+            # Restore the version increments that ordered logical publication
+            # would have produced so optimistic-read semantics remain identical.
+            for ref, logical_count in logical_version_counts.items():
+                for _ in range(logical_count - physical_version_counts.get(ref, 0)):
+                    self.graph.versions.bump(ref)
             physical_cross = int(self.telemetry.get("cross_partition_transactions", 0)) - cross_before
             logical_extra = logical_batches - physical_batches
             if logical_extra:
