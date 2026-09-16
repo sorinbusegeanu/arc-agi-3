@@ -52,5 +52,7 @@ def test_sampling_prefills_distinct_actor_processes(tmp_path) -> None:
         assert int(diagnostics["peak_active_actor_processes"]) == 4
         pids = {value for value in str(diagnostics["actor_process_pids"]).split(",") if value}
         assert len(pids) >= 4
+        assert int(diagnostics["actor_policy_snapshot_cache_misses"]) >= 1
+        assert int(diagnostics["actor_policy_snapshot_cache_hits"]) >= 3
     finally:
         runtime.close(normal=False)
