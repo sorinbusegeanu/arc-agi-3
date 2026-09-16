@@ -1,5 +1,7 @@
 """Independent ARC-AGI-3 Hydra memory runtime."""
 
+from dataclasses import replace as _dc_replace
+
 from v9.environments.contract import EnvironmentCognitionAdapter
 from v9.memory.identity import EventUid, MemoryUid
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig, ScientificConfigId
@@ -28,7 +30,16 @@ if not hasattr(EncodedTransition, "done"):
 _single_ingest = ContinuousMemoryRuntime.apply_prepared_ingestion
 if not getattr(_single_ingest, "_v979_symbol_once", False):
     def _v979_single_ingest(self, prepared):
+        history_before = len(self.stage_tracker.history)
         result = tuple(_ReferenceContinuousMemoryRuntime.apply_prepared_ingestion(self, prepared))
+        event = getattr(prepared, "event", None)
+        if event is not None and len(self.stage_tracker.history) > history_before:
+            interaction_watermark = int(event.identity.causal_watermark)
+            for index in range(history_before, len(self.stage_tracker.history)):
+                self.stage_tracker.history[index] = _dc_replace(
+                    self.stage_tracker.history[index],
+                    evidence_watermark=interaction_watermark,
+                )
         extra = []
         for row in getattr(prepared, "symbols", ()):
             extra.append(int(row.m1n.structural_signature))
