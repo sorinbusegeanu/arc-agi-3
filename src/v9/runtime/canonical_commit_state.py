@@ -11,9 +11,7 @@ from .memory_pipeline_v2 import CanonicalWrite
 
 def ensure_fast_state(runtime: Any) -> None:
     if not hasattr(runtime, "_fast_stable_contingencies"):
-        runtime._fast_stable_contingencies = sum(
-            int(len(rows) >= 2) for rows in runtime._m1n_occurrences.values()
-        )
+        runtime._fast_stable_contingencies = sum(int(len(rows) >= 2) for rows in runtime._m1n_occurrences.values())
     if not hasattr(runtime, "_m1n_family_occurrences"):
         runtime._m1n_family_occurrences = {}
         for rows in runtime._m1n_occurrences.values():
@@ -33,10 +31,7 @@ def stage_evidence_fast(runtime: Any) -> StageEvidence:
         stable_contingencies=int(runtime._fast_stable_contingencies),
         structural_abstractions=len(runtime._m3),
         held_out_transfer_successes=sum(bool(row.validated) for row in runtime._m4.values()),
-        mature_consequences=sum(
-            bool(runtime.graph.payloads[uid].get("mature"))
-            for uid in runtime.graph.uids_at_level(MemoryLevel.M5)
-        ),
+        mature_consequences=sum(bool(runtime.graph.payloads[uid].get("mature")) for uid in runtime.graph.uids_at_level(MemoryLevel.M5)),
         outcome_equivalences=runtime.graph.memory_count(MemoryLevel.M6),
         learned_preferences=sum(int(row.get("primary_valence_sum", 0)) != 0 for row in strategies),
         alternative_strategies=max(0, len(strategies) - 1),
@@ -49,10 +44,7 @@ def advance_stage_fast(runtime: Any) -> Any:
     runtime._stage_interval_events += 1
     next_stage = runtime.stage_tracker.stage
     if runtime._stage_interval_events >= runtime._stage_interval_size:
-        snapshot = runtime.stage_tracker.close_interval(
-            stage_evidence_fast(runtime),
-            evidence_watermark=runtime._watermark,
-        )
+        snapshot = runtime.stage_tracker.close_interval(stage_evidence_fast(runtime), evidence_watermark=runtime._watermark)
         runtime._stage_interval_events = 0
         next_stage = snapshot.next_stage
     return next_stage
@@ -60,6 +52,13 @@ def advance_stage_fast(runtime: Any) -> Any:
 
 def record_normalized_fast(runtime: Any, relation: Any, initial_write: CanonicalWrite, deferred_rows: list[Any]) -> int:
     ensure_fast_state(runtime)
+    normalize = getattr(runtime, "normalize_m1n_family", None)
+    if callable(normalize):
+        relation, initial_write = normalize(relation, initial_write)
+    accumulate = getattr(runtime, "accumulate_m1n_evidence", None)
+    if callable(accumulate):
+        accumulate(relation)
+
     signature = int(relation.structural_signature)
     occurrences = runtime._m1n_occurrences.setdefault(signature, [])
     family = int(getattr(relation, "family_signature", 0) or signature)
@@ -87,11 +86,7 @@ def record_normalized_fast(runtime: Any, relation: Any, initial_write: Canonical
         scoped = None
         if len(parts) >= 5 and parts[0] == "ACTION":
             try:
-                scoped = scoped_action_key(
-                    int(parts[3]),
-                    action_schema_id=int(parts[1]),
-                    environment_type=parts[2],
-                )
+                scoped = scoped_action_key(int(parts[3]), action_schema_id=int(parts[1]), environment_type=parts[2])
             except ValueError:
                 pass
         cache[signature] = scoped
