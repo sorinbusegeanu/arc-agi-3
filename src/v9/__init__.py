@@ -104,6 +104,12 @@ _install_inline_lowlevel_publication(ContinuousMemoryRuntime)
 from v9.runtime.metrics_concurrency import install_metrics_concurrency as _install_metrics_concurrency
 _install_metrics_concurrency(ContinuousMemoryRuntime)
 
+# Canonical commit remains strictly ordered, but it runs independently from the
+# coordinator's queue-draining loop so actor publication and worker preparation
+# continue while the authoritative graph mutation is in progress.
+from v9.runtime.publication_throughput import install_publication_throughput as _install_publication_throughput
+_install_publication_throughput(MemoryPipelineServiceV2)
+
 _hgt_package.train_hgt_epoch = _hgt_training.train_hgt_epoch
 from v9.runtime import epoch_runner as _epoch_runner
 _epoch_runner.train_hgt_epoch = _hgt_training.train_hgt_epoch
