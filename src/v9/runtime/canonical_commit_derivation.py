@@ -11,6 +11,22 @@ def _formation_eligible(row: Any) -> bool:
     return support > contradiction and support > 0.0
 
 
+def _family_rows(runtime: Any, family_signature: int) -> tuple[Any, ...]:
+    index = getattr(runtime, "_m1n_family_occurrences", None)
+    if isinstance(index, dict):
+        return tuple(index.get(int(family_signature), ()))
+
+    # Compatibility fallback for runtimes/tests that have not initialized the
+    # incremental family index yet. The production canonical path initializes
+    # the index in record_normalized_fast before derivation candidates form.
+    rows: list[Any] = []
+    for occurrences in runtime._m1n_occurrences.values():
+        for row in occurrences:
+            if int(row.family_signature or row.structural_signature) == int(family_signature):
+                rows.append(row)
+    return tuple(rows)
+
+
 def derivation_candidates(runtime: Any, signatures: set[int]) -> tuple[DerivationTask, ...]:
     touched_rows = [
         row
@@ -18,29 +34,28 @@ def derivation_candidates(runtime: Any, signatures: set[int]) -> tuple[Derivatio
         for row in runtime._m1n_occurrences.get(int(signature), ())
         if _formation_eligible(row)
     ]
-    by_family: dict[int, list[Any]] = {}
-    for row in touched_rows:
-        family = int(row.family_signature or row.structural_signature)
-        bucket = by_family.setdefault(family, [])
-        identity = (row.uid, row.channel.value, tuple(row.provenance.evidence))
-        if all((existing.uid, existing.channel.value, tuple(existing.provenance.evidence)) != identity for existing in bucket):
-            bucket.append(row)
+    touched_families = {
+        int(row.family_signature or row.structural_signature)
+        for row in touched_rows
+    }
 
-    # Untouched recurrent rows may belong to a family touched through another
-    # channel. Contradiction-dominant controls remain graph/HGT evidence but are
-    # not allowed to create higher-order shared memory.
-    touched_families = set(by_family)
-    for rows in runtime._m1n_occurrences.values():
-        for row in rows:
+    # Only inspect indexed rows for families touched by this canonical batch.
+    # The old implementation scanned every retained M1N occurrence on every
+    # batch, making canonical commit cost grow with total accumulated memory.
+    by_family: dict[int, list[Any]] = {}
+    for family_signature in sorted(touched_families):
+        bucket: list[Any] = []
+        seen: set[tuple[Any, str, tuple[Any, ...]]] = set()
+        for row in _family_rows(runtime, family_signature):
             if not _formation_eligible(row):
                 continue
-            family = int(row.family_signature or row.structural_signature)
-            if family not in touched_families:
-                continue
-            bucket = by_family.setdefault(family, [])
             identity = (row.uid, row.channel.value, tuple(row.provenance.evidence))
-            if all((existing.uid, existing.channel.value, tuple(existing.provenance.evidence)) != identity for existing in bucket):
-                bucket.append(row)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            bucket.append(row)
+        if bucket:
+            by_family[family_signature] = bucket
 
     candidates: list[DerivationTask] = []
     for family_signature in sorted(by_family):
