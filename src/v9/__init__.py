@@ -4,11 +4,25 @@ from v9.environments.contract import EnvironmentCognitionAdapter
 from v9.memory.identity import EventUid, MemoryUid
 from v9.runtime import RuntimeConfig, ScientificConfig, ScientificConfigId
 from v9.runtime.v978_conformant import V978ContinuousMemoryRuntime
+from v9.runtime.multiprocess import EncodedTransition
+from v9.runtime.residency import install_bounded_residency
+from v9.runtime.reset_memory import install_reset_memory
 import v9.runtime as _runtime_package
 
-# One authoritative v9.7.8 runtime for CLI, tests and external callers.
+# One authoritative v9.7.9 runtime: v9.7.8 symbolic grounding plus bounded
+# developmental M0/M1 residency.
 ContinuousMemoryRuntime = V978ContinuousMemoryRuntime
-_runtime_package.ContinuousMemoryRuntime = V978ContinuousMemoryRuntime
+if not hasattr(ContinuousMemoryRuntime, "full_metrics"):
+    ContinuousMemoryRuntime.full_metrics = ContinuousMemoryRuntime.metrics
+install_bounded_residency(ContinuousMemoryRuntime)
+install_reset_memory(ContinuousMemoryRuntime)
+_runtime_package.ContinuousMemoryRuntime = ContinuousMemoryRuntime
+
+# Terminal status is derived from the three authoritative boundary fields.
+if not hasattr(EncodedTransition, "done"):
+    EncodedTransition.done = property(
+        lambda self: bool(self.task_success or self.task_failure or self.task_truncated)
+    )
 
 # High-throughput actors route through the passive-capture adapter factory so
 # symbol timestamps reflect observation/action order rather than post-hoc labels.
