@@ -45,9 +45,11 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
         last_family = ""
         last_scenario = ""
         isf_rows: list[tuple[ISFComponents, int, int, Any, Any, int]] = []
+        max_cross_modal = int(runtime.config.scientific.max_cross_modal_facts_per_macro_event)
 
         for plan in plans:
             signatures: list[int] = []
+            cross_modal_used = 0
             event = plan.event
             previous_interaction = None
             if plan.interaction_grounding is not None:
@@ -125,37 +127,57 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                 signature = record_normalized_fast(runtime, symbol.relation, symbol.normalized_write, deferred_rows)
                 signatures.append(signature)
                 touched_signatures.add(signature)
-                if symbol.aligned_relation is not None:
+                if symbol.aligned_relation is not None and cross_modal_used < max_cross_modal:
                     if symbol.aligned_normalized_write is None:
                         raise RuntimeError("aligned symbol commit plan is incomplete")
                     aligned_signature = record_normalized_fast(runtime, symbol.aligned_relation, symbol.aligned_normalized_write, deferred_rows)
                     signatures.append(aligned_signature)
                     touched_signatures.add(aligned_signature)
+                    cross_modal_used += 1
                     if plan.interaction_grounding is not None:
                         g = plan.interaction_grounding
-                        symbol_grounding_uid = symbol.base_writes[1].node.uid
-                        grounding_key = (int(symbol_grounding_uid.lo), int(g.uid.lo), int(g.environment_instance_id), 0, 0)
+                        # Stable symbolic M1N identity is the grounding authority;
+                        # occurrence-specific M1G remains provenance only.
+                        symbol_structure_uid = symbol.relation.uid
+                        grounding_key = (int(symbol_structure_uid.lo), int(g.uid.lo), int(g.environment_instance_id), 0, 0)
                         before_grounding = runtime.grounding.states.get(grounding_key)
-                        after_grounding = runtime.grounding.observe(GroundingEvidence(int(symbol_grounding_uid.lo), int(g.uid.lo), int(g.environment_instance_id), 0, 0, int(runtime._watermark), recurrent_symbol=True, cross_modal_association=True))
+                        after_grounding = runtime.grounding.observe(
+                            GroundingEvidence(
+                                int(symbol_structure_uid.lo),
+                                int(g.uid.lo),
+                                int(g.environment_instance_id),
+                                0,
+                                0,
+                                int(runtime._watermark),
+                                recurrent_symbol=True,
+                                cross_modal_association=True,
+                            )
+                        )
                         if before_grounding is None or int(after_grounding.maturity) > int(before_grounding.maturity):
                             runtime.telemetry["grounding_promotions"] += 1
                 advance_stage_fast(runtime)
 
             for derived in plan.derived_relations:
+                if derived.relation.channel.value == "CROSS_MODAL":
+                    if cross_modal_used >= max_cross_modal:
+                        continue
+                    cross_modal_used += 1
                 signature = record_normalized_fast(runtime, derived.relation, derived.write, deferred_rows)
                 signatures.append(signature)
                 touched_signatures.add(signature)
 
-            # A symbol paired with a prior interaction is an explicit deterministic
-            # mismatch control. It never grants grounding authority.
-            if previous_interaction is not None:
+            # Shuffled mismatch evidence is bounded and contradiction-only.
+            if previous_interaction is not None and cross_modal_used < max_cross_modal:
                 for symbol in plan.symbols:
+                    if cross_modal_used >= max_cross_modal:
+                        break
                     proxy = SimpleNamespace(m1g=symbol.grounding, base_writes=symbol.base_writes, occurrence=symbol.occurrence)
                     control = shuffled_alignment_control(proxy, previous_interaction, causal_watermark=int(runtime._watermark), occurrence=symbol.occurrence)
                     write = _m1n_write(control.relation, watermark=int(runtime._watermark), occurrence=symbol.occurrence, payload_extra=control.payload())
                     signature = record_normalized_fast(runtime, control.relation, write, deferred_rows)
                     signatures.append(signature)
                     touched_signatures.add(signature)
+                    cross_modal_used += 1
 
             last_step = plan.curriculum_step or "none"
             last_family = str(plan.identity.family)
