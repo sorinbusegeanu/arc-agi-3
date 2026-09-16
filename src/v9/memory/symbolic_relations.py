@@ -50,22 +50,15 @@ def _identity(row: Any) -> tuple[int, int, int, int] | None:
 def _grounding(row: Any) -> M1GroundedContingency:
     value = getattr(row, "m1g", None)
     if value is None:
-        value = getattr(row, "relation", None)
-        parents = getattr(value, "provenance", None)
-        if parents is None:
-            raise ValueError("symbol relation lacks grounded provenance")
-        # Commit plans do not retain the grounded object; caller should only use
-        # this helper with prepared rows. Canonical commit derives before flattening.
         raise ValueError("grounded symbolic row is required")
     return value
 
 
 def _interaction_family_key(row: M1GroundedContingency) -> tuple[object, ...]:
+    """Modality-neutral transformation descriptor shared with memory_pipeline."""
     return (
-        "INTERACTION_TRANSITION",
-        int(row.environment_instance_id),
+        "INTERACTION_TRANSFORMATION",
         int(row.grounded_context_signature),
-        -1 if row.executable_action_token is None else int(row.executable_action_token),
         int(row.realized_transition_signature),
         int(row.grounded_next_context_signature),
     )
@@ -85,7 +78,9 @@ def _occurrence(row: Any, by_event: dict[tuple[int, int], Any]) -> Any | None:
     event = getattr(row, "event", None)
     if event is None:
         return None
-    identity = event.identity.event_id
+    identity = getattr(event.identity, "event_id", None)
+    if identity is None:
+        return None
     return by_event.get((int(identity.hi), int(identity.lo)))
 
 
@@ -94,6 +89,17 @@ def _phase(row: Any, by_event: dict[tuple[int, int], Any]) -> str:
     if occurrence is not None:
         return str(occurrence.temporal_phase)
     return SymbolTemporalPhase.COINCIDENT.value
+
+
+def _row_watermark(row: Any, by_event: dict[tuple[int, int], Any], fallback: int) -> int:
+    occurrence = _occurrence(row, by_event)
+    if occurrence is not None:
+        return int(occurrence.causal_watermark)
+    event = getattr(row, "event", None)
+    identity = getattr(event, "identity", None)
+    if identity is not None and getattr(identity, "causal_watermark", None) is not None:
+        return int(identity.causal_watermark)
+    return int(fallback)
 
 
 def _symbol_key(identity: tuple[int, int, int, int] | None) -> tuple[object, ...]:
@@ -147,11 +153,13 @@ def derive_symbolic_relations(
     transition: Any,
     causal_watermark: int,
     occurrences: Iterable[Any] = (),
+    max_cross_modal_facts: int | None = None,
 ) -> tuple[DerivedSymbolicRelation, ...]:
-    """Derive structural symbolic/cross-modal M1N evidence without semantics."""
+    """Derive bounded structural symbolic/cross-modal M1N evidence without semantics."""
     rows = tuple(symbol_rows)
     by_event = _occurrence_map(occurrences)
-    derived: list[DerivedSymbolicRelation] = []
+    symbolic: list[DerivedSymbolicRelation] = []
+    cross_modal: list[DerivedSymbolicRelation] = []
 
     for left, right in zip(rows, rows[1:]):
         left_id, right_id = _identity(left), _identity(right)
@@ -163,8 +171,9 @@ def derive_symbolic_relations(
             right_pos = 0 if right_id is None else int(right_id[3])
             offset = right_pos - left_pos
         pair_key = ("SYMBOL_PAIR", *_symbol_key(left_id), *_symbol_key(right_id))
-        derived.append(_make(SymbolicRelation.SYMBOL_PRECEDES_SYMBOL, NormalizedChannel.SYMBOL, (_grounding(left), _grounding(right)), symbol_identity=left_id, causal_watermark=causal_watermark, temporal_offsets=(offset,), temporal_phase=_phase(left, by_event), family_key=pair_key, structural_extra=_symbol_key(right_id)))
-        derived.append(_make(SymbolicRelation.SYMBOL_FOLLOWS_SYMBOL, NormalizedChannel.SYMBOL, (_grounding(right), _grounding(left)), symbol_identity=right_id, causal_watermark=causal_watermark, temporal_offsets=(-offset,), temporal_phase=_phase(right, by_event), family_key=pair_key, structural_extra=_symbol_key(left_id)))
+        pair_watermark = max(_row_watermark(left, by_event, causal_watermark), _row_watermark(right, by_event, causal_watermark))
+        symbolic.append(_make(SymbolicRelation.SYMBOL_PRECEDES_SYMBOL, NormalizedChannel.SYMBOL, (_grounding(left), _grounding(right)), symbol_identity=left_id, causal_watermark=pair_watermark, temporal_offsets=(offset,), temporal_phase=_phase(left, by_event), family_key=pair_key, structural_extra=_symbol_key(right_id)))
+        symbolic.append(_make(SymbolicRelation.SYMBOL_FOLLOWS_SYMBOL, NormalizedChannel.SYMBOL, (_grounding(right), _grounding(left)), symbol_identity=right_id, causal_watermark=pair_watermark, temporal_offsets=(-offset,), temporal_phase=_phase(right, by_event), family_key=pair_key, structural_extra=_symbol_key(left_id)))
 
     by_symbol: dict[tuple[int, int, int], list[Any]] = {}
     for row in rows:
@@ -181,7 +190,8 @@ def derive_symbolic_relations(
             else:
                 first_id = _identity(first)
                 offset = int(identity[3]) - (0 if first_id is None else int(first_id[3]))
-            derived.append(_make(SymbolicRelation.SYMBOL_RECURS_WITHIN_WINDOW, NormalizedChannel.SYMBOL, (_grounding(first), _grounding(row)), symbol_identity=identity, causal_watermark=causal_watermark, temporal_offsets=(offset,), temporal_phase=_phase(row, by_event), family_key=("SYMBOL_RECURRENCE", *_symbol_key(identity))))
+            recurrence_watermark = max(_row_watermark(first, by_event, causal_watermark), _row_watermark(row, by_event, causal_watermark))
+            symbolic.append(_make(SymbolicRelation.SYMBOL_RECURS_WITHIN_WINDOW, NormalizedChannel.SYMBOL, (_grounding(first), _grounding(row)), symbol_identity=identity, causal_watermark=recurrence_watermark, temporal_offsets=(offset,), temporal_phase=_phase(row, by_event), family_key=("SYMBOL_RECURRENCE", *_symbol_key(identity))))
         prior.append(row)
 
     changed = int(getattr(transition, "before_signature", 0)) != int(getattr(transition, "after_signature", 0))
@@ -192,6 +202,7 @@ def derive_symbolic_relations(
     for row in rows:
         identity = _identity(row)
         phase = _phase(row, by_event)
+        relation_watermark = max(_row_watermark(row, by_event, causal_watermark), int(causal_watermark))
         before_action = phase == SymbolTemporalPhase.BEFORE_ACTION.value
         after_action = phase in {SymbolTemporalPhase.AFTER_ACTION.value, SymbolTemporalPhase.AFTER_OUTCOME.value, SymbolTemporalPhase.BETWEEN_ACTIONS.value}
         coincident = phase == SymbolTemporalPhase.COINCIDENT.value
@@ -199,27 +210,33 @@ def derive_symbolic_relations(
         previous_family = None if previous_interaction_grounding is None else _interaction_family_key(previous_interaction_grounding)
 
         if interaction_grounding is not None:
-            derived.append(_make(SymbolicRelation.SYMBOL_INTERACTION_ALIGNMENT, NormalizedChannel.CROSS_MODAL, (_grounding(row), interaction_grounding), symbol_identity=identity, causal_watermark=causal_watermark, temporal_offsets=(0,), temporal_phase=phase, family_key=current_family))
+            parents = (_grounding(row), interaction_grounding)
+            cross_modal.append(_make(SymbolicRelation.SYMBOL_INTERACTION_ALIGNMENT, NormalizedChannel.CROSS_MODAL, parents, symbol_identity=identity, causal_watermark=relation_watermark, temporal_offsets=(0,), temporal_phase=phase, family_key=current_family))
+            cross_modal.append(_make(SymbolicRelation.CROSS_MODAL_CORRESPONDENCE, NormalizedChannel.CROSS_MODAL, parents, symbol_identity=identity, causal_watermark=relation_watermark, temporal_offsets=(0,), temporal_phase=phase, family_key=current_family, structural_extra=("ALIGNED",)))
             if before_action:
-                derived.append(_make(SymbolicRelation.SYMBOL_PRECEDES_ACTION, NormalizedChannel.CROSS_MODAL, (_grounding(row), interaction_grounding), symbol_identity=identity, causal_watermark=causal_watermark, temporal_offsets=(-1,), temporal_phase=phase, family_key=current_family))
+                cross_modal.append(_make(SymbolicRelation.SYMBOL_PRECEDES_ACTION, NormalizedChannel.CROSS_MODAL, parents, symbol_identity=identity, causal_watermark=relation_watermark, temporal_offsets=(-1,), temporal_phase=phase, family_key=current_family))
+                cross_modal.append(_make(SymbolicRelation.SYMBOL_TO_INTERACTION_PREDICTION, NormalizedChannel.CROSS_MODAL, parents, symbol_identity=identity, causal_watermark=relation_watermark, temporal_offsets=(-1,), temporal_phase=phase, family_key=current_family))
                 if changed:
-                    derived.append(_make(SymbolicRelation.SYMBOL_PRECEDES_NORMALIZED_CHANGE, NormalizedChannel.CROSS_MODAL, (_grounding(row), interaction_grounding), symbol_identity=identity, causal_watermark=causal_watermark, temporal_offsets=(-1,), temporal_phase=phase, family_key=current_family))
+                    cross_modal.append(_make(SymbolicRelation.SYMBOL_PRECEDES_NORMALIZED_CHANGE, NormalizedChannel.CROSS_MODAL, parents, symbol_identity=identity, causal_watermark=relation_watermark, temporal_offsets=(-1,), temporal_phase=phase, family_key=current_family))
             elif after_action or coincident:
-                derived.append(_make(SymbolicRelation.SYMBOL_FOLLOWS_ACTION, NormalizedChannel.CROSS_MODAL, (_grounding(row), interaction_grounding), symbol_identity=identity, causal_watermark=causal_watermark, temporal_offsets=(0 if coincident else 1,), temporal_phase=phase, family_key=current_family))
+                cross_modal.append(_make(SymbolicRelation.SYMBOL_FOLLOWS_ACTION, NormalizedChannel.CROSS_MODAL, parents, symbol_identity=identity, causal_watermark=relation_watermark, temporal_offsets=(0 if coincident else 1,), temporal_phase=phase, family_key=current_family))
+                cross_modal.append(_make(SymbolicRelation.INTERACTION_TO_SYMBOL_GENERALIZATION, NormalizedChannel.CROSS_MODAL, parents, symbol_identity=identity, causal_watermark=relation_watermark, temporal_offsets=(0 if coincident else 1,), temporal_phase=phase, family_key=current_family))
                 if changed:
-                    derived.append(_make(SymbolicRelation.SYMBOL_FOLLOWS_NORMALIZED_CHANGE, NormalizedChannel.CROSS_MODAL, (_grounding(row), interaction_grounding), symbol_identity=identity, causal_watermark=causal_watermark, temporal_offsets=(0 if coincident else 1,), temporal_phase=phase, family_key=current_family))
+                    cross_modal.append(_make(SymbolicRelation.SYMBOL_FOLLOWS_NORMALIZED_CHANGE, NormalizedChannel.CROSS_MODAL, parents, symbol_identity=identity, causal_watermark=relation_watermark, temporal_offsets=(0 if coincident else 1,), temporal_phase=phase, family_key=current_family))
         elif previous_interaction_grounding is not None and after_action:
-            derived.append(_make(SymbolicRelation.SYMBOL_FOLLOWS_ACTION, NormalizedChannel.CROSS_MODAL, (_grounding(row), previous_interaction_grounding), symbol_identity=identity, causal_watermark=causal_watermark, temporal_offsets=(1,), temporal_phase=phase, family_key=previous_family))
+            cross_modal.append(_make(SymbolicRelation.SYMBOL_FOLLOWS_ACTION, NormalizedChannel.CROSS_MODAL, (_grounding(row), previous_interaction_grounding), symbol_identity=identity, causal_watermark=relation_watermark, temporal_offsets=(1,), temporal_phase=phase, family_key=previous_family))
 
         local_family = current_family or previous_family or ("SYMBOL_CONTEXT", *_symbol_key(identity))
         if boundary:
-            derived.append(_make(SymbolicRelation.SYMBOL_NEAR_BOUNDARY, NormalizedChannel.CROSS_MODAL, (_grounding(row),), symbol_identity=identity, causal_watermark=causal_watermark, temporal_offsets=(0,), temporal_phase=phase, family_key=local_family))
+            cross_modal.append(_make(SymbolicRelation.SYMBOL_NEAR_BOUNDARY, NormalizedChannel.CROSS_MODAL, (_grounding(row),), symbol_identity=identity, causal_watermark=relation_watermark, temporal_offsets=(0,), temporal_phase=phase, family_key=local_family))
         if progress:
-            derived.append(_make(SymbolicRelation.SYMBOL_COINCIDENT_WITH_PROGRESS, NormalizedChannel.CROSS_MODAL, (_grounding(row),), symbol_identity=identity, causal_watermark=causal_watermark, temporal_offsets=(0,), temporal_phase=phase, family_key=local_family))
+            cross_modal.append(_make(SymbolicRelation.SYMBOL_COINCIDENT_WITH_PROGRESS, NormalizedChannel.CROSS_MODAL, (_grounding(row),), symbol_identity=identity, causal_watermark=relation_watermark, temporal_offsets=(0,), temporal_phase=phase, family_key=local_family))
         if outcome and phase in {SymbolTemporalPhase.AFTER_OUTCOME.value, SymbolTemporalPhase.AFTER_ACTION.value, SymbolTemporalPhase.COINCIDENT.value}:
-            derived.append(_make(SymbolicRelation.SYMBOL_COINCIDENT_WITH_OUTCOME, NormalizedChannel.CROSS_MODAL, (_grounding(row),), symbol_identity=identity, causal_watermark=causal_watermark, temporal_offsets=(0,), temporal_phase=phase, family_key=local_family))
+            cross_modal.append(_make(SymbolicRelation.SYMBOL_COINCIDENT_WITH_OUTCOME, NormalizedChannel.CROSS_MODAL, (_grounding(row),), symbol_identity=identity, causal_watermark=relation_watermark, temporal_offsets=(0,), temporal_phase=phase, family_key=local_family))
 
-    return tuple(derived)
+    if max_cross_modal_facts is not None:
+        cross_modal = cross_modal[: max(0, int(max_cross_modal_facts))]
+    return tuple(symbolic + cross_modal)
 
 
 def shuffled_alignment_control(
