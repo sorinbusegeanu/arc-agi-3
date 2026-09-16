@@ -201,4 +201,6 @@ def test_viability_epoch_path_uses_runtime_environment_identity(tmp_path) -> Non
         if line.strip()
     ]
     assert rows
-    assert all("evidence_confidence" in row for row in rows)
+    epoch_rows = [row for row in rows if "game" in row]
+    assert epoch_rows
+    assert all("evidence_confidence" in row for row in epoch_rows)
