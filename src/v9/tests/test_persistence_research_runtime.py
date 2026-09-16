@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from v9.research.grounding_h16 import GroundingCondition, evaluate_h16, run_matched_controls, run_synthetic_h16_controls
+from v9.research.grounding_h16 import GroundingCondition, H16Metrics, evaluate_h16, run_matched_controls, run_synthetic_h16_controls
 from v9.research.evidence import EvidenceLedger
 from v9.research.hypotheses import HypothesisStatus
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
@@ -70,7 +70,23 @@ def test_legacy_ledger_is_deleted_and_new_records_are_discarded(tmp_path: Path) 
 def test_h16_requires_matched_c0_through_c3_and_aligned_advantage() -> None:
     def runner(condition: GroundingCondition, seed: int, budget: int):
         del seed, budget
-        return (1.0, 1.0, 0.5) if condition is GroundingCondition.C2_ALIGNED else (0.1, 0.1, 0.0)
+        if condition is GroundingCondition.C2_ALIGNED:
+            return H16Metrics(
+                interaction_prediction=1.0,
+                action_success=1.0,
+                symbol_conditioned_transfer=1.0,
+                world_to_symbol_generalization=1.0,
+                composition_success=1.0,
+                persistence_without_symbols=1.0,
+            ), 0.5
+        return H16Metrics(
+            interaction_prediction=0.1,
+            action_success=0.1,
+            symbol_conditioned_transfer=0.1,
+            world_to_symbol_generalization=0.1,
+            composition_success=0.1,
+            persistence_without_symbols=0.1,
+        ), 0.0
 
     trials = run_matched_controls(runner, seeds=(1, 2), environment_config_id=9, interaction_budget=10)
     report = evaluate_h16(trials)
@@ -94,7 +110,7 @@ def test_cli_smoke_uses_only_v9_named_artifacts(tmp_path: Path) -> None:
     assert not (tmp_path / "v8_run_summary.json").exists()
     assert not (tmp_path / "evidence" / "ledger.jsonl").exists()
     report = json.loads((tmp_path / "reports" / "reporting_cut.json").read_text())
-    assert report["scientific_config"]["design_version"] == "9.7.6"
+    assert report["scientific_config"]["design_version"] == "9.7.9"
 
 
 def test_native_snapshot_uses_content_addressed_binary_graph_shards(tmp_path: Path) -> None:

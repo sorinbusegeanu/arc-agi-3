@@ -22,7 +22,7 @@ def test_hgt_scientific_config_has_nine_objectives_and_final_graph_budgets() -> 
 
 
 def test_hgt_rejects_wrong_objective_weight_count() -> None:
-    with pytest.raises(ValueError, match="nine positive objective weights"):
+    with pytest.raises(ValueError, match="nine positive base objective weights"):
         ScientificConfig(hgt_loss_weights=(1.0, 1.0))
 
 

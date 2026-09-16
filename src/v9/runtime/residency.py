@@ -1,0 +1,859 @@
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import replace
+import gc
+import heapq
+import math
+import time
+from typing import Any, Iterable
+
+from v9.memory.identity import MemoryUid
+from v9.memory.model import MemoryLevel, MemoryType
+from v9.memory.provenance import DerivationProvenance
+from v9.memory.relations import RelationEdge, RelationType
+from v9.mutation.transactions import MutationOutcome
+
+from .memory_governor import MemoryGovernorState, RuntimeMemoryGovernor
+from .publication import CanonicalGraph, edge_ref, node_ref
+from .read_view import ReadView, _cognitively_visible
+
+
+def _is_deletable_low_level(node: Any) -> bool:
+    return (
+        node.level is MemoryLevel.M0 and node.memory_type is MemoryType.EPISODE
+    ) or (
+        node.level is MemoryLevel.M1 and node.memory_type is MemoryType.GROUNDED_CONTINGENCY
+    )
+
+
+def _replacement_is_more_abstract(target: Any, replacement: Any) -> bool:
+    if target.level is MemoryLevel.M0:
+        return replacement.level >= MemoryLevel.M1
+    if target.level is MemoryLevel.M1 and target.memory_type is MemoryType.GROUNDED_CONTINGENCY:
+        return replacement.level > MemoryLevel.M1 or replacement.memory_type is MemoryType.NORMALIZED_RELATION
+    return False
+
+
+def _has_consolidation_path(graph: CanonicalGraph, source: MemoryUid, target: MemoryUid, *, max_hops: int = 8) -> bool:
+    if source == target:
+        return False
+    frontier = [source]
+    visited = {source}
+    for _ in range(max(1, int(max_hops))):
+        next_frontier: list[MemoryUid] = []
+        for current in frontier:
+            for child in graph._provenance_targets_by_source.get(current, ()):
+                if child == target:
+                    return True
+                if child not in visited:
+                    visited.add(child)
+                    next_frontier.append(child)
+        if not next_frontier:
+            break
+        frontier = next_frontier
+    return False
+
+
+def _prune_payload_uid_rows(payload: dict[str, Any], deleted: set[MemoryUid]) -> bool:
+    changed = False
+    deleted_pairs = {(uid.hi, uid.lo) for uid in deleted}
+    for key in ("parents", "evidence_refs"):
+        rows = payload.get(key)
+        if not isinstance(rows, (list, tuple)):
+            continue
+        kept = [
+            row
+            for row in rows
+            if not (
+                isinstance(row, (list, tuple))
+                and len(row) == 2
+                and (int(row[0]), int(row[1])) in deleted_pairs
+            )
+        ]
+        if len(kept) != len(rows):
+            payload[key] = kept
+            changed = True
+    return changed
+
+
+def _bounded_ancestor_sources(graph: CanonicalGraph, seeds: Iterable[MemoryUid], *, max_nodes: int = 65_536) -> set[MemoryUid]:
+    result: set[MemoryUid] = set()
+    frontier = deque(seeds)
+    while frontier and len(result) < max(1, int(max_nodes)):
+        uid = frontier.popleft()
+        for source in graph._provenance_sources_by_target.get(uid, ()):
+            if source in result:
+                continue
+            result.add(source)
+            frontier.append(source)
+            if len(result) >= max_nodes:
+                break
+    return result
+
+
+def _install_graph_contract() -> None:
+    if getattr(CanonicalGraph, "_v979_residency_installed", False):
+        return
+
+    original_init = CanonicalGraph.__init__
+    original_publish_locked = CanonicalGraph._publish_locked
+    original_state_dict = CanonicalGraph.state_dict
+    original_from_state_dict = CanonicalGraph.from_state_dict
+
+    def graph_init(self: CanonicalGraph, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        self.low_level_nodes_inserted_total = 0
+        self.low_level_nodes_deleted_total = 0
+        self.low_level_edges_deleted_total = 0
+        self.low_level_delete_batches_total = 0
+        self._resident_m0_count = 0
+        self._resident_m1_grounded_count = 0
+
+    def publish_locked(self: CanonicalGraph, proposal: Any):
+        candidates: list[tuple[MemoryUid, MemoryLevel, MemoryType]] = []
+        duplicate = proposal.proposal_uid in self.applied_proposals
+        if not duplicate:
+            for write in proposal.writes:
+                node = getattr(write, "node", None)
+                if node is None or node.uid in self.nodes or not _is_deletable_low_level(node):
+                    continue
+                candidates.append((node.uid, node.level, node.memory_type))
+        result = original_publish_locked(self, proposal)
+        if result.outcome is MutationOutcome.ACCEPTED and candidates:
+            for uid, level, memory_type in candidates:
+                node = self.nodes.get(uid)
+                if node is None or node.level is not level or node.memory_type is not memory_type:
+                    continue
+                if level is MemoryLevel.M0:
+                    self._resident_m0_count += 1
+                else:
+                    self._resident_m1_grounded_count += 1
+                self.low_level_nodes_inserted_total += 1
+        return result
+
+    def delete_low_level_nodes_batch(
+        self: CanonicalGraph,
+        plans: tuple[tuple[MemoryUid, MemoryUid, str], ...],
+    ) -> tuple[MemoryUid, ...]:
+        if not plans:
+            return ()
+        all_partitions = tuple(range(self.partition_count))
+        with self._coordinator.locked(all_partitions), self._publication_lock:
+            requested = {uid for uid, _, _ in plans}
+            accepted: dict[MemoryUid, tuple[Any, MemoryUid, str]] = {}
+            for uid, replacement_uid, reason in plans:
+                node = self.nodes.get(uid)
+                replacement = self.nodes.get(replacement_uid)
+                if node is None or replacement is None or replacement_uid in requested:
+                    continue
+                if not _is_deletable_low_level(node) or not _replacement_is_more_abstract(node, replacement):
+                    continue
+                if not _has_consolidation_path(self, replacement_uid, uid):
+                    continue
+                accepted[uid] = (node, replacement_uid, str(reason))
+            if not accepted:
+                return ()
+
+            deleting = set(accepted)
+            replacement_uids = {replacement_uid for _, replacement_uid, _ in accepted.values()}
+            affected_sources = _bounded_ancestor_sources(self, replacement_uids)
+            affected_sources.update(replacement_uids)
+            for uid in deleting:
+                affected_sources.update(self._provenance_sources_by_target.get(uid, ()))
+
+            incident_keys: set[tuple[MemoryUid, str, MemoryUid]] = set()
+            for uid in deleting:
+                incident_keys.update(self._outgoing_edge_keys.get(uid, ()))
+                incident_keys.update(self._incoming_edge_keys.get(uid, ()))
+
+            removed_edge_refs = []
+            removed_edges = 0
+            for key in tuple(incident_keys):
+                edge = self.edges.get(key)
+                if edge is None:
+                    continue
+                owner = edge.source.shard(self.partition_count)
+                self._deindex_edge(edge)
+                self.edges.pop(key, None)
+                self._edge_keys_by_partition[owner].discard(key)
+                self._edge_counts_by_partition[owner] -= 1
+                removed_edge_refs.append(edge_ref(edge))
+                removed_edges += 1
+
+            for source_uid in affected_sources:
+                payload = self.payloads.get(source_uid)
+                if payload is not None:
+                    _prune_payload_uid_rows(payload, deleting)
+                for key in tuple(self._outgoing_edge_keys.get(source_uid, ())):
+                    edge = self.edges.get(key)
+                    if edge is None or not edge.evidence_uids:
+                        continue
+                    filtered = tuple(uid for uid in edge.evidence_uids if uid not in deleting)
+                    if filtered != edge.evidence_uids:
+                        self.edges[key] = replace(edge, evidence_uids=filtered)
+
+            removed_node_refs = []
+            for uid, (node, _replacement_uid, _reason) in accepted.items():
+                owner = uid.shard(self.partition_count)
+                self.nodes.pop(uid, None)
+                self.payloads.pop(uid, None)
+                self._node_uids_by_partition[owner].discard(uid)
+                self._uids_by_level[node.level].discard(uid)
+                self._node_counts_by_partition[owner] -= 1
+                self._outgoing_edge_keys.pop(uid, None)
+                self._incoming_edge_keys.pop(uid, None)
+                self.retired_tombstones.pop(uid, None)
+                removed_node_refs.append(node_ref(uid))
+                if node.level is MemoryLevel.M0:
+                    self._resident_m0_count = max(0, int(self._resident_m0_count) - 1)
+                else:
+                    self._resident_m1_grounded_count = max(0, int(self._resident_m1_grounded_count) - 1)
+
+            self.versions.remove_many(removed_edge_refs)
+            self.versions.remove_many(removed_node_refs)
+            if deleting:
+                maxlen = self._training_m0_reservoir.maxlen
+                self._training_m0_reservoir = deque(
+                    (uid for uid in self._training_m0_reservoir if uid not in deleting and uid in self.nodes),
+                    maxlen=maxlen,
+                )
+            self.low_level_nodes_deleted_total += len(accepted)
+            self.low_level_edges_deleted_total += removed_edges
+            self.low_level_delete_batches_total += 1
+            self.generation += 1
+            self._cached_read_view = None
+            return tuple(sorted(accepted))
+
+    def retire_nodes_batch(self: CanonicalGraph, plans: tuple[tuple[MemoryUid, MemoryUid, str], ...]) -> tuple[MemoryUid, ...]:
+        return self.delete_low_level_nodes_batch(plans)
+
+    def bounded_view(
+        self: CanonicalGraph,
+        *,
+        max_nodes: int = 800,
+        max_edges: int = 4000,
+        seed_uids: Iterable[MemoryUid] = (),
+        per_level_quotas: dict[MemoryLevel, int] | None = None,
+        selection_reason: str = "bounded_runtime_view",
+    ) -> ReadView:
+        maximum_nodes = max(1, int(max_nodes))
+        maximum_edges = max(1, int(max_edges))
+        seeds = tuple(dict.fromkeys(seed_uids))
+        if not seeds and not per_level_quotas:
+            return self.training_view(max_nodes=maximum_nodes, max_edges=maximum_edges)
+        with self._publication_lock:
+            selected: dict[MemoryUid, Any] = {}
+            for uid in seeds:
+                node = self.nodes.get(uid)
+                if node is not None and _cognitively_visible(self.payloads.get(uid, {})):
+                    selected[uid] = node
+                    if len(selected) >= maximum_nodes:
+                        break
+            quotas = per_level_quotas or {}
+            for level, quota in sorted(quotas.items(), key=lambda row: int(row[0])):
+                if len(selected) >= maximum_nodes:
+                    break
+                rows = (
+                    (uid, self.nodes[uid])
+                    for uid in self._uids_by_level[level]
+                    if uid in self.nodes and uid not in selected and _cognitively_visible(self.payloads.get(uid, {}))
+                )
+                for uid, node in heapq.nlargest(
+                    min(maximum_nodes - len(selected), max(0, int(quota))),
+                    rows,
+                    key=lambda row: (int(row[1].created_watermark), row[0]),
+                ):
+                    selected[uid] = node
+            frontier = deque(selected)
+            while frontier and len(selected) < maximum_nodes:
+                uid = frontier.popleft()
+                keys = set(self._outgoing_edge_keys.get(uid, ())) | set(self._incoming_edge_keys.get(uid, ()))
+                for key in sorted(keys):
+                    edge = self.edges.get(key)
+                    if edge is None:
+                        continue
+                    other = edge.target if edge.source == uid else edge.source
+                    if other in selected:
+                        continue
+                    node = self.nodes.get(other)
+                    if node is None or not _cognitively_visible(self.payloads.get(other, {})):
+                        continue
+                    selected[other] = node
+                    frontier.append(other)
+                    if len(selected) >= maximum_nodes:
+                        break
+            if len(selected) < maximum_nodes:
+                remaining = (
+                    (uid, node)
+                    for uid, node in self.nodes.items()
+                    if uid not in selected and _cognitively_visible(self.payloads.get(uid, {}))
+                )
+                for uid, node in heapq.nlargest(
+                    maximum_nodes - len(selected),
+                    remaining,
+                    key=lambda row: (int(row[1].created_watermark), row[0]),
+                ):
+                    selected[uid] = node
+            selected_uids = set(selected)
+            edge_keys: set[tuple[MemoryUid, str, MemoryUid]] = set()
+            for uid in selected_uids:
+                edge_keys.update(self._outgoing_edge_keys.get(uid, ()))
+            eligible = (
+                self.edges[key]
+                for key in edge_keys
+                if key in self.edges
+                and self.edges[key].source in selected_uids
+                and self.edges[key].target in selected_uids
+            )
+            chosen = heapq.nlargest(
+                maximum_edges,
+                eligible,
+                key=lambda edge: max(
+                    int(self.nodes[edge.source].created_watermark),
+                    int(self.nodes[edge.target].created_watermark),
+                ),
+            )
+            payloads = {uid: self.payloads.get(uid, {}) for uid in selected_uids}
+            return ReadView.build(
+                self.generation,
+                dict(selected),
+                payloads,
+                {edge.key: edge for edge in chosen},
+                {},
+            )
+
+    def state_dict(self: CanonicalGraph) -> dict[str, object]:
+        state = original_state_dict(self)
+        # Deleted concrete evidence is absent from live cognition; snapshots retain
+        # only aggregate deletion accounting rather than UID tombstones.
+        state["retired_tombstones"] = []
+        state["low_level_nodes_inserted_total"] = int(self.low_level_nodes_inserted_total)
+        state["low_level_nodes_deleted_total"] = int(self.low_level_nodes_deleted_total)
+        state["low_level_edges_deleted_total"] = int(self.low_level_edges_deleted_total)
+        state["low_level_delete_batches_total"] = int(self.low_level_delete_batches_total)
+        return state
+
+    @classmethod
+    def from_state_dict(cls, state: dict[str, object]) -> CanonicalGraph:
+        result = original_from_state_dict(state)
+        result.low_level_nodes_inserted_total = int(state.get("low_level_nodes_inserted_total", 0))
+        result.low_level_nodes_deleted_total = int(state.get("low_level_nodes_deleted_total", 0))
+        result.low_level_edges_deleted_total = int(state.get("low_level_edges_deleted_total", 0))
+        result.low_level_delete_batches_total = int(state.get("low_level_delete_batches_total", 0))
+        return result
+
+    CanonicalGraph.__init__ = graph_init
+    CanonicalGraph._publish_locked = publish_locked
+    CanonicalGraph.delete_low_level_nodes_batch = delete_low_level_nodes_batch
+    CanonicalGraph.retire_nodes_batch = retire_nodes_batch
+    CanonicalGraph.bounded_view = bounded_view
+    CanonicalGraph.state_dict = state_dict
+    CanonicalGraph.from_state_dict = from_state_dict
+    CanonicalGraph._v979_residency_installed = True
+
+
+class ResidentMemoryManager:
+    """Capacity-driven representative retention for concrete M0/M1 evidence."""
+
+    def __init__(self, runtime: Any) -> None:
+        self.runtime = runtime
+        self.scientific = runtime.config.scientific
+        self.governor = RuntimeMemoryGovernor(self.scientific)
+        self.compaction_cycles = 0
+        self.compaction_seconds = 0.0
+        self.startup_compaction_seconds = 0.0
+        self.last_deleted = 0
+        self.last_edges_deleted = 0
+        self.last_insert_check = 0
+        self._last_snapshot = None
+        self._recount_graph()
+        legacy_tombstones = len(runtime.graph.retired_tombstones)
+        if legacy_tombstones:
+            runtime.graph.low_level_nodes_deleted_total += legacy_tombstones
+            runtime.graph.retired_tombstones.clear()
+        self.last_insert_check = int(runtime.graph.low_level_nodes_inserted_total)
+
+    def _recount_graph(self) -> None:
+        graph = self.runtime.graph
+        graph._resident_m0_count = len(graph._uids_by_level[MemoryLevel.M0])
+        graph._resident_m1_grounded_count = sum(
+            1
+            for uid in graph._uids_by_level[MemoryLevel.M1]
+            if (node := graph.nodes.get(uid)) is not None
+            and node.memory_type is MemoryType.GROUNDED_CONTINGENCY
+        )
+
+    def counts(self) -> tuple[int, int]:
+        graph = self.runtime.graph
+        return int(graph._resident_m0_count), int(graph._resident_m1_grounded_count)
+
+    def targets(self) -> tuple[int, int]:
+        ratio = float(self.scientific.resident_low_level_target_ratio)
+        return (
+            max(int(self.scientific.resident_m0_representative_floor), int(int(self.scientific.resident_m0_limit) * ratio)),
+            max(int(self.scientific.resident_m1_grounded_representative_floor), int(int(self.scientific.resident_m1_grounded_limit) * ratio)),
+        )
+
+    def backlog(self) -> int:
+        m0, m1g = self.counts()
+        target_m0, target_m1g = self.targets()
+        return max(0, m0 - target_m0) + max(0, m1g - target_m1g)
+
+    def _replacement_for(self, uid: MemoryUid) -> MemoryUid | None:
+        graph = self.runtime.graph
+        node = graph.nodes.get(uid)
+        if node is None or not _is_deletable_low_level(node):
+            return None
+        direct_sources = tuple(graph._provenance_sources_by_target.get(uid, ()))
+        candidates: set[MemoryUid] = set()
+        if node.level is MemoryLevel.M1:
+            for source_uid in direct_sources:
+                source = graph.nodes.get(source_uid)
+                if source is None:
+                    continue
+                if source.memory_type is MemoryType.NORMALIZED_RELATION or source.level > MemoryLevel.M1:
+                    candidates.add(source_uid)
+        else:
+            for source_uid in direct_sources:
+                source = graph.nodes.get(source_uid)
+                if source is None:
+                    continue
+                if source.memory_type is MemoryType.NORMALIZED_RELATION or source.level > MemoryLevel.M1:
+                    candidates.add(source_uid)
+                    continue
+                for second_uid in graph._provenance_sources_by_target.get(source_uid, ()):
+                    second = graph.nodes.get(second_uid)
+                    if second is not None and (
+                        second.memory_type is MemoryType.NORMALIZED_RELATION or second.level > MemoryLevel.M1
+                    ):
+                        candidates.add(second_uid)
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda candidate_uid: (
+                0 if graph.nodes[candidate_uid].memory_type is MemoryType.NORMALIZED_RELATION else 1,
+                int(graph.nodes[candidate_uid].level),
+                candidate_uid,
+            ),
+        )
+
+    def _group_size(self, replacement_uid: MemoryUid, level: MemoryLevel) -> int:
+        graph = self.runtime.graph
+        children = tuple(graph._provenance_targets_by_source.get(replacement_uid, ()))
+        if level is MemoryLevel.M1:
+            return sum(
+                1
+                for uid in children
+                if (node := graph.nodes.get(uid)) is not None
+                and node.level is MemoryLevel.M1
+                and node.memory_type is MemoryType.GROUNDED_CONTINGENCY
+            )
+        count = 0
+        for child_uid in children:
+            child = graph.nodes.get(child_uid)
+            if child is None:
+                continue
+            if child.level is MemoryLevel.M0 and child.memory_type is MemoryType.EPISODE:
+                count += 1
+                continue
+            for grandchild_uid in graph._provenance_targets_by_source.get(child_uid, ()):
+                grandchild = graph.nodes.get(grandchild_uid)
+                if grandchild is not None and grandchild.level is MemoryLevel.M0 and grandchild.memory_type is MemoryType.EPISODE:
+                    count += 1
+        return count
+
+    def _score_candidates(self, rows: list[tuple[MemoryUid, Any, dict[str, Any], MemoryUid]]) -> list[tuple[float, int, MemoryUid, MemoryUid]]:
+        context_counts: dict[tuple[int, int], int] = {}
+        structure_counts: dict[tuple[int, ...], int] = {}
+        training_m0 = set(self.runtime.graph._training_m0_reservoir)
+        for _uid, node, payload, _replacement in rows:
+            context = int(payload.get("context_signature", payload.get("grounded_context_signature", 0)) or 0)
+            action = int(payload.get("action_id", payload.get("executable_action_token", 0)) or 0)
+            context_counts[(context, action)] = context_counts.get((context, action), 0) + 1
+            structure_counts[node.structural_key] = structure_counts.get(node.structural_key, 0) + 1
+
+        watermark = max(1, int(self.runtime.watermark))
+        scored: list[tuple[float, int, MemoryUid, MemoryUid]] = []
+        for uid, node, payload, replacement_uid in rows:
+            age = max(0, watermark - int(node.created_watermark))
+            recency = math.exp(-age / 8192.0)
+            valence = min(1.0, abs(float(payload.get("primary_valence", 0) or 0)))
+            boundary = float(
+                bool(payload.get("task_success", False))
+                or bool(payload.get("task_failure", False))
+                or bool(payload.get("task_truncated", False))
+            )
+            prediction_error = min(1.0, abs(float(payload.get("prediction_error", 0.0) or 0.0)))
+            future_options = min(1.0, abs(float(payload.get("future_option_delta", 0.0) or 0.0)) / 8.0)
+            context = int(payload.get("context_signature", payload.get("grounded_context_signature", 0)) or 0)
+            action = int(payload.get("action_id", payload.get("executable_action_token", 0)) or 0)
+            rarity = 1.0 / max(1, context_counts.get((context, action), 1))
+            structural_rarity = 1.0 / max(1, structure_counts.get(node.structural_key, 1))
+            ancestor_count = len(self.runtime.graph._provenance_sources_by_target.get(replacement_uid, ()))
+            descendant_support = min(1.0, ancestor_count / 4.0)
+            hgt_reservoir = float(uid in training_m0)
+            score = (
+                0.25 * recency
+                + 0.15 * valence
+                + 0.15 * boundary
+                + 0.10 * prediction_error
+                + 0.10 * future_options
+                + 0.08 * rarity
+                + 0.05 * structural_rarity
+                + 0.07 * descendant_support
+                + 0.05 * hgt_reservoir
+            )
+            scored.append((score, int(node.created_watermark), uid, replacement_uid))
+        scored.sort(key=lambda row: (row[0], row[1], row[2]))
+        return scored
+
+    def _candidate_rows(self, level: MemoryLevel, limit: int) -> list[tuple[MemoryUid, Any, dict[str, Any], MemoryUid]]:
+        graph = self.runtime.graph
+        if level is MemoryLevel.M0:
+            source = (
+                uid for uid in graph._uids_by_level[MemoryLevel.M0]
+                if (node := graph.nodes.get(uid)) is not None and node.memory_type is MemoryType.EPISODE
+            )
+        else:
+            source = (
+                uid for uid in graph._uids_by_level[MemoryLevel.M1]
+                if (node := graph.nodes.get(uid)) is not None and node.memory_type is MemoryType.GROUNDED_CONTINGENCY
+            )
+        oldest = heapq.nsmallest(
+            max(1, int(limit)),
+            source,
+            key=lambda uid: (int(graph.nodes[uid].created_watermark), uid),
+        )
+        rows: list[tuple[MemoryUid, Any, dict[str, Any], MemoryUid]] = []
+        for uid in oldest:
+            replacement_uid = self._replacement_for(uid)
+            if replacement_uid is None:
+                continue
+            rows.append((uid, graph.nodes[uid], graph.payloads.get(uid, {}), replacement_uid))
+        return rows
+
+    def _plans_for_level(self, level: MemoryLevel, required: int, scan_budget: int) -> list[tuple[MemoryUid, MemoryUid, str]]:
+        if required <= 0:
+            return []
+        rows = self._candidate_rows(level, scan_budget)
+        scored = self._score_candidates(rows)
+        floor = (
+            int(self.scientific.resident_m0_representative_floor)
+            if level is MemoryLevel.M0
+            else int(self.scientific.resident_m1_grounded_representative_floor)
+        )
+        planned_by_group: dict[MemoryUid, int] = {}
+        group_sizes: dict[MemoryUid, int] = {}
+        plans: list[tuple[MemoryUid, MemoryUid, str]] = []
+        for _score, _created, uid, replacement_uid in scored:
+            if len(plans) >= required:
+                break
+            if replacement_uid not in group_sizes:
+                group_sizes[replacement_uid] = self._group_size(replacement_uid, level)
+            already = planned_by_group.get(replacement_uid, 0)
+            if group_sizes[replacement_uid] - already <= floor:
+                continue
+            plans.append((uid, replacement_uid, "resident_capacity_compaction"))
+            planned_by_group[replacement_uid] = already + 1
+        return plans
+
+    def compact_once(self, *, force: bool = False) -> int:
+        graph = self.runtime.graph
+        m0, m1g = self.counts()
+        target_m0, target_m1g = self.targets()
+        excess_m0 = max(0, m0 - target_m0)
+        excess_m1g = max(0, m1g - target_m1g)
+        if not force and excess_m0 + excess_m1g <= 0:
+            return 0
+        maximum_delete = int(self.scientific.resident_max_delete_batch)
+        maximum_scan = int(self.scientific.resident_max_scan_batch)
+        budget_m0 = min(excess_m0, maximum_delete)
+        budget_m1 = min(excess_m1g, max(0, maximum_delete - budget_m0))
+        if budget_m1 == 0 and excess_m1g > 0 and budget_m0 < maximum_delete:
+            budget_m1 = min(excess_m1g, maximum_delete - budget_m0)
+        scan_m0 = min(maximum_scan, max(4096, budget_m0 * 2)) if budget_m0 else 0
+        scan_m1 = min(maximum_scan, max(4096, budget_m1 * 2)) if budget_m1 else 0
+        plans = self._plans_for_level(MemoryLevel.M0, budget_m0, scan_m0)
+        remaining = max(0, maximum_delete - len(plans))
+        plans.extend(self._plans_for_level(MemoryLevel.M1, min(excess_m1g, remaining), scan_m1))
+        if not plans:
+            return 0
+
+        before_edges = int(graph.low_level_edges_deleted_total)
+        started = time.perf_counter()
+        deleted = graph.delete_low_level_nodes_batch(tuple(plans))
+        elapsed = time.perf_counter() - started
+        if deleted:
+            self.runtime.on_low_level_deleted(deleted)
+            self.compaction_cycles += 1
+            self.compaction_seconds += elapsed
+            self.last_deleted = len(deleted)
+            self.last_edges_deleted = int(graph.low_level_edges_deleted_total) - before_edges
+            self._publish_telemetry()
+        return len(deleted)
+
+    def maybe_compact(self, *, force: bool = False) -> int:
+        graph = self.runtime.graph
+        inserts = int(graph.low_level_nodes_inserted_total)
+        interval_due = inserts - self.last_insert_check >= int(self.scientific.resident_compaction_check_interval)
+        m0, m1g = self.counts()
+        hard_limit = m0 > int(self.scientific.resident_m0_limit) or m1g > int(self.scientific.resident_m1_grounded_limit)
+        snapshot = self.governor.sample(backlog=self.backlog())
+        self._last_snapshot = snapshot
+        pressure = snapshot.state in {MemoryGovernorState.COMPACTING, MemoryGovernorState.HARD_PRESSURE_DRAIN}
+        if not (force or interval_due or hard_limit or pressure):
+            self._publish_telemetry()
+            return 0
+        self.last_insert_check = inserts
+        total = 0
+        passes = 1
+        if hard_limit or snapshot.state is MemoryGovernorState.HARD_PRESSURE_DRAIN or force:
+            passes = 8
+        for _ in range(passes):
+            deleted = self.compact_once(force=True)
+            total += deleted
+            if deleted <= 0 or self.backlog() <= 0:
+                break
+        if snapshot.state is MemoryGovernorState.HARD_PRESSURE_DRAIN:
+            gc.collect()
+        self._publish_telemetry()
+        return total
+
+    def startup_compact(self) -> dict[str, int | float]:
+        started = time.perf_counter()
+        pre_m0, pre_m1g = self.counts()
+        before_deleted = int(self.runtime.graph.low_level_nodes_deleted_total)
+        before_edges = int(self.runtime.graph.low_level_edges_deleted_total)
+        before_memory = self.governor.sample(backlog=self.backlog())
+        passes = 0
+        while self.backlog() > 0 and passes < 128:
+            passes += 1
+            if self.compact_once(force=True) <= 0:
+                break
+        gc.collect()
+        post_m0, post_m1g = self.counts()
+        after_memory = self.governor.sample(backlog=self.backlog())
+        self._last_snapshot = after_memory
+        self.startup_compaction_seconds = time.perf_counter() - started
+        result: dict[str, int | float] = {
+            "pre_migration_M0": pre_m0,
+            "pre_migration_M1G": pre_m1g,
+            "post_migration_M0": post_m0,
+            "post_migration_M1G": post_m1g,
+            "nodes_deleted": int(self.runtime.graph.low_level_nodes_deleted_total) - before_deleted,
+            "edges_deleted": int(self.runtime.graph.low_level_edges_deleted_total) - before_edges,
+            "migration_seconds": self.startup_compaction_seconds,
+            "RSS_before": before_memory.rss_bytes,
+            "RSS_after": after_memory.rss_bytes,
+        }
+        self._publish_telemetry()
+        return result
+
+    def _publish_telemetry(self) -> None:
+        graph = self.runtime.graph
+        snapshot = self._last_snapshot or self.governor.sample(backlog=self.backlog())
+        m0, m1g = self.counts()
+        target_m0, target_m1g = self.targets()
+        gauges = getattr(self.runtime.unified_telemetry, "gauges", None)
+        if isinstance(gauges, dict):
+            gauges.update({
+                "M0_resident": m0,
+                "M1_grounded_resident": m1g,
+                "resident_M0_limit": int(self.scientific.resident_m0_limit),
+                "resident_M1_grounded_limit": int(self.scientific.resident_m1_grounded_limit),
+                "resident_M0_target": target_m0,
+                "resident_M1_grounded_target": target_m1g,
+                "compaction_backlog": self.backlog(),
+                "low_level_nodes_inserted": int(graph.low_level_nodes_inserted_total),
+                "low_level_nodes_deleted": int(graph.low_level_nodes_deleted_total),
+                "low_level_edges_deleted": int(graph.low_level_edges_deleted_total),
+                "low_level_delete_batches": int(graph.low_level_delete_batches_total),
+                "compaction_cycles": int(self.compaction_cycles),
+                "compaction_seconds": float(self.compaction_seconds),
+                "startup_compaction_seconds": float(self.startup_compaction_seconds),
+                "process_rss_bytes": int(snapshot.rss_bytes),
+                "process_uss_bytes": int(snapshot.uss_bytes),
+                "process_swap_bytes": int(snapshot.swap_bytes),
+                "memory_governor_state": snapshot.state.value,
+            })
+            gauges.update(self.governor.state_dict())
+
+    def metrics(self) -> dict[str, int | float | str]:
+        self._publish_telemetry()
+        snapshot = self._last_snapshot or self.governor.sample(backlog=self.backlog())
+        m0, m1g = self.counts()
+        return {
+            "M0_resident": m0,
+            "M1_grounded_resident": m1g,
+            "resident_M0_limit": int(self.scientific.resident_m0_limit),
+            "resident_M1_grounded_limit": int(self.scientific.resident_m1_grounded_limit),
+            "compaction_backlog": self.backlog(),
+            "low_level_nodes_inserted": int(self.runtime.graph.low_level_nodes_inserted_total),
+            "low_level_nodes_deleted": int(self.runtime.graph.low_level_nodes_deleted_total),
+            "low_level_edges_deleted": int(self.runtime.graph.low_level_edges_deleted_total),
+            "compaction_cycles": int(self.compaction_cycles),
+            "compaction_seconds": float(self.compaction_seconds),
+            "startup_compaction_seconds": float(self.startup_compaction_seconds),
+            "process_rss_bytes": int(snapshot.rss_bytes),
+            "process_uss_bytes": int(snapshot.uss_bytes),
+            "process_swap_bytes": int(snapshot.swap_bytes),
+            "memory_governor_state": snapshot.state.value,
+        }
+
+
+def _install_runtime_contract(runtime_cls: type) -> None:
+    if getattr(runtime_cls, "_v979_residency_installed", False):
+        return
+
+    original_init = runtime_cls.__init__
+    original_flush = runtime_cls.flush_deferred_memory_updates
+    original_apply_batch = runtime_cls.apply_prepared_ingestion_batch
+    original_dashboard = runtime_cls.dashboard_metrics
+    original_full_metrics = runtime_cls.full_metrics
+
+    def runtime_init(self: Any, config: Any) -> None:
+        original_init(self, config)
+        self._resident_memory = ResidentMemoryManager(self)
+        migration = self._resident_memory.startup_compact()
+        if int(migration["nodes_deleted"]) > 0:
+            print(
+                f"{time.strftime('[%H:%M]')} startup compaction "
+                f"M0={migration['pre_migration_M0']}->{migration['post_migration_M0']} "
+                f"M1G={migration['pre_migration_M1G']}->{migration['post_migration_M1G']} "
+                f"deleted={migration['nodes_deleted']} seconds={migration['migration_seconds']:.2f}",
+                flush=True,
+            )
+
+    def on_low_level_deleted(self: Any, deleted_uids: Iterable[MemoryUid]) -> None:
+        deleted = set(deleted_uids)
+        if not deleted:
+            return
+        registry = self.lifecycle
+        for uid in deleted:
+            registry.records.pop(uid, None)
+            registry._urgent_set.discard(uid)
+            self._replay_pool.pop(uid, None)
+            self._deferred_base_nodes.pop(uid, None)
+            self._transfer_trials.pop(uid, None)
+        if getattr(registry, "_scan_order", None):
+            registry._scan_order = [uid for uid in registry._scan_order if uid not in deleted]
+            registry._scan_cursor = 0 if not registry._scan_order else registry._scan_cursor % len(registry._scan_order)
+            registry._stale_scan_entries = 0
+        if getattr(registry, "_urgent", None):
+            registry._urgent = deque(uid for uid in registry._urgent if uid not in deleted)
+
+        environment_index = getattr(self, "_memory_uids_by_environment", None)
+        if environment_index is not None:
+            for environment_id in tuple(environment_index):
+                environment_index[environment_id].difference_update(deleted)
+                if not environment_index[environment_id]:
+                    del environment_index[environment_id]
+        self._latest_interaction_grounding = {
+            key: row for key, row in self._latest_interaction_grounding.items() if row.uid not in deleted
+        }
+
+        deleted_lo = {int(uid.lo) for uid in deleted}
+        grounding_states = getattr(getattr(self, "grounding", None), "states", None)
+        if isinstance(grounding_states, dict) and deleted_lo:
+            for key in tuple(grounding_states):
+                if len(key) >= 2 and (int(key[0]) in deleted_lo or int(key[1]) in deleted_lo):
+                    grounding_states.pop(key, None)
+
+        # Preserve aggregate M1N support while rebuilding its bounded concrete
+        # occurrence sample from surviving grounded parents.
+        for signature, rows in tuple(self._m1n_occurrences.items()):
+            if not rows:
+                continue
+            template = rows[0]
+            surviving = tuple(
+                uid
+                for uid in self.graph._provenance_targets_by_source.get(template.uid, ())
+                if uid in self.graph.nodes
+                and self.graph.nodes[uid].memory_type is MemoryType.GROUNDED_CONTINGENCY
+            )
+            if not surviving:
+                self._m1n_occurrences[signature] = []
+                continue
+            limit = max(2, int(self.config.scientific.m1n_facts_per_channel))
+            parents = tuple(sorted(surviving)[:limit])
+            evidence: list[MemoryUid] = []
+            for parent in parents:
+                evidence.extend(
+                    uid
+                    for uid in self.graph._provenance_targets_by_source.get(parent, ())
+                    if uid in self.graph.nodes and self.graph.nodes[uid].level is MemoryLevel.M0
+                )
+            provenance = DerivationProvenance(parents, tuple(sorted(set(evidence))))
+            self._m1n_occurrences[signature] = [replace(template, provenance=provenance)]
+
+    def apply_prepared_ingestion_batch(self: Any, rows: Iterable[Any]):
+        prepared_rows = tuple(rows)
+        manager = getattr(self, "_resident_memory", None)
+        if manager is not None and manager.governor.sample(backlog=manager.backlog()).state is MemoryGovernorState.HARD_PRESSURE_DRAIN:
+            manager.maybe_compact(force=True)
+        result = original_apply_batch(self, prepared_rows)
+        # Add boundary outcome evidence to the deferred M0 payload so retention
+        # scoring can preserve rare successes/failures and truncation boundaries.
+        for prepared in prepared_rows:
+            transition = getattr(prepared, "transition", None)
+            m0 = getattr(prepared, "m0", None)
+            if transition is None or m0 is None:
+                continue
+            deferred = self._deferred_base_nodes.get(m0.uid)
+            if deferred is None:
+                continue
+            node, payload, evidence = deferred
+            payload = dict(payload)
+            payload["task_success"] = bool(getattr(transition, "task_success", False))
+            payload["task_failure"] = bool(getattr(transition, "task_failure", False))
+            payload["task_truncated"] = bool(getattr(transition, "task_truncated", False))
+            payload["level_index"] = int(getattr(transition, "level_index", 0))
+            payload["levels_completed"] = int(getattr(transition, "levels_completed", 0))
+            self._deferred_base_nodes[m0.uid] = (node, payload, evidence)
+        return result
+
+    def flush_deferred_memory_updates(self: Any) -> None:
+        original_flush(self)
+        manager = getattr(self, "_resident_memory", None)
+        if manager is not None:
+            manager.maybe_compact()
+
+    def dashboard_metrics(self: Any) -> dict[str, Any]:
+        result = original_dashboard(self)
+        manager = getattr(self, "_resident_memory", None)
+        if manager is not None:
+            result.update(manager.metrics())
+            primary = result.get("primary_dashboard")
+            if isinstance(primary, dict):
+                primary.update({
+                    "M0_resident": result["M0_resident"],
+                    "M1_grounded_resident": result["M1_grounded_resident"],
+                    "compaction_backlog": result["compaction_backlog"],
+                    "process_rss_bytes": result["process_rss_bytes"],
+                    "process_swap_bytes": result["process_swap_bytes"],
+                    "memory_governor_state": result["memory_governor_state"],
+                })
+        return result
+
+    def full_metrics(self: Any) -> dict[str, Any]:
+        result = original_full_metrics(self)
+        manager = getattr(self, "_resident_memory", None)
+        if manager is not None:
+            result.update(manager.metrics())
+        return result
+
+    runtime_cls.__init__ = runtime_init
+    runtime_cls.on_low_level_deleted = on_low_level_deleted
+    runtime_cls.apply_prepared_ingestion_batch = apply_prepared_ingestion_batch
+    runtime_cls.flush_deferred_memory_updates = flush_deferred_memory_updates
+    runtime_cls.dashboard_metrics = dashboard_metrics
+    runtime_cls.full_metrics = full_metrics
+    runtime_cls._v979_residency_installed = True
+
+
+def install_bounded_residency(runtime_cls: type) -> None:
+    """Install the v9.7.9 bounded-residency contract once at package import."""
+    _install_graph_contract()
+    _install_runtime_contract(runtime_cls)

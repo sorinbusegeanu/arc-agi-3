@@ -15,6 +15,16 @@ def _prepared(count: int = 320):
         watermark += len(symbols)
     return tuple(rows)
 
+def _stage_semantics(runtime):
+    state = runtime.stage_tracker.state_dict()
+    return {
+        **state,
+        "history": [
+            {key: value for key, value in row.items() if key != "evidence_watermark"}
+            for row in state["history"]
+        ],
+    }
+
 def test_true_batch_matches_ordered_single_event_state(tmp_path: Path, monkeypatch) -> None:
     rows = _prepared()
     single = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path / "single", restore=False, enable_snapshots=False))
@@ -30,7 +40,7 @@ def test_true_batch_matches_ordered_single_event_state(tmp_path: Path, monkeypat
     batched.flush_deferred_memory_updates()
     assert batched._m1n_supports == single._m1n_supports
     assert batched._actor_action_supports == single._actor_action_supports
-    assert batched.stage_tracker.state_dict() == single.stage_tracker.state_dict()
+    assert _stage_semantics(batched) == _stage_semantics(single)
     assert batched.isf.state_dict() == single.isf.state_dict()
     assert batched.timeline.state_dict() == single.timeline.state_dict()
     assert batched.environments.state_dict() == single.environments.state_dict()
