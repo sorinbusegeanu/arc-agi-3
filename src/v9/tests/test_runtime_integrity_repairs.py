@@ -47,6 +47,9 @@ def test_viability_observed_once_at_canonical_apply(tmp_path: Path) -> None:
             action_id=0,
             after_signature=11,
             available_actions_after=2,
+            primary_valence=0,
+            symbols=(),
+            curriculum_step="broad",
             game_scenario="integrity",
         )
         prepared = prepare_ingestion(IngestionTask(1, 1, transition))
