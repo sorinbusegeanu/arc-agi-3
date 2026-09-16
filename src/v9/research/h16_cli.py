@@ -3,7 +3,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .grounding_h16 import evaluate_h16, run_hydra_h16_controls, run_synthetic_h16_controls, save_h16_evidence
+from .grounding_h16 import evaluate_h16, run_synthetic_h16_controls, save_h16_evidence
+from .h16_reproducible import run_reproducible_hydra_h16_controls
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -32,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         runtime_root = Path(args.root) if args.root else output.parent / "hydra-runtime"
-        trials = run_hydra_h16_controls(
+        trials = run_reproducible_hydra_h16_controls(
             root=runtime_root,
             seeds=seeds,
             environment_config_id=int(args.environment_config_id),
