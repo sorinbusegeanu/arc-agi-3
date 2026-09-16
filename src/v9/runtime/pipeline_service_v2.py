@@ -47,16 +47,32 @@ class MemoryPipelineServiceV2:
 
     def dispatch_transition(self, transition: Any) -> None:
         self.sampled += 1
-        canonical_sequence = self.runtime.reserve_producer_sequence(
-            int(transition.actor_id), int(transition.producer_sequence)
-        )
+        canonical_sequence = self.runtime.reserve_producer_sequence(int(transition.actor_id), int(transition.producer_sequence))
         if canonical_sequence != int(transition.producer_sequence):
             transition = replace(transition, producer_sequence=canonical_sequence)
+        scientific = self.runtime.config.scientific
+        if not bool(scientific.symbolic_grounding_enabled) and tuple(transition.symbols):
+            transition = replace(transition, symbols=())
         sequence = self.ingest_sequence
         self.ingest_sequence += 1
         self.watermark_cursor += 1
-        self.pending_ingest.append(IngestionTask(sequence, self.watermark_cursor, transition))
-        self.watermark_cursor += len(tuple(transition.symbols))
+        symbol_limit = min(int(scientific.symbol_budget_per_window), int(scientific.max_symbol_facts_per_window))
+        symbol_count = min(len(tuple(transition.symbols)), symbol_limit)
+        self.pending_ingest.append(
+            IngestionTask(
+                sequence,
+                self.watermark_cursor,
+                transition,
+                symbol_limit,
+                int(scientific.symbol_payload_bytes),
+                int(scientific.max_cross_modal_facts_per_macro_event),
+                str(scientific.symbol_deduplication_policy),
+                int(scientific.symbol_window_time_span),
+                str(scientific.symbol_codec_name),
+                int(scientific.symbol_codec_version),
+            )
+        )
+        self.watermark_cursor += symbol_count
 
     def pump_ingest_tasks(self) -> bool:
         if not self.pending_ingest:
@@ -95,11 +111,7 @@ class MemoryPipelineServiceV2:
             return False
         count = min(64, len(self.pending_derivation))
         tasks = tuple(islice(self.pending_derivation, 0, count))
-        batch = DerivationBatchTask(
-            int(tasks[0].task_id),
-            int(tasks[-1].task_id),
-            tasks,
-        )
+        batch = DerivationBatchTask(int(tasks[0].task_id), int(tasks[-1].task_id), tasks)
         try:
             self.memory.derivation_queue.put_nowait(batch)
         except queue.Full:
@@ -114,11 +126,7 @@ class MemoryPipelineServiceV2:
         first = True
         for _ in range(64):
             try:
-                item = (
-                    self.memory.ingest_result_queue.get(timeout=timeout)
-                    if block and first
-                    else self.memory.ingest_result_queue.get_nowait()
-                )
+                item = self.memory.ingest_result_queue.get(timeout=timeout) if block and first else self.memory.ingest_result_queue.get_nowait()
             except queue.Empty:
                 break
             first = False
@@ -159,102 +167,77 @@ class MemoryPipelineServiceV2:
         elapsed = time.perf_counter() - started
         self.canonical_apply_seconds += elapsed
         self.canonical_apply_events += len(plans)
+        self.last_canonical_ingest_batch = len(plans)
         self.ingested += len(plans)
         for candidate in result.derivation_candidates:
             self._consider_candidate(candidate)
-        self.last_canonical_ingest_batch = len(plans)
-        backlog = max(
-            len(self.pending_ingest),
-            sum(len(batch.rows) for batch in self.ingest_results.values()),
-            max(0, self.sampled - self.ingested),
-        )
-        self.canonical_batch_size = _adaptive_canonical_batch_size(
-            self.canonical_batch_size, backlog
-        )
+        backlog = max(len(self.pending_ingest), len(self.ingest_results), max(0, self.sampled - self.ingested))
+        self.canonical_batch_size = _adaptive_canonical_batch_size(self.canonical_batch_size, backlog)
         return True
 
     def drain_derivation_results(self, *, block: bool = False, timeout: float = 0.0) -> bool:
         progressed = False
         first = True
-        for _ in range(128):
+        for _ in range(64):
             try:
-                item = (
-                    self.memory.derivation_result_queue.get(timeout=timeout)
-                    if block and first
-                    else self.memory.derivation_result_queue.get_nowait()
-                )
+                item = self.memory.derivation_result_queue.get(timeout=timeout) if block and first else self.memory.derivation_result_queue.get_nowait()
             except queue.Empty:
                 break
             first = False
             if item[0] == "worker_error":
                 raise RuntimeError(f"{item[1]} worker task {item[2]} failed: {item[3]}")
             if item[0] == "derivation_batch_shm":
-                results, _decode_ms = consume_shared_batch(item[3])
-                for result in results:
-                    self.derive_results[int(result.task_id)] = result
+                descriptor = item[3]
+                batch, _decode_ms = consume_shared_batch(descriptor)
+                for row in batch:
+                    self.derive_results[int(row.task_id)] = row
                 progressed = True
                 continue
-            if item[0] == "derivation":
-                self.derive_results[int(item[1])] = item[2]
+            if item[0] == "derivation_batch":
+                for row in item[3]:
+                    self.derive_results[int(row.task_id)] = row
                 progressed = True
         return progressed
 
     def apply_derivation_ready(self) -> bool:
-        batch: list[DerivationResult] = []
-        while self.derive_apply in self.derive_results and len(batch) < 128:
-            batch.append(self.derive_results.pop(self.derive_apply))
+        rows: list[DerivationResult] = []
+        while self.derive_apply in self.derive_results:
+            row = self.derive_results.pop(self.derive_apply)
+            rows.append(row)
             self.derive_apply += 1
-        if not batch:
+        if not rows:
             return False
-        self.runtime.apply_derivation_results_batch(batch)
-        for result in batch:
-            signature = int(result.structural_signature)
-            self.last_support[signature] = max(
-                int(self.last_support.get(signature, 0)), int(result.support)
-            )
+        self.runtime.apply_derivation_results_batch(rows)
+        self.derived += len(rows)
+        for row in rows:
+            signature = int(row.structural_signature)
             self.inflight.discard(signature)
-            self.derived += 1
+            self.last_support[signature] = int(row.support)
             waiting = self.waiting_candidates.pop(signature, None)
             if waiting is not None:
                 self._consider_candidate(waiting)
         return True
 
     def service(self) -> bool:
-        progressed = self.pump_ingest_tasks()
-        progressed = self.drain_ingest_results() or progressed
+        progressed = self.drain_ingest_results()
         progressed = self.apply_ingest_ready() or progressed
-        progressed = self.pump_ingest_tasks() or progressed
-        progressed = self.pump_derivation_tasks() or progressed
         progressed = self.drain_derivation_results() or progressed
         progressed = self.apply_derivation_ready() or progressed
+        progressed = self.pump_ingest_tasks() or progressed
         progressed = self.pump_derivation_tasks() or progressed
         return progressed
-
-    def block_for_result(self, timeout: float = 0.05) -> bool:
-        progressed = self.drain_ingest_results(block=True, timeout=timeout)
-        progressed = self.apply_ingest_ready() or progressed
-        if progressed:
-            return True
-        progressed = self.drain_derivation_results(block=True, timeout=timeout)
-        return self.apply_derivation_ready() or progressed
 
     def diagnostics(self) -> dict[str, float | int]:
         return {
             "sampled_steps": self.sampled,
             "ingested_steps": self.ingested,
-            "derivations_applied": self.derived,
             "sampling_backlog": max(0, self.sampled - self.ingested),
-            "coordinator_pending_ingest": len(self.pending_ingest),
-            "coordinator_pending_derivation": len(self.pending_derivation),
-            "derivation_inflight": len(self.inflight),
-            "canonical_apply_rate": self.canonical_apply_events / max(1e-9, self.canonical_apply_seconds),
             "canonical_apply_latency_ms": 1000.0 * self.canonical_apply_seconds / max(1, self.canonical_apply_events),
-            "canonical_batch_size": self.canonical_batch_size,
-            "canonical_batch_last_applied": self.last_canonical_ingest_batch,
+            "canonical_batch_size": self.last_canonical_ingest_batch,
+            "canonical_batch_target": self.canonical_batch_size,
             "ingest_result_batches": self.ingest_result_batches,
-            "ingest_result_drain_ms_per_batch": 1000.0 * self.ingest_result_drain_seconds / max(1, self.ingest_result_batches),
-            "ingest_result_encode_ms_per_batch": self.ingest_result_encode_ms / max(1, self.ingest_result_batches),
-            "ingest_result_decode_ms_per_batch": self.ingest_result_decode_ms / max(1, self.ingest_result_batches),
-            "ingest_result_bytes_per_batch": self.ingest_result_bytes / max(1, self.ingest_result_batches),
-            "ingest_ipc_batch_size": self.ipc_batch_size,
+            "ingest_result_bytes": self.ingest_result_bytes,
+            "ingest_result_encode_ms": self.ingest_result_encode_ms,
+            "ingest_result_decode_ms": self.ingest_result_decode_ms,
+            "ingest_result_drain_ms": 1000.0 * self.ingest_result_drain_seconds,
         }
