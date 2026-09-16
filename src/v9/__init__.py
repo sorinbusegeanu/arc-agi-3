@@ -5,12 +5,14 @@ from v9.memory.identity import EventUid, MemoryUid
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig, ScientificConfigId
 from v9.runtime.multiprocess import EncodedTransition
 from v9.runtime.residency import install_bounded_residency
+from v9.runtime.reset_memory import install_reset_memory
 
 # v9.7.9 exposes a full-metrics alias for residency diagnostics while preserving
 # the existing metrics() API used by the runtime and dashboard.
 if not hasattr(ContinuousMemoryRuntime, "full_metrics"):
     ContinuousMemoryRuntime.full_metrics = ContinuousMemoryRuntime.metrics
 install_bounded_residency(ContinuousMemoryRuntime)
+install_reset_memory(ContinuousMemoryRuntime)
 
 # Encoded transitions expose one derived terminal boundary bit for legacy
 # cognition paths while keeping success/failure/truncation as the source fields.
