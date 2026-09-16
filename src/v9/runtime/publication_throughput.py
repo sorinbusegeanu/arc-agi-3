@@ -6,6 +6,7 @@ from threading import Thread
 from typing import Any
 
 from .canonical_commit import apply_canonical_commit_batch
+from .memory_pipeline import CommitPlan, build_commit_plan
 from .parallel_memory_coordinator import _adaptive_canonical_batch_size
 from .shared_batch_transport import SharedBatchDescriptor, consume_shared_batch
 
@@ -97,7 +98,7 @@ def _submit_canonical_commit(service: Any) -> bool:
     service.runtime._canonical_commit_inflight = True
 
     def run() -> None:
-        plans: list[Any] = []
+        plans: list[CommitPlan] = []
         decode_ms = 0.0
         try:
             for value in frozen_batches:
@@ -106,7 +107,8 @@ def _submit_canonical_commit(service: Any) -> bool:
                     decode_ms += float(batch_decode_ms)
                 else:
                     batch = value
-                plans.extend(batch.rows)
+                for row in batch.rows:
+                    plans.append(row if isinstance(row, CommitPlan) else build_commit_plan(row))
             commit_started = time.perf_counter()
             result = apply_canonical_commit_batch(service.runtime, tuple(plans))
             commit_elapsed = time.perf_counter() - commit_started
