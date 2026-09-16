@@ -44,9 +44,8 @@ def consume_shared_batch(descriptor: SharedBatchDescriptor) -> tuple[Any, float]
     started = time.perf_counter()
     segment = shared_memory.SharedMemory(name=descriptor.name, create=False)
     try:
-        payload = bytes(segment.buf[: int(descriptor.size)])
+        value = pickle.loads(segment.buf[: int(descriptor.size)])
     finally:
         segment.close()
         segment.unlink()
-    value = pickle.loads(payload)
     return value, 1000.0 * (time.perf_counter() - started)
