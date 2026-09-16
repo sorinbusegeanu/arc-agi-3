@@ -341,6 +341,12 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                     recurrence = int(self._m1n_supports.get(signature, 0))
                     recurrence_surprise = 1.0 / max(1.0, float(prior_support + 1))
                     prediction_error = abs(float(experience.prediction_error)) if float(experience.prediction_error) != 0.0 else recurrence_surprise
+                    # Deferred batch publication must preserve the graph generation
+                    # observed by the ordered single-event path. Each interaction
+                    # publishes M0, M1G and (on first support) M1N as one group.
+                    # Symbol rows are accounted for below before their stage advance.
+                    interaction_publications = 2 + (1 if prior_support == 0 else 0)
+                    observable_graph_generation = self.graph.generation + interaction_publications
                     self.isf.score(
                         ISFComponents(
                             abs(experience.primary_valence),
@@ -354,7 +360,7 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                         evidence_availability_watermark=event.identity.causal_watermark,
                         stage=stage_before,
                         next_stage=next_stage,
-                        graph_generation=self.graph.generation,
+                        graph_generation=observable_graph_generation,
                     )
                     self._prediction_error_sum += float(prediction_error)
                     self._prediction_error_count += 1
