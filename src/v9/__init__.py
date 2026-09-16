@@ -55,6 +55,8 @@ from v9.environments.passive_capture import install_process_factory_route as _in
 _install_process_factory_route(_multiprocess)
 from v9.runtime.adaptive_exploration import install_adaptive_exploration as _install_adaptive_exploration
 _install_adaptive_exploration(_multiprocess)
+from v9.runtime.actor_production_telemetry import install_actor_production_telemetry as _install_actor_production_telemetry
+_install_actor_production_telemetry(_multiprocess.ProcessTopology)
 
 # HGT uses canonical SymbolOccurrence payloads as the only SYMBOL authority.
 from v9.hgt import training as _hgt_training
