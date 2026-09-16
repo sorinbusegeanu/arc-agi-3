@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from threading import RLock
 from typing import Any
 
 from v9.memory.identity import MemoryUid, stable_u64
@@ -15,6 +16,7 @@ class V978ContinuousMemoryRuntime(FinalContinuousMemoryRuntime):
     """Final Design §20 conformance layer for v9.7.8 symbolic grounding."""
 
     def __init__(self, config: Any) -> None:
+        self._v978_evidence_lock = RLock()
         self._v978_legacy_family_map: dict[int, int] = {}
         self._v978_m1n_evidence: dict[int, dict[str, Any]] = {}
         self._interaction_to_symbol_prediction_delta_sum = 0.0
@@ -30,15 +32,16 @@ class V978ContinuousMemoryRuntime(FinalContinuousMemoryRuntime):
             if signature is None:
                 continue
             offsets = tuple(int(value) for value in payload.get("temporal_offsets", ()) or ())
-            self._v978_m1n_evidence[int(signature)] = {
-                "uid": uid,
-                "support": float(payload.get("support", 1.0)),
-                "contradiction": float(payload.get("contradiction", 0.0)),
-                "offsets": set(offsets),
-                "causal_watermark": int(payload.get("causal_watermark", node.created_watermark)),
-                "family_signature": int(payload.get("family_signature", signature)),
-                "context_signature": int(payload.get("context_signature", 0)),
-            }
+            with self._v978_evidence_lock:
+                self._v978_m1n_evidence[int(signature)] = {
+                    "uid": uid,
+                    "support": float(payload.get("support", 1.0)),
+                    "contradiction": float(payload.get("contradiction", 0.0)),
+                    "offsets": set(offsets),
+                    "causal_watermark": int(payload.get("causal_watermark", node.created_watermark)),
+                    "family_signature": int(payload.get("family_signature", signature)),
+                    "context_signature": int(payload.get("context_signature", 0)),
+                }
 
     def _neutralize_relation(self, relation: M1NormalizedRelation, payload: dict[str, Any] | None = None) -> M1NormalizedRelation:
         legacy = int(relation.family_signature or relation.structural_signature)
@@ -65,44 +68,46 @@ class V978ContinuousMemoryRuntime(FinalContinuousMemoryRuntime):
 
     def accumulate_m1n_evidence(self, relation: M1NormalizedRelation) -> None:
         signature = int(relation.structural_signature)
-        current = self._v978_m1n_evidence.get(signature)
-        if current is None:
-            current = {
-                "uid": relation.uid,
-                "support": 0.0,
-                "contradiction": 0.0,
-                "offsets": set(),
-                "causal_watermark": 0,
-                "family_signature": int(relation.family_signature or relation.structural_signature),
-                "context_signature": int(relation.context_signature),
-            }
-            self._v978_m1n_evidence[signature] = current
-        current["uid"] = relation.uid
-        current["support"] = float(current["support"]) + float(relation.support)
-        current["contradiction"] = float(current["contradiction"]) + float(relation.contradiction)
-        offsets = current["offsets"]
-        offsets.update(int(value) for value in relation.temporal_offsets)
-        if len(offsets) > 64:
-            kept = sorted(offsets, key=lambda value: (abs(value), value))[:64]
-            current["offsets"] = set(kept)
-        current["causal_watermark"] = max(int(current["causal_watermark"]), int(relation.causal_watermark))
-        current["family_signature"] = int(relation.family_signature or relation.structural_signature)
-        current["context_signature"] = int(relation.context_signature)
+        with self._v978_evidence_lock:
+            current = self._v978_m1n_evidence.get(signature)
+            if current is None:
+                current = {
+                    "uid": relation.uid,
+                    "support": 0.0,
+                    "contradiction": 0.0,
+                    "offsets": set(),
+                    "causal_watermark": 0,
+                    "family_signature": int(relation.family_signature or relation.structural_signature),
+                    "context_signature": int(relation.context_signature),
+                }
+                self._v978_m1n_evidence[signature] = current
+            current["uid"] = relation.uid
+            current["support"] = float(current["support"]) + float(relation.support)
+            current["contradiction"] = float(current["contradiction"]) + float(relation.contradiction)
+            offsets = current["offsets"]
+            offsets.update(int(value) for value in relation.temporal_offsets)
+            if len(offsets) > 64:
+                kept = sorted(offsets, key=lambda value: (abs(value), value))[:64]
+                current["offsets"] = set(kept)
+            current["causal_watermark"] = max(int(current["causal_watermark"]), int(relation.causal_watermark))
+            current["family_signature"] = int(relation.family_signature or relation.structural_signature)
+            current["context_signature"] = int(relation.context_signature)
 
     def _evidence_payload(self, signature: int) -> dict[str, Any]:
-        row = self._v978_m1n_evidence.get(int(signature))
-        if row is None:
-            return {}
-        offsets = tuple(sorted(int(value) for value in row["offsets"]))
-        return {
-            "support": float(row["support"]),
-            "contradiction": float(row["contradiction"]),
-            "temporal_offsets": list(offsets),
-            "temporal_offset_range": None if not offsets else [min(offsets), max(offsets)],
-            "causal_watermark": int(row["causal_watermark"]),
-            "family_signature": int(row["family_signature"]),
-            "context_signature": int(row["context_signature"]),
-        }
+        with self._v978_evidence_lock:
+            row = self._v978_m1n_evidence.get(int(signature))
+            if row is None:
+                return {}
+            offsets = tuple(sorted(int(value) for value in row["offsets"]))
+            return {
+                "support": float(row["support"]),
+                "contradiction": float(row["contradiction"]),
+                "temporal_offsets": list(offsets),
+                "temporal_offset_range": None if not offsets else [min(offsets), max(offsets)],
+                "causal_watermark": int(row["causal_watermark"]),
+                "family_signature": int(row["family_signature"]),
+                "context_signature": int(row["context_signature"]),
+            }
 
     def _record_normalized(self, relation: M1NormalizedRelation, *, defer_publication: bool = False, payload_extra: dict[str, Any] | None = None) -> int:
         normalized = self._neutralize_relation(relation, payload_extra)
@@ -157,14 +162,19 @@ class V978ContinuousMemoryRuntime(FinalContinuousMemoryRuntime):
             )
 
     def _patch_m1n_evidence(self) -> None:
-        for signature, evidence in self._v978_m1n_evidence.items():
-            uid = evidence.get("uid")
+        with self._v978_evidence_lock:
+            evidence_rows = self._v978_m1n_evidence.copy()
+            snapshots = tuple(
+                (evidence.get("uid"), self._evidence_payload(signature))
+                for signature, evidence in evidence_rows.items()
+            )
+        for uid, evidence_payload in snapshots:
             if uid in self.graph.payloads:
-                self.graph.payloads[uid].update(self._evidence_payload(signature))
+                self.graph.payloads[uid].update(evidence_payload)
             elif uid in self._deferred_base_nodes:
                 node, payload, refs = self._deferred_base_nodes[uid]
                 merged = dict(payload)
-                merged.update(self._evidence_payload(signature))
+                merged.update(evidence_payload)
                 self._deferred_base_nodes[uid] = (node, merged, refs)
 
     def flush_deferred_memory_updates(self) -> None:
@@ -239,18 +249,20 @@ class V978ContinuousMemoryRuntime(FinalContinuousMemoryRuntime):
     def metrics(self) -> dict[str, Any]:
         self._patch_m1n_evidence()
         result = dict(super().metrics())
+        grounding_states = self.grounding.states.copy()
+        states = tuple(grounding_states.values())
         for maturity in range(6):
-            result[f"grounding_G{maturity}_count"] = sum(int(int(state.maturity) == maturity) for state in self.grounding.states.values())
-        result["grounding_active_count"] = sum(int(state.behavior_eligible) for state in self.grounding.states.values())
+            result[f"grounding_G{maturity}_count"] = sum(int(int(state.maturity) == maturity) for state in states)
+        result["grounding_active_count"] = sum(int(state.behavior_eligible) for state in states)
         result["symbol_to_interaction_prediction_gain"] = float(self._symbol_prediction_delta_sum)
         result["interaction_to_symbol_generalization_gain"] = float(self._interaction_to_symbol_prediction_delta_sum)
-        result["heldout_transfer_successes"] = sum(int(int(state.maturity) >= 3 and state.behavior_eligible and bool(state.validation_trial_ids)) for state in self.grounding.states.values())
+        result["heldout_transfer_successes"] = sum(int(int(state.maturity) >= 3 and state.behavior_eligible and bool(state.validation_trial_ids)) for state in states)
         provenance = dict(result.get("symbol_grounding_provenance", {}))
         provenance.update(
             {
-                "environment_ids": sorted({int(key[2]) for key in self.grounding.states}),
-                "context_scope_ids": sorted({int(key[3]) for key in self.grounding.states}),
-                "lineage_ids": sorted({int(key[4]) for key in self.grounding.states}),
+                "environment_ids": sorted({int(key[2]) for key in grounding_states}),
+                "context_scope_ids": sorted({int(key[3]) for key in grounding_states}),
+                "lineage_ids": sorted({int(key[4]) for key in grounding_states}),
             }
         )
         result["symbol_grounding_provenance"] = provenance
