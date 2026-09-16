@@ -3,42 +3,52 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .grounding_h16 import H16RunState, evaluate_h16, run_synthetic_h16_controls, save_h16_evidence
+from .grounding_h16 import evaluate_h16, run_hydra_h16_controls, run_synthetic_h16_controls, save_h16_evidence
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the matched v9.7.8 H16 C0-C3 grounding experiment")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--root", default=None, help="Hydra/HGT condition roots; defaults beside --output")
     parser.add_argument("--seeds", default="0,1,2,3")
     parser.add_argument("--environment-config-id", type=int, default=1)
     parser.add_argument("--interaction-budget", type=int, default=128)
     parser.add_argument("--evaluation-id", type=int, default=1)
-    parser.add_argument("--scientific-config-id", default="")
-    parser.add_argument("--model-version", default="untrained")
-    parser.add_argument("--snapshot-id", type=int, default=0)
-    parser.add_argument("--source-state-id", default="")
+    parser.add_argument("--no-hgt", action="store_true", help="Run Hydra memory controls without HGT training")
+    parser.add_argument("--reference-synthetic", action="store_true", help="Use the cheap non-Hydra reference control")
     args = parser.parse_args(argv)
+
     seeds = tuple(int(value.strip()) for value in args.seeds.split(",") if value.strip())
     if not seeds:
         parser.error("--seeds must contain at least one integer")
-    source_state_id = args.source_state_id or f"h16:{args.environment_config_id}:{args.evaluation_id}:snapshot:{args.snapshot_id}"
-    run_state = H16RunState(
-        scientific_config_id=str(args.scientific_config_id),
-        model_version=str(args.model_version),
-        snapshot_id=int(args.snapshot_id),
-        symbol_schema_version=2,
-        source_state_id=source_state_id,
-    )
-    trials = run_synthetic_h16_controls(
-        seeds=seeds,
-        environment_config_id=int(args.environment_config_id),
-        interaction_budget=int(args.interaction_budget),
-        evaluation_id=int(args.evaluation_id),
-        run_state=run_state,
-    )
+    output = Path(args.output)
+
+    if args.reference_synthetic:
+        trials = run_synthetic_h16_controls(
+            seeds=seeds,
+            environment_config_id=int(args.environment_config_id),
+            interaction_budget=int(args.interaction_budget),
+            evaluation_id=int(args.evaluation_id),
+        )
+    else:
+        runtime_root = Path(args.root) if args.root else output.parent / "hydra-runtime"
+        trials = run_hydra_h16_controls(
+            root=runtime_root,
+            seeds=seeds,
+            environment_config_id=int(args.environment_config_id),
+            interaction_budget=int(args.interaction_budget),
+            evaluation_id=int(args.evaluation_id),
+            train_hgt=not bool(args.no_hgt),
+        )
+
     report = evaluate_h16(trials)
-    save_h16_evidence(Path(args.output), trials, report)
-    print(f"H16 status={report.result.status.value} matched={int(report.matched)} effect={report.result.effect} causal={report.causal_effect}")
+    save_h16_evidence(output, trials, report)
+    print(
+        f"H16 status={report.result.status.value} matched={int(report.matched)} "
+        f"effect={report.result.effect} causal={report.causal_effect} "
+        f"runtime_backed={int(all(row.run_state.runtime_backed for row in trials))} "
+        f"hgt_used={int(any(row.run_state.hgt_used for row in trials))}"
+    )
     return 0
 
 
