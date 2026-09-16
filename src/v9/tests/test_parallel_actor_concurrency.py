@@ -18,11 +18,8 @@ def test_sampling_prefills_distinct_actor_processes(tmp_path) -> None:
         )
     )
     runtime.start()
-    specs = resolve_game_specs("step1")[:4]
-    jobs = [
-        (index + 1, spec, 8, 1000 + index)
-        for index, spec in enumerate(specs)
-    ]
+    spec = resolve_game_specs("step1")[0]
+    jobs = [(1, spec, 32, 1000)]
     try:
         rows = run_parallel_memory_jobs(
             runtime,
@@ -46,6 +43,9 @@ def test_sampling_prefills_distinct_actor_processes(tmp_path) -> None:
         )
         diagnostics = runtime.unified_telemetry.diagnostic_metrics()
         assert len(rows) == 4
+        assert sum(int(row.steps) for row in rows) == 32
+        assert int(diagnostics["sampling_jobs_before_actor_split"]) == 1
+        assert int(diagnostics["sampling_jobs_after_actor_split"]) == 4
         assert int(diagnostics["actor_prefill_complete"]) == 1
         assert int(diagnostics["actor_prefill_processes"]) == 4
         assert int(diagnostics["actor_slots_target"]) == 4
