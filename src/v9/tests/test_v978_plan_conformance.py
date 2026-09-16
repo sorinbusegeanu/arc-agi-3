@@ -95,6 +95,44 @@ def test_matched_h16_source_state_is_persisted_and_reproducible(tmp_path) -> Non
     assert first_path.exists()
 
 
+def test_passive_capture_observes_symbols_before_and_after_action() -> None:
+    from v9.environments.passive_capture import PassiveSymbolCaptureAdapter
+
+    class Dummy:
+        def __init__(self) -> None:
+            self.state = 0
+
+        def reset(self):
+            self.state = 0
+            return self.state
+
+        def observe(self):
+            return self.state
+
+        def step(self, action):
+            self.state += int(action)
+            return self.state
+
+        def optional_symbol_stream(self):
+            return (f"s{self.state}",)
+
+        def task_progress(self):
+            return SimpleNamespace(terminal=False, success=False, failure=False, truncated=False)
+
+        def boundary_event(self):
+            return SimpleNamespace(continuation=True)
+
+    adapter = PassiveSymbolCaptureAdapter(Dummy())
+    adapter.reset()
+    adapter.observe()
+    adapter.step(1)
+    rows = adapter.optional_symbol_stream()
+    assert [row["token"] for row in rows] == ["s0", "s1"]
+    assert [row["phase"] for row in rows] == ["BEFORE_ACTION", "AFTER_ACTION"]
+    assert rows[0]["macro_step"] == 0
+    assert rows[1]["macro_step"] == 0
+
+
 def test_public_runtime_is_final_conformance_runtime() -> None:
     import v9
     import v9.runtime
