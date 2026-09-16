@@ -97,11 +97,11 @@ def test_shuffled_alignment_is_negative_control_only() -> None:
 
 def test_grounding_objective_contract_matches_plan() -> None:
     assert GROUNDING_OBJECTIVES == (
+        "symbol_conditioned_interaction_prediction",
         "symbol_conditioned_relevant_memory_retrieval",
-        "cross_modal_correspondence_prediction",
-        "symbol_conditioned_interaction_consequence_prediction",
         "world_to_symbol_generalization",
-        "heldout_cross_modal_composition",
+        "heldout_symbol_composition",
+        "symbol_conditioned_action_ranking",
         "shuffled_alignment_discrimination",
         "grounding_confidence_calibration",
     )
