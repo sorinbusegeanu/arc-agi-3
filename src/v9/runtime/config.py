@@ -22,13 +22,24 @@ class ScientificConfigId:
 
 @dataclass(frozen=True, slots=True)
 class ScientificConfig:
-    schema_version: int = 1
+    schema_version: int = 2
     research_contract_version: str = "0.7.0"
     design_version: str = "9.7.8"
     random_seeds: tuple[int, ...] = (0,)
+
+    # Symbolic-grounding scientific identity and bounded ingestion contract.
+    symbol_grounding_schema_version: int = 3
+    symbolic_grounding_enabled: bool = True
+    symbol_codec_name: str = "deterministic-opaque"
+    symbol_codec_version: int = 1
     symbol_budget_per_window: int = 8
+    max_symbol_facts_per_window: int = 8
+    max_cross_modal_facts_per_macro_event: int = 16
     symbol_payload_bytes: int = 4096
+    symbol_deduplication_policy: str = "token_phase_time"
+    symbol_window_time_span: int = 64
     passive_event_queue_depth: int = 64
+
     m1n_facts_per_channel: int = 8
     proposal_queue_depth: int = 8192
     maximum_read_set_size: int = 256
@@ -115,8 +126,11 @@ class ScientificConfig:
 
     def __post_init__(self) -> None:
         positive = (
-            self.symbol_budget_per_window, self.symbol_payload_bytes,
-            self.passive_event_queue_depth, self.m1n_facts_per_channel,
+            self.symbol_grounding_schema_version, self.symbol_codec_version,
+            self.symbol_budget_per_window, self.max_symbol_facts_per_window,
+            self.max_cross_modal_facts_per_macro_event, self.symbol_payload_bytes,
+            self.symbol_window_time_span, self.passive_event_queue_depth,
+            self.m1n_facts_per_channel,
             self.proposal_queue_depth, self.maximum_read_set_size,
             self.candidates_per_radius, self.equivalence_set_size,
             self.replay_candidates, self.normalization_bootstrap_samples,
@@ -141,6 +155,12 @@ class ScientificConfig:
         )
         if min(int(value) for value in positive) <= 0:
             raise ValueError("scientific budgets and thresholds must be positive")
+        if not self.symbol_codec_name:
+            raise ValueError("symbol_codec_name is required")
+        if self.symbol_deduplication_policy not in {"none", "token", "token_phase", "token_phase_time"}:
+            raise ValueError("unsupported symbol_deduplication_policy")
+        if self.max_symbol_facts_per_window > self.symbol_budget_per_window:
+            raise ValueError("max_symbol_facts_per_window cannot exceed symbol_budget_per_window")
         if min(self.allocation_unsolved_weight, self.allocation_optimizing_weight, self.allocation_stable_weight) <= 0:
             raise ValueError("allocation weights must be positive")
         radii = tuple(int(value) for value in self.structural_radii)
@@ -159,7 +179,7 @@ class ScientificConfig:
         if self.deliberation_mode not in {"off", "one_cycle", "fixed", "adaptive"}:
             raise ValueError("unsupported deliberation mode")
         if self.deliberation_min_cycles > self.deliberation_max_cycles:
-            raise ValueError("deliberation minimum cycles cannot exceed maximum cycles")
+            raise ValueError("deliberation minimum cycles cannot exceed maximum")
         if self.deliberation_improvement_threshold < 0 or self.deliberation_ambiguity_threshold < 0:
             raise ValueError("deliberation thresholds must be non-negative")
         if not 0.0 < self.hgt_training_duty_cycle <= 1.0:
