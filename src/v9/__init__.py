@@ -74,7 +74,19 @@ _install_pressure_control(
     _hgt_training,
     MemoryPipelineServiceV2,
 )
+
+# Final correctness layer runs after every prior compatibility/performance
+# wrapper so restore, deletion, viability, IPC and snapshot invariants have one
+# authoritative implementation.
+from v9.runtime.runtime_integrity import install_runtime_integrity as _install_runtime_integrity
+_install_runtime_integrity(
+    ContinuousMemoryRuntime,
+    CanonicalGraph,
+    MemoryPipelineServiceV2,
+    _hgt_training,
+)
 _hgt_package.train_hgt_epoch = _hgt_training.train_hgt_epoch
+_runtime_package.ContinuousMemoryRuntime = ContinuousMemoryRuntime
 
 __all__ = [
     "ContinuousMemoryRuntime",
