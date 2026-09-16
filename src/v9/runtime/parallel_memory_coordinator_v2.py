@@ -82,6 +82,9 @@ def run_parallel_memory_jobs(
     runtime.set_telemetry_gauge("actor_slots_target", target_actor_slots)
     runtime.set_telemetry_gauge("actor_process_start_method", topology.actor_start_method)
 
+    def actor_produced_steps() -> int:
+        return int(getattr(topology, "produced_steps", pipeline.sampled))
+
     def _publish_actor_process_telemetry() -> None:
         runtime.set_telemetry_gauge("active_actor_processes", len(active))
         runtime.set_telemetry_gauge("peak_active_actor_processes", peak_active_actors)
@@ -211,11 +214,21 @@ def run_parallel_memory_jobs(
             runtime.set_telemetry_gauge("hgt_dataset_written_transitions", int(hgt_dataset.count) - dataset_start_count)
             runtime.set_telemetry_gauge("hgt_dataset_bytes", int(hgt_dataset.bytes_written))
         elapsed = max(1e-9, time.monotonic() - started_at)
+        produced = actor_produced_steps()
+        published = int(pipeline.sampled)
+        ingested = int(pipeline.ingested)
         for key, value in memory.queue_depths().items():
             runtime.set_telemetry_gauge(key, value)
         gauges = pipeline.diagnostics()
         gauges.update(
             {
+                "sampled_steps": produced,
+                "actor_produced_steps": produced,
+                "publication_drained_steps": published,
+                "ingested_steps": ingested,
+                "sampling_backlog": max(0, produced - ingested),
+                "publication_backlog": max(0, produced - published),
+                "canonical_ingest_backlog": max(0, published - ingested),
                 "active_actor_processes": len(active),
                 "peak_active_actor_processes": peak_active_actors,
                 "actor_slots_target": target_actor_slots,
@@ -228,8 +241,9 @@ def run_parallel_memory_jobs(
                 "policy_snapshot_generation": int(published_policy_generation),
                 "active_ingest_workers": int(ingest_workers),
                 "active_derivation_workers": int(derivation_workers),
-                "sampling_rate": pipeline.sampled / elapsed,
-                "ingestion_rate": pipeline.ingested / elapsed,
+                "sampling_rate": produced / elapsed,
+                "publication_rate": published / elapsed,
+                "ingestion_rate": ingested / elapsed,
                 "derivation_rate": pipeline.derived / elapsed,
                 "actors_exited_without_done": len(clean_exit_without_done),
                 "canonical_pipeline_version": 2,
@@ -242,13 +256,16 @@ def run_parallel_memory_jobs(
     def progress() -> None:
         telemetry()
         diag = dict(runtime.unified_telemetry.diagnostic_metrics())
-        pct = 100.0 * pipeline.ingested / requested_steps if requested_steps else 100.0
+        produced = actor_produced_steps()
+        published = int(pipeline.sampled)
+        ingested = int(pipeline.ingested)
+        pct = 100.0 * produced / requested_steps if requested_steps else 100.0
         print(
-            f"{time.strftime('[%H:%M]')} {pct:5.1f}% sampled={pipeline.sampled}/{requested_steps} "
+            f"{time.strftime('[%H:%M]')} {pct:5.1f}% sampled={produced}/{requested_steps} "
+            f"published={published} ingested={ingested} "
             f"games_finished={len(results)}/{len(jobs)} actors_active={len(active)}/{target_actor_slots} "
-            f"actors_peak={peak_active_actors} ingested={pipeline.ingested} "
-            f"rate={float(diag.get('ingestion_rate', 0.0)):.0f}/s "
-            f"backlog={max(0, pipeline.sampled - pipeline.ingested)}",
+            f"actors_peak={peak_active_actors} rate={float(diag.get('ingestion_rate', 0.0)):.0f}/s "
+            f"pub_backlog={max(0, produced - published)} ingest_backlog={max(0, published - ingested)}",
             flush=True,
         )
 
@@ -269,8 +286,9 @@ def run_parallel_memory_jobs(
                 next_progress = now + max(1.0, float(progress_interval_seconds))
             if now - last_progress_at >= _PIPELINE_DRAIN_STALL_SECONDS:
                 raise RuntimeError(
-                    f"actor transition drain stalled: expected={expected} sampled={pipeline.sampled} "
-                    f"ingested={pipeline.ingested} pending_ingest={len(pipeline.pending_ingest)}"
+                    f"actor transition drain stalled: expected={expected} produced={actor_produced_steps()} "
+                    f"published={pipeline.sampled} ingested={pipeline.ingested} "
+                    f"pending_ingest={len(pipeline.pending_ingest)}"
                 )
             if not progressed:
                 time.sleep(0.001)
@@ -344,7 +362,7 @@ def run_parallel_memory_jobs(
                     raise RuntimeError(
                         f"shard drain stalled for {_PIPELINE_DRAIN_STALL_SECONDS:.0f}s: "
                         f"completed={sorted(completed_shards)} missing={missing} "
-                        f"sampled={pipeline.sampled} ingested={pipeline.ingested}"
+                        f"produced={actor_produced_steps()} published={pipeline.sampled} ingested={pipeline.ingested}"
                     )
                 continue
             if item[0] == "transition":
@@ -392,7 +410,9 @@ def run_parallel_memory_jobs(
             "shard_worker_processes": int(shards),
             "ingest_worker_processes": int(ingest_workers),
             "derivation_worker_processes": int(derivation_workers),
-            "multiprocess_transitions_published": int(pipeline.ingested),
+            "actor_produced_steps": int(actor_produced_steps()),
+            "publication_drained_steps": int(pipeline.sampled),
+            "multiprocess_transitions_published": int(pipeline.sampled),
             "coordinator_action_requests": 0,
             "policy_snapshot_generation": int(published_policy_generation),
             "policy_snapshot_refreshes": sum(int(row.policy_refreshes) for row in results),
