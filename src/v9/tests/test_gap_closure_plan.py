@@ -48,7 +48,7 @@ def test_authoritative_runtime_has_active_bounded_indexes(tmp_path: Path) -> Non
         assert getattr(runtime.graph, "_bounded_edges_by_uid", None) is not None
         assert getattr(runtime.graph, "_bounded_compaction_queue", None) is not None
         for index in range(200):
-            node = CanonicalNode.build(MemoryLevel.M2, MemoryType.TRANSFORMATION_FAMILY, (index,), index + 1)
+            node = CanonicalNode.build(MemoryLevel.M2, MemoryType.FAMILY, (index,), index + 1)
             runtime._publish(node, {"parents": []}, ())
         view = runtime.graph.bounded_view(max_nodes=12, max_edges=32)
         assert len(view.nodes) <= 12
