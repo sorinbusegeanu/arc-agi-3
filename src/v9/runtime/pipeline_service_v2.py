@@ -50,12 +50,23 @@ class MemoryPipelineServiceV2:
         canonical_sequence = self.runtime.reserve_producer_sequence(int(transition.actor_id), int(transition.producer_sequence))
         if canonical_sequence != int(transition.producer_sequence):
             transition = replace(transition, producer_sequence=canonical_sequence)
+        scientific = self.runtime.config.scientific
+        if not bool(scientific.symbolic_grounding_enabled) and tuple(transition.symbols):
+            transition = replace(transition, symbols=())
         sequence = self.ingest_sequence
         self.ingest_sequence += 1
         self.watermark_cursor += 1
-        scientific = self.runtime.config.scientific
-        symbol_count = min(len(tuple(transition.symbols)), int(scientific.symbol_budget_per_window))
-        self.pending_ingest.append(IngestionTask(sequence, self.watermark_cursor, transition, int(scientific.symbol_budget_per_window), int(scientific.symbol_payload_bytes)))
+        symbol_limit = min(int(scientific.symbol_budget_per_window), int(scientific.max_symbol_facts_per_window))
+        symbol_count = min(len(tuple(transition.symbols)), symbol_limit)
+        self.pending_ingest.append(
+            IngestionTask(
+                sequence,
+                self.watermark_cursor,
+                transition,
+                symbol_limit,
+                int(scientific.symbol_payload_bytes),
+            )
+        )
         self.watermark_cursor += symbol_count
 
     def pump_ingest_tasks(self) -> bool:
