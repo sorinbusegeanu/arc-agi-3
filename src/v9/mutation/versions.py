@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Iterable
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -22,6 +23,18 @@ class VersionTable:
         self._versions[ref] = value
         return value
 
+    def remove(self, ref: ObjectRef) -> int | None:
+        """Drop version metadata for an object that no longer exists."""
+        value = self._versions.pop(ref, None)
+        return None if value is None else int(value)
+
+    def remove_many(self, refs: Iterable[ObjectRef]) -> int:
+        """Drop version metadata for a batch of physically deleted objects."""
+        removed = 0
+        for ref in refs:
+            removed += int(self._versions.pop(ref, None) is not None)
+        return removed
+
     def state_dict(self) -> list[dict[str, object]]:
         return [
             {"kind": ref.kind, "uid_hi": ref.uid_hi, "uid_lo": ref.uid_lo, "version": version}
@@ -35,4 +48,3 @@ class VersionTable:
             ref = ObjectRef(str(row["kind"]), int(row["uid_hi"]), int(row.get("uid_lo", 0)))
             result._versions[ref] = int(row["version"])
         return result
-
