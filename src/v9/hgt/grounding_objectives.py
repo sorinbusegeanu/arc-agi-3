@@ -5,11 +5,11 @@ from typing import Any, Iterable, Mapping
 
 
 GROUNDING_OBJECTIVES = (
-    "symbol_conditioned_interaction_prediction",
     "symbol_conditioned_relevant_memory_retrieval",
+    "cross_modal_correspondence_prediction",
+    "symbol_conditioned_interaction_consequence_prediction",
     "world_to_symbol_generalization",
-    "heldout_symbol_composition",
-    "symbol_conditioned_action_ranking",
+    "heldout_cross_modal_composition",
     "shuffled_alignment_discrimination",
     "grounding_confidence_calibration",
 )
@@ -37,23 +37,39 @@ def _targets(payload: Mapping[str, Any]) -> dict[str, tuple[float, bool]]:
     shuffled = control == "shuffled" or float(payload.get("contradiction", 0.0)) > float(payload.get("support", 0.0))
     relation = str(payload.get("symbol_relation", ""))
     active = bool(payload.get("grounding_active", False))
-    prospective = bool(payload.get("prospective_prediction", False)) or relation in {"SYMBOL_PRECEDES_ACTION", "SYMBOL_TO_INTERACTION_PREDICTION"}
+    explicit = bool(payload.get("symbol_identity") is not None and (relation or active or control == "shuffled"))
+    correspondence = relation in {
+        "CROSS_MODAL_CORRESPONDENCE",
+        "SYMBOL_INTERACTION_ALIGNMENT",
+        "SYMBOL_TO_INTERACTION_PREDICTION",
+        "INTERACTION_TO_SYMBOL_GENERALIZATION",
+        "CROSS_MODAL_HELDOUT_TRANSFER",
+        "CROSS_MODAL_COMPOSITION",
+    } or active
+    prospective = bool(payload.get("prospective_prediction", False)) or relation in {
+        "SYMBOL_PRECEDES_ACTION",
+        "SYMBOL_TO_INTERACTION_PREDICTION",
+    }
     generalization = bool(payload.get("world_to_symbol_generalization", False)) or relation == "INTERACTION_TO_SYMBOL_GENERALIZATION" or (active and bool(payload.get("heldout_transfer", False)))
     heldout = bool(payload.get("heldout_transfer", False))
     composition = bool(payload.get("novel_composition", False)) or relation == "CROSS_MODAL_COMPOSITION"
-    usable_action = payload.get("action_id") is not None
-    valence = int(payload.get("primary_valence", 0))
     confidence = max(0.0, min(1.0, float(payload.get("grounding_confidence", 0.0 if shuffled else (1.0 if active else 0.5)))))
-    explicit = bool(payload.get("symbol_identity") is not None and (relation or active or control == "shuffled"))
     return {
-        "symbol_conditioned_interaction_prediction": (0.0 if shuffled else 1.0, bool(shuffled or prospective)),
         "symbol_conditioned_relevant_memory_retrieval": (0.0 if shuffled else 1.0, explicit),
+        "cross_modal_correspondence_prediction": (0.0 if shuffled else 1.0, bool(shuffled or correspondence)),
+        "symbol_conditioned_interaction_consequence_prediction": (0.0 if shuffled else 1.0, bool(shuffled or prospective)),
         "world_to_symbol_generalization": (0.0 if shuffled else 1.0, bool(shuffled or generalization)),
-        "heldout_symbol_composition": (1.0 if composition and heldout and not shuffled else 0.0, bool(shuffled or heldout or composition)),
-        "symbol_conditioned_action_ranking": (1.0 if usable_action and valence > 0 and not shuffled else 0.0, bool(shuffled or usable_action)),
+        "heldout_cross_modal_composition": (1.0 if composition and heldout and not shuffled else 0.0, bool(shuffled or heldout or composition)),
         "shuffled_alignment_discrimination": (0.0 if shuffled else 1.0, explicit),
         "grounding_confidence_calibration": (confidence, explicit),
     }
+
+
+def _causal_bounds(payload: Mapping[str, Any], node: Any) -> tuple[int, int]:
+    relation_causal = int(payload.get("causal_watermark", payload.get("symbol_causal_watermark", node.created_watermark)))
+    validation_causal = int(payload.get("validation_causal_watermark", relation_causal))
+    evaluation = int(payload.get("grounding_evaluation_watermark", max(int(node.created_watermark), validation_causal)))
+    return max(relation_causal, validation_causal), evaluation
 
 
 def build_objective_evidence(read_view: Any, *, prediction: float = 0.5) -> tuple[GroundingObjectiveEvidence, ...]:
@@ -62,8 +78,7 @@ def build_objective_evidence(read_view: Any, *, prediction: float = 0.5) -> tupl
         payload = read_view.payloads.get(uid, {})
         if payload.get("symbol_identity") is None:
             continue
-        causal = int(payload.get("causal_watermark", payload.get("symbol_causal_watermark", node.created_watermark)))
-        evaluation = int(node.created_watermark)
+        causal, evaluation = _causal_bounds(payload, node)
         if causal > evaluation:
             continue
         control = str(payload.get("cross_modal_control", "aligned"))
