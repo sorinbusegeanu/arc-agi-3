@@ -12,8 +12,7 @@ from v9.modalities.symbols import DeterministicSymbolCodec
 from .canonical_commit_derivation import derivation_candidates
 from .canonical_commit_isf import score_isf_batch
 from .canonical_commit_state import advance_stage_fast, record_normalized_fast, trim_replay_pool
-from .memory_pipeline import DerivationTask
-from .memory_pipeline_v2 import CommitPlan, _m1n_write
+from .memory_pipeline import CommitPlan, DerivationTask, _m1n_write
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,8 +138,6 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                     cross_modal_used += 1
                     if plan.interaction_grounding is not None:
                         g = plan.interaction_grounding
-                        # Stable symbolic M1N identity is the grounding authority;
-                        # occurrence-specific M1G remains provenance only.
                         symbol_structure_uid = symbol.relation.uid
                         grounding_key = (int(symbol_structure_uid.lo), int(g.uid.lo), int(g.environment_instance_id), 0, 0)
                         before_grounding = runtime.grounding.states.get(grounding_key)
@@ -169,7 +166,6 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                 signatures.append(signature)
                 touched_signatures.add(signature)
 
-            # Shuffled mismatch evidence is bounded and contradiction-only.
             if previous_interaction is not None and cross_modal_used < max_cross_modal:
                 for symbol in plan.symbols:
                     if cross_modal_used >= max_cross_modal:
