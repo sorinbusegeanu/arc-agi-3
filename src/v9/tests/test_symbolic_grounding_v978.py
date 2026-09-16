@@ -15,7 +15,7 @@ def test_symbol_occurrence_contract_preserves_identity_order_time_and_provenance
     assert occurrence.position == 0
     assert occurrence.causal_watermark == 7
     assert occurrence.provenance_id == event
-    assert SYMBOL_SCHEMA_VERSION >= 2
+    assert SYMBOL_SCHEMA_VERSION >= 3
 
 
 def test_symbolic_relation_contract_covers_design_m1n_relations() -> None:
@@ -53,13 +53,14 @@ def test_h16_conditions_preserve_statistics_and_shuffle_alignment() -> None:
 
 
 def test_hgt_uses_canonical_symbol_not_legacy_tuple_authority() -> None:
-    from v9.hgt.canonical_symbol_graph import _without_legacy_symbol_tuples
+    from v9.hgt.canonical_symbol_graph import HGT_V978_MODEL_SCHEMA_VERSION, _without_legacy_symbol_tuples
     from v9.hgt.training import SEMANTIC_NODE_TYPES
     assert "SYMBOL" in SEMANTIC_NODE_TYPES
     assert "TEXT" not in SEMANTIC_NODE_TYPES
+    assert HGT_V978_MODEL_SCHEMA_VERSION == 7
     payload = {"symbol_identity": [1, 2, 3, 0], "semantic_before": [[7, 99, 1, 2, 1.0], [5, 1, 2, 3, 1.0]]}
     filtered = _without_legacy_symbol_tuples(payload)
-    assert filtered["symbol_identity"] == [1, 2, 3, 0]
+    assert "symbol_identity" not in filtered
     assert filtered["semantic_before"] == [[5, 1, 2, 3, 1.0]]
 
 
