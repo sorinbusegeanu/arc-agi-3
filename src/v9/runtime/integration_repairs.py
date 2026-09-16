@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from dataclasses import replace
 from typing import Any, Iterable
+
+from v9.cognition.compression import form_families as _canonical_form_families
 
 from .pipeline_service_v2 import MemoryPipelineServiceV2
 
@@ -71,10 +74,6 @@ def _canonical_public_batch(self: Any, rows: Iterable[Any]) -> tuple[tuple[int, 
     if not prepared_rows:
         return ()
 
-    # Public/reference ingestion historically leaves curriculum accounting to
-    # record_curriculum_events_batch(); the coordinator canonical path records it
-    # inline. Preserve that public contract while sharing the canonical mutation
-    # implementation itself.
     telemetry = self.unified_telemetry
     curriculum_before = dict(telemetry.curriculum_counts)
     gauge_names = ("curriculum_step", "environment_family", "game_scenario")
@@ -96,8 +95,175 @@ def _canonical_public_batch(self: Any, rows: Iterable[Any]) -> tuple[tuple[int, 
     return result.signature_rows
 
 
+def _expanded_concept_evidence(self: Any, concept: Any) -> tuple[Any, ...]:
+    pending = deque(tuple(concept.provenance.evidence) + tuple(concept.provenance.parents))
+    seen: set[Any] = set()
+    while pending and len(seen) < 4096:
+        uid = pending.popleft()
+        if uid in seen:
+            continue
+        seen.add(uid)
+        payload = self._evidence_payload(uid)
+        if payload is None:
+            continue
+        for raw in payload.get("parents", ()) or ():
+            if isinstance(raw, (list, tuple)) and len(raw) == 2:
+                from v9.memory.identity import MemoryUid
+                parent = MemoryUid(int(raw[0]), int(raw[1]))
+                if parent not in seen:
+                    pending.append(parent)
+    return tuple(sorted(seen))
+
+
+def _transfer_validation_candidates(self: Any, *, limit: int = 32) -> tuple[dict[str, object], ...]:
+    with self._lock:
+        rows: list[dict[str, object]] = []
+        concepts = sorted(
+            self._m4.values(),
+            key=lambda row: (
+                bool(row.validated),
+                -float(row.compression_benefit),
+                -int(row.explanatory_reach),
+                row.uid,
+            ),
+        )
+        for concept in concepts:
+            if concept.validated:
+                continue
+            evidence_uids = _expanded_concept_evidence(self, concept)
+            scope = self._evidence_environment_scope(evidence_uids) or tuple(
+                int(value) for value in concept.provenance.formation_scope
+            )
+            source_types: set[str] = set()
+            for environment_id in scope:
+                try:
+                    source_types.add(str(self.environments.resolve(environment_id).environment_type))
+                except KeyError:
+                    pass
+
+            action_stats: dict[int, list[int]] = {}
+            contexts: set[int] = set()
+            for uid in evidence_uids:
+                payload = self._evidence_payload(uid)
+                if payload is None:
+                    continue
+                if payload.get("context_signature") is not None:
+                    contexts.add(int(payload["context_signature"]))
+                if payload.get("action_id") is None:
+                    continue
+                action = int(payload["action_id"])
+                stats = action_stats.setdefault(action, [0, 0, 0])
+                valence = int(payload.get("primary_valence", 0))
+                stats[0] += int(valence > 0)
+                stats[1] += 1
+                stats[2] += int(valence < 0)
+            actions = tuple(
+                action
+                for action, _ in sorted(
+                    action_stats.items(),
+                    key=lambda item: (-item[1][0], -item[1][1], item[1][2], item[0]),
+                )
+            )
+            if not actions:
+                continue
+            rows.append(
+                {
+                    "concept_uid": concept.uid,
+                    "formation_scope": tuple(sorted(scope)),
+                    "source_environment_types": tuple(sorted(source_types)),
+                    "actions": actions,
+                    "contexts": tuple(sorted(contexts)),
+                    "positive_evidence": int(sum(stats[0] for stats in action_stats.values())),
+                    "negative_evidence": int(sum(stats[2] for stats in action_stats.values())),
+                    "support": int(sum(stats[1] for stats in action_stats.values())),
+                    "validated": bool(concept.validated),
+                }
+            )
+        rows.sort(
+            key=lambda row: (
+                -int(row["positive_evidence"]),
+                -int(row["support"]),
+                int(row["negative_evidence"]),
+                row["concept_uid"],
+            )
+        )
+        return tuple(rows[: max(1, int(limit))])
+
+
+def _legacy_compatible_form_families(records: tuple[Any, ...], *, minimum_recurrence: int = 2):
+    formed = _canonical_form_families(records, minimum_recurrence=minimum_recurrence)
+    if formed or len(records) < int(minimum_recurrence):
+        return formed
+    structural = {int(row.structural_signature) for row in records}
+    channels = {str(row.channel.value) for row in records if getattr(row, "channel", None) is not None}
+    if len(structural) != 1 or channels != {"WORLD"}:
+        return formed
+    fallback_family = next(iter(structural))
+    migrated = tuple(replace(row, family_signature=fallback_family) for row in records)
+    return _canonical_form_families(migrated, minimum_recurrence=minimum_recurrence)
+
+
+def _prioritized_symbolic_derivation(original: Any):
+    priority = {
+        "CROSS_MODAL_CORRESPONDENCE": 0,
+        "SYMBOL_INTERACTION_ALIGNMENT": 1,
+        "SYMBOL_COINCIDENT_WITH_OUTCOME": 2,
+        "SYMBOL_NEAR_BOUNDARY": 3,
+        "SYMBOL_COINCIDENT_WITH_PROGRESS": 4,
+        "SYMBOL_PRECEDES_ACTION": 5,
+        "SYMBOL_FOLLOWS_ACTION": 6,
+        "SYMBOL_TO_INTERACTION_PREDICTION": 7,
+        "INTERACTION_TO_SYMBOL_GENERALIZATION": 8,
+        "SYMBOL_PRECEDES_NORMALIZED_CHANGE": 9,
+        "SYMBOL_FOLLOWS_NORMALIZED_CHANGE": 10,
+    }
+
+    def repaired(*args: Any, **kwargs: Any):
+        limit = kwargs.get("max_cross_modal_facts")
+        if limit is None:
+            return original(*args, **kwargs)
+        unbounded = dict(kwargs)
+        unbounded["max_cross_modal_facts"] = None
+        rows = tuple(original(*args, **unbounded))
+        symbolic = [row for row in rows if str(row.relation.channel.value) != "CROSS_MODAL"]
+        cross_modal = [row for row in rows if str(row.relation.channel.value) == "CROSS_MODAL"]
+        indexed = list(enumerate(cross_modal))
+        indexed.sort(key=lambda item: (priority.get(str(item[1].relation_kind), 50), item[0]))
+        selected = tuple(row for _index, row in indexed[: max(0, int(limit))])
+        return tuple(symbolic) + selected
+
+    return repaired
+
+
 def install_integration_repairs(runtime_cls: type[Any]) -> None:
     """Install compatibility repairs required by the unified v9.7.8/v9.7.9 runtime."""
     runtime_cls._previous_interactions = _ordered_previous_interactions
     runtime_cls.apply_prepared_ingestion_batch = _canonical_public_batch
+    runtime_cls.transfer_validation_candidates = _transfer_validation_candidates
     MemoryPipelineServiceV2.block_for_result = _block_for_result
+
+    from . import runtime as runtime_module
+    runtime_module.form_families = _legacy_compatible_form_families
+
+    from .final_runtime import FinalContinuousMemoryRuntime
+    if not getattr(FinalContinuousMemoryRuntime, "_integration_flush_repair", False):
+        original_record_interaction = FinalContinuousMemoryRuntime.record_interaction
+
+        def record_interaction(self: Any, *args: Any, **kwargs: Any):
+            result = original_record_interaction(self, *args, **kwargs)
+            self.flush_deferred_memory_updates()
+            return result
+
+        FinalContinuousMemoryRuntime.record_interaction = record_interaction
+        FinalContinuousMemoryRuntime._integration_flush_repair = True
+
+    from v9.memory import symbolic_relations as symbolic_module
+    if not getattr(symbolic_module, "_integration_priority_repair", False):
+        repaired = _prioritized_symbolic_derivation(symbolic_module.derive_symbolic_relations)
+        symbolic_module.derive_symbolic_relations = repaired
+        symbolic_module._integration_priority_repair = True
+
+        from . import completed_runtime, final_runtime, memory_pipeline_v2
+        completed_runtime.derive_symbolic_relations = repaired
+        final_runtime.derive_symbolic_relations = repaired
+        memory_pipeline_v2.derive_symbolic_relations = repaired
