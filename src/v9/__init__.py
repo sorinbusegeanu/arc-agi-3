@@ -5,6 +5,7 @@ from v9.memory.identity import EventUid, MemoryUid
 from v9.runtime import RuntimeConfig, ScientificConfig, ScientificConfigId
 from v9.runtime.v978_conformant import V978ContinuousMemoryRuntime
 from v9.runtime.multiprocess import EncodedTransition
+from v9.runtime.derivation_publication import install_bounded_derivation_publication
 from v9.runtime.residency import install_bounded_residency
 from v9.runtime.reset_memory import install_reset_memory
 from v9.runtime.integration_repairs import install_integration_repairs
@@ -15,6 +16,7 @@ import v9.runtime as _runtime_package
 ContinuousMemoryRuntime = V978ContinuousMemoryRuntime
 if not hasattr(ContinuousMemoryRuntime, "full_metrics"):
     ContinuousMemoryRuntime.full_metrics = ContinuousMemoryRuntime.metrics
+install_bounded_derivation_publication(ContinuousMemoryRuntime)
 install_bounded_residency(ContinuousMemoryRuntime)
 install_reset_memory(ContinuousMemoryRuntime)
 install_integration_repairs(ContinuousMemoryRuntime)
