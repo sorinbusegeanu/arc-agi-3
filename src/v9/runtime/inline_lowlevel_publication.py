@@ -11,7 +11,7 @@ from v9.runtime.bounded_indexes import _ensure_indexes, _remember_edge, _remembe
 from v9.runtime.publication import edge_ref, node_ref
 
 
-_INLINE_ROW_CHUNK = 2048
+_INLINE_ROW_CHUNK = 8192
 
 
 def _merge_payload(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
@@ -238,9 +238,12 @@ def install_inline_lowlevel_publication(runtime_cls: type) -> None:
             # Physical batching coalesces repeated writes to the same object.
             # Restore the version increments that ordered logical publication
             # would have produced so optimistic-read semantics remain identical.
-            for ref, logical_count in logical_version_counts.items():
-                for _ in range(logical_count - physical_version_counts.get(ref, 0)):
-                    self.graph.versions.bump(ref)
+            version_deltas = {
+                ref: logical_count - physical_version_counts.get(ref, 0)
+                for ref, logical_count in logical_version_counts.items()
+                if logical_count > physical_version_counts.get(ref, 0)
+            }
+            self.graph.versions.bump_many(version_deltas)
             physical_cross = int(self.telemetry.get("cross_partition_transactions", 0)) - cross_before
             logical_extra = logical_batches - physical_batches
             if logical_extra:
