@@ -5,11 +5,11 @@ from typing import Any, Iterable, Mapping
 
 
 GROUNDING_OBJECTIVES = (
-    "symbol_conditioned_interaction_prediction",
     "symbol_conditioned_relevant_memory_retrieval",
+    "cross_modal_correspondence_prediction",
+    "symbol_conditioned_interaction_consequence_prediction",
     "world_to_symbol_generalization",
-    "heldout_symbol_composition",
-    "symbol_conditioned_action_ranking",
+    "heldout_cross_modal_composition",
     "shuffled_alignment_discrimination",
     "grounding_confidence_calibration",
 )
@@ -53,15 +53,15 @@ def _targets(payload: Mapping[str, Any]) -> dict[str, tuple[float, bool]]:
     generalization = bool(payload.get("world_to_symbol_generalization", False)) or relation == "INTERACTION_TO_SYMBOL_GENERALIZATION" or (active and bool(payload.get("heldout_transfer", False)))
     heldout = bool(payload.get("heldout_transfer", False))
     composition = bool(payload.get("novel_composition", False)) or relation == "CROSS_MODAL_COMPOSITION"
-    action_ranking = bool(payload.get("symbol_conditioned_action_ranking", False)) or (active and correspondence)
     confidence = max(0.0, min(1.0, float(payload.get("grounding_confidence", 0.0 if shuffled else (1.0 if active else 0.5)))))
+    aligned_target = 0.0 if shuffled else 1.0
     return {
-        "symbol_conditioned_interaction_prediction": (0.0 if shuffled else 1.0, bool(shuffled or prospective)),
-        "symbol_conditioned_relevant_memory_retrieval": (0.0 if shuffled else 1.0, explicit),
-        "world_to_symbol_generalization": (0.0 if shuffled else 1.0, bool(shuffled or generalization)),
-        "heldout_symbol_composition": (1.0 if composition and heldout and not shuffled else 0.0, bool(shuffled or heldout or composition)),
-        "symbol_conditioned_action_ranking": (0.0 if shuffled else 1.0, bool(shuffled or action_ranking)),
-        "shuffled_alignment_discrimination": (0.0 if shuffled else 1.0, explicit),
+        "symbol_conditioned_relevant_memory_retrieval": (aligned_target, explicit),
+        "cross_modal_correspondence_prediction": (aligned_target, bool(shuffled or correspondence)),
+        "symbol_conditioned_interaction_consequence_prediction": (aligned_target, bool(shuffled or prospective)),
+        "world_to_symbol_generalization": (aligned_target, bool(shuffled or generalization)),
+        "heldout_cross_modal_composition": (1.0 if composition and heldout and not shuffled else 0.0, bool(shuffled or heldout or composition)),
+        "shuffled_alignment_discrimination": (aligned_target, explicit),
         "grounding_confidence_calibration": (confidence, explicit),
     }
 
