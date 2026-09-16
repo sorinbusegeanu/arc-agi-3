@@ -9,6 +9,21 @@ from v9.cognition.compression import form_families as _canonical_form_families
 from .pipeline_service_v2 import MemoryPipelineServiceV2
 
 
+_CROSS_MODAL_PRIORITY = {
+    "CROSS_MODAL_CORRESPONDENCE": 0,
+    "SYMBOL_INTERACTION_ALIGNMENT": 1,
+    "SYMBOL_COINCIDENT_WITH_OUTCOME": 2,
+    "SYMBOL_NEAR_BOUNDARY": 3,
+    "SYMBOL_COINCIDENT_WITH_PROGRESS": 4,
+    "SYMBOL_PRECEDES_ACTION": 5,
+    "SYMBOL_FOLLOWS_ACTION": 6,
+    "SYMBOL_TO_INTERACTION_PREDICTION": 7,
+    "INTERACTION_TO_SYMBOL_GENERALIZATION": 8,
+    "SYMBOL_PRECEDES_NORMALIZED_CHANGE": 9,
+    "SYMBOL_FOLLOWS_NORMALIZED_CHANGE": 10,
+}
+
+
 class _PreviousInteractionCursor:
     """Replay the exact ordered previous-interaction state inside one true batch."""
 
@@ -161,9 +176,6 @@ def _transfer_validation_candidates(self: Any, *, limit: int = 32) -> tuple[dict
                 if payload is not None:
                     _accumulate_action_payload(payload, action_stats, contexts)
 
-            # M2-M4 provenance can legitimately retain normalized/grounded roots
-            # without retaining every M0 UID directly. Recover action evidence only
-            # from the concept's formation environments, preserving held-out scope.
             if not action_stats and scope:
                 scope_set = {int(value) for value in scope}
                 for payload in self.graph.payloads.values():
@@ -224,20 +236,6 @@ def _legacy_compatible_form_families(records: tuple[Any, ...], *, minimum_recurr
 
 
 def _prioritized_symbolic_derivation(original: Any):
-    priority = {
-        "CROSS_MODAL_CORRESPONDENCE": 0,
-        "SYMBOL_INTERACTION_ALIGNMENT": 1,
-        "SYMBOL_COINCIDENT_WITH_OUTCOME": 2,
-        "SYMBOL_NEAR_BOUNDARY": 3,
-        "SYMBOL_COINCIDENT_WITH_PROGRESS": 4,
-        "SYMBOL_PRECEDES_ACTION": 5,
-        "SYMBOL_FOLLOWS_ACTION": 6,
-        "SYMBOL_TO_INTERACTION_PREDICTION": 7,
-        "INTERACTION_TO_SYMBOL_GENERALIZATION": 8,
-        "SYMBOL_PRECEDES_NORMALIZED_CHANGE": 9,
-        "SYMBOL_FOLLOWS_NORMALIZED_CHANGE": 10,
-    }
-
     def repaired(*args: Any, **kwargs: Any):
         limit = kwargs.get("max_cross_modal_facts")
         unbounded = dict(kwargs)
@@ -246,7 +244,7 @@ def _prioritized_symbolic_derivation(original: Any):
         symbolic = [row for row in rows if str(row.relation.channel.value) != "CROSS_MODAL"]
         cross_modal = [row for row in rows if str(row.relation.channel.value) == "CROSS_MODAL"]
         indexed = list(enumerate(cross_modal))
-        indexed.sort(key=lambda item: (priority.get(str(item[1].relation_kind), 50), item[0]))
+        indexed.sort(key=lambda item: (_CROSS_MODAL_PRIORITY.get(str(item[1].relation_kind), 50), item[0]))
         selected = tuple(row for _index, row in indexed)
         if limit is not None:
             selected = selected[: max(0, int(limit))]
@@ -255,11 +253,28 @@ def _prioritized_symbolic_derivation(original: Any):
     return repaired
 
 
+def _prioritize_commit_plan(plan: Any) -> Any:
+    derived = tuple(getattr(plan, "derived_relations", ()) or ())
+    if not derived:
+        return plan
+    ordered = tuple(
+        sorted(
+            derived,
+            key=lambda item: _CROSS_MODAL_PRIORITY.get(
+                str(item.write.payload.get("symbol_relation", item.relation.observable_relation)),
+                50,
+            ),
+        )
+    )
+    return replace(plan, derived_relations=ordered)
+
+
 def _canonical_commit_without_implicit_grounding(original: Any):
     def repaired(runtime: Any, rows: Iterable[Any]):
+        plans = tuple(_prioritize_commit_plan(row) for row in rows)
         states_before = dict(runtime.grounding.states)
         promotions_before = int(runtime.telemetry.get("grounding_promotions", 0))
-        result = original(runtime, rows)
+        result = original(runtime, plans)
         runtime.grounding.states.clear()
         runtime.grounding.states.update(states_before)
         runtime.telemetry["grounding_promotions"] = promotions_before
