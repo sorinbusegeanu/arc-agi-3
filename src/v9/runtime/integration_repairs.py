@@ -115,6 +115,19 @@ def _expanded_concept_evidence(self: Any, concept: Any) -> tuple[Any, ...]:
     return tuple(sorted(seen))
 
 
+def _accumulate_action_payload(payload: dict[str, Any], action_stats: dict[int, list[int]], contexts: set[int]) -> None:
+    if payload.get("context_signature") is not None:
+        contexts.add(int(payload["context_signature"]))
+    if payload.get("action_id") is None:
+        return
+    action = int(payload["action_id"])
+    stats = action_stats.setdefault(action, [0, 0, 0])
+    valence = int(payload.get("primary_valence", 0))
+    stats[0] += int(valence > 0)
+    stats[1] += 1
+    stats[2] += int(valence < 0)
+
+
 def _transfer_validation_candidates(self: Any, *, limit: int = 32) -> tuple[dict[str, object], ...]:
     with self._lock:
         rows: list[dict[str, object]] = []
@@ -145,18 +158,25 @@ def _transfer_validation_candidates(self: Any, *, limit: int = 32) -> tuple[dict
             contexts: set[int] = set()
             for uid in evidence_uids:
                 payload = self._evidence_payload(uid)
-                if payload is None:
-                    continue
-                if payload.get("context_signature") is not None:
-                    contexts.add(int(payload["context_signature"]))
-                if payload.get("action_id") is None:
-                    continue
-                action = int(payload["action_id"])
-                stats = action_stats.setdefault(action, [0, 0, 0])
-                valence = int(payload.get("primary_valence", 0))
-                stats[0] += int(valence > 0)
-                stats[1] += 1
-                stats[2] += int(valence < 0)
+                if payload is not None:
+                    _accumulate_action_payload(payload, action_stats, contexts)
+
+            # M2-M4 provenance can legitimately retain normalized/grounded roots
+            # without retaining every M0 UID directly. Recover action evidence only
+            # from the concept's formation environments, preserving held-out scope.
+            if not action_stats and scope:
+                scope_set = {int(value) for value in scope}
+                for payload in self.graph.payloads.values():
+                    environment_id = payload.get("environment_instance_id")
+                    if environment_id is None or int(environment_id) not in scope_set:
+                        continue
+                    _accumulate_action_payload(payload, action_stats, contexts)
+                for _node, payload, _evidence in self._deferred_base_nodes.values():
+                    environment_id = payload.get("environment_instance_id")
+                    if environment_id is None or int(environment_id) not in scope_set:
+                        continue
+                    _accumulate_action_payload(payload, action_stats, contexts)
+
             actions = tuple(
                 action
                 for action, _ in sorted(
@@ -220,8 +240,6 @@ def _prioritized_symbolic_derivation(original: Any):
 
     def repaired(*args: Any, **kwargs: Any):
         limit = kwargs.get("max_cross_modal_facts")
-        if limit is None:
-            return original(*args, **kwargs)
         unbounded = dict(kwargs)
         unbounded["max_cross_modal_facts"] = None
         rows = tuple(original(*args, **unbounded))
@@ -229,8 +247,23 @@ def _prioritized_symbolic_derivation(original: Any):
         cross_modal = [row for row in rows if str(row.relation.channel.value) == "CROSS_MODAL"]
         indexed = list(enumerate(cross_modal))
         indexed.sort(key=lambda item: (priority.get(str(item[1].relation_kind), 50), item[0]))
-        selected = tuple(row for _index, row in indexed[: max(0, int(limit))])
+        selected = tuple(row for _index, row in indexed)
+        if limit is not None:
+            selected = selected[: max(0, int(limit))]
         return tuple(symbolic) + selected
+
+    return repaired
+
+
+def _canonical_commit_without_implicit_grounding(original: Any):
+    def repaired(runtime: Any, rows: Iterable[Any]):
+        states_before = dict(runtime.grounding.states)
+        promotions_before = int(runtime.telemetry.get("grounding_promotions", 0))
+        result = original(runtime, rows)
+        runtime.grounding.states.clear()
+        runtime.grounding.states.update(states_before)
+        runtime.telemetry["grounding_promotions"] = promotions_before
+        return result
 
     return repaired
 
@@ -267,3 +300,10 @@ def install_integration_repairs(runtime_cls: type[Any]) -> None:
         completed_runtime.derive_symbolic_relations = repaired
         final_runtime.derive_symbolic_relations = repaired
         memory_pipeline_v2.derive_symbolic_relations = repaired
+
+    from . import canonical_commit, pipeline_service_v2
+    if not getattr(canonical_commit, "_integration_grounding_repair", False):
+        repaired_commit = _canonical_commit_without_implicit_grounding(canonical_commit.apply_canonical_commit_batch)
+        canonical_commit.apply_canonical_commit_batch = repaired_commit
+        pipeline_service_v2.apply_canonical_commit_batch = repaired_commit
+        canonical_commit._integration_grounding_repair = True
