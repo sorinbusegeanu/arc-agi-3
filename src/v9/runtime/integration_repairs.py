@@ -283,6 +283,28 @@ def _canonical_commit_without_implicit_grounding(original: Any):
     return repaired
 
 
+def _flush_preserving_symbolic_payload(original: Any):
+    def repaired(runtime: Any, *args: Any, **kwargs: Any):
+        preserved: dict[Any, dict[str, Any]] = {
+            uid: dict(payload)
+            for uid, payload in runtime.graph.payloads.items()
+            if payload.get("symbol_relation") is not None
+        }
+        for uid, (_node, payload, _evidence) in runtime._deferred_base_nodes.items():
+            if payload.get("symbol_relation") is not None:
+                preserved[uid] = {**preserved.get(uid, {}), **dict(payload)}
+        result = original(runtime, *args, **kwargs)
+        for uid, payload in preserved.items():
+            current = runtime.graph.payloads.get(uid)
+            if current is None:
+                continue
+            for key, value in payload.items():
+                current.setdefault(key, value)
+        return result
+
+    return repaired
+
+
 def install_integration_repairs(runtime_cls: type[Any]) -> None:
     """Install compatibility repairs required by the unified v9.7.8/v9.7.9 runtime."""
     runtime_cls._previous_interactions = _ordered_previous_interactions
@@ -322,3 +344,9 @@ def install_integration_repairs(runtime_cls: type[Any]) -> None:
         canonical_commit.apply_canonical_commit_batch = repaired_commit
         pipeline_service_v2.apply_canonical_commit_batch = repaired_commit
         canonical_commit._integration_grounding_repair = True
+
+    if not getattr(runtime_cls, "_integration_symbolic_flush_repair", False):
+        runtime_cls.flush_deferred_memory_updates = _flush_preserving_symbolic_payload(
+            runtime_cls.flush_deferred_memory_updates
+        )
+        runtime_cls._integration_symbolic_flush_repair = True
