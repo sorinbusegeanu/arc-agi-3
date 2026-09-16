@@ -32,6 +32,10 @@ class Uid:
         if not (0 <= int(self.hi) <= _MASK64 and 0 <= int(self.lo) <= _MASK64):
             raise ValueError("UID components must be uint64")
 
+    def __int__(self) -> int:
+        """Return the canonical scalar/low component used by runtime APIs."""
+        return int(self.lo)
+
     @classmethod
     def derive(cls, domain: str, *parts: object) -> "Uid":
         digest = blake2b(digest_size=16, person=b"arc-hydra-v9")
