@@ -11,7 +11,16 @@ from v9.research.grounding_h16 import H16RunState, evaluate_h16, load_h16_trials
 
 def _grounded(low: int):
     uid = MemoryUid(1, low)
-    return SimpleNamespace(uid=uid, provenance=SimpleNamespace(evidence=(uid,)))
+    return SimpleNamespace(
+        uid=uid,
+        provenance=SimpleNamespace(evidence=(uid,)),
+        environment_instance_id=1,
+        episode_id=1,
+        grounded_context_signature=10,
+        executable_action_token=0,
+        realized_transition_signature=20,
+        grounded_next_context_signature=30,
+    )
 
 
 def _symbol(low: int, identity: tuple[int, int, int, int]):
