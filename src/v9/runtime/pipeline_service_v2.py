@@ -65,6 +65,11 @@ class MemoryPipelineServiceV2:
                 transition,
                 symbol_limit,
                 int(scientific.symbol_payload_bytes),
+                int(scientific.max_cross_modal_facts_per_macro_event),
+                str(scientific.symbol_deduplication_policy),
+                int(scientific.symbol_window_time_span),
+                str(scientific.symbol_codec_name),
+                int(scientific.symbol_codec_version),
             )
         )
         self.watermark_cursor += symbol_count
