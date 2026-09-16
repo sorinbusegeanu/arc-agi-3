@@ -86,6 +86,8 @@ _install_runtime_integrity(
     _hgt_training,
 )
 _hgt_package.train_hgt_epoch = _hgt_training.train_hgt_epoch
+from v9.runtime import epoch_runner as _epoch_runner
+_epoch_runner.train_hgt_epoch = _hgt_training.train_hgt_epoch
 _runtime_package.ContinuousMemoryRuntime = ContinuousMemoryRuntime
 
 __all__ = [
