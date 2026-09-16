@@ -1,11 +1,22 @@
 import logging
+import os
+import sys
 import warnings
 
 warnings.filterwarnings("ignore")
 logging.disable(logging.INFO)
 
 
+def _consume_reset_memory_flag() -> None:
+    if "--reset-memory" not in sys.argv:
+        return
+    sys.argv[:] = [value for value in sys.argv if value != "--reset-memory"]
+    os.environ["ARC_AGI3_V9_RESET_MEMORY"] = "1"
+
+
 if __name__ == "__main__":
+    _consume_reset_memory_flag()
+
     # Start the multiprocessing server before importing the full CLI and before
     # ContinuousMemoryRuntime restores a multi-gigabyte graph. Later actors and
     # pipeline workers are forked by this small server rather than started from
