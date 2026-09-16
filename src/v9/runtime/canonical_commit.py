@@ -28,7 +28,7 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
         return CanonicalCommitResult((), ())
 
     with runtime._lock:
-        deferred_rows: list[Any] = []
+        deferred_groups: list[tuple[Any, ...]] = []
         signature_rows: list[tuple[int, ...]] = []
         touched_signatures: set[int] = set()
         registered_identities: dict[int, Any] = {}
@@ -46,8 +46,11 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
         last_scenario = ""
         isf_rows: list[tuple[ISFComponents, int, int, Any, Any, int]] = []
         max_cross_modal = int(runtime.config.scientific.max_cross_modal_facts_per_macro_event)
+        logical_graph_generation = int(runtime.graph.generation)
+        publication_generation_delta = getattr(runtime, "_deferred_publication_generation_delta", None)
 
         for plan in plans:
+            plan_deferred_rows: list[Any] = []
             signatures: list[int] = []
             cross_modal_used = 0
             event = plan.event
@@ -76,7 +79,7 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                 modality_deltas[modality] = modality_deltas.get(modality, 0) + 1
                 formation_environments.add(environment_id)
                 stage_before = runtime.stage_tracker.stage
-                deferred_rows.extend(write.runtime_row() for write in plan.base_writes)
+                plan_deferred_rows.extend(write.runtime_row() for write in plan.base_writes)
 
                 if plan.interaction_grounding is not None:
                     grounding = plan.interaction_grounding
@@ -85,7 +88,7 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                     raise RuntimeError("interaction commit plan is incomplete")
 
                 prior_support = int(runtime._m1n_supports.get(int(plan.relation.structural_signature), 0))
-                signature = record_normalized_fast(runtime, plan.relation, plan.normalized_write, deferred_rows)
+                signature = record_normalized_fast(runtime, plan.relation, plan.normalized_write, plan_deferred_rows)
                 signatures.append(signature)
                 touched_signatures.add(signature)
                 next_stage = advance_stage_fast(runtime)
@@ -100,7 +103,7 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                     recurrence = int(runtime._m1n_supports.get(signature, 0))
                     recurrence_pe = 1.0 / max(1.0, float(prior_support + 1))
                     pe = abs(float(explicit_pe)) if float(explicit_pe) != 0.0 else recurrence_pe
-                    isf_rows.append((ISFComponents(pvi, osi, pe, 1.0 / max(1, recurrence), tp, ep), int(runtime._watermark), int(event.identity.causal_watermark), stage_before, next_stage, int(runtime.graph.generation)))
+                    isf_rows.append((ISFComponents(pvi, osi, pe, 1.0 / max(1, recurrence), tp, ep), int(runtime._watermark), int(event.identity.causal_watermark), stage_before, next_stage, logical_graph_generation))
                     runtime._prediction_error_sum += abs(float(pe))
                     runtime._prediction_error_count += 1
 
@@ -122,15 +125,15 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                 modality = int(symbol_event.identity.modality_id.value)
                 modality_deltas[modality] = modality_deltas.get(modality, 0) + 1
                 formation_environments.add(int(symbol_event.identity.environment_instance_id))
-                deferred_rows.extend(write.runtime_row() for write in symbol.base_writes)
+                plan_deferred_rows.extend(write.runtime_row() for write in symbol.base_writes)
 
-                signature = record_normalized_fast(runtime, symbol.relation, symbol.normalized_write, deferred_rows)
+                signature = record_normalized_fast(runtime, symbol.relation, symbol.normalized_write, plan_deferred_rows)
                 signatures.append(signature)
                 touched_signatures.add(signature)
                 if symbol.aligned_relation is not None and cross_modal_used < max_cross_modal:
                     if symbol.aligned_normalized_write is None:
                         raise RuntimeError("aligned symbol commit plan is incomplete")
-                    aligned_signature = record_normalized_fast(runtime, symbol.aligned_relation, symbol.aligned_normalized_write, deferred_rows)
+                    aligned_signature = record_normalized_fast(runtime, symbol.aligned_relation, symbol.aligned_normalized_write, plan_deferred_rows)
                     signatures.append(aligned_signature)
                     touched_signatures.add(aligned_signature)
                     cross_modal_used += 1
@@ -162,7 +165,7 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                     if cross_modal_used >= max_cross_modal:
                         continue
                     cross_modal_used += 1
-                signature = record_normalized_fast(runtime, derived.relation, derived.write, deferred_rows)
+                signature = record_normalized_fast(runtime, derived.relation, derived.write, plan_deferred_rows)
                 signatures.append(signature)
                 touched_signatures.add(signature)
 
@@ -174,7 +177,7 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                     proxy = SimpleNamespace(m1g=symbol.grounding, base_writes=symbol.base_writes, occurrence=symbol.occurrence)
                     control = shuffled_alignment_control(proxy, previous_interaction, causal_watermark=int(runtime._watermark), occurrence=symbol.occurrence)
                     write = _m1n_write(control.relation, watermark=int(runtime._watermark), occurrence=symbol.occurrence, payload_extra=control.payload())
-                    signature = record_normalized_fast(runtime, control.relation, write, deferred_rows)
+                    signature = record_normalized_fast(runtime, control.relation, write, plan_deferred_rows)
                     signatures.append(signature)
                     touched_signatures.add(signature)
                     cross_modal_used += 1
@@ -186,8 +189,18 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
             curriculum_counts[key] = curriculum_counts.get(key, 0) + 1
             signature_rows.append(tuple(signatures))
 
-        if deferred_rows:
-            runtime._defer_base_group(tuple(deferred_rows))
+            deferred_group = tuple(plan_deferred_rows)
+            if deferred_group:
+                deferred_groups.append(deferred_group)
+                if callable(publication_generation_delta):
+                    logical_graph_generation += int(publication_generation_delta(deferred_group))
+
+        if deferred_groups:
+            defer_groups = getattr(runtime, "_defer_base_groups", None)
+            if callable(defer_groups):
+                defer_groups(tuple(deferred_groups))
+            else:
+                runtime._defer_base_group(tuple(row for group in deferred_groups for row in group))
         trim_replay_pool(runtime)
         runtime._formation_environments.update(formation_environments)
         runtime.timeline.events_seen += timeline_events_delta
