@@ -101,7 +101,12 @@ class GroundingRegistry:
         )
         support = current.support + support_delta
         contradiction = current.contradiction + contradiction_delta
-        suspended = contradiction >= support and contradiction > 0.0
+        causal_contradiction = bool(
+            not evidence.positive
+            and evidence.causal_intervention
+            and current.maturity >= GroundingMaturity.G3
+        )
+        suspended = causal_contradiction or (contradiction >= support and contradiction > 0.0)
 
         if evidence.positive:
             maturity = max(current.maturity, candidate)
