@@ -45,7 +45,7 @@ def test_derivation_candidates_use_touched_family_index_only() -> None:
     assert len(candidates) == 1
     assert candidates[0].structural_signature == 77
     assert candidates[0].support == 2
-    assert candidates[0].environment_scope == (1, 2)
+    assert candidates[0].formation_scope == (1, 2)
     assert candidates[0].evidence_confidence == 0.75
 
 
