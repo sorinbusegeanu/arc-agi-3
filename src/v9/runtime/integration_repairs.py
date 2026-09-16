@@ -62,7 +62,42 @@ def _block_for_result(self: MemoryPipelineServiceV2, *, timeout: float = 0.05) -
     return progressed
 
 
+def _canonical_public_batch(self: Any, rows: Iterable[Any]) -> tuple[tuple[int, ...], ...]:
+    """Use the same canonical commit implementation as the multiprocess pipeline."""
+    from .canonical_commit import apply_canonical_commit_batch
+    from .memory_pipeline_v2 import build_commit_plan
+
+    prepared_rows = tuple(rows)
+    if not prepared_rows:
+        return ()
+
+    # Public/reference ingestion historically leaves curriculum accounting to
+    # record_curriculum_events_batch(); the coordinator canonical path records it
+    # inline. Preserve that public contract while sharing the canonical mutation
+    # implementation itself.
+    telemetry = self.unified_telemetry
+    curriculum_before = dict(telemetry.curriculum_counts)
+    gauge_names = ("curriculum_step", "environment_family", "game_scenario")
+    gauges_before = {
+        name: (name in telemetry.gauges, telemetry.gauges.get(name))
+        for name in gauge_names
+    }
+
+    plans = tuple(build_commit_plan(row) for row in prepared_rows)
+    result = apply_canonical_commit_batch(self, plans)
+
+    telemetry.curriculum_counts.clear()
+    telemetry.curriculum_counts.update(curriculum_before)
+    for name, (present, value) in gauges_before.items():
+        if present:
+            telemetry.gauges[name] = value
+        else:
+            telemetry.gauges.pop(name, None)
+    return result.signature_rows
+
+
 def install_integration_repairs(runtime_cls: type[Any]) -> None:
     """Install compatibility repairs required by the unified v9.7.8/v9.7.9 runtime."""
     runtime_cls._previous_interactions = _ordered_previous_interactions
+    runtime_cls.apply_prepared_ingestion_batch = _canonical_public_batch
     MemoryPipelineServiceV2.block_for_result = _block_for_result
