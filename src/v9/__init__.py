@@ -98,6 +98,12 @@ _install_runtime_integrity_followup(_runtime_integrity_module, MemoryPipelineSer
 from v9.runtime.inline_lowlevel_publication import install_inline_lowlevel_publication as _install_inline_lowlevel_publication
 _install_inline_lowlevel_publication(ContinuousMemoryRuntime)
 
+# Metrics layers compose several mutable runtime registries. Keep each complete
+# dashboard/metrics read on one authoritative runtime cut so publication cannot
+# resize graph dictionaries during telemetry traversal.
+from v9.runtime.metrics_concurrency import install_metrics_concurrency as _install_metrics_concurrency
+_install_metrics_concurrency(ContinuousMemoryRuntime)
+
 _hgt_package.train_hgt_epoch = _hgt_training.train_hgt_epoch
 from v9.runtime import epoch_runner as _epoch_runner
 _epoch_runner.train_hgt_epoch = _hgt_training.train_hgt_epoch

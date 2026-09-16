@@ -24,6 +24,33 @@ def _merge_payload(current: dict[str, Any], incoming: dict[str, Any]) -> dict[st
     return merged
 
 
+def _row_partitions(graph: Any, rows: tuple[tuple[Any, dict[str, Any], tuple[Any, ...]], ...]) -> set[int]:
+    partitions: set[int] = set()
+    for node, payload, _evidence in rows:
+        partitions.add(node.uid.shard(graph.partition_count))
+        for raw_parent in payload.get("parents", []):
+            if not isinstance(raw_parent, (list, tuple)) or len(raw_parent) != 2:
+                continue
+            parent = MemoryUid(int(raw_parent[0]), int(raw_parent[1]))
+            partitions.add(parent.shard(graph.partition_count))
+    return partitions
+
+
+def _publication_chunks(rows: tuple[Any, ...]) -> int:
+    if not rows:
+        return 0
+    return (len(rows) + _INLINE_ROW_CHUNK - 1) // _INLINE_ROW_CHUNK
+
+
+def _logical_cross_partition_transactions(graph: Any, groups: tuple[tuple[Any, ...], ...]) -> int:
+    total = 0
+    for group in groups:
+        for offset in range(0, len(group), _INLINE_ROW_CHUNK):
+            chunk = tuple(group[offset : offset + _INLINE_ROW_CHUNK])
+            total += int(len(_row_partitions(graph, chunk)) > 1)
+    return total
+
+
 def _publish_chunk(runtime: Any, rows: tuple[tuple[Any, dict[str, Any], tuple[Any, ...]], ...]) -> int:
     if not rows:
         return 0
@@ -154,7 +181,7 @@ def _publish_chunk(runtime: Any, rows: tuple[tuple[Any, dict[str, Any], tuple[An
                 uid,
                 support_delta=1,
                 relevant_opportunity=True,
-                watermark=runtime._watermark,
+                watermark=int(node.created_watermark),
             )
     runtime.set_telemetry_gauge("grounding_action_index_size", len(grounding_index))
     return inserted_low_level
@@ -164,20 +191,38 @@ def install_inline_lowlevel_publication(runtime_cls: type) -> None:
     if getattr(runtime_cls, "_inline_lowlevel_publication_installed", False):
         return
 
-    def publish_inline(self: Any, rows: tuple[tuple[Any, dict[str, Any], tuple[Any, ...]], ...]) -> None:
-        if not rows:
+    def publication_generation_delta(self: Any, rows: tuple[Any, ...]) -> int:
+        return _publication_chunks(tuple(rows))
+
+    def publish_inline_groups(self: Any, groups: tuple[tuple[Any, ...], ...]) -> None:
+        logical_groups = tuple(tuple(group) for group in groups if group)
+        if not logical_groups:
             return
+        rows = tuple(row for group in logical_groups for row in group)
         started = time.perf_counter()
         inserted = 0
-        batches = 0
+        physical_batches = 0
+        logical_batches = sum(_publication_chunks(group) for group in logical_groups)
+        logical_cross = _logical_cross_partition_transactions(self.graph, logical_groups)
         with self._lock:
+            cross_before = int(self.telemetry.get("cross_partition_transactions", 0))
             for offset in range(0, len(rows), _INLINE_ROW_CHUNK):
                 chunk = tuple(rows[offset : offset + _INLINE_ROW_CHUNK])
                 inserted += _publish_chunk(self, chunk)
-                batches += 1
+                physical_batches += 1
+            physical_cross = int(self.telemetry.get("cross_partition_transactions", 0)) - cross_before
+            logical_extra = logical_batches - physical_batches
+            if logical_extra:
+                self.graph.generation += logical_extra
+                self.graph._cached_read_view = None
+                self.telemetry["proposals"] += logical_extra
+                self.telemetry["accepted"] += logical_extra
+            cross_adjustment = logical_cross - physical_cross
+            if cross_adjustment:
+                self.telemetry["cross_partition_transactions"] += cross_adjustment
         elapsed = time.perf_counter() - started
         self._inline_lowlevel_rows = int(getattr(self, "_inline_lowlevel_rows", 0)) + len(rows)
-        self._inline_lowlevel_batches = int(getattr(self, "_inline_lowlevel_batches", 0)) + batches
+        self._inline_lowlevel_batches = int(getattr(self, "_inline_lowlevel_batches", 0)) + logical_batches
         self._inline_lowlevel_seconds = float(getattr(self, "_inline_lowlevel_seconds", 0.0)) + elapsed
         self.set_telemetry_gauge("inline_lowlevel_publication_rows", self._inline_lowlevel_rows)
         self.set_telemetry_gauge("inline_lowlevel_publication_batches", self._inline_lowlevel_batches)
@@ -188,5 +233,10 @@ def install_inline_lowlevel_publication(runtime_cls: type) -> None:
         self.set_telemetry_gauge("deferred_base_nodes", len(self._deferred_base_nodes))
         self.set_telemetry_gauge("dirty_m1n_supports", len(self._m1n_dirty))
 
+    def publish_inline(self: Any, rows: tuple[tuple[Any, dict[str, Any], tuple[Any, ...]], ...]) -> None:
+        publish_inline_groups(self, (tuple(rows),))
+
+    runtime_cls._deferred_publication_generation_delta = publication_generation_delta
+    runtime_cls._defer_base_groups = publish_inline_groups
     runtime_cls._defer_base_group = publish_inline
     runtime_cls._inline_lowlevel_publication_installed = True
