@@ -91,7 +91,7 @@ class ActorPolicySnapshot:
         by_type_contextual = {
             str(environment_type): {
                 int(context): {int(action): max(-1.0, min(1.0, float(score))) for action, score in actions.items()}
-                for context, actions in (hgt_context_action_scores_by_type or {}).items()
+                for context, actions in contexts.items()
             }
             for environment_type, contexts in (hgt_context_action_scores_by_type or {}).items()
         }
