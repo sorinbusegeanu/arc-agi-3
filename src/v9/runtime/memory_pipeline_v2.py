@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
-from v9.memory.identity import MemoryUid
+from v9.memory.identity import MemoryUid, stable_u64
 from v9.memory.m1_grounded import M1GroundedContingency
 from v9.memory.m1_normalized import M1NormalizedRelation
 from v9.memory.model import CanonicalNode, MemoryLevel, MemoryType
 from v9.memory.symbolic_relations import derive_symbolic_relations
+from v9.memory.v978_descriptors import modality_neutral_family_signature
 from v9.modalities.contract import InteractionEvent, PassiveSymbolEvent
 
 from .memory_pipeline import DerivationTask, IngestionTask, PreparedIngestion, derive_memory, prepare_ingestion
@@ -105,6 +106,27 @@ def _occurrence_payload(occurrence: Any | None) -> dict[str, Any]:
     }
 
 
+def _nearby_payload(transition: Any, occurrence: Any | None) -> dict[str, Any]:
+    if transition is None or occurrence is None:
+        return {}
+    transformation = stable_u64(
+        int(transition.before_signature),
+        int(transition.after_signature),
+        int(bool(transition.semantic_delta)),
+        person=b"v9-symbol-nearby",
+    )
+    return {
+        "nearby_context_signature": int(transition.before_signature),
+        "nearby_action_id": int(transition.action_id),
+        "nearby_transformation_signature": int(transformation),
+        "nearby_progress": bool(transition.task_success or int(transition.levels_completed) > 0),
+        "nearby_outcome": int(transition.primary_valence),
+        "nearby_boundary_scope": str(transition.boundary_scope),
+        "nearby_task_success": bool(transition.task_success),
+        "nearby_task_failure": bool(transition.task_failure),
+    }
+
+
 def _m0_write(m0: Any, event: Any, transition: Any = None, occurrence: Any | None = None) -> CanonicalWrite:
     return CanonicalWrite(
         CanonicalNode(m0.uid, MemoryLevel.M0, MemoryType.EPISODE, (event.identity.event_id.hi, event.identity.event_id.lo), int(event.identity.causal_watermark)),
@@ -123,6 +145,7 @@ def _m0_write(m0: Any, event: Any, transition: Any = None, occurrence: Any | Non
             "realized_cost": m0.realized_cost,
             "evidence_confidence": 1.0,
             **_occurrence_payload(occurrence),
+            **_nearby_payload(transition, occurrence),
             **({"task_success": bool(transition.task_success), "task_failure": bool(transition.task_failure), "task_truncated": bool(transition.task_truncated), "level_index": int(transition.level_index), "levels_completed": int(transition.levels_completed)} if transition is not None else {}),
             **({"semantic_before": [list(row) for row in transition.semantic_before]} if transition is not None and transition.semantic_before else {}),
             **({"semantic_action": [list(row) for row in transition.semantic_action]} if transition is not None and transition.semantic_action else {}),
@@ -147,6 +170,7 @@ def _m1g_write(m1g: Any, m0: Any, event: Any, transition: Any = None, occurrence
             "grounded_next_context_signature": m1g.grounded_next_context_signature,
             "evidence_confidence": 1.0,
             **_occurrence_payload(occurrence),
+            **_nearby_payload(transition, occurrence),
             **({"semantic_action": [list(row) for row in transition.semantic_action]} if transition is not None and transition.semantic_action else {}),
             **({"semantic_effects": [list(row) for row in transition.semantic_delta]} if transition is not None and transition.semantic_delta else {}),
             "parents": [[m0.uid.hi, m0.uid.lo]],
@@ -163,13 +187,16 @@ def _m1n_write(relation: M1NormalizedRelation, *, watermark: int, transition: An
         "channel": relation.channel.value,
         "structural_signature": relation.structural_signature,
         "family_signature": int(relation.family_signature or relation.structural_signature),
+        "context_signature": int(relation.context_signature),
         "support": float(relation.support),
         "contradiction": float(relation.contradiction),
         "temporal_offsets": list(relation.temporal_offsets),
+        "temporal_offset_range": None if relation.temporal_offset_range is None else list(relation.temporal_offset_range),
         "causal_watermark": int(relation.causal_watermark or watermark),
         "heldout_transfer": bool(relation.heldout_transfer),
         "evidence_confidence": 1.0,
         **_occurrence_payload(occurrence),
+        **_nearby_payload(transition, occurrence),
         "parents": [[uid.hi, uid.lo] for uid in parents],
         **({"semantic_before": [list(row) for row in transition.semantic_before]} if transition is not None and transition.semantic_before else {}),
         **({"semantic_action": [list(row) for row in transition.semantic_action]} if transition is not None and transition.semantic_action else {}),
@@ -179,22 +206,32 @@ def _m1n_write(relation: M1NormalizedRelation, *, watermark: int, transition: An
     }
     if payload_extra:
         payload.update(payload_extra)
-    return CanonicalWrite(
-        CanonicalNode(relation.uid, MemoryLevel.M1, MemoryType.NORMALIZED_RELATION, (relation.structural_signature,), int(watermark)),
-        payload,
-        evidence,
-    )
+    return CanonicalWrite(CanonicalNode(relation.uid, MemoryLevel.M1, MemoryType.NORMALIZED_RELATION, (relation.structural_signature,), int(watermark)), payload, evidence)
+
+
+def _neutralize_prepared_relation(relation: M1NormalizedRelation | None, neutral_family: int | None) -> M1NormalizedRelation | None:
+    if relation is None or neutral_family is None:
+        return relation
+    return replace(relation, family_signature=int(neutral_family))
 
 
 def build_commit_plan(prepared: PreparedIngestion) -> CommitPlan:
     base_writes: tuple[CanonicalWrite, ...] = ()
     normalized_write: CanonicalWrite | None = None
     isf_static: tuple[float, float, float, float, float] | None = None
+    original_family = None if prepared.m1n is None else int(prepared.m1n.family_signature or prepared.m1n.structural_signature)
+    neutral_family = None
+    relation = prepared.m1n
     if prepared.event is not None:
         if prepared.m0 is None or prepared.m1g is None or prepared.m1n is None:
             raise RuntimeError("prepared interaction is incomplete")
+        descriptor_payload = {
+            "semantic_effects": [list(row) for row in prepared.transition.semantic_delta],
+        }
+        neutral_family = int(modality_neutral_family_signature(prepared.m1n, descriptor_payload))
+        relation = replace(prepared.m1n, family_signature=neutral_family, context_signature=int(prepared.m1g.grounded_context_signature))
         base_writes = (_m0_write(prepared.m0, prepared.event, prepared.transition), _m1g_write(prepared.m1g, prepared.m0, prepared.event, prepared.transition))
-        normalized_write = _m1n_write(prepared.m1n, watermark=int(prepared.event.identity.causal_watermark), transition=prepared.transition)
+        normalized_write = _m1n_write(relation, watermark=int(prepared.event.identity.causal_watermark), transition=prepared.transition)
         experience = prepared.event.experience
         isf_static = (
             abs(float(experience.primary_valence)), abs(float(experience.future_option_delta)), float(experience.prediction_error),
@@ -204,11 +241,21 @@ def build_commit_plan(prepared: PreparedIngestion) -> CommitPlan:
     symbols: list[SymbolCommitPlan] = []
     for index, symbol in enumerate(prepared.symbols):
         occurrence = prepared.symbol_occurrences[index] if index < len(prepared.symbol_occurrences) else None
-        writes = (_m0_write(symbol.m0, symbol.event, occurrence=occurrence), _m1g_write(symbol.m1g, symbol.m0, symbol.event, occurrence=occurrence))
+        symbol_relation = symbol.m1n
+        aligned_relation = symbol.aligned_m1n
+        if neutral_family is not None and original_family is not None:
+            if int(symbol_relation.family_signature or symbol_relation.structural_signature) == original_family:
+                symbol_relation = replace(symbol_relation, family_signature=neutral_family, context_signature=int(prepared.m1g.grounded_context_signature if prepared.m1g is not None else 0))
+            if aligned_relation is not None and int(aligned_relation.family_signature or aligned_relation.structural_signature) == original_family:
+                aligned_relation = replace(aligned_relation, family_signature=neutral_family, context_signature=int(prepared.m1g.grounded_context_signature if prepared.m1g is not None else 0))
+        writes = (
+            _m0_write(symbol.m0, symbol.event, prepared.transition, occurrence=occurrence),
+            _m1g_write(symbol.m1g, symbol.m0, symbol.event, prepared.transition, occurrence=occurrence),
+        )
         symbols.append(SymbolCommitPlan(
-            symbol.event, symbol.m1g, symbol.m1n, symbol.aligned_m1n, writes,
-            _m1n_write(symbol.m1n, watermark=int(symbol.event.identity.causal_watermark), occurrence=occurrence),
-            None if symbol.aligned_m1n is None else _m1n_write(symbol.aligned_m1n, watermark=int(symbol.event.identity.causal_watermark), occurrence=occurrence),
+            symbol.event, symbol.m1g, symbol_relation, aligned_relation, writes,
+            _m1n_write(symbol_relation, watermark=int(symbol.event.identity.causal_watermark), transition=prepared.transition, occurrence=occurrence),
+            None if aligned_relation is None else _m1n_write(aligned_relation, watermark=int(symbol.event.identity.causal_watermark), transition=prepared.transition, occurrence=occurrence),
             occurrence,
         ))
 
@@ -224,13 +271,18 @@ def build_commit_plan(prepared: PreparedIngestion) -> CommitPlan:
             occurrences=prepared.symbol_occurrences,
         )
         for item in derived:
+            derived_relation = item.relation
+            if neutral_family is not None and original_family is not None and int(derived_relation.family_signature or derived_relation.structural_signature) == original_family:
+                derived_relation = replace(derived_relation, family_signature=neutral_family, context_signature=int(prepared.m1g.grounded_context_signature if prepared.m1g is not None else 0))
+            payload_extra = item.payload()
+            payload_extra["family_signature"] = int(derived_relation.family_signature or derived_relation.structural_signature)
             derived_plans.append(DerivedRelationCommitPlan(
-                item.relation,
-                _m1n_write(item.relation, watermark=watermark, payload_extra=item.payload()),
+                derived_relation,
+                _m1n_write(derived_relation, watermark=watermark, transition=prepared.transition, payload_extra=payload_extra),
             ))
 
     return CommitPlan(
-        int(prepared.sequence), prepared.identity, prepared.event, prepared.m1g, prepared.m1n,
+        int(prepared.sequence), prepared.identity, prepared.event, prepared.m1g, relation,
         base_writes, normalized_write, tuple(symbols), prepared.symbol_codec_state, prepared.symbol_occurrences,
         prepared.transition.curriculum_step, str(prepared.transition.game_scenario), isf_static, prepared.transition,
         tuple(derived_plans),
