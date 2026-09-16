@@ -8,8 +8,8 @@ from .canonical_commit import apply_canonical_commit_batch
 from .parallel_memory_coordinator import _adaptive_canonical_batch_size
 
 
-_MIN_PUBLICATION_INTAKE_HIGH_WATER = 4096
-_MAX_PUBLICATION_INTAKE_HIGH_WATER = 16384
+_MIN_PUBLICATION_INTAKE_HIGH_WATER = 1024
+_MAX_PUBLICATION_INTAKE_HIGH_WATER = 4096
 
 
 def _finish_canonical_commit(service: Any) -> bool:
@@ -89,7 +89,7 @@ def _submit_canonical_commit(service: Any) -> bool:
 
 
 def install_publication_throughput(pipeline_cls: type) -> None:
-    """Overlap canonical commit with publication intake and worker preparation."""
+    """Overlap canonical commit with bounded publication intake and worker preparation."""
     if getattr(pipeline_cls, "_publication_throughput_installed", False):
         return
 
@@ -104,7 +104,7 @@ def install_publication_throughput(pipeline_cls: type) -> None:
             max(
                 int(self.ingest_local_high_water),
                 _MIN_PUBLICATION_INTAKE_HIGH_WATER,
-                capacity * 8,
+                capacity * 4,
             ),
         )
         self._canonical_commit_thread = None
@@ -122,12 +122,11 @@ def install_publication_throughput(pipeline_cls: type) -> None:
 
     def service(self: Any) -> bool:
         progressed = _finish_canonical_commit(self)
+        progressed = self.pump_ingest_tasks() or progressed
+        progressed = self.pump_derivation_tasks() or progressed
         progressed = self.drain_ingest_results() or progressed
         progressed = self.drain_derivation_results() or progressed
 
-        # Canonical ingestion and derivation publication mutate the same runtime.
-        # Keep them ordered, while allowing IPC/result draining to overlap with
-        # the canonical commit thread.
         if self._canonical_commit_thread is None:
             progressed = self.apply_derivation_ready() or progressed
         progressed = self.apply_ingest_ready() or progressed
