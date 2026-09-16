@@ -90,6 +90,14 @@ _install_runtime_integrity(
 )
 from v9.runtime.runtime_integrity_followup import install as _install_runtime_integrity_followup
 _install_runtime_integrity_followup(_runtime_integrity_module, MemoryPipelineServiceV2)
+
+# Unique M0/grounded-M1 and first-seen normalized M1 rows are append-only.
+# Publish them continuously in bounded canonical batches instead of accumulating
+# a second large deferred publication debt. Repeated M1N support remains dirty
+# and coalesced until the normal flush boundary.
+from v9.runtime.inline_lowlevel_publication import install_inline_lowlevel_publication as _install_inline_lowlevel_publication
+_install_inline_lowlevel_publication(ContinuousMemoryRuntime)
+
 _hgt_package.train_hgt_epoch = _hgt_training.train_hgt_epoch
 from v9.runtime import epoch_runner as _epoch_runner
 _epoch_runner.train_hgt_epoch = _hgt_training.train_hgt_epoch
