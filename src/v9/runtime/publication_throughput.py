@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-from itertools import islice
 from threading import Thread
 from typing import Any
 
@@ -18,6 +17,7 @@ def _finish_canonical_commit(service: Any) -> bool:
     if thread is None or thread.is_alive():
         return False
     thread.join()
+    service.runtime._canonical_commit_inflight = False
     error = getattr(service, "_canonical_commit_error", None)
     if error is not None:
         service._canonical_commit_thread = None
@@ -71,6 +71,7 @@ def _submit_canonical_commit(service: Any) -> bool:
     service._canonical_commit_events = len(frozen_plans)
     service._canonical_commit_result = None
     service._canonical_commit_error = None
+    service.runtime._canonical_commit_inflight = True
 
     def run() -> None:
         started = time.perf_counter()
@@ -111,6 +112,7 @@ def install_publication_throughput(pipeline_cls: type) -> None:
         self._canonical_commit_error = None
         self._canonical_commit_events = 0
         self._canonical_commit_batches = 0
+        self.runtime._canonical_commit_inflight = False
 
     def apply_ingest_ready(self: Any) -> bool:
         progressed = _finish_canonical_commit(self)
