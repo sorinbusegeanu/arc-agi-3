@@ -553,7 +553,7 @@ class CommitPlan:
 class PreparedCommitBatch:
     start_sequence: int
     end_sequence: int
-    rows: tuple[CommitPlan, ...]
+    rows: tuple[Any, ...]
 
 
 def _m0_write(m0: Any, event: Any, context: TransitionCommitContext | None = None, occurrence: Any | None = None) -> CanonicalWrite:
@@ -757,7 +757,11 @@ def prepare_commit_batch(batch: IngestionBatchTask) -> PreparedCommitBatch:
     return PreparedCommitBatch(int(batch.start_sequence), int(batch.end_sequence), rows)
 
 
+_INGEST_RESULT_CHUNK_SIZE = 128
+
+
 def ingest_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
+    """Prepare large task batches in parallel but publish compact rows in bounded chunks."""
     while True:
         item = task_queue.get()
         if isinstance(item, WorkerStop):
@@ -765,14 +769,24 @@ def ingest_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
         if not isinstance(item, IngestionBatchTask):
             continue
         try:
-            result = prepare_commit_batch(item)
-            descriptor = publish_shared_batch(
-                result,
-                start_sequence=result.start_sequence,
-                end_sequence=result.end_sequence,
-                rows=len(result.rows),
-            )
-            result_queue.put(("ingest_batch_shm", result.start_sequence, result.end_sequence, descriptor))
+            tasks = tuple(item.tasks)
+            for offset in range(0, len(tasks), _INGEST_RESULT_CHUNK_SIZE):
+                chunk = tasks[offset : offset + _INGEST_RESULT_CHUNK_SIZE]
+                if not chunk:
+                    continue
+                rows = tuple(prepare_ingestion(task) for task in chunk)
+                result = PreparedCommitBatch(
+                    int(chunk[0].sequence),
+                    int(chunk[-1].sequence),
+                    rows,
+                )
+                descriptor = publish_shared_batch(
+                    result,
+                    start_sequence=result.start_sequence,
+                    end_sequence=result.end_sequence,
+                    rows=len(result.rows),
+                )
+                result_queue.put(("ingest_batch_shm", result.start_sequence, result.end_sequence, descriptor))
         except BaseException as exc:
             result_queue.put(("worker_error", "ingest", int(item.start_sequence), repr(exc)))
 
