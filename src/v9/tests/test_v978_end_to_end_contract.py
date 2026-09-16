@@ -134,6 +134,6 @@ def test_h16_evidence_round_trip_preserves_matched_run_state(tmp_path) -> None:
 def test_public_runtime_is_final_v978_runtime() -> None:
     import v9
     import v9.runtime
-    from v9.runtime.final_runtime import FinalContinuousMemoryRuntime
-    assert v9.ContinuousMemoryRuntime is FinalContinuousMemoryRuntime
-    assert v9.runtime.ContinuousMemoryRuntime is FinalContinuousMemoryRuntime
+    from v9.runtime.v978_conformant import V978ContinuousMemoryRuntime
+    assert v9.ContinuousMemoryRuntime is V978ContinuousMemoryRuntime
+    assert v9.runtime.ContinuousMemoryRuntime is V978ContinuousMemoryRuntime
