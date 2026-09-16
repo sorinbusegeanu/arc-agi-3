@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Mapping
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -22,6 +22,20 @@ class VersionTable:
         value = self.get(ref) + 1
         self._versions[ref] = value
         return value
+
+    def bump_by(self, ref: ObjectRef, delta: int) -> int:
+        amount = int(delta)
+        if amount < 0:
+            raise ValueError("version delta cannot be negative")
+        if amount == 0:
+            return self.get(ref)
+        value = self.get(ref) + amount
+        self._versions[ref] = value
+        return value
+
+    def bump_many(self, deltas: Mapping[ObjectRef, int]) -> None:
+        for ref, delta in deltas.items():
+            self.bump_by(ref, int(delta))
 
     def remove(self, ref: ObjectRef) -> int | None:
         """Drop version metadata for an object that no longer exists."""
