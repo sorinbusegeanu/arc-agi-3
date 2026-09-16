@@ -1,9 +1,30 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 
 SYMBOL_FEATURE_SCHEMA_VERSION = 1
+SYMBOL_FEATURE_NAMES = (
+    "vocabulary_id",
+    "symbol_id",
+    "occurrence_count",
+    "mean_position",
+    "min_position",
+    "max_position",
+    "mean_micro_step",
+    "temporal_span",
+    "context_diversity",
+    "before_action_ratio",
+    "between_actions_ratio",
+    "after_action_ratio",
+    "after_outcome_ratio",
+    "support",
+    "contradiction",
+    "grounding_confidence",
+    "grounding_maturity",
+)
 
 
 def _phase_bucket(phase: str) -> int:
@@ -16,10 +37,38 @@ def _phase_bucket(phase: str) -> int:
     }.get(str(phase), 4)
 
 
+def _patch_checkpoint_metadata(training_module: Any, result: Any, root: str | Path) -> None:
+    checkpoint = getattr(result, "checkpoint", None)
+    if not checkpoint:
+        return
+    torch, _, _ = training_module._require_torch()
+    root = Path(root)
+    path = root / str(checkpoint)
+    if not path.exists():
+        return
+    data = torch.load(path, map_location="cpu")
+    data["symbol_feature_schema_version"] = SYMBOL_FEATURE_SCHEMA_VERSION
+    data["symbol_feature_names"] = list(SYMBOL_FEATURE_NAMES)
+    torch.save(data, path)
+    sidecar = path.with_suffix(".json")
+    if sidecar.exists():
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        payload["symbol_feature_schema_version"] = SYMBOL_FEATURE_SCHEMA_VERSION
+        payload["symbol_feature_names"] = list(SYMBOL_FEATURE_NAMES)
+        sidecar.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    manifest_path = root / "models" / "hgt_manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["symbol_feature_schema_version"] = SYMBOL_FEATURE_SCHEMA_VERSION
+        manifest["symbol_feature_names"] = list(SYMBOL_FEATURE_NAMES)
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def install(training_module: Any) -> None:
     if getattr(training_module, "_v978_symbol_features_installed", False):
         return
     original_graph = training_module.build_hgt_graph
+    original_train = training_module.train_hgt_epoch
 
     def build_hgt_graph(read_view: Any, **kwargs: Any):
         result = original_graph(read_view, **kwargs)
@@ -106,5 +155,14 @@ def install(training_module: Any) -> None:
         training_module._v978_symbol_feature_schema_version = SYMBOL_FEATURE_SCHEMA_VERSION
         return result
 
+    def train_hgt_epoch(runtime: Any, **kwargs: Any):
+        result = original_train(runtime, **kwargs)
+        root = kwargs.get("root")
+        if root is not None:
+            _patch_checkpoint_metadata(training_module, result, root)
+        return result
+
     training_module.build_hgt_graph = build_hgt_graph
+    training_module.train_hgt_epoch = train_hgt_epoch
+    training_module._v978_symbol_feature_schema_version = SYMBOL_FEATURE_SCHEMA_VERSION
     training_module._v978_symbol_features_installed = True
