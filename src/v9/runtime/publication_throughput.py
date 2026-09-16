@@ -8,7 +8,7 @@ from .canonical_commit import apply_canonical_commit_batch
 from .parallel_memory_coordinator import _adaptive_canonical_batch_size
 
 
-_MIN_PUBLICATION_INTAKE_HIGH_WATER = 1024
+_MIN_PUBLICATION_INTAKE_HIGH_WATER = 4096
 _MAX_PUBLICATION_INTAKE_HIGH_WATER = 4096
 
 
@@ -98,15 +98,7 @@ def install_publication_throughput(pipeline_cls: type) -> None:
 
     def init(self: Any, runtime: Any, memory: Any, *, ingest_queue_capacity: int) -> None:
         original_init(self, runtime, memory, ingest_queue_capacity=ingest_queue_capacity)
-        capacity = max(1, int(ingest_queue_capacity))
-        self.ingest_local_high_water = min(
-            _MAX_PUBLICATION_INTAKE_HIGH_WATER,
-            max(
-                int(self.ingest_local_high_water),
-                _MIN_PUBLICATION_INTAKE_HIGH_WATER,
-                capacity * 4,
-            ),
-        )
+        self.ingest_local_high_water = _MAX_PUBLICATION_INTAKE_HIGH_WATER
         self._canonical_commit_thread = None
         self._canonical_commit_result = None
         self._canonical_commit_error = None
