@@ -14,6 +14,7 @@ from v9.runtime.integration_repairs import install_integration_repairs
 from v9.runtime.pipeline_service_v2 import MemoryPipelineServiceV2
 from v9.runtime.environment_viability import install_environment_viability
 from v9.runtime.viability_confidence import install_viability_confidence
+from v9.runtime.actor_policy_cache import install_actor_policy_cache
 from v9.runtime.publication import CanonicalGraph
 import v9.runtime as _runtime_package
 
@@ -30,6 +31,7 @@ install_reset_memory(ContinuousMemoryRuntime)
 install_integration_repairs(ContinuousMemoryRuntime)
 install_environment_viability(ContinuousMemoryRuntime, MemoryPipelineServiceV2)
 install_viability_confidence(ContinuousMemoryRuntime)
+install_actor_policy_cache(ContinuousMemoryRuntime)
 _runtime_package.ContinuousMemoryRuntime = ContinuousMemoryRuntime
 
 # Terminal status is derived from the three authoritative boundary fields.
