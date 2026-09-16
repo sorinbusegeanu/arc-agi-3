@@ -6,7 +6,7 @@ from v9.cognition.developmental_stage import StageEvidence
 from v9.cognition.action_selection import scoped_action_key
 from v9.memory.model import MemoryLevel
 
-from .memory_pipeline_v2 import CanonicalWrite
+from .memory_pipeline import CanonicalWrite
 
 
 def ensure_fast_state(runtime: Any) -> None:
