@@ -3,6 +3,9 @@
 from v9.environments.contract import EnvironmentCognitionAdapter
 from v9.memory.identity import EventUid, MemoryUid
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig, ScientificConfigId
+from v9.runtime.residency import install_bounded_residency
+
+install_bounded_residency(ContinuousMemoryRuntime)
 
 __all__ = [
     "ContinuousMemoryRuntime",
