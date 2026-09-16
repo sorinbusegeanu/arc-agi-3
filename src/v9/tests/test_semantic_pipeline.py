@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from v9.runtime.memory_pipeline import IngestionTask, prepare_ingestion
-from v9.runtime.memory_pipeline_v2 import build_commit_plan
+from v9.runtime.memory_pipeline import IngestionTask, build_commit_plan, prepare_ingestion
 from v9.runtime.multiprocess import EncodedTransition
 
 
@@ -36,9 +35,9 @@ def _transition() -> EncodedTransition:
 def test_semantics_survive_into_m0_m1_payloads() -> None:
     prepared = prepare_ingestion(IngestionTask(1, 1, _transition()))
     plan = build_commit_plan(prepared)
-    m0_payload = plan.base_writes[0].payload
-    m1_payload = plan.base_writes[1].payload
-    normalized = plan.normalized_write.payload
+    m0_payload = plan.base_writes[0].runtime_row()[1]
+    m1_payload = plan.base_writes[1].runtime_row()[1]
+    normalized = plan.normalized_write.runtime_row()[1]
     assert m0_payload["semantic_before"] == [[2, 1001, 6, 3, 3.0]]
     assert m0_payload["semantic_after"] == [[2, 1001, 6, 4, 4.0]]
     assert m1_payload["semantic_action"] == [[8, 2001, 23, 2, 1.0]]
