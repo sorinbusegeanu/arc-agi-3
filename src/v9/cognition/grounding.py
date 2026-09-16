@@ -69,14 +69,10 @@ class GroundingRegistry:
             maturity = GroundingMaturity.G1
         if evidence.cross_modal_association:
             maturity = GroundingMaturity.G2
-        # G3 requires prospective/held-out evidence that precedes evaluation.
         if evidence.prospective_prediction or evidence.heldout_transfer:
             maturity = GroundingMaturity.G3
-        # G4 is reserved for validated novel composition/causal recombination.
         if (evidence.novel_composition or evidence.causal_intervention) and evidence.positive:
             maturity = GroundingMaturity.G4
-        # G5 requires symbols to mediate learning of interaction knowledge that was
-        # not already available through direct interaction evidence.
         if (evidence.symbol_mediated_learning or evidence.unexperienced_interaction) and evidence.positive:
             maturity = GroundingMaturity.G5
         return maturity
@@ -100,7 +96,12 @@ class GroundingRegistry:
         )
         support = current.support + support_delta
         contradiction = current.contradiction + contradiction_delta
-        suspended = contradiction >= support and contradiction > 0.0
+        causal_contradiction = bool(
+            not evidence.positive
+            and evidence.causal_intervention
+            and current.maturity >= GroundingMaturity.G3
+        )
+        suspended = causal_contradiction or (contradiction >= support and contradiction > 0.0)
         if evidence.positive:
             maturity = max(current.maturity, candidate)
         else:
