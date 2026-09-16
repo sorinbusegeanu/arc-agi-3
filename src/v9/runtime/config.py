@@ -24,7 +24,7 @@ class ScientificConfigId:
 class ScientificConfig:
     schema_version: int = 1
     research_contract_version: str = "0.7.0"
-    design_version: str = "9.7.8"
+    design_version: str = "9.7.9"
     random_seeds: tuple[int, ...] = (0,)
     symbol_budget_per_window: int = 8
     symbol_payload_bytes: int = 4096
@@ -108,6 +108,22 @@ class ScientificConfig:
     hgt_examples_per_train_trigger: int = 5000
     hgt_training_duty_cycle: float = 0.50
     hgt_target_inference_latency_ms: float = 50.0
+
+    # v9.7.9 bounded resident-memory contract.
+    resident_m0_limit: int = 250_000
+    resident_m1_grounded_limit: int = 250_000
+    resident_low_level_target_ratio: float = 0.85
+    resident_compaction_check_interval: int = 25_000
+    resident_m0_representative_floor: int = 8
+    resident_m1_grounded_representative_floor: int = 2
+    resident_max_delete_batch: int = 262_144
+    resident_max_scan_batch: int = 524_288
+    memory_rss_high_watermark_bytes: int = 48 * 1024 * 1024 * 1024
+    memory_rss_hard_watermark_bytes: int = 56 * 1024 * 1024 * 1024
+    memory_swap_high_watermark_bytes: int = 512 * 1024 * 1024
+    hgt_transition_chunk_rows: int = 8192
+    hgt_active_episode_limit: int = 128
+
     enabled_structural_relations: tuple[str, ...] = (
         "TEMPORAL", "CO_OCCURS", "DEPENDS_ON", "ENABLES", "BLOCKS",
         "EXPLAINS", "SIMILAR_TO", "OUTCOME_EQUIVALENT", "LEADS_TO", "PREFERENCE",
@@ -138,11 +154,26 @@ class ScientificConfig:
             self.hgt_max_subgraph_edges, self.hgt_max_total_nodes, self.hgt_max_total_edges,
             self.hgt_max_semantic_facts_per_memory, self.hgt_oom_retry_limit, self.hgt_training_microbatch,
             self.hgt_gradient_accumulation, self.hgt_examples_per_train_trigger,
+            self.resident_m0_limit, self.resident_m1_grounded_limit,
+            self.resident_compaction_check_interval,
+            self.resident_m0_representative_floor, self.resident_m1_grounded_representative_floor,
+            self.resident_max_delete_batch, self.resident_max_scan_batch,
+            self.memory_rss_high_watermark_bytes, self.memory_rss_hard_watermark_bytes,
+            self.memory_swap_high_watermark_bytes,
+            self.hgt_transition_chunk_rows, self.hgt_active_episode_limit,
         )
         if min(int(value) for value in positive) <= 0:
             raise ValueError("scientific budgets and thresholds must be positive")
         if min(self.allocation_unsolved_weight, self.allocation_optimizing_weight, self.allocation_stable_weight) <= 0:
             raise ValueError("allocation weights must be positive")
+        if not 0.0 < float(self.resident_low_level_target_ratio) < 1.0:
+            raise ValueError("resident low-level target ratio must be in (0, 1)")
+        if self.resident_m0_limit <= self.resident_m0_representative_floor:
+            raise ValueError("resident M0 limit must exceed representative floor")
+        if self.resident_m1_grounded_limit <= self.resident_m1_grounded_representative_floor:
+            raise ValueError("resident M1-grounded limit must exceed representative floor")
+        if self.memory_rss_high_watermark_bytes >= self.memory_rss_hard_watermark_bytes:
+            raise ValueError("RSS high watermark must be below hard watermark")
         radii = tuple(int(value) for value in self.structural_radii)
         if not radii or tuple(sorted(set(radii))) != radii or any(r <= 0 or r & (r - 1) for r in radii):
             raise ValueError("structural radii must be unique ascending powers of two")
