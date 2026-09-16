@@ -8,6 +8,7 @@ from v9.runtime.multiprocess import EncodedTransition
 from v9.runtime.derivation_publication import install_bounded_derivation_publication
 from v9.runtime.residency import ResidentMemoryManager, install_bounded_residency
 from v9.runtime.bounded_indexes import install_bounded_indexes
+from v9.runtime.bounded_index_cleanup import install_bounded_index_cleanup
 from v9.runtime.reset_memory import install_reset_memory
 from v9.runtime.integration_repairs import install_integration_repairs
 from v9.runtime.pipeline_service_v2 import MemoryPipelineServiceV2
@@ -24,6 +25,7 @@ if not hasattr(ContinuousMemoryRuntime, "full_metrics"):
 install_bounded_derivation_publication(ContinuousMemoryRuntime)
 install_bounded_residency(ContinuousMemoryRuntime)
 install_bounded_indexes(ContinuousMemoryRuntime)
+install_bounded_index_cleanup(CanonicalGraph)
 install_reset_memory(ContinuousMemoryRuntime)
 install_integration_repairs(ContinuousMemoryRuntime)
 install_environment_viability(ContinuousMemoryRuntime, MemoryPipelineServiceV2)
