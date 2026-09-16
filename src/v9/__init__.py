@@ -10,6 +10,12 @@ import v9.runtime as _runtime_package
 ContinuousMemoryRuntime = V978ContinuousMemoryRuntime
 _runtime_package.ContinuousMemoryRuntime = V978ContinuousMemoryRuntime
 
+# High-throughput actors route through the passive-capture adapter factory so
+# symbol timestamps reflect observation/action order rather than post-hoc labels.
+from v9.runtime import multiprocess as _multiprocess
+from v9.environments.passive_capture import install_process_factory_route as _install_process_factory_route
+_install_process_factory_route(_multiprocess)
+
 # HGT uses canonical SymbolOccurrence payloads as the only SYMBOL authority.
 from v9.hgt import training as _hgt_training
 from v9.hgt.canonical_symbol_graph import install as _install_canonical_symbol_graph
