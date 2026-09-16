@@ -189,19 +189,16 @@ def test_actor_policy_snapshot_is_picklable(tmp_path) -> None:
     assert restored.normalized_action_supports == snapshot.normalized_action_supports
 
 
-def test_parallel_sampling_defers_raw_graph_publication(tmp_path) -> None:
-    from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
+def _prepared_transition(sequence: int):
     from v9.runtime.memory_pipeline import IngestionTask, prepare_ingestion
     from v9.runtime.multiprocess import EncodedTransition
 
-    runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False, enable_snapshots=False))
-    identity = ("synthetic", "syn_move", "default", "instance-1")
     transition = EncodedTransition(
         actor_id=1,
-        producer_sequence=1,
-        environment_identity=identity,
+        producer_sequence=sequence,
+        environment_identity=("synthetic", "syn_move", "default", "instance-1"),
         episode_id=1,
-        global_step=0,
+        global_step=sequence - 1,
         before_signature=1,
         action_id=0,
         after_signature=2,
@@ -221,14 +218,45 @@ def test_parallel_sampling_defers_raw_graph_publication(tmp_path) -> None:
         curriculum_step="step1",
         game_scenario="syn_move",
     )
-    prepared = prepare_ingestion(IngestionTask(1, 1, transition))
-    runtime.apply_prepared_ingestion(prepared)
+    return prepare_ingestion(IngestionTask(sequence, sequence, transition))
+
+
+def test_parallel_sampling_publishes_raw_graph_inline(tmp_path) -> None:
+    from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
+
+    runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False, enable_snapshots=False))
+    runtime.apply_prepared_ingestion(_prepared_transition(1))
 
     assert runtime.metrics()["memory_levels"]["M0"] == 1
-    assert runtime.graph.memory_count() == 0
+    assert runtime.graph.memory_count() >= 3
+    assert runtime._deferred_base_nodes == {}
+    before_flush = runtime.graph.memory_count()
 
     runtime.flush_deferred_memory_updates()
+
+    assert runtime.graph.memory_count() == before_flush
+    diagnostics = runtime.unified_telemetry.diagnostic_metrics()
+    assert diagnostics["inline_lowlevel_publication_rows"] >= 3
+    assert diagnostics["deferred_base_nodes"] == 0
+
+
+def test_canonical_batch_publishes_lowlevel_inline_and_defers_only_support(tmp_path) -> None:
+    from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
+    from v9.runtime.canonical_commit import apply_canonical_commit_batch
+    from v9.runtime.memory_pipeline_v2 import build_commit_plan
+
+    runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False, enable_snapshots=False))
+    first = build_commit_plan(_prepared_transition(1))
+    second = build_commit_plan(_prepared_transition(2))
+
+    apply_canonical_commit_batch(runtime, (first, second))
+
+    assert runtime._deferred_base_nodes == {}
     assert runtime.graph.memory_count() >= 3
+    assert runtime._m1n_dirty
+    diagnostics = runtime.unified_telemetry.diagnostic_metrics()
+    assert diagnostics["inline_lowlevel_publication_rows"] >= 3
+    assert diagnostics["dirty_m1n_supports"] >= 1
 
 
 def test_child_queue_flush_closes_and_joins_feeder() -> None:
