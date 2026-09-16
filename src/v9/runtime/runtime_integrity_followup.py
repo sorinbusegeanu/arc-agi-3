@@ -25,10 +25,11 @@ def preserve_pipeline_viability_dispatch(pipeline_cls: type) -> None:
 
 def install(runtime_integrity_module: Any, pipeline_cls: type) -> None:
     preserve_pipeline_viability_dispatch(pipeline_cls)
+    runtime_integrity_module._VIABILITY_PROFILE_LIMIT = 256
 
-    # A consumer that already unlinked a segment has also unregistered it from
-    # the shared resource tracker. Do not issue a second unregister from worker
-    # cleanup; only unlink segments that still physically exist.
+    # A consumer that already unlinked a segment has also removed it from the
+    # shared resource tracker. Worker cleanup only unlinks segments that still
+    # physically exist.
     def cleanup_owned_shared_memory(names: set[str]) -> None:
         from multiprocessing import shared_memory
 
