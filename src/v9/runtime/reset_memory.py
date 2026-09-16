@@ -47,7 +47,7 @@ def resolve_last_accepted_hgt(root: str | Path) -> dict[str, Any]:
     root_path = Path(root)
     manifest_path = root_path / "models" / "hgt_manifest.json"
     if not manifest_path.is_file():
-        raise RuntimeError("--reset-memory requires an existing HGT manifest with an accepted model")
+        raise RuntimeError("--reset-memory requires an existing accepted HGT model manifest")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     accepted_version = manifest.get("last_accepted_model_version") or manifest.get("accepted_model_version")
     if not accepted_version:
@@ -63,6 +63,7 @@ def resolve_last_accepted_hgt(root: str | Path) -> dict[str, Any]:
     manifest_scores_are_accepted = (
         str(current_version or "") == str(accepted_version)
         and (not candidate_version or candidate_status == "PROMOTED")
+        and bool(manifest.get("action_scores"))
     )
     if manifest_scores_are_accepted:
         action_scores = _nested_scores(manifest.get("action_scores", {}))
@@ -142,7 +143,8 @@ def install_reset_memory(runtime_cls: type) -> None:
     original_init = runtime_cls.__init__
 
     def runtime_init(self: Any, config: Any) -> None:
-        requested = os.environ.pop(RESET_MEMORY_ENV, "0") == "1"
+        requested_flag = os.environ.pop(RESET_MEMORY_ENV, "0") == "1"
+        requested = requested_flag and bool(getattr(config, "restore", True))
         if not requested:
             original_init(self, config)
             return
