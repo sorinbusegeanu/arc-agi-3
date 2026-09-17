@@ -7,8 +7,8 @@ from types import SimpleNamespace
 from v9.mutation.versions import ObjectRef, VersionTable
 from v9.runtime.actor_policy_cache import install_actor_policy_cache
 from v9.runtime.canonical_commit import CanonicalCommitResult
-from v9.runtime.memory_pipeline_v2 import PreparedCommitBatch
-from v9.runtime.pipeline_service_v2 import MemoryPipelineServiceV2
+from v9.runtime.memory_pipeline import CommitPlan, PreparedCommitBatch
+from v9.runtime.parallel_memory_coordinator import MemoryPipelineService
 import v9.runtime.publication_throughput as publication_throughput
 
 
@@ -23,8 +23,9 @@ def test_canonical_commit_submission_does_not_block_pipeline(monkeypatch) -> Non
 
     monkeypatch.setattr(publication_throughput, "apply_canonical_commit_batch", slow_commit)
     runtime = SimpleNamespace(watermark=0)
-    service = MemoryPipelineServiceV2(runtime, SimpleNamespace(), ingest_queue_capacity=128)
-    service.ingest_results[1] = PreparedCommitBatch(1, 1, (object(),))
+    service = MemoryPipelineService(runtime, SimpleNamespace(), ingest_queue_capacity=128)
+    plan = CommitPlan(1, None, None, None, None, (), None, (), None, (), None, "", None)
+    service.ingest_results[1] = PreparedCommitBatch(1, 1, (plan,))
 
     started = time.perf_counter()
     assert service.apply_ingest_ready()
