@@ -416,8 +416,8 @@ def _cleanup_owned_shared_memory(names: set[str]) -> None:
                 pass
 
 
-def _install_shared_memory_cleanup(memory_pipeline_v2: Any, topology_module: Any, shared_batch_transport: Any, worker_stop_cls: type) -> None:
-    if getattr(memory_pipeline_v2, "_runtime_integrity_shm_installed", False):
+def _install_shared_memory_cleanup(memory_pipeline: Any, topology_module: Any, shared_batch_transport: Any, worker_stop_cls: type) -> None:
+    if getattr(memory_pipeline, "_runtime_integrity_shm_installed", False):
         return
 
     def publish_shared_batch(value: Any, *, start_sequence: int, end_sequence: int, rows: int):
@@ -445,13 +445,29 @@ def _install_shared_memory_cleanup(memory_pipeline_v2: Any, topology_module: Any
                 item = task_queue.get()
                 if isinstance(item, worker_stop_cls):
                     return
-                if not isinstance(item, memory_pipeline_v2.IngestionBatchTask):
+                if not isinstance(item, memory_pipeline.IngestionBatchTask):
                     continue
                 try:
-                    result = memory_pipeline_v2.prepare_commit_batch(item)
-                    descriptor = publish_shared_batch(result, start_sequence=result.start_sequence, end_sequence=result.end_sequence, rows=len(result.rows))
-                    owned.add(descriptor.name)
-                    result_queue.put(("ingest_batch_shm", result.start_sequence, result.end_sequence, descriptor))
+                    tasks = tuple(item.tasks)
+                    chunk_size = max(1, int(getattr(memory_pipeline, "_INGEST_RESULT_CHUNK_SIZE", 128)))
+                    for offset in range(0, len(tasks), chunk_size):
+                        chunk = tasks[offset : offset + chunk_size]
+                        if not chunk:
+                            continue
+                        rows = tuple(memory_pipeline.prepare_ingestion(task) for task in chunk)
+                        result = memory_pipeline.PreparedCommitBatch(
+                            int(chunk[0].sequence),
+                            int(chunk[-1].sequence),
+                            rows,
+                        )
+                        descriptor = publish_shared_batch(
+                            result,
+                            start_sequence=result.start_sequence,
+                            end_sequence=result.end_sequence,
+                            rows=len(result.rows),
+                        )
+                        owned.add(descriptor.name)
+                        result_queue.put(("ingest_batch_shm", result.start_sequence, result.end_sequence, descriptor))
                 except BaseException as exc:
                     result_queue.put(("worker_error", "ingest", int(item.start_sequence), repr(exc)))
         finally:
@@ -464,10 +480,10 @@ def _install_shared_memory_cleanup(memory_pipeline_v2: Any, topology_module: Any
                 item = task_queue.get()
                 if isinstance(item, worker_stop_cls):
                     return
-                if not isinstance(item, memory_pipeline_v2.DerivationBatchTask):
+                if not isinstance(item, memory_pipeline.DerivationBatchTask):
                     continue
                 try:
-                    results = tuple(memory_pipeline_v2.derive_memory(task) for task in item.tasks)
+                    results = tuple(memory_pipeline.derive_memory(task) for task in item.tasks)
                     descriptor = publish_shared_batch(results, start_sequence=item.start_task_id, end_sequence=item.end_task_id, rows=len(results))
                     owned.add(descriptor.name)
                     result_queue.put(("derivation_batch_shm", item.start_task_id, item.end_task_id, descriptor))
@@ -477,12 +493,12 @@ def _install_shared_memory_cleanup(memory_pipeline_v2: Any, topology_module: Any
             _cleanup_owned_shared_memory(owned)
 
     shared_batch_transport.publish_shared_batch = publish_shared_batch
-    memory_pipeline_v2.publish_shared_batch = publish_shared_batch
-    memory_pipeline_v2.ingest_batch_worker_main = ingest_batch_worker_main
-    memory_pipeline_v2.derivation_batch_worker_main = derivation_batch_worker_main
+    memory_pipeline.publish_shared_batch = publish_shared_batch
+    memory_pipeline.ingest_batch_worker_main = ingest_batch_worker_main
+    memory_pipeline.derivation_batch_worker_main = derivation_batch_worker_main
     topology_module.ingest_batch_worker_main = ingest_batch_worker_main
     topology_module.derivation_batch_worker_main = derivation_batch_worker_main
-    memory_pipeline_v2._runtime_integrity_shm_installed = True
+    memory_pipeline._runtime_integrity_shm_installed = True
 
 
 def _install_hgt_promotion_guard(hgt_training: Any) -> None:
@@ -558,15 +574,15 @@ def install_runtime_integrity(
     from v9.runtime import chunked_snapshot
     from v9.runtime import environment_viability
     from v9.runtime import epoch_runner
-    from v9.runtime import memory_pipeline_v2
-    from v9.runtime import memory_worker_topology_v2
+    from v9.runtime import memory_pipeline
+    from v9.runtime import memory_worker_topology
     from v9.runtime import shared_batch_transport
     from v9.runtime.multiprocess import WorkerStop
 
     _install_grounding_bounds()
     _install_viability_bounds_and_schema(environment_viability)
     _install_epoch_viability_unification(epoch_runner)
-    _install_shared_memory_cleanup(memory_pipeline_v2, memory_worker_topology_v2, shared_batch_transport, WorkerStop)
+    _install_shared_memory_cleanup(memory_pipeline, memory_worker_topology, shared_batch_transport, WorkerStop)
     _install_hgt_promotion_guard(hgt_training)
 
     original_restore = runtime_cls._restore

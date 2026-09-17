@@ -41,7 +41,7 @@ def cleanup_owned_shared_memory(names: set[str]) -> None:
 
 def ingest_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
     """Spawn-safe ingestion worker with crash-time shared-memory cleanup."""
-    from v9.runtime import memory_pipeline_v2
+    from v9.runtime import memory_pipeline
     from v9.runtime.multiprocess import WorkerStop
 
     owned: set[str] = set()
@@ -50,11 +50,11 @@ def ingest_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
             item = task_queue.get()
             if isinstance(item, WorkerStop):
                 return
-            if not isinstance(item, memory_pipeline_v2.IngestionBatchTask):
+            if not isinstance(item, memory_pipeline.IngestionBatchTask):
                 continue
             try:
-                result = memory_pipeline_v2.prepare_commit_batch(item)
-                descriptor = memory_pipeline_v2.publish_shared_batch(
+                result = memory_pipeline.prepare_commit_batch(item)
+                descriptor = memory_pipeline.publish_shared_batch(
                     result,
                     start_sequence=result.start_sequence,
                     end_sequence=result.end_sequence,
@@ -70,7 +70,7 @@ def ingest_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
 
 def derivation_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
     """Spawn-safe derivation worker with crash-time shared-memory cleanup."""
-    from v9.runtime import memory_pipeline_v2
+    from v9.runtime import memory_pipeline
     from v9.runtime.multiprocess import WorkerStop
 
     owned: set[str] = set()
@@ -79,11 +79,11 @@ def derivation_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
             item = task_queue.get()
             if isinstance(item, WorkerStop):
                 return
-            if not isinstance(item, memory_pipeline_v2.DerivationBatchTask):
+            if not isinstance(item, memory_pipeline.DerivationBatchTask):
                 continue
             try:
-                results = tuple(memory_pipeline_v2.derive_memory(task) for task in item.tasks)
-                descriptor = memory_pipeline_v2.publish_shared_batch(
+                results = tuple(memory_pipeline.derive_memory(task) for task in item.tasks)
+                descriptor = memory_pipeline.publish_shared_batch(
                     results,
                     start_sequence=item.start_task_id,
                     end_sequence=item.end_task_id,
@@ -105,10 +105,10 @@ def install(runtime_integrity_module: Any, pipeline_cls: type) -> None:
     # Multiprocessing spawn can only pickle module-level callables. The first
     # integrity layer installs local closures to add crash cleanup; replace only
     # those worker targets with equivalent top-level functions here.
-    from v9.runtime import memory_pipeline_v2
-    from v9.runtime import memory_worker_topology_v2
+    from v9.runtime import memory_pipeline
+    from v9.runtime import memory_worker_topology
 
-    memory_pipeline_v2.ingest_batch_worker_main = ingest_batch_worker_main
-    memory_pipeline_v2.derivation_batch_worker_main = derivation_batch_worker_main
-    memory_worker_topology_v2.ingest_batch_worker_main = ingest_batch_worker_main
-    memory_worker_topology_v2.derivation_batch_worker_main = derivation_batch_worker_main
+    memory_pipeline.ingest_batch_worker_main = ingest_batch_worker_main
+    memory_pipeline.derivation_batch_worker_main = derivation_batch_worker_main
+    memory_worker_topology.ingest_batch_worker_main = ingest_batch_worker_main
+    memory_worker_topology.derivation_batch_worker_main = derivation_batch_worker_main

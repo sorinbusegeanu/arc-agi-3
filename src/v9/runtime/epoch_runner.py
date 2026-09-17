@@ -12,7 +12,7 @@ from v9.hgt.matched_evaluation import matched_jobs, select_matched_branch
 from v9.memory.m1_normalized import NormalizedChannel
 from v9.telemetry import HGTInferenceSample, OptimizationSample
 from .lifecycle import run_lifecycle_maintenance
-from .parallel_memory_coordinator_v2 import run_parallel_memory_jobs
+from .parallel_memory_coordinator import run_parallel_memory_jobs
 from .transfer_validation import run_transfer_validation_interval
 
 

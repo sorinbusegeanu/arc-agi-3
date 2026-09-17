@@ -74,7 +74,7 @@ def test_m2_retains_modality_support_decomposition() -> None:
 def test_symbolic_commit_plan_carries_occurrence_provenance() -> None:
     import inspect
     from v9.runtime.memory_pipeline import PreparedIngestion
-    from v9.runtime.memory_pipeline_v2 import CommitPlan
+    from v9.runtime.memory_pipeline import CommitPlan
     assert "symbol_occurrences" in inspect.signature(PreparedIngestion).parameters
     assert "symbol_occurrences" in inspect.signature(CommitPlan).parameters
 

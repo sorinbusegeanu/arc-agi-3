@@ -243,7 +243,7 @@ def test_parallel_sampling_publishes_raw_graph_inline(tmp_path) -> None:
 def test_canonical_batch_publishes_lowlevel_inline_and_defers_only_support(tmp_path) -> None:
     from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
     from v9.runtime.canonical_commit import apply_canonical_commit_batch
-    from v9.runtime.memory_pipeline_v2 import build_commit_plan
+    from v9.runtime.memory_pipeline import build_commit_plan
 
     runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False, enable_snapshots=False))
     first = build_commit_plan(_prepared_transition(1))

@@ -3,7 +3,7 @@ from __future__ import annotations
 from v9 import ContinuousMemoryRuntime
 from v9.cli import resolve_game_specs
 from v9.runtime.config import RuntimeConfig
-from v9.runtime.parallel_memory_coordinator_v2 import run_parallel_memory_jobs
+from v9.runtime.parallel_memory_coordinator import run_parallel_memory_jobs
 
 
 def test_sampling_prefills_distinct_actor_processes(tmp_path) -> None:

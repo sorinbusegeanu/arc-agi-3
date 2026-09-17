@@ -6,7 +6,7 @@ from typing import Any, Iterable
 
 from v9.cognition.compression import form_families as _canonical_form_families
 
-from .pipeline_service_v2 import MemoryPipelineServiceV2
+from .parallel_memory_coordinator import MemoryPipelineService
 
 
 _CROSS_MODAL_PRIORITY = {
@@ -51,7 +51,7 @@ def _ordered_previous_interactions(self: Any, prepared_rows: Iterable[Any]) -> _
     return _PreviousInteractionCursor(rows)
 
 
-def _block_for_result(self: MemoryPipelineServiceV2, *, timeout: float = 0.05) -> bool:
+def _block_for_result(self: MemoryPipelineService, *, timeout: float = 0.05) -> bool:
     """Bounded blocking wait used while draining ingestion/derivation at epoch boundaries."""
     progressed = self.pump_ingest_tasks()
     progressed = self.pump_derivation_tasks() or progressed
@@ -83,7 +83,7 @@ def _block_for_result(self: MemoryPipelineServiceV2, *, timeout: float = 0.05) -
 def _canonical_public_batch(self: Any, rows: Iterable[Any]) -> tuple[tuple[int, ...], ...]:
     """Use the same canonical commit implementation as the multiprocess pipeline."""
     from .canonical_commit import apply_canonical_commit_batch
-    from .memory_pipeline_v2 import build_commit_plan
+    from .memory_pipeline import build_commit_plan
 
     prepared_rows = tuple(rows)
     if not prepared_rows:
@@ -310,7 +310,7 @@ def install_integration_repairs(runtime_cls: type[Any]) -> None:
     runtime_cls._previous_interactions = _ordered_previous_interactions
     runtime_cls.apply_prepared_ingestion_batch = _canonical_public_batch
     runtime_cls.transfer_validation_candidates = _transfer_validation_candidates
-    MemoryPipelineServiceV2.block_for_result = _block_for_result
+    MemoryPipelineService.block_for_result = _block_for_result
 
     from . import runtime as runtime_module
     runtime_module.form_families = _legacy_compatible_form_families
@@ -333,16 +333,16 @@ def install_integration_repairs(runtime_cls: type[Any]) -> None:
         symbolic_module.derive_symbolic_relations = repaired
         symbolic_module._integration_priority_repair = True
 
-        from . import completed_runtime, final_runtime, memory_pipeline_v2
+        from . import completed_runtime, final_runtime, memory_pipeline
         completed_runtime.derive_symbolic_relations = repaired
         final_runtime.derive_symbolic_relations = repaired
-        memory_pipeline_v2.derive_symbolic_relations = repaired
+        memory_pipeline.derive_symbolic_relations = repaired
 
-    from . import canonical_commit, pipeline_service_v2
+    from . import canonical_commit, parallel_memory_coordinator
     if not getattr(canonical_commit, "_integration_grounding_repair", False):
         repaired_commit = _canonical_commit_without_implicit_grounding(canonical_commit.apply_canonical_commit_batch)
         canonical_commit.apply_canonical_commit_batch = repaired_commit
-        pipeline_service_v2.apply_canonical_commit_batch = repaired_commit
+        parallel_memory_coordinator.apply_canonical_commit_batch = repaired_commit
         canonical_commit._integration_grounding_repair = True
 
     if not getattr(runtime_cls, "_integration_symbolic_flush_repair", False):

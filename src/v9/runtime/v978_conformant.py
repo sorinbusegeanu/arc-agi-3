@@ -9,7 +9,7 @@ from v9.memory.m1_normalized import M1NormalizedRelation, NormalizedChannel
 from v9.memory.v978_descriptors import modality_neutral_family_signature
 
 from .final_runtime import FinalContinuousMemoryRuntime
-from .memory_pipeline_v2 import CanonicalWrite
+from .memory_pipeline import CanonicalWrite
 
 
 class V978ContinuousMemoryRuntime(FinalContinuousMemoryRuntime):
