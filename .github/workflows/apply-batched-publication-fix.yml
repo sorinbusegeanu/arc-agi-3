@@ -6,6 +6,7 @@ on:
       - fix-v9-batched-publication-intake
     paths:
       - '.github/scripts/apply_batched_publication_fix.py'
+      - '.github/scripts/fix_batched_publication_tests.py'
       - '.github/workflows/apply-batched-publication-fix.yml'
   workflow_dispatch:
 
@@ -24,7 +25,9 @@ jobs:
         with:
           python-version: '3.12'
       - name: Apply implementation
-        run: python .github/scripts/apply_batched_publication_fix.py
+        run: |
+          python .github/scripts/apply_batched_publication_fix.py
+          python .github/scripts/fix_batched_publication_tests.py
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
