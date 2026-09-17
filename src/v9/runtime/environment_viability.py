@@ -525,6 +525,7 @@ def install_environment_viability(runtime_cls: type, pipeline_cls: type) -> None
     original_apply_batch = runtime_cls.apply_prepared_ingestion_batch
     original_metrics = runtime_cls.metrics
     original_pipeline_dispatch = pipeline_cls.dispatch_transition
+    original_pipeline_dispatch_batch = pipeline_cls.dispatch_transitions_batch
 
     def runtime_init(self: Any, config: Any) -> None:
         self._environment_viability = EnvironmentViabilityController(config.root)
@@ -593,6 +594,24 @@ def install_environment_viability(runtime_cls: type, pipeline_cls: type) -> None
             observe(transition, watermark=int(self.watermark_cursor) + 1)
         return original_pipeline_dispatch(self, transition)
 
+    def pipeline_dispatch_batch(self: Any, transitions: Iterable[Any]) -> int:
+        rows = tuple(transitions)
+        observe = getattr(self.runtime, "observe_environment_transition", None)
+        if callable(observe) and rows:
+            scientific = self.runtime.config.scientific
+            grounded = bool(scientific.symbolic_grounding_enabled)
+            symbol_limit = min(
+                int(scientific.symbol_budget_per_window),
+                int(scientific.max_symbol_facts_per_window),
+            )
+            cursor = int(self.watermark_cursor)
+            for transition in rows:
+                cursor += 1
+                observe(transition, watermark=cursor)
+                if grounded:
+                    cursor += min(len(tuple(getattr(transition, "symbols", ()))), symbol_limit)
+        return int(original_pipeline_dispatch_batch(self, rows))
+
     runtime_cls.__init__ = runtime_init
     runtime_cls._restore = restore
     runtime_cls.state_dict = state_dict
@@ -601,4 +620,5 @@ def install_environment_viability(runtime_cls: type, pipeline_cls: type) -> None
     runtime_cls.apply_prepared_ingestion_batch = apply_prepared_ingestion_batch
     runtime_cls.metrics = metrics
     pipeline_cls.dispatch_transition = pipeline_dispatch
+    pipeline_cls.dispatch_transitions_batch = pipeline_dispatch_batch
     runtime_cls._environment_viability_installed = True

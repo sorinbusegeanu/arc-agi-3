@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from itertools import islice
 import queue
 import time
+from threading import Thread
 from typing import Any
 
 from .canonical_commit import apply_canonical_commit_batch
@@ -20,6 +21,105 @@ _CANONICAL_BATCH_MIN = 256
 _CANONICAL_BATCH_MAX = 4096
 _INGEST_RESULT_DECODE_BATCHES = 2
 _INGEST_RESULT_DECODE_BUDGET_SECONDS = 0.005
+_PUBLICATION_BATCH_MIN = 1024
+_PUBLICATION_BATCH_MAX = 8192
+_PUBLICATION_PRIORITY_DRAINS = 4
+_HGT_WRITER_BATCHES = 8
+
+
+def _adaptive_publication_batch_size(backlog: int) -> int:
+    backlog = max(0, int(backlog))
+    if backlog >= 25_000:
+        return _PUBLICATION_BATCH_MAX
+    if backlog >= 10_000:
+        return 4096
+    if backlog >= 2_000:
+        return 2048
+    return _PUBLICATION_BATCH_MIN
+
+
+def _drain_publication_batch(
+    publication_queue: Any,
+    budget: int,
+    *,
+    preserve_shard_done: bool = True,
+    first_timeout: float = 0.0,
+) -> tuple[tuple[Any, ...], tuple[int, ...]]:
+    transitions: list[Any] = []
+    shard_done: list[int] = []
+    marker_items: list[Any] = []
+    for index in range(max(0, int(budget))):
+        try:
+            if index == 0 and float(first_timeout) > 0.0:
+                item = publication_queue.get(timeout=float(first_timeout))
+            else:
+                item = publication_queue.get_nowait()
+        except queue.Empty:
+            break
+        if item[0] == "transition":
+            transitions.append(item[3])
+        elif item[0] == "shard_done":
+            shard_done.append(int(item[1]))
+            if preserve_shard_done:
+                marker_items.append(item)
+    if preserve_shard_done:
+        for item in marker_items:
+            publication_queue.put(item)
+    return tuple(transitions), tuple(shard_done)
+
+
+class _AsyncHGTWriter:
+    def __init__(self, dataset: Any, *, max_batches: int = _HGT_WRITER_BATCHES) -> None:
+        self.dataset = dataset
+        self.queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(max_batches)))
+        self.error: BaseException | None = None
+        self.append_seconds = 0.0
+        self.rows = 0
+        self.thread = Thread(target=self._run, name="v9-hgt-dataset-writer", daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self.queue.get()
+            if item is None:
+                return
+            try:
+                started = time.perf_counter()
+                self.dataset.append_batch(item)
+                self.append_seconds += time.perf_counter() - started
+                self.rows += len(item)
+            except BaseException as exc:
+                self.error = exc
+                return
+
+    def _raise_if_failed(self) -> None:
+        if self.error is not None:
+            raise RuntimeError("HGT dataset writer failed") from self.error
+
+    def submit(self, transitions: tuple[Any, ...]) -> None:
+        if not transitions:
+            return
+        while True:
+            self._raise_if_failed()
+            try:
+                self.queue.put(tuple(transitions), timeout=0.05)
+                return
+            except queue.Full:
+                continue
+
+    def close(self) -> None:
+        if not self.thread.is_alive():
+            self._raise_if_failed()
+            return
+        while True:
+            self._raise_if_failed()
+            try:
+                self.queue.put(None, timeout=0.05)
+                break
+            except queue.Full:
+                continue
+        self.thread.join()
+        self._raise_if_failed()
 
 
 def _adaptive_canonical_batch_size(current: int, backlog: int) -> int:
@@ -80,6 +180,8 @@ class MemoryPipelineService:
         self.runtime = runtime
         self.memory = memory
         self.pending_ingest: deque[IngestionTask] = deque()
+        self.pending_ingest_batches: deque[IngestionBatchTask] = deque()
+        self.pending_ingest_batch_rows = 0
         self.pending_derivation: deque[Any] = deque()
         self.ingest_results: dict[int, PreparedCommitBatch] = {}
         self.derive_results: dict[int, DerivationResult] = {}
@@ -106,6 +208,13 @@ class MemoryPipelineService:
         self.ingest_result_bytes = 0
         self.ingest_result_encode_ms = 0.0
         self.ingest_result_decode_ms = 0.0
+        self.producer_sequence_batch_seconds = 0.0
+        self.watermark_allocation_seconds = 0.0
+        self.ingestion_task_build_seconds = 0.0
+        self.publication_to_ingest_queue_seconds = 0.0
+        self.publication_dispatch_seconds = 0.0
+        self.publication_dispatch_rows = 0
+        self.publication_batches = 0
 
     def dispatch_transition(self, transition: Any) -> None:
         self.sampled += 1
@@ -136,7 +245,111 @@ class MemoryPipelineService:
         )
         self.watermark_cursor += symbol_count
 
+    def dispatch_transitions_batch(self, transitions: tuple[Any, ...]) -> int:
+        transitions = tuple(transitions)
+        if not transitions:
+            return 0
+        outstanding = max(0, int(self.sampled) - int(self.ingested))
+        if outstanding + len(transitions) > int(self.ingest_local_high_water):
+            raise RuntimeError(
+                f"publication batch exceeds bounded ingest high-water: outstanding={outstanding} "
+                f"incoming={len(transitions)} high_water={self.ingest_local_high_water}"
+            )
+
+        dispatch_started = time.perf_counter()
+        sequence_started = time.perf_counter()
+        reserve_batch = getattr(self.runtime, "reserve_producer_sequences_batch", None)
+        requests = tuple((int(row.actor_id), int(row.producer_sequence)) for row in transitions)
+        if callable(reserve_batch):
+            canonical_sequences = tuple(reserve_batch(requests))
+        else:
+            canonical_sequences = tuple(
+                self.runtime.reserve_producer_sequence(producer_id, proposed)
+                for producer_id, proposed in requests
+            )
+        if len(canonical_sequences) != len(transitions):
+            raise RuntimeError("producer sequence batch reservation length mismatch")
+        self.producer_sequence_batch_seconds += time.perf_counter() - sequence_started
+
+        scientific = self.runtime.config.scientific
+        grounded = bool(scientific.symbolic_grounding_enabled)
+        prepared: list[Any] = []
+        for transition, canonical_sequence in zip(transitions, canonical_sequences):
+            if int(canonical_sequence) != int(transition.producer_sequence):
+                transition = replace(transition, producer_sequence=int(canonical_sequence))
+            if not grounded and tuple(transition.symbols):
+                transition = replace(transition, symbols=())
+            prepared.append(transition)
+
+        symbol_limit = min(int(scientific.symbol_budget_per_window), int(scientific.max_symbol_facts_per_window))
+        watermark_started = time.perf_counter()
+        cursor = int(self.watermark_cursor)
+        first_sequence = int(self.ingest_sequence)
+        watermarks: list[int] = []
+        for transition in prepared:
+            cursor += 1
+            watermarks.append(cursor)
+            cursor += min(len(tuple(transition.symbols)), symbol_limit)
+        self.watermark_cursor = cursor
+        self.ingest_sequence += len(prepared)
+        self.watermark_allocation_seconds += time.perf_counter() - watermark_started
+
+        build_started = time.perf_counter()
+        tasks = tuple(
+            IngestionTask(
+                first_sequence + index,
+                watermarks[index],
+                transition,
+                symbol_limit,
+                int(scientific.symbol_payload_bytes),
+                int(scientific.max_cross_modal_facts_per_macro_event),
+                str(scientific.symbol_deduplication_policy),
+                int(scientific.symbol_window_time_span),
+                str(scientific.symbol_codec_name),
+                int(scientific.symbol_codec_version),
+            )
+            for index, transition in enumerate(prepared)
+        )
+        batches = tuple(
+            IngestionBatchTask(chunk[0].sequence, chunk[-1].sequence, chunk)
+            for start in range(0, len(tasks), max(1, int(self.ipc_batch_size)))
+            for chunk in (tasks[start : start + max(1, int(self.ipc_batch_size))],)
+        )
+        self.ingestion_task_build_seconds += time.perf_counter() - build_started
+
+        self.sampled += len(tasks)
+        enqueue_started = time.perf_counter()
+        pending_mode = bool(self.pending_ingest_batches)
+        for batch in batches:
+            if not pending_mode:
+                try:
+                    self.memory.ingest_queue.put_nowait(batch)
+                    continue
+                except queue.Full:
+                    pending_mode = True
+            rows = len(batch.tasks)
+            if self.pending_ingest_batch_rows + rows > int(self.ingest_local_high_water):
+                raise RuntimeError("bounded pending ingest-batch buffer exceeded")
+            self.pending_ingest_batches.append(batch)
+            self.pending_ingest_batch_rows += rows
+        self.publication_to_ingest_queue_seconds += time.perf_counter() - enqueue_started
+        self.publication_dispatch_seconds += time.perf_counter() - dispatch_started
+        self.publication_dispatch_rows += len(tasks)
+        self.publication_batches += 1
+        return len(tasks)
+
     def pump_ingest_tasks(self) -> bool:
+        if self.pending_ingest_batches:
+            batch = self.pending_ingest_batches[0]
+            try:
+                self.memory.ingest_queue.put_nowait(batch)
+            except queue.Full:
+                return False
+            self.pending_ingest_batches.popleft()
+            self.pending_ingest_batch_rows -= len(batch.tasks)
+            if self.pending_ingest_batch_rows < 0:
+                raise RuntimeError("pending ingest-batch accounting underflow")
+            return True
         if not self.pending_ingest:
             return False
         count = min(self.ipc_batch_size, len(self.pending_ingest))
@@ -314,6 +527,15 @@ class MemoryPipelineService:
             "ingest_result_drain_ms": 1000.0 * self.ingest_result_drain_seconds,
             "ipc_bytes_per_transition": self.ingest_result_bytes / rows,
             "decode_ms_per_transition": self.ingest_result_decode_ms / rows,
+            "pending_ingest_batches": len(self.pending_ingest_batches),
+            "pending_ingest_batch_rows": self.pending_ingest_batch_rows,
+            "producer_sequence_batch_ms": 1000.0 * self.producer_sequence_batch_seconds,
+            "watermark_allocation_ms": 1000.0 * self.watermark_allocation_seconds,
+            "ingestion_task_build_ms": 1000.0 * self.ingestion_task_build_seconds,
+            "publication_to_ingest_queue_ms": 1000.0 * self.publication_to_ingest_queue_seconds,
+            "publication_dispatch_ms": 1000.0 * self.publication_dispatch_seconds,
+            "publication_dispatch_ms_per_transition": 1000.0 * self.publication_dispatch_seconds / max(1, self.publication_dispatch_rows),
+            "publication_batches": self.publication_batches,
         }
 
 
@@ -377,6 +599,12 @@ def run_parallel_memory_jobs(
     next_progress = started_at + max(1.0, float(progress_interval_seconds))
     clean_shutdown = False
     dataset_start_count = int(getattr(hgt_dataset, "count", 0)) if hgt_dataset is not None else 0
+    hgt_writer = _AsyncHGTWriter(hgt_dataset) if hgt_dataset is not None else None
+    publication_queue_drain_seconds = 0.0
+    publication_queue_drain_rows = 0
+    publication_dispatch_seconds = 0.0
+    publication_batches = 0
+    last_publication_batch_size = 0
 
     runtime.set_telemetry_gauge("actor_slots_target", target_actor_slots)
     runtime.set_telemetry_gauge("actor_process_start_method", topology.actor_start_method)
@@ -437,27 +665,46 @@ def run_parallel_memory_jobs(
             launched += 1
         return launched
 
-    def dispatch_published_transition(transition: Any) -> None:
-        if hgt_dataset is not None:
-            hgt_dataset.append(transition)
-        pipeline.dispatch_transition(transition)
+    def dispatch_published_transitions(transitions: tuple[Any, ...]) -> int:
+        nonlocal publication_dispatch_seconds, publication_batches, last_publication_batch_size
+        if not transitions:
+            return 0
+        started = time.perf_counter()
+        if hgt_writer is not None:
+            hgt_writer.submit(transitions)
+        accepted = int(pipeline.dispatch_transitions_batch(transitions))
+        if accepted != len(transitions):
+            raise RuntimeError(f"publication batch dispatch mismatch: expected={len(transitions)} accepted={accepted}")
+        publication_dispatch_seconds += time.perf_counter() - started
+        publication_batches += 1
+        last_publication_batch_size = len(transitions)
+        return accepted
 
-    def drain_publication_queue() -> bool:
-        if pipeline.sampled - pipeline.ingested >= pipeline.ingest_local_high_water:
-            return False
+    def drain_publication_queue() -> int:
+        nonlocal publication_queue_drain_seconds, publication_queue_drain_rows
+        available = int(pipeline.ingest_local_high_water) - max(0, int(pipeline.sampled) - int(pipeline.ingested))
+        if available <= 0:
+            return 0
+        backlog = max(0, actor_produced_steps() - int(pipeline.sampled))
+        budget = min(int(available), _adaptive_publication_batch_size(backlog))
+        started = time.perf_counter()
+        transitions, _ = _drain_publication_batch(topology.publication_queue, budget)
+        publication_queue_drain_seconds += time.perf_counter() - started
+        publication_queue_drain_rows += len(transitions)
+        if not transitions:
+            return 0
+        return dispatch_published_transitions(transitions)
+
+    def service_publication_priority() -> bool:
         progressed = False
-        budget = min(512, pipeline.ingest_local_high_water - (pipeline.sampled - pipeline.ingested))
-        for _ in range(max(0, budget)):
-            try:
-                item = topology.publication_queue.get_nowait()
-            except queue.Empty:
+        backlog = max(0, actor_produced_steps() - int(pipeline.sampled))
+        drains = _PUBLICATION_PRIORITY_DRAINS if backlog >= 2 * _PUBLICATION_BATCH_MIN else 1
+        for _ in range(drains):
+            drained = drain_publication_queue()
+            progressed = bool(drained) or progressed
+            if not drained or int(pipeline.sampled) - int(pipeline.ingested) >= int(pipeline.ingest_local_high_water):
                 break
-            if item[0] == "transition":
-                dispatch_published_transition(item[3])
-                progressed = True
-            elif item[0] == "shard_done":
-                topology.publication_queue.put(item)
-                break
+        progressed = pipeline.service() or progressed
         return progressed
 
     def drain_actor_results() -> bool:
@@ -509,6 +756,9 @@ def run_parallel_memory_jobs(
         if hgt_dataset is not None:
             runtime.set_telemetry_gauge("hgt_dataset_written_transitions", int(hgt_dataset.count) - dataset_start_count)
             runtime.set_telemetry_gauge("hgt_dataset_bytes", int(hgt_dataset.bytes_written))
+            if hgt_writer is not None:
+                runtime.set_telemetry_gauge("hgt_append_ms", 1000.0 * hgt_writer.append_seconds)
+                runtime.set_telemetry_gauge("hgt_append_ms_per_transition", 1000.0 * hgt_writer.append_seconds / max(1, hgt_writer.rows))
         elapsed = max(1e-9, time.monotonic() - started_at)
         produced = actor_produced_steps()
         published = int(pipeline.sampled)
@@ -543,6 +793,12 @@ def run_parallel_memory_jobs(
                 "derivation_rate": pipeline.derived / elapsed,
                 "actors_exited_without_done": len(clean_exit_without_done),
                 "canonical_pipeline_version": 3,
+                "publication_queue_drain_ms": 1000.0 * publication_queue_drain_seconds,
+                "publication_queue_drain_rows": publication_queue_drain_rows,
+                "publication_batch_size": last_publication_batch_size,
+                "publication_dispatch_ms": 1000.0 * publication_dispatch_seconds,
+                "publication_dispatch_ms_per_transition": 1000.0 * publication_dispatch_seconds / max(1, published),
+                "publication_batches_per_second": publication_batches / elapsed,
             }
         )
         for key, value in gauges.items():
@@ -570,8 +826,7 @@ def run_parallel_memory_jobs(
         last_progress_at = time.monotonic()
         last_state = (pipeline.sampled, pipeline.ingested)
         while pipeline.sampled < int(expected):
-            progressed = drain_publication_queue()
-            progressed = pipeline.service() or progressed
+            progressed = service_publication_priority()
             state = (pipeline.sampled, pipeline.ingested)
             if progressed or state != last_state:
                 last_progress_at = time.monotonic()
@@ -583,7 +838,8 @@ def run_parallel_memory_jobs(
             if now - last_progress_at >= _PIPELINE_DRAIN_STALL_SECONDS:
                 raise RuntimeError(
                     f"actor transition drain stalled: expected={expected} produced={actor_produced_steps()} "
-                    f"published={pipeline.sampled} ingested={pipeline.ingested} pending_ingest={len(pipeline.pending_ingest)}"
+                    f"published={pipeline.sampled} ingested={pipeline.ingested} pending_ingest={len(pipeline.pending_ingest)} "
+                    f"pending_ingest_batches={len(pipeline.pending_ingest_batches)}"
                 )
             if not progressed:
                 time.sleep(0.001)
@@ -601,8 +857,7 @@ def run_parallel_memory_jobs(
         _publish_actor_process_telemetry()
 
         while active or pending:
-            progressed = drain_publication_queue()
-            progressed = pipeline.service() or progressed
+            progressed = service_publication_priority()
             progressed = drain_actor_results() or progressed
             launched = launch_available_slots()
             progressed = bool(launched) or progressed
@@ -633,9 +888,30 @@ def run_parallel_memory_jobs(
         last_shard_progress = shard_drain_started
         completed_shards: set[int] = set()
         while shard_done < int(shards):
-            try:
-                item = topology.publication_queue.get(timeout=0.05)
-            except queue.Empty:
+            available = int(pipeline.ingest_local_high_water) - max(0, int(pipeline.sampled) - int(pipeline.ingested))
+            if available <= 0:
+                progressed = pipeline.service()
+                if not progressed:
+                    pipeline.block_for_result(timeout=0.05)
+                if time.monotonic() - last_shard_progress >= _PIPELINE_DRAIN_STALL_SECONDS:
+                    raise RuntimeError("final shard transition drain stalled under ingestion backpressure")
+                continue
+            backlog = max(0, actor_produced_steps() - int(pipeline.sampled))
+            budget = min(int(available), _adaptive_publication_batch_size(backlog))
+            started = time.perf_counter()
+            transitions, completed = _drain_publication_batch(
+                topology.publication_queue, budget, preserve_shard_done=False, first_timeout=0.05
+            )
+            publication_queue_drain_seconds += time.perf_counter() - started
+            publication_queue_drain_rows += len(transitions)
+            if transitions:
+                dispatch_published_transitions(transitions)
+                last_shard_progress = time.monotonic()
+            for shard_id in completed:
+                completed_shards.add(int(shard_id))
+                last_shard_progress = time.monotonic()
+            shard_done = len(completed_shards)
+            if not transitions and not completed:
                 pipeline.service()
                 exited = {index: process.exitcode for index, process in enumerate(topology.shard_processes) if process.exitcode is not None}
                 if exited and len(completed_shards) < int(shards):
@@ -650,28 +926,12 @@ def run_parallel_memory_jobs(
                         f"missing={missing} produced={actor_produced_steps()} published={pipeline.sampled} ingested={pipeline.ingested}"
                     )
                 continue
-            if item[0] == "transition":
-                backpressure_started = time.monotonic()
-                while pipeline.sampled - pipeline.ingested >= pipeline.ingest_local_high_water:
-                    progressed = pipeline.service()
-                    if not progressed:
-                        pipeline.block_for_result(timeout=0.05)
-                    if time.monotonic() - backpressure_started >= _PIPELINE_DRAIN_STALL_SECONDS:
-                        raise RuntimeError(
-                            "final shard transition drain stalled under ingestion backpressure"
-                        )
-                dispatch_published_transition(item[3])
-                last_shard_progress = time.monotonic()
-            elif item[0] == "shard_done":
-                completed_shards.add(int(item[1]))
-                shard_done = len(completed_shards)
-                last_shard_progress = time.monotonic()
             pipeline.service()
         runtime.set_telemetry_gauge("shard_drain_seconds", time.monotonic() - shard_drain_started)
         topology.join_shard_workers()
 
         last_progress_at = time.monotonic()
-        while pipeline.ingested < pipeline.sampled or pipeline.pending_ingest or pipeline.ingest_results:
+        while pipeline.ingested < pipeline.sampled or pipeline.pending_ingest_batches or pipeline.pending_ingest or pipeline.ingest_results:
             progressed = pipeline.service()
             if progressed:
                 last_progress_at = time.monotonic()
@@ -710,6 +970,7 @@ def run_parallel_memory_jobs(
             "policy_snapshot_refreshes": sum(int(row.policy_refreshes) for row in results),
             "actors_exited_without_done": 0,
             "coordinator_pending_ingest": 0,
+            "coordinator_pending_ingest_batches": 0,
             "coordinator_pending_derivation": 0,
             "canonical_pipeline_version": 3,
         }.items():
@@ -722,6 +983,8 @@ def run_parallel_memory_jobs(
         topology.terminate()
         raise
     finally:
+        if hgt_writer is not None:
+            hgt_writer.close()
         shutdown_parallel_pipeline = getattr(pipeline, "shutdown_parallel_pipeline", None)
         if callable(shutdown_parallel_pipeline):
             shutdown_parallel_pipeline()

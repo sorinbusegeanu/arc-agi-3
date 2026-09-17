@@ -207,6 +207,7 @@ def _finish_reducer_results(service: Any) -> bool:
     if progressed:
         backlog = max(
             len(service.pending_ingest),
+            int(getattr(service, "pending_ingest_batch_rows", 0)),
             _prepared_rows_waiting(service),
             max(0, int(service.sampled) - int(service.ingested)),
         )

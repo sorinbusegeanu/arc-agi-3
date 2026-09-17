@@ -38,6 +38,18 @@ class EpochTransitionDataset:
         self.count += 1
         self.bytes_written += len(encoded.encode("utf-8")) + 1
 
+    def append_batch(self, transitions: Iterable[Any]) -> int:
+        encoded_rows = [
+            json.dumps(asdict(transition), separators=(",", ":"), sort_keys=True)
+            for transition in transitions
+        ]
+        if not encoded_rows:
+            return 0
+        self._handle.writelines(encoded + "\n" for encoded in encoded_rows)
+        self.count += len(encoded_rows)
+        self.bytes_written += sum(len(encoded.encode("utf-8")) + 1 for encoded in encoded_rows)
+        return len(encoded_rows)
+
     def close(self) -> None:
         if self._handle.closed:
             return

@@ -251,9 +251,10 @@ def test_compiled_batch_start_and_row_sequences_are_validated() -> None:
 
 def test_final_shard_drain_uses_normal_transition_handler_and_backpressure() -> None:
     source = (Path(__file__).parents[1] / "runtime" / "parallel_memory_coordinator.py").read_text()
-    assert source.count("dispatch_published_transition(item[3])") >= 2
+    assert source.count("dispatch_published_transitions(transitions)") >= 2
     assert "final shard transition drain stalled under ingestion backpressure" in source
-    assert source.count("hgt_dataset.append") == 1
+    assert "hgt_writer.submit(transitions)" in source
+    assert "hgt_dataset.append(" not in source
 
 
 def test_lock_telemetry_measures_hold_time_after_acquisition() -> None:

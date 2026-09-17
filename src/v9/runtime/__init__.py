@@ -33,6 +33,16 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
         self._m7: dict[MemoryUid, M7Strategy] = {}
         self._restore_higher_memory_objects()
 
+    def reserve_producer_sequences_batch(self, requests):
+        sequences = []
+        with self._lock:
+            for producer_id, proposed_sequence in requests:
+                producer_id = int(producer_id)
+                sequence = max(int(proposed_sequence), self._producer_sequences.get(producer_id, 0) + 1)
+                self._producer_sequences[producer_id] = sequence
+                sequences.append(sequence)
+        return tuple(sequences)
+
     def _evidence_payload(self, uid: MemoryUid):
         payload = self.graph.payloads.get(uid)
         if payload is not None:
