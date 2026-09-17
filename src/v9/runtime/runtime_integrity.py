@@ -438,66 +438,10 @@ def _install_shared_memory_cleanup(memory_pipeline: Any, topology_module: Any, s
             encode_ms=1000.0 * (time.perf_counter() - started),
         )
 
-    def ingest_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
-        owned: set[str] = set()
-        try:
-            while True:
-                item = task_queue.get()
-                if isinstance(item, worker_stop_cls):
-                    return
-                if not isinstance(item, memory_pipeline.IngestionBatchTask):
-                    continue
-                try:
-                    tasks = tuple(item.tasks)
-                    chunk_size = max(1, int(getattr(memory_pipeline, "_INGEST_RESULT_CHUNK_SIZE", 128)))
-                    for offset in range(0, len(tasks), chunk_size):
-                        chunk = tasks[offset : offset + chunk_size]
-                        if not chunk:
-                            continue
-                        rows = tuple(memory_pipeline.prepare_ingestion(task) for task in chunk)
-                        result = memory_pipeline.PreparedCommitBatch(
-                            int(chunk[0].sequence),
-                            int(chunk[-1].sequence),
-                            rows,
-                        )
-                        descriptor = publish_shared_batch(
-                            result,
-                            start_sequence=result.start_sequence,
-                            end_sequence=result.end_sequence,
-                            rows=len(result.rows),
-                        )
-                        owned.add(descriptor.name)
-                        result_queue.put(("ingest_batch_shm", result.start_sequence, result.end_sequence, descriptor))
-                except BaseException as exc:
-                    result_queue.put(("worker_error", "ingest", int(item.start_sequence), repr(exc)))
-        finally:
-            _cleanup_owned_shared_memory(owned)
-
-    def derivation_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
-        owned: set[str] = set()
-        try:
-            while True:
-                item = task_queue.get()
-                if isinstance(item, worker_stop_cls):
-                    return
-                if not isinstance(item, memory_pipeline.DerivationBatchTask):
-                    continue
-                try:
-                    results = tuple(memory_pipeline.derive_memory(task) for task in item.tasks)
-                    descriptor = publish_shared_batch(results, start_sequence=item.start_task_id, end_sequence=item.end_task_id, rows=len(results))
-                    owned.add(descriptor.name)
-                    result_queue.put(("derivation_batch_shm", item.start_task_id, item.end_task_id, descriptor))
-                except BaseException as exc:
-                    result_queue.put(("worker_error", "derivation", int(item.start_task_id), repr(exc)))
-        finally:
-            _cleanup_owned_shared_memory(owned)
-
+    # Cleanup/integrity owns transport allocation only. Worker behavior remains
+    # authoritative in memory_pipeline.py so performance wrappers cannot regress it.
     shared_batch_transport.publish_shared_batch = publish_shared_batch
     memory_pipeline.publish_shared_batch = publish_shared_batch
-    memory_pipeline.ingest_batch_worker_main = ingest_batch_worker_main
-    memory_pipeline.derivation_batch_worker_main = derivation_batch_worker_main
-    topology_module.ingest_batch_worker_main = ingest_batch_worker_main
-    topology_module.derivation_batch_worker_main = derivation_batch_worker_main
     memory_pipeline._runtime_integrity_shm_installed = True
 
 

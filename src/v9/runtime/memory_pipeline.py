@@ -531,7 +531,7 @@ class DerivedRelationCommitPlan:
 
 
 @dataclass(frozen=True, slots=True)
-class CommitPlan:
+class CanonicalMutationIntent:
     sequence: int
     identity: Any
     event: InteractionEvent | None
@@ -547,6 +547,10 @@ class CommitPlan:
     isf_static: tuple[float, float, float, float, float] | None
     context: TransitionCommitContext | None = None
     derived_relations: tuple[DerivedRelationCommitPlan, ...] = ()
+
+
+# Backward-compatible type name for callers/tests; the runtime boundary is the compiled intent.
+CommitPlan = CanonicalMutationIntent
 
 
 @dataclass(frozen=True, slots=True)
@@ -761,7 +765,7 @@ _INGEST_RESULT_CHUNK_SIZE = 128
 
 
 def ingest_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
-    """Prepare large task batches in parallel but publish compact rows in bounded chunks."""
+    """Compile immutable canonical mutation intents in parallel ingest processes."""
     while True:
         item = task_queue.get()
         if isinstance(item, WorkerStop):
@@ -774,7 +778,7 @@ def ingest_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
                 chunk = tasks[offset : offset + _INGEST_RESULT_CHUNK_SIZE]
                 if not chunk:
                     continue
-                rows = tuple(prepare_ingestion(task) for task in chunk)
+                rows = tuple(build_commit_plan(prepare_ingestion(task)) for task in chunk)
                 result = PreparedCommitBatch(
                     int(chunk[0].sequence),
                     int(chunk[-1].sequence),

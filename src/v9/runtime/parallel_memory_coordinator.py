@@ -710,5 +710,8 @@ def run_parallel_memory_jobs(
         topology.terminate()
         raise
     finally:
+        shutdown_parallel_pipeline = getattr(pipeline, "shutdown_parallel_pipeline", None)
+        if callable(shutdown_parallel_pipeline):
+            shutdown_parallel_pipeline()
         memory.close(drain=clean_shutdown)
         topology.close(drain=clean_shutdown)

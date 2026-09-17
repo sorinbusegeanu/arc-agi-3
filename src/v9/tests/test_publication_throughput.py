@@ -96,3 +96,27 @@ def test_version_table_supports_batched_deltas() -> None:
     table.bump(ref)
     table.bump_many({ref: 999})
     assert table.get(ref) == 1000
+
+
+def test_ingest_worker_source_compiles_canonical_intents() -> None:
+    import inspect
+    from v9.runtime import memory_pipeline
+    source = inspect.getsource(memory_pipeline.ingest_batch_worker_main)
+    assert "build_commit_plan(prepare_ingestion(task))" in source
+
+
+def test_publication_throughput_has_persistent_reducer_and_no_plan_build() -> None:
+    import inspect
+    from v9.runtime import publication_throughput
+    source = inspect.getsource(publication_throughput)
+    assert "class _CanonicalReducer" in source
+    assert "build_commit_plan" not in source
+    assert "ThreadPoolExecutor" in source
+
+
+def test_runtime_integrity_does_not_replace_ingest_worker() -> None:
+    import inspect
+    from v9.runtime import runtime_integrity
+    source = inspect.getsource(runtime_integrity._install_shared_memory_cleanup)
+    assert "ingest_batch_worker_main" not in source
+    assert "derivation_batch_worker_main" not in source

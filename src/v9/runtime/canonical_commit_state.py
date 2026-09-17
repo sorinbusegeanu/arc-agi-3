@@ -50,7 +50,7 @@ def advance_stage_fast(runtime: Any) -> Any:
     return next_stage
 
 
-def record_normalized_fast(runtime: Any, relation: Any, initial_write: CanonicalWrite, deferred_rows: list[Any]) -> int:
+def record_normalized_fast(runtime: Any, relation: Any, initial_write: CanonicalWrite, deferred_rows: list[Any], *, materialized_row: Any | None = None) -> int:
     ensure_fast_state(runtime)
     normalize = getattr(runtime, "normalize_m1n_family", None)
     if callable(normalize):
@@ -102,7 +102,7 @@ def record_normalized_fast(runtime: Any, relation: Any, initial_write: Canonical
 
     runtime._replay_pool[relation.uid] = float(support)
     if support == 1:
-        deferred_rows.append(initial_write.runtime_row())
+        deferred_rows.append(initial_write.runtime_row() if materialized_row is None else materialized_row)
     else:
         runtime._m1n_dirty.add(signature)
     return signature
