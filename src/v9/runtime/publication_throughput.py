@@ -21,6 +21,7 @@ _REDUCER_QUEUE_BATCHES = 4
 _MAX_DECODE_PENDING_BATCHES = 32
 _MAX_PREPARED_INTENT_ROWS = 8192
 _MAX_REDUCER_INFLIGHT_EVENTS = 8192
+_REDUCER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
 def _batch_rows(value: Any) -> int:
@@ -36,7 +37,11 @@ def _batch_end_sequence(value: Any) -> int:
 
 
 def _prepared_rows_waiting(service: Any) -> int:
-    return sum(_batch_rows(value) for value in service.ingest_results.values())
+    return sum(
+        _batch_rows(value)
+        for value in service.ingest_results.values()
+        if not isinstance(value, BaseException)
+    )
 
 
 class _CanonicalReducer:
@@ -72,21 +77,32 @@ class _CanonicalReducer:
             return False
         return True
 
-    def close(self) -> None:
+    def close(self, *, timeout: float = _REDUCER_SHUTDOWN_TIMEOUT_SECONDS) -> None:
         if not self.thread.is_alive():
             return
-        try:
-            self.input.put_nowait(None)
-        except queue.Full:
-            # Never block forever if the reducer has already terminated while its
-            # input queue still contains abandoned work.
-            while self.thread.is_alive():
-                try:
-                    self.input.put(None, timeout=0.05)
-                    break
-                except queue.Full:
-                    continue
-        self.thread.join(timeout=5.0)
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while self.thread.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise RuntimeError("canonical reducer shutdown timed out")
+            try:
+                self.input.put(None, timeout=min(0.05, remaining))
+                break
+            except queue.Full:
+                continue
+        remaining = max(0.0, deadline - time.monotonic())
+        self.thread.join(timeout=remaining)
+        if self.thread.is_alive():
+            raise RuntimeError("canonical reducer shutdown timed out")
+
+
+def _store_ingest_result(service: Any, start_sequence: int, value: Any) -> None:
+    sequence = int(start_sequence)
+    if sequence < int(service.ingest_apply):
+        raise RuntimeError(f"stale ingest result sequence: {sequence} < {service.ingest_apply}")
+    if sequence in service.ingest_results:
+        raise RuntimeError(f"duplicate ingest result sequence: {sequence}")
+    service.ingest_results[sequence] = value
 
 
 def _drain_decode_completions(service: Any) -> bool:
@@ -96,24 +112,47 @@ def _drain_decode_completions(service: Any) -> bool:
             start_sequence, batch, decode_ms = service._decoded_ingest_queue.get_nowait()
         except queue.Empty:
             break
+        sequence = int(start_sequence)
+        reservation = service._decode_rows_by_sequence.pop(sequence, None)
+        if reservation is None:
+            raise RuntimeError(f"decode completion without reservation: {sequence}")
         service._decode_pending -= 1
+        service._decode_pending_rows -= int(reservation)
+        if service._decode_pending < 0 or service._decode_pending_rows < 0:
+            raise RuntimeError("decode reservation accounting underflow")
         if not isinstance(batch, BaseException):
-            service._decode_pending_rows -= len(batch.rows)
-            service.ingest_result_decode_ms += float(decode_ms)
-        else:
-            # The reserved row count is tracked by descriptor sequence for failed
-            # decodes; release it conservatively from the recorded reservation.
-            service._decode_pending_rows -= int(service._decode_rows_by_sequence.pop(int(start_sequence), 0))
-        service._decode_rows_by_sequence.pop(int(start_sequence), None)
-        service.ingest_results[int(start_sequence)] = batch
+            expected_end = sequence + int(reservation) - 1
+            if (
+                len(batch.rows) != int(reservation)
+                or int(batch.start_sequence) != sequence
+                or int(batch.end_sequence) != expected_end
+            ):
+                batch = RuntimeError(
+                    "decoded batch reservation mismatch: "
+                    f"start={sequence} reserved={reservation} "
+                    f"actual_start={getattr(batch, 'start_sequence', None)} "
+                    f"actual_end={getattr(batch, 'end_sequence', None)} "
+                    f"actual_rows={len(getattr(batch, 'rows', ())) }"
+                )
+            else:
+                service.ingest_result_decode_ms += float(decode_ms)
+        _store_ingest_result(service, sequence, batch)
         progressed = True
     return progressed
 
 
 def _submit_decode(service: Any, descriptor: SharedBatchDescriptor) -> None:
+    sequence = int(descriptor.start_sequence)
+    rows = int(descriptor.rows)
+    if rows <= 0:
+        raise RuntimeError(f"invalid decode reservation rows: {rows}")
+    if sequence < int(service.ingest_apply):
+        raise RuntimeError(f"stale decode sequence: {sequence} < {service.ingest_apply}")
+    if sequence in service._decode_rows_by_sequence or sequence in service.ingest_results:
+        raise RuntimeError(f"duplicate decode sequence: {sequence}")
     service._decode_pending += 1
-    service._decode_pending_rows += int(descriptor.rows)
-    service._decode_rows_by_sequence[int(descriptor.start_sequence)] = int(descriptor.rows)
+    service._decode_pending_rows += rows
+    service._decode_rows_by_sequence[sequence] = rows
 
     def decode() -> tuple[Any, float]:
         return consume_shared_batch(descriptor)
@@ -148,7 +187,12 @@ def _finish_reducer_results(service: Any) -> bool:
             service.runtime._canonical_commit_inflight = False
             raise item[2]
         _, batch_id, result, elapsed, count, lock_seconds = item
-        metadata = service._reducer_inflight.pop(int(batch_id))
+        expected_batch_id = min(service._reducer_inflight) if service._reducer_inflight else None
+        if expected_batch_id is None or int(batch_id) != int(expected_batch_id):
+            raise RuntimeError(
+                f"canonical reducer completion out of order: expected={expected_batch_id} actual={batch_id}"
+            )
+        service._reducer_inflight.pop(int(batch_id))
         service.canonical_apply_seconds += float(elapsed)
         service.canonical_apply_events += int(count)
         service.last_canonical_ingest_batch = int(count)
@@ -264,6 +308,7 @@ def install_publication_throughput(pipeline_cls: type) -> None:
         self._backpressure_decode_hits = 0
         self._backpressure_prepared_hits = 0
         self._backpressure_reducer_hits = 0
+        self._reducer_shutdown_timeout_seconds = _REDUCER_SHUTDOWN_TIMEOUT_SECONDS
         self.runtime._canonical_commit_inflight = False
 
     def drain_ingest_results(self: Any, *, block: bool = False, timeout: float = 0.0) -> bool:
@@ -308,7 +353,7 @@ def install_publication_throughput(pipeline_cls: type) -> None:
                     self._held_ingest_items.appendleft(item)
                     self._backpressure_prepared_hits += 1
                     break
-                self.ingest_results[int(item[1])] = batch
+                _store_ingest_result(self, int(item[1]), batch)
                 self.ingest_result_batches += 1
                 self.ingest_result_rows += len(batch.rows)
                 progressed = True
@@ -353,8 +398,31 @@ def install_publication_throughput(pipeline_cls: type) -> None:
                 item = self._canonical_reducer.output.get(timeout=max(0.0, float(timeout)))
             except queue.Empty:
                 return False
-            self._canonical_reducer.output.put(item)
-            return _finish_reducer_results(self)
+            kind = item[0]
+            if kind == "error":
+                failed_batch_id = int(item[1])
+                self._reducer_inflight.pop(failed_batch_id, None)
+                self._reducer_inflight.clear()
+                self.runtime._canonical_commit_inflight = False
+                raise item[2]
+            _, batch_id, result, elapsed, count, lock_seconds = item
+            expected_batch_id = min(self._reducer_inflight) if self._reducer_inflight else None
+            if expected_batch_id is None or int(batch_id) != int(expected_batch_id):
+                raise RuntimeError(
+                    f"canonical reducer completion out of order: expected={expected_batch_id} actual={batch_id}"
+                )
+            self._reducer_inflight.pop(int(batch_id))
+            self.canonical_apply_seconds += float(elapsed)
+            self.canonical_apply_events += int(count)
+            self.last_canonical_ingest_batch = int(count)
+            self.ingested += int(count)
+            self._canonical_commit_batches += 1
+            self._reducer_apply_ms += 1000.0 * float(elapsed)
+            self._reducer_lock_ms += 1000.0 * float(lock_seconds)
+            for candidate in result.derivation_candidates:
+                self._consider_candidate(candidate)
+            self.runtime._canonical_commit_inflight = bool(self._reducer_inflight)
+            return True
         if self._decode_pending:
             time.sleep(min(max(0.0, float(timeout)), 0.005))
             return _drain_decode_completions(self)
@@ -366,10 +434,15 @@ def install_publication_throughput(pipeline_cls: type) -> None:
     def shutdown_parallel_pipeline(self: Any) -> None:
         self._decode_pool.shutdown(wait=True, cancel_futures=False)
         _drain_decode_completions(self)
+        deadline = time.monotonic() + float(self._reducer_shutdown_timeout_seconds)
         while self._reducer_inflight:
-            if not _finish_reducer_results(self):
-                time.sleep(0.001)
-        self._canonical_reducer.close()
+            if _finish_reducer_results(self):
+                continue
+            if time.monotonic() >= deadline:
+                raise RuntimeError("canonical reducer shutdown timed out")
+            time.sleep(0.001)
+        remaining = max(0.0, deadline - time.monotonic())
+        self._canonical_reducer.close(timeout=remaining)
         self.runtime._canonical_commit_inflight = False
 
     def diagnostics(self: Any) -> dict[str, float | int]:

@@ -260,3 +260,76 @@ def test_lock_telemetry_measures_hold_time_after_acquisition() -> None:
     source = (Path(__file__).parents[1] / "runtime" / "canonical_commit.py").read_text()
     assert "with runtime._lock:\n        lock_acquired = time.perf_counter()" in source
     assert "time.perf_counter() - lock_acquired" in source
+
+
+
+def test_prepared_rows_waiting_ignores_decode_exception() -> None:
+    runtime = SimpleNamespace(watermark=0)
+    service = MemoryPipelineService(runtime, SimpleNamespace(), ingest_queue_capacity=128)
+    service.ingest_results[1] = RuntimeError("decode failed")
+    assert publication_throughput._prepared_rows_waiting(service) == 0
+    with pytest.raises(RuntimeError, match="decode failed"):
+        service.apply_ingest_ready()
+    service.shutdown_parallel_pipeline()
+
+
+def test_decode_reservation_mismatch_releases_exact_reservation_and_propagates() -> None:
+    runtime = SimpleNamespace(watermark=0)
+    service = MemoryPipelineService(runtime, SimpleNamespace(), ingest_queue_capacity=128)
+    plan = CommitPlan(1, None, None, None, None, (), None, (), None, (), None, "", None)
+    service._decode_pending = 1
+    service._decode_pending_rows = 2
+    service._decode_rows_by_sequence[1] = 2
+    service._decoded_ingest_queue.put((1, PreparedCommitBatch(1, 1, (plan,)), 0.1))
+
+    assert publication_throughput._drain_decode_completions(service)
+    assert service._decode_pending == 0
+    assert service._decode_pending_rows == 0
+    assert isinstance(service.ingest_results[1], RuntimeError)
+    with pytest.raises(RuntimeError, match="reservation mismatch"):
+        service.apply_ingest_ready()
+    service.shutdown_parallel_pipeline()
+
+
+def test_duplicate_decode_sequence_is_rejected_before_reservation_overwrite() -> None:
+    runtime = SimpleNamespace(watermark=0)
+    service = MemoryPipelineService(runtime, SimpleNamespace(), ingest_queue_capacity=128)
+    service._decode_rows_by_sequence[7] = 3
+    descriptor = SimpleNamespace(start_sequence=7, rows=2)
+    with pytest.raises(RuntimeError, match="duplicate decode sequence"):
+        publication_throughput._submit_decode(service, descriptor)
+    service._decode_rows_by_sequence.clear()
+    service.shutdown_parallel_pipeline()
+
+
+def test_block_for_result_does_not_requeue_reducer_completion() -> None:
+    source = (Path(__file__).parents[1] / "runtime" / "publication_throughput.py").read_text()
+    block_source = source[source.index("    def block_for_result"):source.index("    def shutdown_parallel_pipeline")]
+    assert "self._canonical_reducer.output.put(item)" not in block_source
+    assert "canonical reducer completion out of order" in block_source
+
+
+def test_reducer_completion_order_is_enforced() -> None:
+    runtime = SimpleNamespace(watermark=0)
+    service = MemoryPipelineService(runtime, SimpleNamespace(), ingest_queue_capacity=128)
+    service._reducer_inflight = {1: (1, 1, 1), 2: (1, 2, 2)}
+    result = CanonicalCommitResult((), ())
+    service._canonical_reducer.output.put(("ok", 2, result, 0.0, 1, 0.0))
+    with pytest.raises(RuntimeError, match="completion out of order"):
+        publication_throughput._finish_reducer_results(service)
+    service._reducer_inflight.clear()
+    service.shutdown_parallel_pipeline()
+
+
+def test_shutdown_has_bounded_wait_when_reducer_stalls(monkeypatch) -> None:
+    runtime = SimpleNamespace(watermark=0)
+    service = MemoryPipelineService(runtime, SimpleNamespace(), ingest_queue_capacity=128)
+    service._reducer_shutdown_timeout_seconds = 0.01
+    service._reducer_inflight = {1: (1, 1, 1)}
+    monkeypatch.setattr(publication_throughput, "_finish_reducer_results", lambda _service: False)
+    started = time.perf_counter()
+    with pytest.raises(RuntimeError, match="shutdown timed out"):
+        service.shutdown_parallel_pipeline()
+    assert time.perf_counter() - started < 0.5
+    service._reducer_inflight.clear()
+    service._canonical_reducer.close(timeout=0.5)
