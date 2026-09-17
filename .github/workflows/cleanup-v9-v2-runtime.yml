@@ -26,6 +26,7 @@ jobs:
               'parallel_memory_coordinator_v2': 'parallel_memory_coordinator',
               'memory_pipeline_v2': 'memory_pipeline',
               'memory_worker_topology_v2': 'memory_worker_topology',
+              'pipeline_service_v2': 'parallel_memory_coordinator',
               'MemoryPipelineServiceV2': 'MemoryPipelineService',
           }
           for path in root.rglob('*.py'):
@@ -33,9 +34,6 @@ jobs:
               updated = text
               for old, new in replacements.items():
                   updated = updated.replace(old, new)
-              # pipeline_service_v2 was only a compatibility alias for the primary coordinator service.
-              updated = updated.replace('.pipeline_service_v2 import MemoryPipelineService', '.parallel_memory_coordinator import MemoryPipelineService')
-              updated = updated.replace('v9.runtime.pipeline_service_v2 import MemoryPipelineService', 'v9.runtime.parallel_memory_coordinator import MemoryPipelineService')
               if updated != text:
                   path.write_text(updated, encoding='utf-8')
 
@@ -59,13 +57,7 @@ jobs:
           workflow = Path('.github/workflows/cleanup-v9-v2-runtime.yml')
           workflow.unlink(missing_ok=True)
 
-          forbidden = (
-              'parallel_memory_coordinator_v2',
-              'memory_pipeline_v2',
-              'memory_worker_topology_v2',
-              'pipeline_service_v2',
-              'MemoryPipelineServiceV2',
-          )
+          forbidden = tuple(replacements)
           residual = []
           for path in root.rglob('*.py'):
               text = path.read_text(encoding='utf-8')
