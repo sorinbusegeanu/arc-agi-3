@@ -120,3 +120,48 @@ def test_runtime_integrity_does_not_replace_ingest_worker() -> None:
     source = inspect.getsource(runtime_integrity._install_shared_memory_cleanup)
     assert "ingest_batch_worker_main" not in source
     assert "derivation_batch_worker_main" not in source
+
+
+def test_option_a_backpressure_limits_are_hard_bounded() -> None:
+    assert publication_throughput._MAX_DECODE_PENDING_BATCHES > 0
+    assert publication_throughput._MAX_PREPARED_INTENT_ROWS > 0
+    assert publication_throughput._MAX_REDUCER_INFLIGHT_EVENTS > 0
+
+
+def test_option_a_diagnostics_expose_compile_reducer_and_backpressure_metrics() -> None:
+    runtime = SimpleNamespace(watermark=0)
+    service = MemoryPipelineService(runtime, SimpleNamespace(), ingest_queue_capacity=128)
+    diagnostics = service.diagnostics()
+    required = {
+        "intent_compile_ms_per_transition", "intent_bytes_per_transition",
+        "canonical_reducer_queue_depth", "reducer_apply_ms",
+        "reducer_apply_ms_per_transition", "reducer_lock_ms",
+        "reducer_lock_fraction", "prepared_ingest_rows_waiting",
+        "backpressure_decode_hits", "backpressure_prepared_hits",
+        "backpressure_reducer_hits",
+    }
+    assert required <= set(diagnostics)
+
+
+def test_coordinator_source_does_not_compile_commit_plans() -> None:
+    import inspect
+    source = inspect.getsource(publication_throughput)
+    assert "build_commit_plan(" not in source
+    assert "ThreadPoolExecutor" in source
+    assert "_CanonicalReducer" in source
+
+
+def test_reducer_is_single_canonical_writer() -> None:
+    import inspect
+    reducer_source = inspect.getsource(publication_throughput._CanonicalReducer)
+    submit_source = inspect.getsource(publication_throughput._submit_canonical_commit)
+    assert "apply_canonical_commit_batch" in reducer_source
+    assert "apply_canonical_commit_batch" not in submit_source
+
+
+def test_intent_worker_reports_compile_time() -> None:
+    import inspect
+    from v9.runtime import memory_pipeline
+    source = inspect.getsource(memory_pipeline.ingest_batch_worker_main)
+    assert "compile_ms" in source
+    assert "build_commit_plan(prepare_ingestion(task))" in source

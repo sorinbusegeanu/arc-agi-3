@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Iterable
@@ -19,6 +20,7 @@ from .memory_pipeline import CommitPlan, DerivationTask, _m1n_write
 class CanonicalCommitResult:
     signature_rows: tuple[tuple[int, ...], ...]
     derivation_candidates: tuple[DerivationTask, ...]
+    lock_seconds: float = 0.0
 
 
 def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> CanonicalCommitResult:
@@ -43,6 +45,7 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
         for derived in plan.derived_relations:
             materialized_rows[id(derived.write)] = derived.write.runtime_row()
 
+    lock_started = time.perf_counter()
     with runtime._lock:
         deferred_groups: list[tuple[Any, ...]] = []
         signature_rows: list[tuple[int, ...]] = []
@@ -234,4 +237,4 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
         runtime.unified_telemetry.gauges["game_scenario"] = last_scenario
         score_isf_batch(runtime, isf_rows)
         candidates = derivation_candidates(runtime, touched_signatures)
-        return CanonicalCommitResult(tuple(signature_rows), candidates)
+        return CanonicalCommitResult(tuple(signature_rows), candidates, time.perf_counter() - lock_started)

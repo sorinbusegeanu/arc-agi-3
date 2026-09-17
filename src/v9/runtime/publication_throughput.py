@@ -17,6 +17,9 @@ _MIN_PUBLICATION_INTAKE_HIGH_WATER = 4096
 _MAX_PUBLICATION_INTAKE_HIGH_WATER = 16384
 _RESULT_QUEUE_DRAIN_BATCHES = 64
 _REDUCER_QUEUE_BATCHES = 4
+_MAX_DECODE_PENDING_BATCHES = 32
+_MAX_PREPARED_INTENT_ROWS = 8192
+_MAX_REDUCER_INFLIGHT_EVENTS = 8192
 
 
 def _batch_rows(value: Any) -> int:
@@ -57,7 +60,7 @@ class _CanonicalReducer:
             except BaseException as exc:
                 self.output.put(("error", batch_id, exc))
                 continue
-            self.output.put(("ok", batch_id, result, time.perf_counter() - started, len(plans)))
+            self.output.put(("ok", batch_id, result, time.perf_counter() - started, len(plans), float(getattr(result, "lock_seconds", 0.0))))
 
     def submit(self, batch_id: int, plans: tuple[CanonicalMutationIntent, ...]) -> bool:
         try:
@@ -118,13 +121,15 @@ def _finish_reducer_results(service: Any) -> bool:
         if kind == "error":
             service.runtime._canonical_commit_inflight = False
             raise item[2]
-        _, batch_id, result, elapsed, count = item
+        _, batch_id, result, elapsed, count, lock_seconds = item
         metadata = service._reducer_inflight.pop(int(batch_id))
         service.canonical_apply_seconds += float(elapsed)
         service.canonical_apply_events += int(count)
         service.last_canonical_ingest_batch = int(count)
         service.ingested += int(count)
         service._canonical_commit_batches += 1
+        service._reducer_apply_ms += 1000.0 * float(elapsed)
+        service._reducer_lock_ms += 1000.0 * float(lock_seconds)
         for candidate in result.derivation_candidates:
             service._consider_candidate(candidate)
         progressed = True
@@ -206,6 +211,13 @@ def install_publication_throughput(pipeline_cls: type) -> None:
         self._reducer_inflight: dict[int, tuple[int, int, int]] = {}
         self._reducer_batch_id = 1
         self._canonical_commit_batches = 0
+        self._intent_compile_ms = 0.0
+        self._intent_compile_rows = 0
+        self._reducer_apply_ms = 0.0
+        self._reducer_lock_ms = 0.0
+        self._backpressure_decode_hits = 0
+        self._backpressure_prepared_hits = 0
+        self._backpressure_reducer_hits = 0
         self.runtime._canonical_commit_inflight = False
 
     def drain_ingest_results(self: Any, *, block: bool = False, timeout: float = 0.0) -> bool:
@@ -213,6 +225,12 @@ def install_publication_throughput(pipeline_cls: type) -> None:
         started = time.perf_counter()
         first = True
         for _ in range(_RESULT_QUEUE_DRAIN_BATCHES):
+            if self._decode_pending >= _MAX_DECODE_PENDING_BATCHES:
+                self._backpressure_decode_hits += 1
+                break
+            if _prepared_rows_waiting(self) >= _MAX_PREPARED_INTENT_ROWS:
+                self._backpressure_prepared_hits += 1
+                break
             try:
                 item = self.memory.ingest_result_queue.get(timeout=timeout) if block and first else self.memory.ingest_result_queue.get_nowait()
             except queue.Empty:
@@ -227,6 +245,9 @@ def install_publication_throughput(pipeline_cls: type) -> None:
                 self.ingest_result_rows += int(descriptor.rows)
                 self.ingest_result_bytes += int(descriptor.size)
                 self.ingest_result_encode_ms += float(descriptor.encode_ms)
+                if len(item) > 4:
+                    self._intent_compile_ms += float(item[4])
+                    self._intent_compile_rows += int(descriptor.rows)
                 progressed = True
                 continue
             if item[0] == "ingest_batch":
@@ -243,6 +264,10 @@ def install_publication_throughput(pipeline_cls: type) -> None:
         progressed = _drain_decode_completions(self) or progressed
         # Keep a bounded number of batches queued so the reducer never waits on the coordinator.
         while len(self._reducer_inflight) < _REDUCER_QUEUE_BATCHES:
+            inflight_events = sum(row[0] for row in self._reducer_inflight.values())
+            if inflight_events >= _MAX_REDUCER_INFLIGHT_EVENTS:
+                self._backpressure_reducer_hits += 1
+                break
             if not _submit_canonical_commit(self):
                 break
             progressed = True
@@ -301,6 +326,20 @@ def install_publication_throughput(pipeline_cls: type) -> None:
             "prepared_ingest_batches_waiting": int(len(self.ingest_results)),
             "prepared_ingest_rows_waiting": int(_prepared_rows_waiting(self)),
             "coordinator_ingest_decode_ms": 0.0,
+            "intent_compile_ms": float(self._intent_compile_ms),
+            "intent_compile_ms_per_transition": float(self._intent_compile_ms / max(1, self._intent_compile_rows)),
+            "intent_bytes_per_transition": float(self.ingest_result_bytes / max(1, self.ingest_result_rows)),
+            "reducer_apply_ms": float(self._reducer_apply_ms),
+            "reducer_apply_ms_per_transition": float(self._reducer_apply_ms / max(1, self.canonical_apply_events)),
+            "reducer_lock_ms": float(self._reducer_lock_ms),
+            "reducer_lock_fraction": float(self._reducer_lock_ms / max(0.001, self._reducer_apply_ms)),
+            "reducer_inflight_events": int(sum(row[0] for row in self._reducer_inflight.values())),
+            "backpressure_decode_hits": int(self._backpressure_decode_hits),
+            "backpressure_prepared_hits": int(self._backpressure_prepared_hits),
+            "backpressure_reducer_hits": int(self._backpressure_reducer_hits),
+            "max_decode_pending_batches": int(_MAX_DECODE_PENDING_BATCHES),
+            "max_prepared_intent_rows": int(_MAX_PREPARED_INTENT_ROWS),
+            "max_reducer_inflight_events": int(_MAX_REDUCER_INFLIGHT_EVENTS),
         })
         return result
 

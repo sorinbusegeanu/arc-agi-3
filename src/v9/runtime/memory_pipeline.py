@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
@@ -778,7 +779,9 @@ def ingest_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
                 chunk = tasks[offset : offset + _INGEST_RESULT_CHUNK_SIZE]
                 if not chunk:
                     continue
+                compile_started = time.perf_counter()
                 rows = tuple(build_commit_plan(prepare_ingestion(task)) for task in chunk)
+                compile_ms = 1000.0 * (time.perf_counter() - compile_started)
                 result = PreparedCommitBatch(
                     int(chunk[0].sequence),
                     int(chunk[-1].sequence),
@@ -790,7 +793,7 @@ def ingest_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
                     end_sequence=result.end_sequence,
                     rows=len(result.rows),
                 )
-                result_queue.put(("ingest_batch_shm", result.start_sequence, result.end_sequence, descriptor))
+                result_queue.put(("ingest_batch_shm", result.start_sequence, result.end_sequence, descriptor, compile_ms))
         except BaseException as exc:
             result_queue.put(("worker_error", "ingest", int(item.start_sequence), repr(exc)))
 
