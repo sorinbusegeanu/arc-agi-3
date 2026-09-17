@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import time
 from threading import Event
 from types import SimpleNamespace
@@ -49,6 +50,16 @@ def test_canonical_commit_submission_does_not_block_pipeline(monkeypatch) -> Non
     diagnostics = service.diagnostics()
     assert diagnostics["canonical_commit_batches"] == 1
     assert diagnostics["canonical_commit_inflight"] == 0
+
+
+def test_primary_runtime_has_no_v2_compatibility_modules() -> None:
+    for module_name in (
+        "v9.runtime.memory_pipeline_v2",
+        "v9.runtime.memory_worker_topology_v2",
+        "v9.runtime.pipeline_service_v2",
+        "v9.runtime.parallel_memory_coordinator_v2",
+    ):
+        assert importlib.util.find_spec(module_name) is None
 
 
 def test_actor_policy_cache_serves_last_completed_snapshot_during_commit() -> None:
