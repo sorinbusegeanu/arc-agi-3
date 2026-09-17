@@ -1,0 +1,44 @@
+name: Fix v9 reducer follow-up
+
+on:
+  push:
+    branches:
+      - fix-v9-reducer-followup-actual
+    paths:
+      - '.github/workflows/fix-v9-reducer-followup.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply fixes
+        run: python .github/scripts/fix_v9_reducer_followup.py
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile v9
+        run: python -m compileall -q src/v9
+      - name: Run focused tests
+        env:
+          PYTHONPATH: src
+        run: python -m pytest -q src/v9/tests/test_publication_throughput.py
+      - name: Run all v9 tests
+        env:
+          PYTHONPATH: src
+        run: python -m pytest -q src/v9/tests
+      - name: Commit validated fixes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/scripts/fix_v9_reducer_followup.py .github/workflows/fix-v9-reducer-followup.yml
+          git add src/v9
+          git commit -m "Fix reducer ordering and shutdown defects"
+          git push origin HEAD:fix-v9-reducer-followup-actual
