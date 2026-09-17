@@ -1,0 +1,43 @@
+name: Run Option A steps 11-15
+
+on:
+  push:
+    paths:
+      - '.github/workflows/run-option-a-steps11-15.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply patch
+        run: python .github/scripts/patch_option_a_steps11_15.py
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile v9
+        run: python -m compileall -q src/v9
+      - name: Run focused tests
+        env:
+          PYTHONPATH: src
+        run: python -m pytest -q src/v9/tests/test_publication_throughput.py src/v9/tests/test_canonical_pipeline_v2.py src/v9/tests/test_gap_closure_plan.py
+      - name: Run all v9 tests
+        env:
+          PYTHONPATH: src
+        run: python -m pytest -q src/v9/tests
+      - name: Commit and push
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/scripts/patch_option_a_steps11_15.py .github/workflows/run-option-a-steps11-15.yml .github/workflows/implement-option-a-steps11-15.yml
+          git add src/v9
+          git commit -m "Complete Option A backpressure and telemetry"
+          git pull --rebase origin main
+          git push origin HEAD:main
