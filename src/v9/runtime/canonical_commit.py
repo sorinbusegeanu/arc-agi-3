@@ -45,8 +45,8 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
         for derived in plan.derived_relations:
             materialized_rows[id(derived.write)] = derived.write.runtime_row()
 
-    lock_started = time.perf_counter()
     with runtime._lock:
+        lock_acquired = time.perf_counter()
         deferred_groups: list[tuple[Any, ...]] = []
         signature_rows: list[tuple[int, ...]] = []
         touched_signatures: set[int] = set()
@@ -237,4 +237,4 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
         runtime.unified_telemetry.gauges["game_scenario"] = last_scenario
         score_isf_batch(runtime, isf_rows)
         candidates = derivation_candidates(runtime, touched_signatures)
-        return CanonicalCommitResult(tuple(signature_rows), candidates, time.perf_counter() - lock_started)
+        return CanonicalCommitResult(tuple(signature_rows), candidates, time.perf_counter() - lock_acquired)

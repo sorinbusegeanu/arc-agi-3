@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 import time
+import queue
+
+import pytest
 from threading import Event
 from types import SimpleNamespace
+from pathlib import Path
 
 from v9.mutation.versions import ObjectRef, VersionTable
 from v9.runtime.actor_policy_cache import install_actor_policy_cache
@@ -165,3 +169,94 @@ def test_intent_worker_reports_compile_time() -> None:
     source = inspect.getsource(memory_pipeline.ingest_batch_worker_main)
     assert "compile_ms" in source
     assert "build_commit_plan(prepare_ingestion(task))" in source
+
+
+
+def test_reducer_failure_clears_inflight_and_shutdown_does_not_hang(monkeypatch) -> None:
+    def failing_commit(_runtime, _plans):
+        raise RuntimeError("canonical boom")
+
+    monkeypatch.setattr(publication_throughput, "apply_canonical_commit_batch", failing_commit)
+    runtime = SimpleNamespace(watermark=0)
+    service = MemoryPipelineService(runtime, SimpleNamespace(), ingest_queue_capacity=128)
+    plan = CommitPlan(1, None, None, None, None, (), None, (), None, (), None, "", None)
+    service.ingest_results[1] = PreparedCommitBatch(1, 1, (plan,))
+    assert service.apply_ingest_ready()
+
+    deadline = time.monotonic() + 2.0
+    while service._canonical_reducer.output.empty() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    with pytest.raises(RuntimeError, match="canonical boom"):
+        service.apply_ingest_ready()
+    assert service._reducer_inflight == {}
+    assert runtime._canonical_commit_inflight is False
+
+    started = time.perf_counter()
+    service.shutdown_parallel_pipeline()
+    assert time.perf_counter() - started < 1.0
+
+
+def test_reducer_event_limit_cannot_be_overshot(monkeypatch) -> None:
+    entered = Event()
+    release = Event()
+
+    def slow_commit(_runtime, plans):
+        entered.set()
+        assert release.wait(timeout=2.0)
+        return CanonicalCommitResult(tuple(() for _ in plans), ())
+
+    monkeypatch.setattr(publication_throughput, "apply_canonical_commit_batch", slow_commit)
+    monkeypatch.setattr(publication_throughput, "_MAX_REDUCER_INFLIGHT_EVENTS", 1)
+    runtime = SimpleNamespace(watermark=0)
+    service = MemoryPipelineService(runtime, SimpleNamespace(), ingest_queue_capacity=128)
+    plan1 = CommitPlan(1, None, None, None, None, (), None, (), None, (), None, "", None)
+    plan2 = CommitPlan(2, None, None, None, None, (), None, (), None, (), None, "", None)
+    service.ingest_results[1] = PreparedCommitBatch(1, 1, (plan1,))
+    service.ingest_results[2] = PreparedCommitBatch(2, 2, (plan2,))
+
+    assert service.apply_ingest_ready()
+    assert entered.wait(timeout=1.0)
+    assert sum(row[0] for row in service._reducer_inflight.values()) <= 1
+    assert service.ingest_apply == 2
+    assert 2 in service.ingest_results
+    release.set()
+    service.shutdown_parallel_pipeline()
+
+
+def test_prepared_intent_limit_holds_result_instead_of_overshooting(monkeypatch) -> None:
+    monkeypatch.setattr(publication_throughput, "_MAX_PREPARED_INTENT_ROWS", 1)
+    memory = SimpleNamespace(ingest_result_queue=queue.Queue())
+    runtime = SimpleNamespace(watermark=0)
+    service = MemoryPipelineService(runtime, memory, ingest_queue_capacity=128)
+    plan1 = CommitPlan(1, None, None, None, None, (), None, (), None, (), None, "", None)
+    plan2 = CommitPlan(2, None, None, None, None, (), None, (), None, (), None, "", None)
+    memory.ingest_result_queue.put(("ingest_batch", 1, 1, PreparedCommitBatch(1, 1, (plan1,))))
+    memory.ingest_result_queue.put(("ingest_batch", 2, 2, PreparedCommitBatch(2, 2, (plan2,))))
+
+    assert service.drain_ingest_results()
+    assert publication_throughput._prepared_rows_waiting(service) <= 1
+    assert len(service._held_ingest_items) == 1
+    service.shutdown_parallel_pipeline()
+
+
+def test_compiled_batch_start_and_row_sequences_are_validated() -> None:
+    runtime = SimpleNamespace(watermark=0)
+    service = MemoryPipelineService(runtime, SimpleNamespace(), ingest_queue_capacity=128)
+    wrong_start = CommitPlan(2, None, None, None, None, (), None, (), None, (), None, "", None)
+    service.ingest_results[1] = PreparedCommitBatch(2, 2, (wrong_start,))
+    with pytest.raises(RuntimeError, match="sequence mismatch"):
+        service.apply_ingest_ready()
+    service.shutdown_parallel_pipeline()
+
+
+def test_final_shard_drain_uses_normal_transition_handler_and_backpressure() -> None:
+    source = (Path(__file__).parents[1] / "runtime" / "parallel_memory_coordinator.py").read_text()
+    assert source.count("dispatch_published_transition(item[3])") >= 2
+    assert "final shard transition drain stalled under ingestion backpressure" in source
+    assert source.count("hgt_dataset.append") == 1
+
+
+def test_lock_telemetry_measures_hold_time_after_acquisition() -> None:
+    source = (Path(__file__).parents[1] / "runtime" / "canonical_commit.py").read_text()
+    assert "with runtime._lock:\n        lock_acquired = time.perf_counter()" in source
+    assert "time.perf_counter() - lock_acquired" in source

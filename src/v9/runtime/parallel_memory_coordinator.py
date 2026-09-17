@@ -437,6 +437,11 @@ def run_parallel_memory_jobs(
             launched += 1
         return launched
 
+    def dispatch_published_transition(transition: Any) -> None:
+        if hgt_dataset is not None:
+            hgt_dataset.append(transition)
+        pipeline.dispatch_transition(transition)
+
     def drain_publication_queue() -> bool:
         if pipeline.sampled - pipeline.ingested >= pipeline.ingest_local_high_water:
             return False
@@ -448,9 +453,7 @@ def run_parallel_memory_jobs(
             except queue.Empty:
                 break
             if item[0] == "transition":
-                if hgt_dataset is not None:
-                    hgt_dataset.append(item[3])
-                pipeline.dispatch_transition(item[3])
+                dispatch_published_transition(item[3])
                 progressed = True
             elif item[0] == "shard_done":
                 topology.publication_queue.put(item)
@@ -648,7 +651,16 @@ def run_parallel_memory_jobs(
                     )
                 continue
             if item[0] == "transition":
-                pipeline.dispatch_transition(item[3])
+                backpressure_started = time.monotonic()
+                while pipeline.sampled - pipeline.ingested >= pipeline.ingest_local_high_water:
+                    progressed = pipeline.service()
+                    if not progressed:
+                        pipeline.block_for_result(timeout=0.05)
+                    if time.monotonic() - backpressure_started >= _PIPELINE_DRAIN_STALL_SECONDS:
+                        raise RuntimeError(
+                            "final shard transition drain stalled under ingestion backpressure"
+                        )
+                dispatch_published_transition(item[3])
                 last_shard_progress = time.monotonic()
             elif item[0] == "shard_done":
                 completed_shards.add(int(item[1]))

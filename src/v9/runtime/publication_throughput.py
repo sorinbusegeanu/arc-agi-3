@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Thread
 from typing import Any
@@ -58,8 +59,10 @@ class _CanonicalReducer:
             try:
                 result = apply_canonical_commit_batch(self.runtime, plans)
             except BaseException as exc:
+                # Canonical mutation failure is terminal for this reducer.  Do not
+                # process later batches after an authoritative commit has failed.
                 self.output.put(("error", batch_id, exc))
-                continue
+                return
             self.output.put(("ok", batch_id, result, time.perf_counter() - started, len(plans), float(getattr(result, "lock_seconds", 0.0))))
 
     def submit(self, batch_id: int, plans: tuple[CanonicalMutationIntent, ...]) -> bool:
@@ -70,10 +73,19 @@ class _CanonicalReducer:
         return True
 
     def close(self) -> None:
+        if not self.thread.is_alive():
+            return
         try:
             self.input.put_nowait(None)
         except queue.Full:
-            self.input.put(None)
+            # Never block forever if the reducer has already terminated while its
+            # input queue still contains abandoned work.
+            while self.thread.is_alive():
+                try:
+                    self.input.put(None, timeout=0.05)
+                    break
+                except queue.Full:
+                    continue
         self.thread.join(timeout=5.0)
 
 
@@ -85,14 +97,23 @@ def _drain_decode_completions(service: Any) -> bool:
         except queue.Empty:
             break
         service._decode_pending -= 1
+        if not isinstance(batch, BaseException):
+            service._decode_pending_rows -= len(batch.rows)
+            service.ingest_result_decode_ms += float(decode_ms)
+        else:
+            # The reserved row count is tracked by descriptor sequence for failed
+            # decodes; release it conservatively from the recorded reservation.
+            service._decode_pending_rows -= int(service._decode_rows_by_sequence.pop(int(start_sequence), 0))
+        service._decode_rows_by_sequence.pop(int(start_sequence), None)
         service.ingest_results[int(start_sequence)] = batch
-        service.ingest_result_decode_ms += float(decode_ms)
         progressed = True
     return progressed
 
 
 def _submit_decode(service: Any, descriptor: SharedBatchDescriptor) -> None:
     service._decode_pending += 1
+    service._decode_pending_rows += int(descriptor.rows)
+    service._decode_rows_by_sequence[int(descriptor.start_sequence)] = int(descriptor.rows)
 
     def decode() -> tuple[Any, float]:
         return consume_shared_batch(descriptor)
@@ -119,6 +140,11 @@ def _finish_reducer_results(service: Any) -> bool:
             break
         kind = item[0]
         if kind == "error":
+            failed_batch_id = int(item[1])
+            service._reducer_inflight.pop(failed_batch_id, None)
+            # The reducer terminates on a canonical failure, so queued batches will
+            # never complete and must not keep shutdown waiting forever.
+            service._reducer_inflight.clear()
             service.runtime._canonical_commit_inflight = False
             raise item[2]
         _, batch_id, result, elapsed, count, lock_seconds = item
@@ -144,18 +170,25 @@ def _finish_reducer_results(service: Any) -> bool:
     return progressed
 
 
-def _submit_canonical_commit(service: Any) -> bool:
+def _submit_canonical_commit(service: Any, *, max_rows: int | None = None) -> bool:
     transport_batches: list[PreparedCommitBatch] = []
     row_count = 0
     while service.ingest_apply in service.ingest_results:
-        value = service.ingest_results[service.ingest_apply]
+        lookup_sequence = int(service.ingest_apply)
+        value = service.ingest_results[lookup_sequence]
         if isinstance(value, BaseException):
-            service.ingest_results.pop(service.ingest_apply)
+            service.ingest_results.pop(lookup_sequence)
             raise value
+        if int(value.start_sequence) != lookup_sequence:
+            raise RuntimeError(
+                f"compiled intent sequence mismatch: expected start={lookup_sequence} actual={value.start_sequence}"
+            )
         rows = _batch_rows(value)
+        if max_rows is not None and row_count + rows > int(max_rows):
+            break
         if transport_batches and row_count + rows > service.canonical_batch_size:
             break
-        service.ingest_results.pop(service.ingest_apply)
+        service.ingest_results.pop(lookup_sequence)
         transport_batches.append(value)
         row_count += rows
         service.ingest_apply = _batch_end_sequence(value) + 1
@@ -169,10 +202,20 @@ def _submit_canonical_commit(service: Any) -> bool:
     for batch in transport_batches:
         if expected is not None and int(batch.start_sequence) != expected:
             raise RuntimeError(f"compiled intent sequence gap: expected={expected} actual={batch.start_sequence}")
+        row_sequence = int(batch.start_sequence)
         for row in batch.rows:
             if not isinstance(row, CanonicalMutationIntent):
                 raise TypeError(f"ingest workers must emit CanonicalMutationIntent, got {type(row).__name__}")
+            if int(row.sequence) != row_sequence:
+                raise RuntimeError(
+                    f"compiled intent row sequence mismatch: expected={row_sequence} actual={row.sequence}"
+                )
             plans.append(row)
+            row_sequence += 1
+        if row_sequence - 1 != int(batch.end_sequence):
+            raise RuntimeError(
+                f"compiled intent batch end mismatch: expected={row_sequence - 1} actual={batch.end_sequence}"
+            )
         expected = int(batch.end_sequence) + 1
 
     batch_id = service._reducer_batch_id
@@ -205,7 +248,10 @@ def install_publication_throughput(pipeline_cls: type) -> None:
             max(_MIN_PUBLICATION_INTAKE_HIGH_WATER, self.ipc_batch_size * ingest_workers),
         )
         self._decoded_ingest_queue: queue.Queue[Any] = queue.Queue()
+        self._held_ingest_items: deque[Any] = deque()
         self._decode_pending = 0
+        self._decode_pending_rows = 0
+        self._decode_rows_by_sequence: dict[int, int] = {}
         self._decode_pool = ThreadPoolExecutor(max_workers=max(2, ingest_workers), thread_name_prefix="v9-intent-decode")
         self._canonical_reducer = _CanonicalReducer(runtime)
         self._reducer_inflight: dict[int, tuple[int, int, int]] = {}
@@ -225,21 +271,27 @@ def install_publication_throughput(pipeline_cls: type) -> None:
         started = time.perf_counter()
         first = True
         for _ in range(_RESULT_QUEUE_DRAIN_BATCHES):
-            if self._decode_pending >= _MAX_DECODE_PENDING_BATCHES:
-                self._backpressure_decode_hits += 1
-                break
-            if _prepared_rows_waiting(self) >= _MAX_PREPARED_INTENT_ROWS:
-                self._backpressure_prepared_hits += 1
-                break
-            try:
-                item = self.memory.ingest_result_queue.get(timeout=timeout) if block and first else self.memory.ingest_result_queue.get_nowait()
-            except queue.Empty:
-                break
+            if self._held_ingest_items:
+                item = self._held_ingest_items.popleft()
+            else:
+                try:
+                    item = self.memory.ingest_result_queue.get(timeout=timeout) if block and first else self.memory.ingest_result_queue.get_nowait()
+                except queue.Empty:
+                    break
             first = False
             if item[0] == "worker_error":
                 raise RuntimeError(f"{item[1]} worker task {item[2]} failed: {item[3]}")
             if item[0] == "ingest_batch_shm":
                 descriptor = item[3]
+                if self._decode_pending >= _MAX_DECODE_PENDING_BATCHES:
+                    self._held_ingest_items.appendleft(item)
+                    self._backpressure_decode_hits += 1
+                    break
+                reserved_rows = _prepared_rows_waiting(self) + int(self._decode_pending_rows)
+                if reserved_rows + int(descriptor.rows) > _MAX_PREPARED_INTENT_ROWS:
+                    self._held_ingest_items.appendleft(item)
+                    self._backpressure_prepared_hits += 1
+                    break
                 _submit_decode(self, descriptor)
                 self.ingest_result_batches += 1
                 self.ingest_result_rows += int(descriptor.rows)
@@ -252,6 +304,10 @@ def install_publication_throughput(pipeline_cls: type) -> None:
                 continue
             if item[0] == "ingest_batch":
                 batch = item[3]
+                if _prepared_rows_waiting(self) + len(batch.rows) > _MAX_PREPARED_INTENT_ROWS:
+                    self._held_ingest_items.appendleft(item)
+                    self._backpressure_prepared_hits += 1
+                    break
                 self.ingest_results[int(item[1])] = batch
                 self.ingest_result_batches += 1
                 self.ingest_result_rows += len(batch.rows)
@@ -265,10 +321,13 @@ def install_publication_throughput(pipeline_cls: type) -> None:
         # Keep a bounded number of batches queued so the reducer never waits on the coordinator.
         while len(self._reducer_inflight) < _REDUCER_QUEUE_BATCHES:
             inflight_events = sum(row[0] for row in self._reducer_inflight.values())
-            if inflight_events >= _MAX_REDUCER_INFLIGHT_EVENTS:
+            remaining_events = _MAX_REDUCER_INFLIGHT_EVENTS - inflight_events
+            if remaining_events <= 0:
                 self._backpressure_reducer_hits += 1
                 break
-            if not _submit_canonical_commit(self):
+            if not _submit_canonical_commit(self, max_rows=remaining_events):
+                if self.ingest_apply in self.ingest_results:
+                    self._backpressure_reducer_hits += 1
                 break
             progressed = True
         return progressed
@@ -321,6 +380,8 @@ def install_publication_throughput(pipeline_cls: type) -> None:
             "canonical_commit_pending_events": sum(row[0] for row in self._reducer_inflight.values()),
             "canonical_reducer_queue_depth": int(self._canonical_reducer.input.qsize()),
             "intent_decode_pending": int(self._decode_pending),
+            "intent_decode_pending_rows": int(self._decode_pending_rows),
+            "held_ingest_result_items": int(len(self._held_ingest_items)),
             "publication_intake_high_water": int(self.ingest_local_high_water),
             "ingest_task_batch_size": int(self.ipc_batch_size),
             "prepared_ingest_batches_waiting": int(len(self.ingest_results)),
