@@ -1,0 +1,47 @@
+name: Fast land validated Option A
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fast-land-option-a.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  land:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply validated Option A patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import textwrap
+          text = Path('.github/workflows/implement-option-a.yml').read_text()
+          marker = "          python - <<'PY'\n"
+          start = text.index(marker) + len(marker)
+          end = text.index("\n          PY\n", start)
+          source = textwrap.dedent(text[start:end])
+          exec(compile(source, 'option-a-patch', 'exec'), {})
+
+          p = Path('src/v9/runtime/runtime_integrity_followup.py')
+          text = p.read_text()
+          start = text.index('def ingest_batch_worker_main(')
+          prefix = text[:start]
+          new_install = '''def install(runtime_integrity_module: Any, pipeline_cls: type) -> None:\n    preserve_pipeline_viability_dispatch(pipeline_cls)\n    runtime_integrity_module._VIABILITY_PROFILE_LIMIT = 256\n    runtime_integrity_module._cleanup_owned_shared_memory = cleanup_owned_shared_memory\n\n    # memory_pipeline.py owns the spawn-safe ingest and derivation worker targets.\n    # Integrity follow-up only preserves viability dispatch and cleanup helpers.\n'''
+          p.write_text(prefix + new_install)
+          PY
+      - name: Commit and push
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/implement-option-a.yml .github/workflows/implement-option-a-fix.yml .github/workflows/land-option-a-main.yml .github/workflows/fast-land-option-a.yml
+          git add src/v9
+          git commit -m "Implement parallel canonical intent pipeline"
+          git pull --rebase origin main
+          git push origin HEAD:main
