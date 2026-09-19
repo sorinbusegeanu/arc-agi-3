@@ -2,9 +2,50 @@
 
 ## **A Memory-Centric Theory of Emergent Intelligence**
 
-**Version 0.6.3.1**
+**Version 0.7.0**
 
 ### **Abstract**
+
+### **Version 0.7.0 Revision**
+
+Version 0.7.0 extends the frozen v0.6.3.1 developmental theory with one
+new falsifiable hypothesis: **learned relational reasoning can emerge as
+a trainable operator over the explicit developmental memory substrate
+without replacing that substrate as the authority for persistent
+knowledge**.
+
+The extension is motivated by Hydra System Design v9.7.2. It separates
+two functions that earlier versions treated together:
+
+-   **developmental memory formation** remains responsible for grounded
+    M0-M7 knowledge, canonical identity, provenance, lineage, lifecycle,
+    grounding, causal transfer validation, negative evidence,
+    developmental stage, primary valence, ISF, and future-option
+    structure;
+-   **learned relational reasoning** operates over bounded, versioned
+    subgraphs of that memory to estimate relevance, similarity,
+    correspondence, consequences, strategy quality, candidate
+    refinement, and useful reasoning operations.
+
+The learned reasoner is therefore downstream of developmental grounding
+and upstream of candidate selection and deliberation. Its outputs are
+hypotheses, scores, latent representations, and refinements. They do not
+by themselves create validated concepts, establish grounding, prove
+transfer, or mutate canonical memory.
+
+Version 0.7.0 also makes continual reasoner learning explicit. Published
+model versions are immutable; candidate successor models learn
+asynchronously from causally provenance-preserving interaction,
+consolidation, transfer, grounding, replay, and deliberation evidence.
+Publication requires improvement without unacceptable
+historical-retention loss.
+
+This extension creates a new experimental question: whether a learned
+relational operator over emergent developmental memory improves
+prediction, retrieval, structural correspondence, transfer, planning,
+and sample efficiency beyond explicit-memory reasoning alone, while
+preserving the developmental ordering and causal-validation requirements
+of the theory.
 
 ### **Version 0.6.3.1 Revision**
 
@@ -1862,8 +1903,8 @@ A symmetry condition is therefore:
 
 while:
 
-\[ `\Delta `{=tex}I_r(X)
-`\le `{=tex}`\theta`{=tex}\_{`\mathrm{symmetry}`{=tex}} \]
+\[ `\Delta`{=tex}I_r(X)
+`\le`{=tex}`\theta`{=tex}\_{`\mathrm{symmetry}`{=tex}} \]
 
 for a declared number of successive admissible scale expansions, or
 until the declared structural budget is exhausted.
@@ -5661,6 +5702,176 @@ input. It is to identify which structural priors are necessary, which
 are merely sample-efficient, and which can be reconstructed through
 interaction.
 
+# **17.24 Learned Relational Reasoning Over Developmental Memory**
+
+The preceding theory explains how grounded, auditable relational
+structure can develop from interaction. Version 0.7.0 adds a second
+question: once such structure exists, can a learned relational operator
+acquire reusable reasoning regularities over it?
+
+Let the explicit developmental memory at time (t) be:
+
+\[ G_t = (V_t, E_t, P_t) \]
+
+where (V_t) contains typed M0-M7 memories, (E_t) contains typed
+evidence-supported relations, and (P_t) contains provenance, lifecycle,
+context, authority, grounding, and validation state.
+
+For a decision, the learner retrieves a bounded relevant subgraph:
+
+\[ G_t\^{(b)} `\subseteq `{=tex}G_t \]
+
+and applies a learned relational operator:
+
+\[ Z\_{k+1} = R\_{`\theta`{=tex}\_n}(G_t\^{(b)}, X_t, Y_k, Z_k) \]
+
+where:
+
+-   (X_t) is the current grounded state;
+-   (Y_k) is the current candidate;
+-   (Z_k) is an ephemeral reasoning workspace;
+-   (R\_{`\theta`{=tex}\_n}) is the currently published learned
+    relational model;
+-   \(k\) indexes recursive deliberation cycles.
+
+The candidate may then be refined:
+
+\[ Y\_{k+1} = Refine(X_t, Y_k, Z\_{k+1}) \]
+
+This introduces learned computation over memory without changing the
+ontology of persistent knowledge.
+
+## **17.24.1 Authority Boundary**
+
+The explicit developmental memory remains authoritative for persistent
+knowledge. A learned reasoner may estimate:
+
+-   memory relevance;
+-   structural similarity;
+-   correspondence likelihood;
+-   likely consequences;
+-   strategy quality;
+-   candidate refinements;
+-   useful next reasoning operations.
+
+A learned-model output is not itself sufficient evidence for:
+
+-   M4 concept validation;
+-   causal transfer success;
+-   symbol grounding;
+-   canonical identity;
+-   lifecycle promotion;
+-   primary valence;
+-   persistent causal authority.
+
+Any persistent change proposed using learned reasoning must pass through
+the same evidence, provenance, developmental, and causal-validation
+mechanisms as other Hydra proposals.
+
+This boundary is theoretically important. Otherwise the learned model
+could manufacture the high-level structures whose emergence the theory
+is intended to test.
+
+## **17.24.2 Developmental Dependence**
+
+The learned reasoner may consume multiple memory levels simultaneously,
+but its training targets must preserve the causal order of evidence.
+
+Later consolidation may supervise which earlier structures became
+useful, but the implementation must preserve the temporal relation
+between:
+
+1.  evidence available when a prediction or decision was made;
+2.  later evidence used to evaluate that prediction or decision;
+3.  model version used during the decision;
+4.  memory-graph version used during the decision.
+
+Training on future consolidation is permitted as retrospective learning.
+Scientific evaluation must not reinterpret that later evidence as
+information that was available to the earlier behavior.
+
+## **17.24.3 Learned Relational Representation**
+
+The reasoner is expected to learn representations that are sensitive to
+typed relations and functional structure rather than
+environment-specific semantic labels.
+
+The central prediction is not that a particular neural architecture is
+necessary. HGT-style relational attention is the reference
+implementation in Hydra v9.7.2. The theoretical claim concerns a broader
+class of learned relational operators operating over bounded
+developmental-memory subgraphs.
+
+A successful learned representation should improve discrimination of
+structurally useful memory while retaining the theory's existing
+requirements for held-out causal validation.
+
+## **17.24.4 Recursive Deliberation**
+
+Reasoning depth may arise through repeated bounded applications of the
+learned operator rather than through one monolithic inference pass.
+
+A deliberation cycle may:
+
+1.  retrieve or expand relevant memory;
+2.  score correspondences or consequences;
+3.  refine a candidate;
+4.  invoke another reasoning operation;
+5.  stop when the declared budget or stopping criterion is reached.
+
+Recursive deliberation remains epistemically subordinate to
+environmental evidence. Additional internal cycles can improve a
+hypothesis but cannot convert an unvalidated hypothesis into causal
+fact.
+
+## **17.24.5 Continual Relational Learning**
+
+Let (`\theta`{=tex}*n) denote immutable published model version (n). New
+evidence may train candidate parameters (`\theta`{=tex}*{n+1}\^{\*})
+asynchronously while (`\theta`{=tex}\_n) remains the inference
+authority.
+
+Training evidence may include:
+
+-   observed transitions and action effects;
+-   later Hydra consolidation outcomes;
+-   matched causal transfer trials;
+-   grounding controls;
+-   successful and failed deliberation traces;
+-   replay outcomes;
+-   structure-preserving transformations and hard negatives.
+
+A candidate model is published only after declared evaluation gates are
+met:
+
+\[ `\theta`{=tex}*{n+1} = Publish(`\theta`{=tex}*{n+1}\^{\*}) \]
+
+subject to improvement and historical-retention criteria.
+
+This creates two interacting forms of continual development:
+
+\[ Memory\_{t+1} = Develop(Memory_t, Experience_t) \]
+
+\[ `\theta`{=tex}\_{n+1} = Learn(`\theta`{=tex}*n, Evidence*{0:t}) \]
+
+The memory substrate can continue to grow, revise, suspend, promote,
+demote, and forget independently of the fixed parameter count of a
+configured learned reasoner.
+
+## **17.24.6 Scientific Separation of Memory and Model Evidence**
+
+Every scientific report involving learned reasoning should distinguish:
+
+-   explicit-memory evidence;
+-   learned-model estimates;
+-   deliberation-derived candidate changes;
+-   subsequent environmental outcomes;
+-   causal validation results.
+
+This separation is required to determine whether an observed gain came
+from better memory formation, better retrieval, better learned
+inference, better deliberation, or target-local execution.
+
 # **18. Predictions and Falsification Analysis**
 
 A scientific theory must expose its principal claims to tests that can
@@ -6109,7 +6320,85 @@ topology against fixed-permutation, topology-withheld, and other
 structure-reduced observation conditions while preserving underlying
 environment dynamics.
 
-# **18.14 Strong Comparative Predictions**
+# **18.14 Learned Relational Reasoning Hypothesis**
+
+### **H19 --- Learned Relational Reasoning Over Emergent Memory**
+
+After sufficient grounded developmental structure exists, a learned
+relational operator trained over bounded M0-M7 memory subgraphs will
+improve one or more of:
+
+-   relevant-memory retrieval;
+-   structural correspondence;
+-   consequence prediction;
+-   candidate refinement;
+-   strategy selection;
+-   cross-family transfer;
+-   sample efficiency;
+
+relative to an otherwise matched explicit-memory-only system.
+
+H19 additionally predicts that recursive learned deliberation can
+outperform a single learned relational pass when tasks require
+multi-step refinement, while incurring measurable additional reasoning
+cost.
+
+H19 is supported only if gains survive held-out evaluation and cannot be
+explained solely by additional environment interaction, privileged
+semantic labels, future-information leakage, or unmatched starting
+states.
+
+Required primary ablations are:
+
+1.  **Hydra only** --- explicit developmental memory and existing
+    explicit reasoning mechanisms;
+2.  **Hydra + learned relational single-pass** --- one bounded learned
+    reasoning pass;
+3.  **Hydra + learned relational recursive deliberation** --- repeated
+    bounded reasoning/refinement cycles.
+
+Additional controls should include:
+
+-   random/untrained relational representations;
+-   frozen early learned model;
+-   continually trained current model;
+-   explicit similarity versus learned similarity;
+-   model-only learned policy where experimentally feasible.
+
+Measure at minimum:
+
+-   sample efficiency;
+-   prediction quality;
+-   held-out task success;
+-   cross-family transfer;
+-   memory growth;
+-   reasoning cost;
+-   historical-stage retention/catastrophic forgetting;
+-   trajectory efficiency.
+
+### **H19 Developmental Constraint**
+
+H19 is rejected as an explanation of developmental emergence if the
+learned reasoner obtains its gains by directly creating or validating
+high-level semantics that bypass the M0-M7 formation and
+causal-validation pathway.
+
+A positive behavioral result under such a bypass may demonstrate a
+useful hybrid engineering architecture, but it would not support the
+developmental claim of this paper.
+
+### **H19 Continual-Learning Prediction**
+
+Continual relational training should improve current-stage reasoning
+while retaining useful relational competence from earlier environment
+families better when combined with explicit Hydra memory and stratified
+historical replay than when trained only on the newest curriculum stage.
+
+A candidate successor model should not be treated as developmental
+progress if new-stage gains are accompanied by unacceptable loss on
+declared historical retention tests.
+
+# **18.15 Strong Comparative Predictions**
 
 The following comparisons are especially diagnostic.
 
@@ -6153,7 +6442,7 @@ exist rather than serving as necessary primitives for their formation.
 Persistent memory becomes increasingly compact relative to accumulated
 experience in recurrently compressible environments.
 
-# **18.15 Core Falsification Criteria**
+# **18.16 Core Falsification Criteria**
 
 The framework is substantially weakened by repeated, well-powered
 observations of the following.
@@ -6285,7 +6574,15 @@ the predicted systematic capability differences, or if claimed emergent
 abstractions are shown to depend on undeclared domain-semantic structure
 at the observation boundary.
 
-# **18.16 Levels of Negative Evidence**
+H19 is rejected or revised if a causally controlled, held-out comparison
+shows no reproducible reasoning or behavioral advantage from the learned
+relational operator over Hydra-only reasoning across the declared
+evaluation regime; if recursive deliberation provides no advantage over
+a matched single pass where multi-step refinement is required; or if
+apparent gains depend on semantic shortcuts, future-information leakage,
+or bypassing developmental validation.
+
+# **18.17 Levels of Negative Evidence**
 
 ### **Local Failure**
 
@@ -6320,7 +6617,7 @@ Examples:
 -   transferable abstractions do not arise from interaction-derived
     relational structure.
 
-# **18.17 Interpretation of Negative Results**
+# **18.18 Interpretation of Negative Results**
 
 Negative results should be classified by the claim actually tested. The
 framework should not treat every failed implementation as a
@@ -6335,7 +6632,7 @@ Experiments should therefore preregister:
 -   alternative explanations,
 -   the criterion for local, structural, or foundational failure.
 
-# **18.18 Central Falsifiable Proposition**
+# **18.19 Central Falsifiable Proposition**
 
 The most important proposition is:
 
@@ -6670,7 +6967,18 @@ Knowledge begins with remembered interactions rather than objects.
 
 Memory organization is primary.
 
-Prediction, planning, and concepts emerge from memory.
+Concepts and persistent world knowledge emerge through developmental
+memory organization. Prediction and planning may use both explicit
+memory structure and a learned relational reasoner operating over that
+structure.
+
+### **Learned Reasoning Over Explicit Developmental Memory**
+
+The theory distinguishes persistent knowledge formation from learned
+relational inference. A trainable reasoner may improve retrieval,
+correspondence, prediction, strategy ranking, and recursive deliberation
+while explicit developmental memory retains authority for grounding,
+provenance, validation, and persistent knowledge.
 
 ### **Transformation Primacy**
 
@@ -6758,6 +7066,20 @@ The theory therefore shifts the focus of intelligence from optimization
 and representation toward developmental memory organization.
 
 # **20. Conclusion and Future Research Agenda**
+
+## **Version 0.7.0 Research Extension**
+
+The next empirical phase must test the boundary between **memory
+formation** and **learned reasoning over memory**. Hydra v9.7.2 provides
+the reference implementation: explicit M0-M7 developmental memory
+supplies the grounded, auditable substrate; an HGT-style learned
+relational operator performs bounded inference over retrieved subgraphs;
+recursive deliberation refines candidates; and environmental
+consequences return causal evidence to memory and future training.
+
+The decisive question is whether this hybrid produces reproducible gains
+over Hydra-only reasoning without weakening the developmental claims
+that make those gains scientifically interpretable.
 
 ## **Conclusion**
 
@@ -7333,3 +7655,54 @@ lineage storage, plausibility calibration, online-statistics data
 structures, memory retirement, provenance representation, and concrete
 graph implementation are system-design or experimental decisions rather
 than additions to the theory.
+
+------------------------------------------------------------------------
+
+## **Version 0.7.0 Research Addendum**
+
+Version 0.7.0 introduces **H19: Learned Relational Reasoning Over
+Emergent Memory** and aligns the research contract with Hydra Memory
+System Design v9.7.2.
+
+The reference implementation uses an HGT-style heterogeneous graph
+transformer, but H19 does not require HGT specifically. The scientific
+claim is that a learned relational operator can exploit the explicit
+developmental memory graph while remaining subordinate to its grounding,
+provenance, lifecycle, and causal validation rules.
+
+The principal new causal comparison is:
+
+``` text
+Hydra only
+vs.
+Hydra + learned relational single-pass
+vs.
+Hydra + learned relational recursive deliberation
+```
+
+with matched interaction budgets, held-out evaluation, model-version and
+memory-version provenance, and explicit measurement of reasoning cost
+and historical retention.
+
+This extension changes the theory from:
+
+``` text
+developmental memory -> cognition
+```
+
+to the more precise:
+
+``` text
+interaction
+    -> developmental memory formation
+    -> explicit grounded relational substrate
+    -> learned relational inference
+    -> recursive candidate refinement
+    -> action
+    -> causal consequence
+    -> memory update + continual reasoner learning
+```
+
+Persistent knowledge remains developmental and evidence-governed.
+Learned reasoning becomes an adaptive computational operator over that
+knowledge.
