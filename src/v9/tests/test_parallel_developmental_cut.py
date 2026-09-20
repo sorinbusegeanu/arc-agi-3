@@ -58,7 +58,7 @@ def test_consolidation_retries_if_support_changes_after_cut(tmp_path, monkeypatc
     monkeypatch.setattr(runtime, "_prepare_dirty_rows_parallel", prepare_with_support_advance)
     runtime.flush_deferred_memory_updates()
 
-    assert runtime.signature_index.support(signature) == runtime.signature_support(signature)
+    assert runtime.signature_index.get(signature).support == runtime.signature_support(signature)
 
 
 def test_replay_retries_if_authoritative_cut_changes(tmp_path, monkeypatch) -> None:
