@@ -1226,9 +1226,26 @@ def run_parallel_memory_jobs(
             progressed = pipeline.service()
             if progressed:
                 last_progress_at = time.monotonic()
-            elif not pipeline.block_for_result():
-                if time.monotonic() - last_progress_at >= _PIPELINE_DRAIN_STALL_SECONDS:
-                    raise RuntimeError("derivation drain stalled")
+                continue
+            if pipeline.block_for_result():
+                last_progress_at = time.monotonic()
+                continue
+
+            # After ingestion is fully drained no new support can arrive. A timed
+            # out derivation lease can therefore be retried immediately instead of
+            # turning a transient worker loss/slow task into an epoch-fatal stall.
+            if time.monotonic() - last_progress_at >= _PIPELINE_DRAIN_STALL_SECONDS:
+                retried = False
+                for task_id in tuple(sorted(pipeline._derivation_lease_by_task)):
+                    retried = pipeline._retry_derivation_task(int(task_id)) or retried
+                if retried:
+                    last_progress_at = time.monotonic()
+                    continue
+                diagnostics = pipeline.diagnostics()
+                raise RuntimeError(
+                    "derivation drain stalled with no retryable leases: "
+                    f"{diagnostics}"
+                )
         memory.signal_derivation_stop()
         memory.join_derivation()
 
