@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from pathlib import Path
 from threading import RLock
@@ -1244,10 +1246,48 @@ class ContinuousMemoryRuntime:
             self._m1n_dirty.add(int(relation.structural_signature))
         return relation.structural_signature
 
+    def _parallel_worker_count(self, item_count: int) -> int:
+        return max(1, min(int(item_count), 16, os.cpu_count() or 1))
+
+    @staticmethod
+    def _prepare_dirty_m1n_row(snapshot):
+        signature, rows, support, watermark = snapshot
+        if not rows:
+            return None
+        relation = rows[0]
+        parents = tuple(uid for occurrence in rows for uid in occurrence.provenance.parents)
+        evidence = tuple(uid for occurrence in rows for uid in occurrence.provenance.evidence)
+        return signature, (
+            CanonicalNode(relation.uid, MemoryLevel.M1, MemoryType.NORMALIZED_RELATION, (relation.structural_signature,), watermark),
+            {"observable_relation": relation.observable_relation, "channel": relation.channel.value,
+             "structural_signature": relation.structural_signature, "support": support,
+             "parents": [[uid.hi, uid.lo] for uid in parents]},
+            evidence,
+        )
+
     def flush_deferred_memory_updates(self) -> None:
+        # Snapshot mutable inputs under the lock; do CPU-heavy materialization outside it.
         with self._lock:
             pending = tuple(self._deferred_base_nodes.values())
             self._deferred_base_nodes.clear()
+            dirty = tuple(self._m1n_dirty)
+            watermark = self._watermark
+            dirty_snapshots = []
+            for signature in dirty:
+                rows = tuple(self._m1n_occurrences.get(int(signature), ()))
+                if rows:
+                    dirty_snapshots.append((int(signature), rows, self.signature_support(int(signature), len(rows)), watermark))
+
+        workers = self._parallel_worker_count(len(dirty_snapshots))
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="v9-consolidate") as pool:
+                prepared = tuple(pool.map(self._prepare_dirty_m1n_row, dirty_snapshots))
+        else:
+            prepared = tuple(self._prepare_dirty_m1n_row(row) for row in dirty_snapshots)
+        dirty_rows = [row for row in prepared if row is not None]
+
+        # Publication mutates canonical state and remains deterministic/serialized.
+        with self._lock:
             batch_size = 16384
             for offset in range(0, len(pending), batch_size):
                 chunk = pending[offset : offset + batch_size]
@@ -1263,21 +1303,14 @@ class ContinuousMemoryRuntime:
                         if not isinstance(raw_parent, (list, tuple)) or len(raw_parent) != 2:
                             continue
                         parent = MemoryUid(int(raw_parent[0]), int(raw_parent[1]))
-                        edge = RelationEdge(node.uid, RelationType.PROVENANCE, parent, evidence)
-                        writes.append(MutationWrite(edge=edge))
+                        writes.append(MutationWrite(edge=RelationEdge(node.uid, RelationType.PROVENANCE, parent, evidence)))
                         target_partitions.add(self.partitions.owner(parent))
                 if writes:
                     proposal = MutationProposal.build(
-                        MutationKind.UPSERT_NODE,
-                        target_partitions=tuple(sorted(target_partitions)),
-                        read_set=ReadSet.build(
-                            (),
-                            maximum_size=self.config.scientific.maximum_read_set_size,
-                        ),
-                        evidence_refs=tuple(sorted(evidence_refs)),
-                        causal_watermark=self._watermark,
-                        writes=tuple(writes),
-                        proposal_class=ProposalClass.ADDITIVE,
+                        MutationKind.UPSERT_NODE, target_partitions=tuple(sorted(target_partitions)),
+                        read_set=ReadSet.build((), maximum_size=self.config.scientific.maximum_read_set_size),
+                        evidence_refs=tuple(sorted(evidence_refs)), causal_watermark=self._watermark,
+                        writes=tuple(writes), proposal_class=ProposalClass.ADDITIVE,
                     )
                     self.telemetry["proposals"] += 1
                     self.telemetry["cross_partition_transactions"] += int(len(target_partitions) > 1)
@@ -1286,70 +1319,22 @@ class ContinuousMemoryRuntime:
                         self.telemetry["accepted"] += 1
                         if self.config.enable_lifecycle:
                             for node, _, _ in chunk:
-                                self.lifecycle.observe(
-                                    node.uid,
-                                    support_delta=1,
-                                    relevant_opportunity=True,
-                                    watermark=self._watermark,
-                                )
+                                self.lifecycle.observe(node.uid, support_delta=1, relevant_opportunity=True, watermark=self._watermark)
                     elif result.outcome.value == "STALE_READ_SET":
                         self.telemetry["stale"] += 1
                         self.telemetry["read_set_conflicts"] += 1
                     else:
                         self.telemetry["rejected"] += 1
 
-            dirty = tuple(self._m1n_dirty)
-            dirty_rows: list[tuple[int, tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]]]] = []
-            for signature in dirty:
-                rows = self._m1n_occurrences.get(int(signature), ())
-                if not rows:
-                    continue
-                relation = rows[0]
-                support = self.signature_support(int(signature), len(rows))
-                retained_parents = tuple(
-                    uid
-                    for occurrence in rows
-                    for uid in occurrence.provenance.parents
-                )
-                retained_evidence = tuple(
-                    uid
-                    for occurrence in rows
-                    for uid in occurrence.provenance.evidence
-                )
-                dirty_rows.append((signature, (
-                    CanonicalNode(
-                        relation.uid,
-                        MemoryLevel.M1,
-                        MemoryType.NORMALIZED_RELATION,
-                        (relation.structural_signature,),
-                        self._watermark,
-                    ),
-                    {
-                        "observable_relation": relation.observable_relation,
-                        "channel": relation.channel.value,
-                        "structural_signature": relation.structural_signature,
-                        "support": support,
-                        "parents": [[uid.hi, uid.lo] for uid in retained_parents],
-                    },
-                    retained_evidence,
-                )))
             maximum_dependencies = int(self.config.scientific.maximum_read_set_size)
             if not hasattr(self, "canonical_store"):
                 for signature, (node, payload, evidence) in dirty_rows:
-                    if self._publish(
-                        node,
-                        payload,
-                        evidence,
-                        proposal_class=ProposalClass.STATEFUL,
-                    ):
+                    if self._publish(node, payload, evidence, proposal_class=ProposalClass.STATEFUL):
                         self._m1n_dirty.discard(signature)
                 return
-            pending_rows: list[tuple[int, tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]]]] = []
+            pending_rows = []
             pending_dependencies = 0
             for signature, row in dirty_rows:
-                # The normalized node is the stateful support authority. Its
-                # provenance-edge additions are commutative and do not consume
-                # optimistic read dependencies.
                 cost = 1
                 if cost > maximum_dependencies:
                     raise ValueError("one dirty M1 row exceeds the configured read-set bound")
@@ -1361,10 +1346,9 @@ class ContinuousMemoryRuntime:
                     pending_dependencies = 0
                 pending_rows.append((signature, row))
                 pending_dependencies += cost
-            if pending_rows:
-                if self._publish_stateful_group(tuple(row for _, row in pending_rows)):
-                    for pending_signature, _ in pending_rows:
-                        self._m1n_dirty.discard(pending_signature)
+            if pending_rows and self._publish_stateful_group(tuple(row for _, row in pending_rows)):
+                for pending_signature, _ in pending_rows:
+                    self._m1n_dirty.discard(pending_signature)
 
     def _ingest(self, event: TimelineEvent) -> tuple[int, ...]:
         self._formation_environments.add(int(event.identity.environment_instance_id))
@@ -1706,26 +1690,62 @@ class ContinuousMemoryRuntime:
                     candidate.provenance.evidence,
                 )
 
+    @staticmethod
+    def _prepare_development(snapshot):
+        signature, rows, support, formation_scope = snapshot
+        if len(rows) < 2 or support < 2:
+            return None
+        family = form_families(rows)[0]
+        family = replace(family, recurrence=support, compression_benefit=float(support - 1))
+        roles = tuple(form_roles((family,), consequence_by_family={family.uid.lo: family.structural_signature}))
+        concepts = tuple(
+            M4Concept.candidate((role,), compression_benefit=family.compression_benefit,
+                                explanatory_reach=max(1, len(role.provenance.evidence)),
+                                transfer_prior=0.5, formation_scope=formation_scope)
+            for role in roles
+        )
+        return family, roles, concepts
+
+    def _commit_development(self, prepared) -> None:
+        if prepared is None:
+            return
+        family, roles, concepts = prepared
+        self._m2[family.uid] = family
+        self._publish(
+            CanonicalNode(family.uid, MemoryLevel.M2, MemoryType.FAMILY, (family.structural_signature,), self._watermark),
+            {"structural_signature": family.structural_signature, "recurrence": family.recurrence,
+             "compression_benefit": family.compression_benefit,
+             "parents": [[uid.hi, uid.lo] for uid in family.provenance.parents]},
+            family.provenance.evidence,
+        )
+        for role, candidate in zip(roles, concepts):
+            self._m3[role.uid] = role
+            self._publish(
+                CanonicalNode(role.uid, MemoryLevel.M3, MemoryType.ROLE, (role.relational_signature, role.consequence_signature), self._watermark),
+                {"relational_signature": role.relational_signature, "consequence_signature": role.consequence_signature,
+                 "parents": [[uid.hi, uid.lo] for uid in role.provenance.parents]},
+                role.provenance.evidence,
+            )
+            if candidate.uid not in self._m4:
+                self._m4[candidate.uid] = candidate
+                self._publish(
+                    CanonicalNode(candidate.uid, MemoryLevel.M4, MemoryType.CONCEPT, candidate.invariant_descriptor, self._watermark),
+                    {"invariant_descriptor": list(candidate.invariant_descriptor), "compression_benefit": candidate.compression_benefit,
+                     "explanatory_reach": candidate.explanatory_reach, "transfer_prior": candidate.transfer_prior,
+                     "formation_scope": list(candidate.provenance.formation_scope), "held_out_targets": [],
+                     "validated": False, "concept_state": candidate.state.value,
+                     "parents": [[uid.hi, uid.lo] for uid in candidate.provenance.parents]},
+                    candidate.provenance.evidence,
+                )
+
     def _develop(self, signatures: tuple[int, ...] = ()) -> None:
-        for signature in tuple(sorted(set(signatures)))[: self.config.scientific.replay_candidates_per_interval]:
-            rows = tuple(self._m1n_occurrences[signature])
-            support = self.signature_support(signature, len(rows))
-            if len(rows) < 2 or support < 2:
-                continue
-            family = form_families(rows)[0]
-            family = replace(family, recurrence=support, compression_benefit=float(support - 1))
-            self._m2[family.uid] = family
-            self._publish(CanonicalNode(family.uid, MemoryLevel.M2, MemoryType.FAMILY, (family.structural_signature,), self._watermark), {"structural_signature": family.structural_signature, "recurrence": family.recurrence, "compression_benefit": family.compression_benefit, "parents": [[row.uid.hi, row.uid.lo] for row in rows]}, family.provenance.evidence)
-            roles = form_roles((family,), consequence_by_family={family.uid.lo: family.structural_signature})
-            for role in roles:
-                self._m3[role.uid] = role
-                self._publish(CanonicalNode(role.uid, MemoryLevel.M3, MemoryType.ROLE, (role.relational_signature, role.consequence_signature), self._watermark), {"relational_signature": role.relational_signature, "consequence_signature": role.consequence_signature, "parents": [[uid.hi, uid.lo] for uid in role.provenance.parents]}, role.provenance.evidence)
-                formation_scope = tuple(sorted(self._formation_environments))
-                compression = family.compression_benefit
-                candidate = M4Concept.candidate((role,), compression_benefit=compression, explanatory_reach=max(1, len(role.provenance.evidence)), transfer_prior=0.5, formation_scope=formation_scope)
-                if candidate.uid not in self._m4:
-                    self._m4[candidate.uid] = candidate
-                    self._publish(CanonicalNode(candidate.uid, MemoryLevel.M4, MemoryType.CONCEPT, candidate.invariant_descriptor, self._watermark), {"invariant_descriptor": list(candidate.invariant_descriptor), "compression_benefit": candidate.compression_benefit, "explanatory_reach": candidate.explanatory_reach, "transfer_prior": candidate.transfer_prior, "formation_scope": list(candidate.provenance.formation_scope), "held_out_targets": [], "validated": False, "concept_state": candidate.state.value, "parents": [[uid.hi, uid.lo] for uid in candidate.provenance.parents]}, candidate.provenance.evidence)
+        selected = tuple(sorted(set(signatures)))[: self.config.scientific.replay_candidates_per_interval]
+        formation_scope = tuple(sorted(self._formation_environments))
+        for signature in selected:
+            rows = tuple(self._m1n_occurrences.get(signature, ()))
+            self._commit_development(self._prepare_development(
+                (signature, rows, self.signature_support(signature, len(rows)), formation_scope)
+            ))
 
     def effective_state(self, uid: MemoryUid, *, lineage_uid: LineageUid | None = None, context_scope_id: ContextScopeId | None = None, target_environment_id: int | None = None) -> EffectiveCognitiveState:
         node = self.graph.nodes.get(uid)
@@ -1745,6 +1765,7 @@ class ContinuousMemoryRuntime:
         return outcome
 
     def replay_once(self) -> ReplayResult:
+        # Snapshot under lock, derive independently in parallel, commit in stable order.
         with self._lock:
             before_m0 = self.graph.memory_count(MemoryLevel.M0)
             candidates = tuple(
@@ -1752,18 +1773,38 @@ class ContinuousMemoryRuntime:
                 for uid, fitness in sorted(self._replay_pool.items())
                 if uid in self.graph.nodes and uid in self.graph.payloads
             )
-
-            def process(_candidate: ReplayCandidate) -> tuple[int, int, int]:
-                payload = self.graph.payloads.get(_candidate.uid)
-                if payload is None or _candidate.uid not in self.graph.nodes:
-                    self._replay_pool.pop(_candidate.uid, None)
-                    return 0, 0, 0
-                before_nodes, before_generation = len(self.graph.nodes), self.graph.generation
+            selected = tuple(sorted(candidates, key=lambda row: (-row.fitness, row.uid))[: self.replay.candidate_limit])
+            formation_scope = tuple(sorted(self._formation_environments))
+            snapshots = []
+            for candidate in selected:
+                payload = self.graph.payloads.get(candidate.uid)
+                if payload is None or candidate.uid not in self.graph.nodes:
+                    self._replay_pool.pop(candidate.uid, None)
+                    continue
                 signature = int(payload["structural_signature"])
-                self._develop((signature,))
-                return len(self.graph.nodes) - before_nodes, int(self.graph.generation > before_generation), 0
+                rows = tuple(self._m1n_occurrences.get(signature, ()))
+                snapshots.append((signature, rows, self.signature_support(signature, len(rows)), formation_scope))
 
-            result = self.replay.run(candidates, process)
+        workers = self._parallel_worker_count(len(snapshots))
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="v9-replay") as pool:
+                prepared = tuple(pool.map(self._prepare_development, snapshots))
+        else:
+            prepared = tuple(self._prepare_development(row) for row in snapshots)
+
+        with self._lock:
+            new_memories = revisions = 0
+            for row in prepared:
+                before_nodes, before_generation = len(self.graph.nodes), self.graph.generation
+                self._commit_development(row)
+                new_memories += len(self.graph.nodes) - before_nodes
+                revisions += int(self.graph.generation > before_generation)
+            processed = len(snapshots)
+            self.replay.selected += len(selected)
+            self.replay.processed += processed
+            self.replay.new_memories += new_memories
+            self.replay.revisions += revisions
+            result = ReplayResult(len(selected), processed, new_memories, revisions, 0)
             if self.graph.memory_count(MemoryLevel.M0) != before_m0:
                 raise RuntimeError("replay may not fabricate M0 environment evidence")
             self.evidence.append("REPLAY", self._watermark, asdict(result))
