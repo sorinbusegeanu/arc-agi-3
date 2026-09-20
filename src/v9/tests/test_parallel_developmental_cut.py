@@ -56,7 +56,7 @@ def test_consolidation_retries_if_support_changes_after_cut(tmp_path, monkeypatc
 
     relation = runtime._m1n_occurrences[signature][0]
     assert runtime.graph.payloads[relation.uid]["support"] == runtime.signature_support(signature)
-    assert signature not in runtime._m1n_dirty
+    assert runtime.signature_index.support(signature) == runtime.signature_support(signature)
 
 
 def test_replay_retries_if_authoritative_cut_changes(tmp_path, monkeypatch) -> None:
