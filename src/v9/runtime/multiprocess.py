@@ -258,6 +258,36 @@ def _silence_actor_output():
         os.close(sink_fd)
 
 
+def _ensure_live_child_stdio() -> None:
+    """Leave multiprocessing bootstrap with flushable stdout/stderr streams.
+
+    Some environment libraries close a Python stdio wrapper during teardown.
+    multiprocessing flushes both streams after the process target returns, so a
+    closed wrapper causes the fatal "lost sys.stderr" shutdown diagnostic.
+    Rebind only streams that can no longer be flushed, using a duplicate of the
+    corresponding live OS descriptor.
+    """
+
+    for name, fd in (("stdout", 1), ("stderr", 2)):
+        stream = getattr(sys, name, None)
+        try:
+            stream.flush()
+            continue
+        except (AttributeError, OSError, ValueError):
+            pass
+        try:
+            replacement = os.fdopen(
+                os.dup(fd),
+                "w",
+                buffering=1,
+                encoding=getattr(stream, "encoding", None) or "utf-8",
+                errors=getattr(stream, "errors", None) or "backslashreplace",
+            )
+        except (OSError, ValueError):
+            continue
+        setattr(sys, name, replacement)
+
+
 def _put_counted_stage_batch(
     stage_queue: Any,
     counters: Any,
@@ -607,6 +637,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                         close()
                 except BaseException:
                     pass
+        _ensure_live_child_stdio()
 
 
 def stage_worker_main(stage_queue: Any, shard_queues: tuple[Any, ...]) -> None:
