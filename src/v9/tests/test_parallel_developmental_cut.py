@@ -48,6 +48,7 @@ def test_consolidation_retries_if_support_changes_after_cut(tmp_path, monkeypatc
             with runtime._lock:
                 support = runtime.signature_support(signature) + 1
                 runtime._m1n_supports[signature] = support
+                runtime._m1n_dirty.add(signature)
                 runtime.signature_index.mark_dirty(signature, support)
         return rows
 
