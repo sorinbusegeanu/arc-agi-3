@@ -180,9 +180,13 @@ class AlfworldTextBackend:
         return self._capture(observation, info), self._instruction, boundary
 
     def close(self) -> None:
-        close = getattr(self._environment, "close", None)
-        if callable(close):
-            close()
+        # TextWorld runs inside a short-lived Hydra actor process.  Its close()
+        # path can close an inherited Python stdio wrapper (observed with
+        # CPython 3.14 free-threaded), after which multiprocessing teardown
+        # fails while flushing stderr.  TextWorld owns no external simulator
+        # process here, so process exit is the authoritative cleanup boundary.
+        self._environment = None
+        self._actions = ()
 
 
 class AlfworldThorBackend:
