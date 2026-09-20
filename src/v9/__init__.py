@@ -2,9 +2,14 @@
 
 from v9.environments.contract import EnvironmentCognitionAdapter
 from v9.memory.identity import EventUid, MemoryUid
-from v9.runtime import RuntimeConfig, ScientificConfig, ScientificConfigId
+from v9.runtime import (
+    LearnedDevelopmentalFeedbackProfile,
+    RuntimeConfig,
+    ScientificConfig,
+    ScientificConfigId,
+    ScientificVisibilityMode,
+)
 from v9.runtime.v978_conformant import V978ContinuousMemoryRuntime
-from v9.runtime.multiprocess import EncodedTransition
 from v9.runtime.derivation_publication import install_bounded_derivation_publication
 from v9.runtime.residency import ResidentMemoryManager, install_bounded_residency
 from v9.runtime.bounded_indexes import install_bounded_indexes
@@ -35,28 +40,6 @@ install_viability_confidence(ContinuousMemoryRuntime)
 install_grounding_action_index(ContinuousMemoryRuntime)
 install_actor_policy_cache(ContinuousMemoryRuntime)
 _runtime_package.ContinuousMemoryRuntime = ContinuousMemoryRuntime
-
-# --actors is sampler-process parallelism, not merely a cap on one-job-per-game
-# scheduling. Split per-game budgets when fewer jobs than actor slots exist.
-from v9.runtime import parallel_memory_coordinator as _parallel_memory_coordinator
-from v9.runtime.actor_job_parallelism import install_actor_job_parallelism as _install_actor_job_parallelism
-_install_actor_job_parallelism(_parallel_memory_coordinator)
-
-# Terminal status is derived from the three authoritative boundary fields.
-if not hasattr(EncodedTransition, "done"):
-    EncodedTransition.done = property(
-        lambda self: bool(self.task_success or self.task_failure or self.task_truncated)
-    )
-
-# High-throughput actors route through the passive-capture adapter factory so
-# symbol timestamps reflect observation/action order rather than post-hoc labels.
-from v9.runtime import multiprocess as _multiprocess
-from v9.environments.passive_capture import install_process_factory_route as _install_process_factory_route
-_install_process_factory_route(_multiprocess)
-from v9.runtime.adaptive_exploration import install_adaptive_exploration as _install_adaptive_exploration
-_install_adaptive_exploration(_multiprocess)
-from v9.runtime.actor_production_telemetry import install_actor_production_telemetry as _install_actor_production_telemetry
-_install_actor_production_telemetry(_multiprocess.ProcessTopology)
 
 # HGT uses canonical SymbolOccurrence payloads as the only SYMBOL authority.
 from v9.hgt import training as _hgt_training
@@ -115,12 +98,80 @@ from v9.runtime import epoch_runner as _epoch_runner
 _epoch_runner.train_hgt_epoch = _hgt_training.train_hgt_epoch
 _runtime_package.ContinuousMemoryRuntime = ContinuousMemoryRuntime
 
+_LAZY_EXPORTS = {
+    name: ("v9.runtime", name)
+    for name in (
+        "CanonicalStateHandle", "CanonicalStore", "CanonicalTransaction",
+        "CanonicalCommitWAL", "DevelopmentalCut", "EpochInferenceView",
+        "PersistenceFrontiers", "PolicyProjection", "PolicyVersion",
+        "SignatureIndexStore", "StorageGovernor", "StorageGovernorStatus",
+        "TrainingEvidenceManifest", "TrainingEvidenceRecord", "TransportBatchBundle",
+        "TransportSlabDescriptor", "TransportSlabPool", "TransactionOverlay",
+        "WALRecoveryResult",
+    )
+}
+_LAZY_EXPORTS.update({
+    name: ("v9.research.experiment_manifest", name)
+    for name in (
+        "ExperimentManifest", "ExperimentManifestId", "GroundingCondition",
+        "InteractionOpportunityManifest", "ReasoningCondition", "ScientificEvidenceId",
+        "StructuralPriorProfile", "TrialManifest", "TrialSpec",
+    )
+})
+_LAZY_EXPORTS.update({
+    "DevelopmentalMilestoneLedger": ("v9.research.prediction_registry", "DevelopmentalMilestoneLedger"),
+    "ResearchPredictionRegistry": ("v9.research.prediction_registry", "ResearchPredictionRegistry"),
+})
+
+
+def __getattr__(name: str):
+    import importlib
+
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(name)
+    value = getattr(importlib.import_module(target[0]), target[1])
+    globals()[name] = value
+    return value
+
 __all__ = [
     "ContinuousMemoryRuntime",
+    "CanonicalStateHandle",
+    "CanonicalStore",
+    "CanonicalTransaction",
+    "CanonicalCommitWAL",
+    "DevelopmentalCut",
+    "DevelopmentalMilestoneLedger",
+    "EpochInferenceView",
     "EnvironmentCognitionAdapter",
     "EventUid",
     "MemoryUid",
     "RuntimeConfig",
     "ScientificConfig",
     "ScientificConfigId",
+    "ScientificVisibilityMode",
+    "LearnedDevelopmentalFeedbackProfile",
+    "PersistenceFrontiers",
+    "PolicyProjection",
+    "PolicyVersion",
+    "ExperimentManifest",
+    "ExperimentManifestId",
+    "GroundingCondition",
+    "InteractionOpportunityManifest",
+    "ReasoningCondition",
+    "ScientificEvidenceId",
+    "StructuralPriorProfile",
+    "TrialManifest",
+    "TrialSpec",
+    "TransactionOverlay",
+    "SignatureIndexStore",
+    "StorageGovernor",
+    "StorageGovernorStatus",
+    "TrainingEvidenceManifest",
+    "TrainingEvidenceRecord",
+    "TransportBatchBundle",
+    "TransportSlabDescriptor",
+    "TransportSlabPool",
+    "WALRecoveryResult",
+    "ResearchPredictionRegistry",
 ]

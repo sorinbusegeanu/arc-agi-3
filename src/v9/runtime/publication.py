@@ -5,9 +5,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import heapq
 from threading import RLock
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Callable
 
-from v9.memory.identity import MemoryUid
+from v9.memory.identity import MemoryUid, stable_u64
 from v9.memory.model import CanonicalNode, MemoryLevel, MemoryType
 from v9.memory.relations import EdgeAuthority, RelationEdge, RelationType
 from v9.mutation.proposals import MutationKind, MutationProposal
@@ -79,6 +80,17 @@ class CanonicalGraph:
         self._cached_read_view: ReadView | None = None
         self._coordinator = TransactionCoordinator(partition_count)
         self._publication_lock = RLock()
+        self._durable_commit: Callable[..., None] | None = None
+
+    def configure_durable_commit(self, callback: Callable[..., None] | None) -> None:
+        """Set the explicit WAL/immutable-store owner for accepted publications.
+
+        The callback runs after all proposal validation and staging, but before
+        any live graph dictionary is changed.  Raising from it therefore leaves
+        the actor-visible graph at its previous complete generation.
+        """
+        with self._publication_lock:
+            self._durable_commit = callback
 
     def _index_edge(self, edge: RelationEdge) -> None:
         self._outgoing_edge_keys.setdefault(edge.source, set()).add(edge.key)
@@ -172,8 +184,16 @@ class CanonicalGraph:
                 else:
                     if current_edge is None:
                         edge_count_deltas[owner] += 1
-                    edge_updates[write.edge.key] = write.edge
+                edge_updates[write.edge.key] = write.edge
                 refs.append(ref)
+        if self._durable_commit is not None:
+            self._durable_commit(
+                proposal=proposal,
+                node_updates=node_updates,
+                node_deletes={},
+                edge_updates=edge_updates,
+                next_generation=self.generation + 1,
+            )
         for uid, (node, payload) in node_updates.items():
             if uid not in self.nodes:
                 owner = uid.shard(self.partition_count)
@@ -308,6 +328,20 @@ class CanonicalGraph:
             for uid in retiring:
                 incident_keys.update(self._outgoing_edge_keys.get(uid, ()))
                 incident_keys.update(self._incoming_edge_keys.get(uid, ()))
+            if self._durable_commit is not None:
+                self._durable_commit(
+                    proposal=SimpleNamespace(
+                        proposal_uid=stable_u64(
+                            self.generation,
+                            *(uid.hex() for uid in sorted(retiring)),
+                            person=b"v9-retire-wal",
+                        )
+                    ),
+                    node_updates={},
+                    node_deletes={uid: accepted[uid][0] for uid in retiring},
+                    edge_updates={key: None for key in incident_keys},
+                    next_generation=self.generation + 1,
+                )
             for key in tuple(incident_keys):
                 edge = self.edges.get(key)
                 if edge is None:

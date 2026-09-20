@@ -1,0 +1,447 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import struct
+from dataclasses import dataclass, replace
+from pathlib import Path
+from threading import RLock
+from typing import Any, Callable, Iterable, Mapping
+
+from .canonical_store import CanonicalStateHandle, CanonicalStore
+from .canonical_transaction import TransactionOverlay
+
+
+_HEADER_MAGIC = b"V9WAL716"
+_FRAME_MAGIC = b"FRM1"
+_FOOTER_MAGIC = b"CMT1"
+_VERSION = 1
+_HEADER = struct.Struct(">8sIQQIQ32s")
+_FRAME = struct.Struct(">4sQQQ32s")
+_FOOTER = struct.Struct(">4sQQ32s")
+
+
+def _json_bytes(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def _checksum(value: bytes) -> bytes:
+    return hashlib.sha256(value).digest()
+
+
+@dataclass(frozen=True, slots=True)
+class WalGroupHeader:
+    group_id: int
+    previous_lsn: int
+    frame_count: int
+    payload_bytes: int
+    checksum: str
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalCommitFrame:
+    wal_lsn: int
+    wal_tx_id: str
+    previous_lsn: int
+    mutations: tuple[Mapping[str, Any], ...] = ()
+    scientific_identity: Mapping[str, Any] | None = None
+    producer_causal_ranges: tuple[tuple[int, int, int], ...] = ()
+    training_evidence_records: tuple[Mapping[str, Any], ...] = ()
+    work_metadata: Mapping[str, int] | None = None
+    checksum: str = ""
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "wal_lsn": self.wal_lsn,
+            "wal_tx_id": self.wal_tx_id,
+            "previous_lsn": self.previous_lsn,
+            "mutations": list(self.mutations),
+            "scientific_identity": self.scientific_identity,
+            "producer_causal_ranges": [list(row) for row in self.producer_causal_ranges],
+            "training_evidence_records": list(self.training_evidence_records),
+            "work_metadata": self.work_metadata,
+        }
+
+    def with_checksum(self) -> "CanonicalCommitFrame":
+        digest = hashlib.sha256(_json_bytes(self.payload())).hexdigest()
+        if self.checksum and self.checksum != digest:
+            raise ValueError("canonical WAL frame checksum mismatch")
+        return self if self.checksum else replace(self, checksum=digest)
+
+
+@dataclass(frozen=True, slots=True)
+class WalGroupCommitFooter:
+    group_id: int
+    last_lsn: int
+    group_checksum: str
+
+
+@dataclass(frozen=True, slots=True)
+class WALRecoveryResult:
+    frames: tuple[CanonicalCommitFrame, ...]
+    groups: int
+    wal_durable_lsn: int
+    valid_bytes: int
+    truncated_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class PersistenceFrontiers:
+    wal_durable_lsn: int = 0
+    canonical_applied_lsn: int = 0
+    snapshot_applied_lsn: int = 0
+    hgt_checkpoint_lsn: int = 0
+
+    def __post_init__(self) -> None:
+        values = (
+            self.wal_durable_lsn,
+            self.canonical_applied_lsn,
+            self.snapshot_applied_lsn,
+            self.hgt_checkpoint_lsn,
+        )
+        if min(values) < 0:
+            raise ValueError("persistence frontiers must be non-negative")
+        if not self.wal_durable_lsn >= self.canonical_applied_lsn >= self.snapshot_applied_lsn:
+            raise ValueError("WAL/canonical/snapshot frontier invariant violated")
+        if self.hgt_checkpoint_lsn > self.wal_durable_lsn:
+            raise ValueError("HGT checkpoint cannot exceed durable WAL")
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalRecoveryResult:
+    store: CanonicalStore
+    wal_recovery: WALRecoveryResult
+    replayed_lsns: tuple[int, ...]
+    frontiers: PersistenceFrontiers
+
+
+def _decode_frame(payload: bytes, checksum: bytes, lsn: int, previous_lsn: int) -> CanonicalCommitFrame:
+    if _checksum(payload) != checksum:
+        raise ValueError("canonical WAL transaction-frame checksum mismatch")
+    raw = json.loads(payload.decode("utf-8"))
+    if int(raw["wal_lsn"]) != lsn or int(raw["previous_lsn"]) != previous_lsn:
+        raise ValueError("canonical WAL frame header/payload mismatch")
+    return CanonicalCommitFrame(
+        wal_lsn=lsn,
+        wal_tx_id=str(raw["wal_tx_id"]),
+        previous_lsn=previous_lsn,
+        mutations=tuple(dict(row) for row in raw.get("mutations", ())),
+        scientific_identity=None if raw.get("scientific_identity") is None else dict(raw["scientific_identity"]),
+        producer_causal_ranges=tuple(tuple(int(value) for value in row) for row in raw.get("producer_causal_ranges", ())),
+        training_evidence_records=tuple(dict(row) for row in raw.get("training_evidence_records", ())),
+        work_metadata=None if raw.get("work_metadata") is None else {str(key): int(value) for key, value in dict(raw["work_metadata"]).items()},
+        checksum=checksum.hex(),
+    )
+
+
+class CanonicalCommitWAL:
+    """Framed group-commit redo log; visibility advances only after fsync."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        max_group_frames: int = 1024,
+        max_pending_bytes: int = 64 * 1024 * 1024,
+        max_durable_consumers: int = 256,
+        fsync: Callable[[int], None] = os.fsync,
+    ) -> None:
+        if min(max_group_frames, max_pending_bytes, max_durable_consumers) <= 0:
+            raise ValueError("WAL group bounds must be positive")
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.max_group_frames = int(max_group_frames)
+        self.max_pending_bytes = int(max_pending_bytes)
+        self.max_durable_consumers = int(max_durable_consumers)
+        self._fsync = fsync
+        self._lock = RLock()
+        self._durable_consumers: dict[str, int] = {}
+        self._group_id = 0
+        self._durable_lsn = 0
+        self._poisoned = False
+        recovery = self.recover(truncate=True)
+        self._durable_lsn = recovery.wal_durable_lsn
+        self._group_id = recovery.groups
+
+    @property
+    def wal_durable_lsn(self) -> int:
+        with self._lock:
+            return self._durable_lsn
+
+    @property
+    def append_available(self) -> bool:
+        """Whether this process can safely append without reopening the WAL."""
+        with self._lock:
+            return not self._poisoned
+
+    @staticmethod
+    def _write_all(handle: Any, payload: bytes) -> None:
+        view = memoryview(payload)
+        while view:
+            written = handle.write(view)
+            if written is None or written <= 0:
+                raise OSError("canonical WAL write made no progress")
+            view = view[written:]
+
+    def _prepare_frames(
+        self, rows: Iterable[CanonicalCommitFrame | Mapping[str, Any]]
+    ) -> tuple[CanonicalCommitFrame, ...]:
+        result: list[CanonicalCommitFrame] = []
+        previous = self._durable_lsn
+        for index, row in enumerate(rows, start=1):
+            if isinstance(row, CanonicalCommitFrame):
+                tx_id = row.wal_tx_id
+                values = {
+                    "mutations": row.mutations,
+                    "scientific_identity": row.scientific_identity,
+                    "producer_causal_ranges": row.producer_causal_ranges,
+                    "training_evidence_records": row.training_evidence_records,
+                    "work_metadata": row.work_metadata,
+                }
+            else:
+                values = dict(row)
+                tx_id = str(values.pop("wal_tx_id", values.pop("transaction_id", "")))
+            if not tx_id:
+                raise ValueError("every WAL transaction requires wal_tx_id")
+            frame = CanonicalCommitFrame(
+                wal_lsn=self._durable_lsn + index,
+                wal_tx_id=tx_id,
+                previous_lsn=previous,
+                mutations=tuple(values.get("mutations", ())),
+                scientific_identity=values.get("scientific_identity"),
+                producer_causal_ranges=tuple(tuple(row) for row in values.get("producer_causal_ranges", ())),
+                training_evidence_records=tuple(values.get("training_evidence_records", ())),
+                work_metadata=values.get("work_metadata"),
+            ).with_checksum()
+            result.append(frame)
+            previous = frame.wal_lsn
+        if not result:
+            raise ValueError("cannot append an empty WAL group")
+        if len(result) > self.max_group_frames:
+            raise OverflowError("WAL group frame ceiling exceeded")
+        return tuple(result)
+
+    def append_group(
+        self, rows: Iterable[CanonicalCommitFrame | Mapping[str, Any]]
+    ) -> tuple[CanonicalCommitFrame, ...]:
+        with self._lock:
+            if self._poisoned:
+                raise RuntimeError(
+                    "canonical WAL append state is indeterminate; reopen and recover the WAL"
+                )
+            frames = self._prepare_frames(rows)
+            payloads = tuple(_json_bytes(frame.payload()) for frame in frames)
+            total_payload = sum(len(payload) for payload in payloads)
+            if total_payload > self.max_pending_bytes:
+                raise OverflowError("WAL group pending-byte ceiling exceeded")
+            group_id = self._group_id + 1
+            header_core = struct.pack(">8sIQQIQ", _HEADER_MAGIC, _VERSION, group_id, self._durable_lsn, len(frames), total_payload)
+            header_checksum = _checksum(header_core)
+            encoded_header = _HEADER.pack(
+                _HEADER_MAGIC,
+                _VERSION,
+                group_id,
+                self._durable_lsn,
+                len(frames),
+                total_payload,
+                header_checksum,
+            )
+            encoded_frames = []
+            for frame, payload in zip(frames, payloads):
+                encoded_frames.append(
+                    _FRAME.pack(
+                        _FRAME_MAGIC,
+                        frame.wal_lsn,
+                        frame.previous_lsn,
+                        len(payload),
+                        bytes.fromhex(frame.checksum),
+                    )
+                    + payload
+                )
+            group_checksum = _checksum(encoded_header + b"".join(encoded_frames))
+            footer = _FOOTER.pack(_FOOTER_MAGIC, group_id, frames[-1].wal_lsn, group_checksum)
+            try:
+                with self.path.open("ab", buffering=0) as handle:
+                    self._write_all(handle, encoded_header)
+                    for encoded_frame in encoded_frames:
+                        self._write_all(handle, encoded_frame)
+                    self._write_all(handle, footer)
+                    handle.flush()
+                    self._fsync(handle.fileno())
+            except BaseException:
+                # Once bytes may have reached the file, their durability is
+                # unknowable to this process.  Continuing from the old LSN can
+                # create a second branch with the same previous_lsn.  Recovery
+                # in a newly opened WAL is the only safe way to resume.
+                self._poisoned = True
+                raise
+            # The durable frontier moves only after the complete group fsync returns.
+            self._durable_lsn = frames[-1].wal_lsn
+            self._group_id = group_id
+            return frames
+
+    def recover(self, *, truncate: bool = True) -> WALRecoveryResult:
+        with self._lock:
+            if not self.path.exists():
+                return WALRecoveryResult((), 0, 0, 0, 0)
+            data = self.path.read_bytes()
+            offset = 0
+            valid_end = 0
+            frames: list[CanonicalCommitFrame] = []
+            groups = 0
+            expected_previous = 0
+            while offset + _HEADER.size <= len(data):
+                group_start = offset
+                try:
+                    magic, version, group_id, previous_lsn, frame_count, payload_bytes, header_checksum = _HEADER.unpack_from(data, offset)
+                    if (
+                        magic != _HEADER_MAGIC
+                        or version != _VERSION
+                        or group_id != groups + 1
+                        or previous_lsn != expected_previous
+                    ):
+                        break
+                    core = struct.pack(">8sIQQIQ", magic, version, group_id, previous_lsn, frame_count, payload_bytes)
+                    if (
+                        _checksum(core) != header_checksum
+                        or not 0 < frame_count <= self.max_group_frames
+                        or payload_bytes > self.max_pending_bytes
+                    ):
+                        break
+                    offset += _HEADER.size
+                    group_frames: list[CanonicalCommitFrame] = []
+                    actual_payload = 0
+                    frame_previous = previous_lsn
+                    for _ in range(frame_count):
+                        if offset + _FRAME.size > len(data):
+                            raise ValueError("torn frame header")
+                        frame_magic, lsn, prior, length, checksum = _FRAME.unpack_from(data, offset)
+                        if (
+                            frame_magic != _FRAME_MAGIC
+                            or prior != frame_previous
+                            or lsn != frame_previous + 1
+                            or length > self.max_pending_bytes
+                        ):
+                            raise ValueError("invalid frame header")
+                        offset += _FRAME.size
+                        if offset + length > len(data):
+                            raise ValueError("torn frame payload")
+                        payload = data[offset : offset + length]
+                        offset += length
+                        group_frames.append(_decode_frame(payload, checksum, lsn, prior))
+                        actual_payload += length
+                        frame_previous = lsn
+                    if actual_payload != payload_bytes or offset + _FOOTER.size > len(data):
+                        raise ValueError("invalid group payload size or torn footer")
+                    footer_magic, footer_group, last_lsn, group_checksum = _FOOTER.unpack_from(data, offset)
+                    if footer_magic != _FOOTER_MAGIC or footer_group != group_id or last_lsn != group_frames[-1].wal_lsn:
+                        raise ValueError("invalid WAL group footer")
+                    if _checksum(data[group_start:offset]) != group_checksum:
+                        raise ValueError("WAL group checksum mismatch")
+                    offset += _FOOTER.size
+                except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                    break
+                frames.extend(group_frames)
+                groups += 1
+                expected_previous = group_frames[-1].wal_lsn
+                valid_end = offset
+            truncated = len(data) - valid_end
+            if truncate and truncated:
+                with self.path.open("r+b") as handle:
+                    handle.truncate(valid_end)
+                    handle.flush()
+                    self._fsync(handle.fileno())
+            return WALRecoveryResult(tuple(frames), groups, expected_previous, valid_end, truncated)
+
+    def commit_overlay(
+        self,
+        store: CanonicalStore,
+        overlay: TransactionOverlay,
+        *,
+        transaction_id: str,
+        frame_payload: Mapping[str, Any] | None = None,
+        after_durable: Callable[[CanonicalCommitFrame], None] | None = None,
+    ) -> CanonicalStateHandle:
+        if overlay.base_handle is not store.current_handle:
+            raise RuntimeError("WAL commit overlay is not based on the current canonical handle")
+        values = dict(frame_payload or {})
+        values["wal_tx_id"] = transaction_id
+        frames = self.append_group((values,))
+        durable = frames[0]
+        if durable.wal_lsn != overlay.target_lsn:
+            raise RuntimeError("overlay target LSN does not match durable WAL LSN")
+        if after_durable is not None:
+            after_durable(durable)
+        return store.finalize_overlay(overlay)
+
+    def register_durable_consumer(self, name: str, checkpoint_lsn: int = 0) -> None:
+        if not name or not 0 <= checkpoint_lsn <= self.wal_durable_lsn:
+            raise ValueError("invalid WAL durable-consumer checkpoint")
+        with self._lock:
+            if name not in self._durable_consumers and len(self._durable_consumers) >= self.max_durable_consumers:
+                raise OverflowError("WAL durable-consumer count ceiling exceeded")
+            self._durable_consumers[name] = int(checkpoint_lsn)
+
+    def update_durable_consumer(self, name: str, checkpoint_lsn: int) -> None:
+        with self._lock:
+            previous = self._durable_consumers.get(name)
+            if previous is None:
+                raise KeyError(name)
+            if not previous <= checkpoint_lsn <= self._durable_lsn:
+                raise ValueError("durable-consumer checkpoints must advance within durable WAL")
+            self._durable_consumers[name] = int(checkpoint_lsn)
+
+    @property
+    def wal_reclaim_lsn(self) -> int:
+        with self._lock:
+            return min(self._durable_consumers.values(), default=0)
+
+
+def recover_canonical_store(
+    *,
+    snapshot_path: str | Path,
+    wal: CanonicalCommitWAL,
+    expected_scientific_identity: Mapping[str, str] | None = None,
+) -> CanonicalRecoveryResult:
+    store = CanonicalStore.from_snapshot(
+        snapshot_path, expected_scientific_identity=expected_scientific_identity
+    )
+    recovery = wal.recover(truncate=True)
+    snapshot_applied_lsn = store.current_handle.canonical_applied_lsn
+    replayed = []
+    for frame in recovery.frames:
+        if frame.wal_lsn <= store.current_handle.canonical_applied_lsn:
+            continue
+        overlay = store.begin_overlay(frame.wal_lsn)
+        for mutation in frame.mutations:
+            collection = str(mutation["collection"])
+            key = mutation["key"]
+            operation = str(mutation.get("operation", "put"))
+            if operation == "delete":
+                overlay.delete(collection, key)
+            elif operation == "put":
+                overlay.put(collection, key, mutation.get("value"))
+            else:
+                raise ValueError(f"unknown recovered canonical mutation: {operation}")
+        store.finalize_overlay(overlay)
+        replayed.append(frame.wal_lsn)
+    frontiers = PersistenceFrontiers(
+        recovery.wal_durable_lsn,
+        store.current_handle.canonical_applied_lsn,
+        snapshot_applied_lsn,
+        0,
+    )
+    return CanonicalRecoveryResult(store, recovery, tuple(replayed), frontiers)
+
+
+__all__ = [
+    "CanonicalCommitFrame",
+    "CanonicalCommitWAL",
+    "CanonicalRecoveryResult",
+    "PersistenceFrontiers",
+    "WALRecoveryResult",
+    "WalGroupCommitFooter",
+    "WalGroupHeader",
+    "recover_canonical_store",
+]

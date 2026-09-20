@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 from v9.memory.identity import MemoryUid
 from v9.runtime.canonical_commit_derivation import derivation_candidates
-from v9.runtime.actor_production_telemetry import _CountingStageQueue
+from v9.runtime.multiprocess import TransitionBatchEnvelope, _put_counted_stage_batch
 
 
 class _NoFullScan(dict):
@@ -59,9 +59,17 @@ def test_actor_production_counter_increments_after_queue_accepts() -> None:
 
     counters = [5]
     queue = Queue()
-    wrapped = _CountingStageQueue(queue, counters, 0)
+    envelope = TransitionBatchEnvelope(
+        1,
+        1,
+        2,
+        (
+            SimpleNamespace(actor_id=1, producer_sequence=1),
+            SimpleNamespace(actor_id=1, producer_sequence=2),
+        ),
+    )
 
-    wrapped.put("transition")
+    _put_counted_stage_batch(queue, counters, 0, envelope)
 
-    assert queue.rows == ["transition"]
-    assert counters[0] == 6
+    assert queue.rows == [envelope]
+    assert counters[0] == 7

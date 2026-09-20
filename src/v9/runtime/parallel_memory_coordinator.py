@@ -8,6 +8,7 @@ import time
 from threading import Thread
 from typing import Any
 
+from .actor_job_parallelism import expand_jobs_for_actor_limit
 from .canonical_commit import apply_canonical_commit_batch
 from .memory_pipeline import DerivationBatchTask, DerivationResult, IngestionBatchTask, IngestionTask, PreparedCommitBatch
 from .memory_worker_topology import MemoryWorkerTopology
@@ -58,10 +59,16 @@ def _drain_publication_batch(
             break
         if item[0] == "transition":
             transitions.append(item[3])
+        elif item[0] == "transition_batch":
+            transitions.extend(item[3].transitions)
+        elif item[0] == "shard_error":
+            raise RuntimeError(str(item[3]))
         elif item[0] == "shard_done":
             shard_done.append(int(item[1]))
             if preserve_shard_done:
                 marker_items.append(item)
+        if len(transitions) >= int(budget):
+            break
     if preserve_shard_done:
         for item in marker_items:
             publication_queue.put(item)
@@ -146,6 +153,7 @@ class ProcessActorResult:
     task_failures: int = 0
     task_truncations: int = 0
     levels_completed: int = 0
+    epoch_inference_view_id: str = ""
 
 
 def _reconcile_actor_liveness(
@@ -560,8 +568,14 @@ def run_parallel_memory_jobs(
     publication_queue_capacity: int,
     actor_view_refresh_steps: int = 64,
     actor_view_refresh_ms: float = 250.0,
+    allow_policy_refresh: bool = True,
+    bound_epoch_view: Any | None = None,
     hgt_dataset: Any | None = None,
 ) -> list[ProcessActorResult]:
+    original_job_count = len(jobs)
+    jobs = expand_jobs_for_actor_limit(jobs, actor_limit)
+    runtime.set_telemetry_gauge("sampling_jobs_before_actor_split", original_job_count)
+    runtime.set_telemetry_gauge("sampling_jobs_after_actor_split", len(jobs))
     target_actor_slots = min(int(actor_limit), len(jobs))
     topology = ProcessTopology(
         actors=target_actor_slots,
@@ -590,7 +604,12 @@ def run_parallel_memory_jobs(
     clean_exit_without_done: dict[int, float] = {}
     grounded_influence_total = 0
     peak_active_actors = 0
-    initial_policy = runtime.actor_policy_snapshot()
+    initial_policy = (
+        bound_epoch_view.policy_projection.snapshot
+        if bound_epoch_view is not None
+        else runtime.actor_policy_snapshot()
+    )
+    bound_epoch_view_id = "" if bound_epoch_view is None else str(bound_epoch_view.identity.checksum)
     published_policy_generation = int(initial_policy.generation)
     next_policy_publish = time.monotonic() + max(0.01, float(actor_view_refresh_ms) / 1000.0)
     run_nonce = int(runtime.watermark)
@@ -638,11 +657,13 @@ def run_parallel_memory_jobs(
             adapter_factory_path="v9.cli:make_adapter",
             alfred_backend_factory=alfred_backend_factory,
             run_nonce=run_nonce,
-            initial_policy=runtime.actor_policy_snapshot(),
+            initial_policy=(runtime.actor_policy_snapshot() if allow_policy_refresh else initial_policy),
             epsilon=float(epsilon),
             stagnation=stagnation,
             policy_refresh_steps=int(actor_view_refresh_steps),
             policy_refresh_ms=float(actor_view_refresh_ms),
+            policy_refresh_enabled=bool(allow_policy_refresh),
+            epoch_inference_view_id=bound_epoch_view_id,
         )
         process = topology.actor_processes[-1]
         if process.pid is None:
@@ -683,10 +704,12 @@ def run_parallel_memory_jobs(
     def drain_publication_queue() -> int:
         nonlocal publication_queue_drain_seconds, publication_queue_drain_rows
         available = int(pipeline.ingest_local_high_water) - max(0, int(pipeline.sampled) - int(pipeline.ingested))
-        if available <= 0:
+        if available < 64:
             return 0
         backlog = max(0, actor_produced_steps() - int(pipeline.sampled))
-        budget = min(int(available), _adaptive_publication_batch_size(backlog))
+        # A transport envelope contains at most 64 rows. Reserve its maximum
+        # possible overshoot before removing it from the multiprocessing queue.
+        budget = min(int(available) - 63, _adaptive_publication_batch_size(backlog))
         started = time.perf_counter()
         transitions, _ = _drain_publication_batch(topology.publication_queue, budget)
         publication_queue_drain_seconds += time.perf_counter() - started
@@ -742,7 +765,8 @@ def run_parallel_memory_jobs(
                     done.task_successes,
                     done.task_failures,
                     done.task_truncations,
-                    done.levels_completed,
+                        done.levels_completed,
+                        done.epoch_inference_view_id,
                 )
             )
             runtime.set_telemetry_gauge("live_environment_instances", len(active))
@@ -770,6 +794,7 @@ def run_parallel_memory_jobs(
             {
                 "sampled_steps": produced,
                 "actor_produced_steps": produced,
+                "causally_admitted_steps": published,
                 "publication_drained_steps": published,
                 "ingested_steps": ingested,
                 "sampling_backlog": max(0, produced - ingested),
@@ -864,7 +889,7 @@ def run_parallel_memory_jobs(
             missing = _reconcile_actor_liveness(active, clean_exit_without_done)
             runtime.set_telemetry_gauge("actors_exited_without_done", missing)
             now = time.monotonic()
-            if now >= next_policy_publish:
+            if allow_policy_refresh and now >= next_policy_publish:
                 snapshot = runtime.actor_policy_snapshot()
                 if int(snapshot.generation) > int(published_policy_generation):
                     topology.publish_policy_snapshot(tuple(slot for slot, _ in active.values()), snapshot)
@@ -889,7 +914,7 @@ def run_parallel_memory_jobs(
         completed_shards: set[int] = set()
         while shard_done < int(shards):
             available = int(pipeline.ingest_local_high_water) - max(0, int(pipeline.sampled) - int(pipeline.ingested))
-            if available <= 0:
+            if available < 64:
                 progressed = pipeline.service()
                 if not progressed:
                     pipeline.block_for_result(timeout=0.05)
@@ -897,7 +922,7 @@ def run_parallel_memory_jobs(
                     raise RuntimeError("final shard transition drain stalled under ingestion backpressure")
                 continue
             backlog = max(0, actor_produced_steps() - int(pipeline.sampled))
-            budget = min(int(available), _adaptive_publication_batch_size(backlog))
+            budget = min(int(available) - 63, _adaptive_publication_batch_size(backlog))
             started = time.perf_counter()
             transitions, completed = _drain_publication_batch(
                 topology.publication_queue, budget, preserve_shard_done=False, first_timeout=0.05
@@ -954,6 +979,19 @@ def run_parallel_memory_jobs(
 
         if pipeline.ingested != expected_transitions:
             raise RuntimeError(f"ingestion count mismatch at epoch boundary: expected={expected_transitions} ingested={pipeline.ingested}")
+        produced_transitions = int(actor_produced_steps())
+        causally_admitted = int(pipeline.sampled)
+        if not produced_transitions == causally_admitted == int(pipeline.ingested):
+            raise RuntimeError(
+                "epoch causal completion mismatch: "
+                f"produced={produced_transitions} causally_admitted={causally_admitted} "
+                f"published={pipeline.sampled} ingested={pipeline.ingested}"
+            )
+        actor_view_ids = {row.epoch_inference_view_id for row in results}
+        if bound_epoch_view is not None and actor_view_ids != {bound_epoch_view_id}:
+            raise RuntimeError(
+                f"matched actor EpochInferenceView mismatch: expected={bound_epoch_view_id} actual={sorted(actor_view_ids)}"
+            )
         for key, value in {
             "actor_processes": target_actor_slots,
             "peak_active_actor_processes": peak_active_actors,
@@ -962,12 +1000,14 @@ def run_parallel_memory_jobs(
             "shard_worker_processes": int(shards),
             "ingest_worker_processes": int(ingest_workers),
             "derivation_worker_processes": int(derivation_workers),
-            "actor_produced_steps": int(actor_produced_steps()),
+            "actor_produced_steps": produced_transitions,
+            "causally_admitted_steps": causally_admitted,
             "publication_drained_steps": int(pipeline.sampled),
             "multiprocess_transitions_published": int(pipeline.sampled),
             "coordinator_action_requests": 0,
             "policy_snapshot_generation": int(published_policy_generation),
             "policy_snapshot_refreshes": sum(int(row.policy_refreshes) for row in results),
+            "actor_epoch_inference_view_ids": ",".join(sorted(actor_view_ids)),
             "actors_exited_without_done": 0,
             "coordinator_pending_ingest": 0,
             "coordinator_pending_ingest_batches": 0,

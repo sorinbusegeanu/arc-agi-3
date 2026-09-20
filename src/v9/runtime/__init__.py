@@ -11,6 +11,7 @@ from v9.mutation.proposals import MutationKind, ProposalClass
 from v9.mutation.lineage import LineageAwareDependencyEdge, LineageContextOverlay, RegimeState
 
 from .config import RuntimeConfig, ScientificConfig, ScientificConfigId
+from .scientific_modes import LearnedDevelopmentalFeedbackProfile, ScientificVisibilityMode
 from .publication import CanonicalGraph
 from .read_view import ReadView
 from .optimized_runtime import ContinuousMemoryRuntime as _OptimizedContinuousMemoryRuntime
@@ -340,4 +341,66 @@ class ContinuousMemoryRuntime(_OptimizedContinuousMemoryRuntime):
             )
 
 
-__all__ = ["CanonicalGraph", "ContinuousMemoryRuntime", "ReadView", "RuntimeConfig", "ScientificConfig", "ScientificConfigId"]
+_LAZY_EXPORTS = {
+    "CanonicalStateHandle": ("v9.runtime.canonical_store", "CanonicalStateHandle"),
+    "CanonicalStore": ("v9.runtime.canonical_store", "CanonicalStore"),
+    "CanonicalTransaction": ("v9.runtime.canonical_transaction", "CanonicalTransaction"),
+    "TransactionOverlay": ("v9.runtime.canonical_transaction", "TransactionOverlay"),
+    "CanonicalCommitWAL": ("v9.runtime.canonical_wal", "CanonicalCommitWAL"),
+    "PersistenceFrontiers": ("v9.runtime.canonical_wal", "PersistenceFrontiers"),
+    "WALRecoveryResult": ("v9.runtime.canonical_wal", "WALRecoveryResult"),
+    "DevelopmentalCut": ("v9.runtime.developmental_cut", "DevelopmentalCut"),
+    "EpochInferenceView": ("v9.runtime.epoch_inference_view", "EpochInferenceView"),
+    "PolicyProjection": ("v9.runtime.policy_projection", "PolicyProjection"),
+    "PolicyVersion": ("v9.runtime.policy_projection", "PolicyVersion"),
+    "SignatureIndexStore": ("v9.runtime.signature_index", "SignatureIndexStore"),
+    "StorageGovernor": ("v9.runtime.storage_governor", "StorageGovernor"),
+    "StorageGovernorStatus": ("v9.runtime.storage_governor", "StorageGovernorStatus"),
+    "TrainingEvidenceManifest": ("v9.runtime.training_evidence", "TrainingEvidenceManifest"),
+    "TrainingEvidenceRecord": ("v9.runtime.training_evidence", "TrainingEvidenceRecord"),
+    "TransportBatchBundle": ("v9.runtime.shared_batch_transport", "TransportBatchBundle"),
+    "TransportSlabDescriptor": ("v9.runtime.shared_batch_transport", "TransportSlabDescriptor"),
+    "TransportSlabPool": ("v9.runtime.shared_batch_transport", "TransportSlabPool"),
+}
+
+
+def __getattr__(name: str):
+    import importlib
+
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(name)
+    value = getattr(importlib.import_module(target[0]), target[1])
+    globals()[name] = value
+    return value
+
+
+__all__ = [
+    "CanonicalGraph",
+    "CanonicalStateHandle",
+    "CanonicalStore",
+    "CanonicalTransaction",
+    "CanonicalCommitWAL",
+    "DevelopmentalCut",
+    "EpochInferenceView",
+    "ContinuousMemoryRuntime",
+    "LearnedDevelopmentalFeedbackProfile",
+    "PersistenceFrontiers",
+    "PolicyProjection",
+    "PolicyVersion",
+    "ReadView",
+    "RuntimeConfig",
+    "ScientificConfig",
+    "ScientificConfigId",
+    "ScientificVisibilityMode",
+    "SignatureIndexStore",
+    "StorageGovernor",
+    "StorageGovernorStatus",
+    "TrainingEvidenceManifest",
+    "TrainingEvidenceRecord",
+    "TransportBatchBundle",
+    "TransportSlabDescriptor",
+    "TransportSlabPool",
+    "TransactionOverlay",
+    "WALRecoveryResult",
+]

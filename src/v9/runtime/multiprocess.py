@@ -13,11 +13,12 @@ from dataclasses import dataclass
 from typing import Any
 from random import Random
 
-from v9.cognition.action_selection import choose_action
 from v9.runtime.actor_policy import ActorPolicySnapshot
+from v9.runtime.adaptive_exploration import choose_action
 from v9.cognition.planning import choose_strategy, replan
 from v9.cognition.outcome_selection import select_target_outcome
 from v9.memory.identity import stable_u64
+from .shared_batch_transport import ProducerAffinityRouter
 
 
 _FORKSERVER_READY = False
@@ -63,6 +64,32 @@ class EncodedTransition:
     strategy_replanned: bool = False
     replanning_baseline_cost: float | None = None
 
+    @property
+    def done(self) -> bool:
+        return bool(self.task_success or self.task_failure or self.task_truncated)
+
+
+@dataclass(frozen=True, slots=True)
+class TransitionBatchEnvelope:
+    producer_id: int
+    start_sequence: int
+    end_sequence: int
+    transitions: tuple[EncodedTransition, ...]
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.transitions) <= 64:
+            raise ValueError("transition batch envelopes require 1-64 rows")
+        if self.start_sequence > self.end_sequence:
+            raise ValueError("transition batch sequence range is inverted")
+        if self.end_sequence - self.start_sequence + 1 != len(self.transitions):
+            raise ValueError("transition batch sequence range must be contiguous")
+        if any(int(row.actor_id) != int(self.producer_id) for row in self.transitions):
+            raise ValueError("transition batch must contain one producer-affine stream")
+        if tuple(int(row.producer_sequence) for row in self.transitions) != tuple(
+            range(self.start_sequence, self.end_sequence + 1)
+        ):
+            raise ValueError("transition batch rows must match the declared causal range")
+
 
 @dataclass(frozen=True, slots=True)
 class ActorDone:
@@ -84,6 +111,7 @@ class ActorDone:
     mean_branching_factor: float = 0.0
     max_branching_factor: int = 0
     changed_transitions: int = 0
+    epoch_inference_view_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,11 +207,38 @@ def _flush_child_queue(queue_obj: Any) -> None:
         pass
 
 
-def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, initial_policy: ActorPolicySnapshot, policy_updates: Any, epsilon: float, stagnation: float = 0.0, policy_refresh_steps: int = 32, policy_refresh_ms: float = 100.0, stage_queue: Any, result_queue: Any, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int) -> None:
+def _put_counted_stage_batch(
+    stage_queue: Any,
+    counters: Any,
+    counter_index: int,
+    envelope: TransitionBatchEnvelope,
+) -> None:
+    stage_queue.put(envelope)
+    if counters is not None:
+        counters[int(counter_index)] = int(counters[int(counter_index)]) + len(envelope.transitions)
+
+
+def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, initial_policy: ActorPolicySnapshot, policy_updates: Any, epsilon: float, stagnation: float = 0.0, policy_refresh_steps: int = 32, policy_refresh_ms: float = 100.0, policy_refresh_enabled: bool = True, stage_queue: Any, result_queue: Any, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, production_counters: Any = None, counter_index: int = 0, epoch_inference_view_id: str = "") -> None:
     game_id = str(getattr(spec, "display_name", getattr(spec, "game_id", "unknown")))
     adapter = None
     devnull = open(os.devnull, "w", encoding="utf-8")
     completion_sent = False
+    pending_transitions: list[EncodedTransition] = []
+
+    def flush_transitions() -> None:
+        if not pending_transitions:
+            return
+        rows = tuple(pending_transitions)
+        _put_counted_stage_batch(
+            stage_queue,
+            production_counters,
+            int(counter_index),
+            TransitionBatchEnvelope(
+                int(actor_id), int(rows[0].producer_sequence), int(rows[-1].producer_sequence), rows
+            ),
+        )
+        pending_transitions.clear()
+
     try:
         logging.disable(logging.INFO)
         warnings.filterwarnings("ignore")
@@ -234,7 +289,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     if not actions:
                         continue
                 now = __import__("time").monotonic()
-                if index % refresh_steps == 0 or now >= next_refresh_time:
+                if policy_refresh_enabled and (index % refresh_steps == 0 or now >= next_refresh_time):
                     newest = None
                     while True:
                         try:
@@ -367,46 +422,47 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     and active_strategy_position >= len(active_strategy_actions)
                     and (progress.success or progress.failure or not boundary.continuation)
                 )
-                stage_queue.put(
-                    EncodedTransition(
-                        actor_id=actor_id,
-                        producer_sequence=index + 1,
-                        global_step=index,
-                        environment_identity=(identity.family, identity.environment_type, identity.config, identity.instance),
-                        episode_id=int(stable_u64(environment_instance_id, run_nonce, actor_id, episode_ordinal, person=b"v9-mp-episode")),
-                        observation_schema_id=observation_schema_id,
-                        action_schema_id=action_schema_id,
-                        before_signature=before_signature,
-                        action_id=int(adapter.encode_action(action)),
-                        after_signature=int(adapter.encode_observation(after)),
-                        available_actions_after=len(available_after),
-                        available_action_set_signature=_action_set_signature(action_schema_id, available_after),
-                        primary_valence=int(boundary.primary_valence),
-                        boundary_scope=str(boundary.scope.value),
-                        task_success=bool(progress.success),
-                        task_failure=bool(progress.failure),
-                        task_truncated=bool(progress.truncated),
-                        level_index=int(progress.level_index),
-                        levels_completed=int(progress.levels_completed),
-                        semantic_before=semantic_before,
-                        semantic_action=semantic_action,
-                        semantic_options=semantic_options,
-                        semantic_after=semantic_after,
-                        semantic_delta=semantic_delta,
-                        symbols=tuple(adapter.optional_symbol_stream()),
-                        curriculum_step=getattr(spec, "curriculum_step", None),
-                        game_scenario=str(getattr(spec, "game_id", identity.environment_type)),
-                        symbols_only=str(getattr(spec, "condition", "") or "").upper() == "C1",
-                        strategy_uid_hi=None if executed_strategy_uid is None else int(executed_strategy_uid.hi),
-                        strategy_uid_lo=None if executed_strategy_uid is None else int(executed_strategy_uid.lo),
-                        strategy_terminal=strategy_terminal,
-                        strategy_realized_cost=active_strategy_realized_cost if executed_strategy_uid is not None else 0,
-                        strategy_target_outcome_hi=None if active_strategy_outcome is None else int(active_strategy_outcome.hi),
-                        strategy_target_outcome_lo=None if active_strategy_outcome is None else int(active_strategy_outcome.lo),
-                        strategy_replanned=active_replanned,
-                        replanning_baseline_cost=active_replanning_baseline_cost if executed_strategy_uid is not None else None,
-                    )
+                transition = EncodedTransition(
+                    actor_id=actor_id,
+                    producer_sequence=completed + 1,
+                    global_step=index,
+                    environment_identity=(identity.family, identity.environment_type, identity.config, identity.instance),
+                    episode_id=int(stable_u64(environment_instance_id, run_nonce, actor_id, episode_ordinal, person=b"v9-mp-episode")),
+                    observation_schema_id=observation_schema_id,
+                    action_schema_id=action_schema_id,
+                    before_signature=before_signature,
+                    action_id=int(adapter.encode_action(action)),
+                    after_signature=int(adapter.encode_observation(after)),
+                    available_actions_after=len(available_after),
+                    available_action_set_signature=_action_set_signature(action_schema_id, available_after),
+                    primary_valence=int(boundary.primary_valence),
+                    boundary_scope=str(boundary.scope.value),
+                    task_success=bool(progress.success),
+                    task_failure=bool(progress.failure),
+                    task_truncated=bool(progress.truncated),
+                    level_index=int(progress.level_index),
+                    levels_completed=int(progress.levels_completed),
+                    semantic_before=semantic_before,
+                    semantic_action=semantic_action,
+                    semantic_options=semantic_options,
+                    semantic_after=semantic_after,
+                    semantic_delta=semantic_delta,
+                    symbols=tuple(adapter.optional_symbol_stream()),
+                    curriculum_step=getattr(spec, "curriculum_step", None),
+                    game_scenario=str(getattr(spec, "game_id", identity.environment_type)),
+                    symbols_only=str(getattr(spec, "condition", "") or "").upper() == "C1",
+                    strategy_uid_hi=None if executed_strategy_uid is None else int(executed_strategy_uid.hi),
+                    strategy_uid_lo=None if executed_strategy_uid is None else int(executed_strategy_uid.lo),
+                    strategy_terminal=strategy_terminal,
+                    strategy_realized_cost=active_strategy_realized_cost if executed_strategy_uid is not None else 0,
+                    strategy_target_outcome_hi=None if active_strategy_outcome is None else int(active_strategy_outcome.hi),
+                    strategy_target_outcome_lo=None if active_strategy_outcome is None else int(active_strategy_outcome.lo),
+                    strategy_replanned=active_replanned,
+                    replanning_baseline_cost=active_replanning_baseline_cost if executed_strategy_uid is not None else None,
                 )
+                pending_transitions.append(transition)
+                if len(pending_transitions) >= 64:
+                    flush_transitions()
                 completed += 1
                 changed_transitions += int(before_signature != int(adapter.encode_observation(after)))
                 positives += int(boundary.primary_valence > 0)
@@ -424,6 +480,10 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                         active_strategy_outcome = None
                         active_replanning_baseline_cost = None
                         active_replanned = False
+                if not boundary.continuation and bool(
+                    dict(getattr(spec, "options", {}) or {}).get("fixed_trial_stop_on_terminal", False)
+                ):
+                    break
                 if not boundary.continuation:
                     adapter.reset()
                     episode_ordinal += 1
@@ -440,6 +500,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
 
             # ActorDone is an end-of-stream marker. Ensure every transition this
             # actor produced has left its feeder before publishing completion.
+            flush_transitions()
             _flush_child_queue(stage_queue)
             result_queue.put(ActorDone(
                 actor_id, game_id, completed, positives, negatives, episode_boundaries, resets,
@@ -447,11 +508,12 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                 grounded_action_influence, len(context_action_counts),
                 sum(len(counts) for counts in context_action_counts.values()),
                 float(branching_total) / max(1, branching_samples), max_branching_factor,
-                changed_transitions,
+                changed_transitions, str(epoch_inference_view_id),
             ))
             completion_sent = True
     except BaseException as exc:
         try:
+            flush_transitions()
             _flush_child_queue(stage_queue)
         except BaseException:
             pass
@@ -476,27 +538,134 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
 
 
 def stage_worker_main(stage_queue: Any, shard_queues: tuple[Any, ...]) -> None:
+    router = ProducerAffinityRouter(len(shard_queues))
     while True:
         item = stage_queue.get()
         if isinstance(item, WorkerStop):
             return
-        if not isinstance(item, EncodedTransition):
+        if isinstance(item, EncodedTransition):
+            item = TransitionBatchEnvelope(
+                int(item.actor_id),
+                int(item.producer_sequence),
+                int(item.producer_sequence),
+                (item,),
+            )
+        if not isinstance(item, TransitionBatchEnvelope):
             continue
-        shard = int(stable_u64(item.environment_identity[1], item.actor_id, item.producer_sequence, person=b"v9-stage-route") % len(shard_queues))
+        shard = router.shard_for(int(item.producer_id))
         shard_queues[shard].put(item)
 
 
-def shard_worker_main(shard_id: int, shard_queue: Any, publication_queue: Any) -> None:
+def shard_worker_main(
+    shard_id: int,
+    shard_queue: Any,
+    publication_queue: Any,
+    reorder_row_limit: int = 8192,
+    gap_timeout_seconds: float = 30.0,
+) -> None:
+    if reorder_row_limit <= 0 or gap_timeout_seconds <= 0:
+        raise ValueError("shard causal-admission bounds must be positive")
     sequence = 0
+    next_by_producer: dict[int, int] = {}
+    held_by_producer: dict[int, dict[int, EncodedTransition]] = {}
+    gap_started_by_producer: dict[int, float] = {}
+    held_rows = 0
+
+    def admit(item: EncodedTransition) -> tuple[EncodedTransition, ...]:
+        nonlocal held_rows
+        producer = int(item.actor_id)
+        proposed = int(item.producer_sequence)
+        expected = next_by_producer.get(producer, 1)
+        if proposed < expected:
+            raise RuntimeError(
+                f"duplicate/stale producer sequence producer={producer} sequence={proposed} expected={expected}"
+            )
+        held = held_by_producer.setdefault(producer, {})
+        if proposed > expected:
+            if proposed in held:
+                raise RuntimeError(
+                    f"duplicate held producer sequence producer={producer} sequence={proposed}"
+                )
+            if held_rows >= int(reorder_row_limit):
+                raise RuntimeError("producer causal reorder row ceiling exceeded")
+            held[proposed] = item
+            held_rows += 1
+            gap_started_by_producer.setdefault(producer, time.monotonic())
+            return ()
+        admitted: list[EncodedTransition] = []
+        ready: EncodedTransition | None = item
+        while ready is not None:
+            admitted.append(ready)
+            expected += 1
+            next_by_producer[producer] = expected
+            ready = held.pop(expected, None)
+            if ready is not None:
+                held_rows -= 1
+        if not held:
+            held_by_producer.pop(producer, None)
+            gap_started_by_producer.pop(producer, None)
+        return tuple(admitted)
+
     while True:
-        item = shard_queue.get()
+        try:
+            item = shard_queue.get(timeout=min(0.1, float(gap_timeout_seconds)))
+        except queue.Empty:
+            now = time.monotonic()
+            expired = sorted(
+                producer
+                for producer, started in gap_started_by_producer.items()
+                if now - started >= float(gap_timeout_seconds)
+            )
+            if expired:
+                producer = expired[0]
+                publication_queue.put(
+                    (
+                        "shard_error",
+                        int(shard_id),
+                        int(sequence),
+                        f"producer transport gap timeout producer={producer} "
+                        f"expected={next_by_producer.get(producer, 1)}",
+                    )
+                )
+                return
+            continue
         if isinstance(item, WorkerStop):
+            if held_rows:
+                missing = min(
+                    (producer, next_by_producer.get(producer, 1))
+                    for producer in held_by_producer
+                )
+                publication_queue.put(
+                    (
+                        "shard_error",
+                        int(shard_id),
+                        int(sequence),
+                        f"producer causal gap at shard shutdown producer={missing[0]} expected={missing[1]}",
+                    )
+                )
+                return
             publication_queue.put(("shard_done", int(shard_id), int(sequence)))
             return
-        if not isinstance(item, EncodedTransition):
+        if isinstance(item, EncodedTransition):
+            item = TransitionBatchEnvelope(
+                int(item.actor_id),
+                int(item.producer_sequence),
+                int(item.producer_sequence),
+                (item,),
+            )
+        if not isinstance(item, TransitionBatchEnvelope):
             continue
-        sequence += 1
-        publication_queue.put(("transition", int(shard_id), int(sequence), item))
+        admitted = tuple(row for transition in item.transitions for row in admit(transition))
+        for start in range(0, len(admitted), 64):
+            rows = admitted[start : start + 64]
+            envelope = TransitionBatchEnvelope(
+                int(rows[0].actor_id),
+                int(rows[0].producer_sequence),
+                int(rows[-1].producer_sequence),
+                rows,
+            )
+            sequence += len(rows)
+            publication_queue.put(("transition_batch", int(shard_id), int(sequence), envelope))
 
 
 class ProcessTopology:
@@ -509,11 +678,13 @@ class ProcessTopology:
         self.actors = int(actors)
         self.stage_workers = int(stage_workers)
         self.shards = int(shards)
-        self.stage_queue = self.ctx.Queue(maxsize=int(queue_capacity))
-        self.publication_queue = self.ctx.Queue(maxsize=int(queue_capacity))
+        self.queue_capacity = int(queue_capacity)
+        self.stage_queue = self.ctx.Queue(maxsize=self.queue_capacity)
+        self.publication_queue = self.ctx.Queue(maxsize=self.queue_capacity)
         self.result_queue = self.ctx.Queue(maxsize=max(64, int(actors) * 2))
-        self.shard_queues = tuple(self.ctx.Queue(maxsize=int(queue_capacity)) for _ in range(self.shards))
+        self.shard_queues = tuple(self.ctx.Queue(maxsize=self.queue_capacity) for _ in range(self.shards))
         self.policy_updates = tuple(self.ctx.Queue(maxsize=1) for _ in range(self.actors))
+        self._actor_production_counters = self.ctx.Array("Q", self.actors, lock=False)
         self.stage_processes: list[Any] = []
         self.shard_processes: list[Any] = []
         self.actor_processes: list[Any] = []
@@ -521,7 +692,11 @@ class ProcessTopology:
 
     def start_workers(self) -> None:
         for shard_id, shard_queue in enumerate(self.shard_queues):
-            process = self.ctx.Process(target=shard_worker_main, args=(shard_id, shard_queue, self.publication_queue), name=f"v9-shard-{shard_id}")
+            process = self.ctx.Process(
+                target=shard_worker_main,
+                args=(shard_id, shard_queue, self.publication_queue, self.queue_capacity),
+                name=f"v9-shard-{shard_id}",
+            )
             process.start()
             self.shard_processes.append(process)
         for index in range(self.stage_workers):
@@ -529,7 +704,9 @@ class ProcessTopology:
             process.start()
             self.stage_processes.append(process)
 
-    def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, initial_policy: ActorPolicySnapshot, epsilon: float, stagnation: float = 0.0, policy_refresh_steps: int = 64, policy_refresh_ms: float = 250.0) -> None:
+    def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, initial_policy: ActorPolicySnapshot, epsilon: float, stagnation: float = 0.0, policy_refresh_steps: int = 64, policy_refresh_ms: float = 250.0, policy_refresh_enabled: bool = True, epoch_inference_view_id: str = "") -> None:
+        if adapter_factory_path == "v9.cli:make_adapter":
+            adapter_factory_path = "v9.environments.passive_capture:make_adapter"
         process = self.actor_ctx.Process(
             target=actor_process_main,
             kwargs={
@@ -544,11 +721,15 @@ class ProcessTopology:
                 "stagnation": float(stagnation),
                 "policy_refresh_steps": int(policy_refresh_steps),
                 "policy_refresh_ms": float(policy_refresh_ms),
+                "policy_refresh_enabled": bool(policy_refresh_enabled),
                 "stage_queue": self.stage_queue,
                 "result_queue": self.result_queue,
                 "adapter_factory_path": adapter_factory_path,
                 "alfred_backend_factory": alfred_backend_factory,
                 "run_nonce": int(run_nonce),
+                "production_counters": self._actor_production_counters,
+                "counter_index": int(index),
+                "epoch_inference_view_id": str(epoch_inference_view_id),
             },
             name=f"v9-actor-{actor_id}",
         )
@@ -628,3 +809,7 @@ class ProcessTopology:
     @property
     def process_count(self) -> int:
         return len(self.actor_processes) + len(self.stage_processes) + len(self.shard_processes)
+
+    @property
+    def produced_steps(self) -> int:
+        return sum(int(value) for value in self._actor_production_counters)

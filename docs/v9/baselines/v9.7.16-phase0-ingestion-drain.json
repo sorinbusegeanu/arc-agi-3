@@ -1,0 +1,47 @@
+{
+  "baseline_commit": "958345c",
+  "baseline_suite": {
+    "command": "pytest -q src/v9/tests",
+    "passed": 295,
+    "warnings": 2,
+    "seconds": 368.85
+  },
+  "benchmark_command": "python -m v9.benchmarks.ingestion_drain --rows 4096 --repeats 3",
+  "median_commit_seconds": 0.5490805770004954,
+  "median_drain_seconds": 0.2514564180000889,
+  "median_total_seconds": 0.8005369950005843,
+  "peak_rss_bytes": 154169344,
+  "peak_tracked_shm_bytes": 0,
+  "repeats": 3,
+  "rows": 4096,
+  "samples": [
+    {
+      "commit_seconds": 0.5363466329999937,
+      "drain_seconds": 0.24934809500155097,
+      "memory_counts": {"M0": 4312, "M1": 489, "M2": 0, "M3": 0, "M4": 0, "M5": 0, "M6": 0, "M7": 0},
+      "peak_rss_bytes": 154169344,
+      "repeat": 1,
+      "signature_rows": 4096,
+      "total_seconds": 0.7856947280015447
+    },
+    {
+      "commit_seconds": 0.663536505000593,
+      "drain_seconds": 0.25238879199969233,
+      "memory_counts": {"M0": 4312, "M1": 489, "M2": 0, "M3": 0, "M4": 0, "M5": 0, "M6": 0, "M7": 0},
+      "peak_rss_bytes": 154169344,
+      "repeat": 2,
+      "signature_rows": 4096,
+      "total_seconds": 0.9159252970002854
+    },
+    {
+      "commit_seconds": 0.5490805770004954,
+      "drain_seconds": 0.2514564180000889,
+      "memory_counts": {"M0": 4312, "M1": 489, "M2": 0, "M3": 0, "M4": 0, "M5": 0, "M6": 0, "M7": 0},
+      "peak_rss_bytes": 154169344,
+      "repeat": 3,
+      "signature_rows": 4096,
+      "total_seconds": 0.8005369950005843
+    }
+  ],
+  "schema": "v9.7.16-fixed-ingestion-drain-v1"
+}

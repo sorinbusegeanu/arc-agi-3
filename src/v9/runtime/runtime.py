@@ -53,6 +53,9 @@ from v9.telemetry import (
 )
 
 from .actor_policy import ActorPolicySnapshot, ActorStrategyPolicy, ActorOutcomePolicy
+from .canonical_store import CanonicalStore, canonical_value
+from .canonical_transaction import CanonicalCollection
+from .canonical_wal import CanonicalCommitWAL, PersistenceFrontiers
 from .config import RuntimeConfig, write_scientific_config_manifest
 from .lifecycle import LifecycleRegistry
 from .partitions import PartitionMap
@@ -165,6 +168,223 @@ class ContinuousMemoryRuntime:
                     runtime_state["graph"] = graph_header
                     self._restore({"state": runtime_state}, graph_override=graph)
             self._restore_hgt_checkpoint()
+        if config.enable_canonical_durability:
+            self._initialize_canonical_durability()
+
+    def _initialize_canonical_durability(self) -> None:
+        """Compose the WAL and immutable canonical root into graph publication."""
+        store = CanonicalStore(
+            schema_versions={"canonical_graph": int(self.graph.SCHEMA_VERSION)},
+            max_chunk_entries=min(8192, int(self.config.canonical_transaction_max_writes)),
+            max_chunk_bytes=min(64 * 1024 * 1024, int(self.config.canonical_transaction_max_mutation_bytes)),
+            chunk_directory=self.root / "canonical" / "chunks",
+            resident_chunk_limit=0,
+        )
+        self.canonical_wal = CanonicalCommitWAL(
+            self.root / "canonical" / "commit.wal",
+            max_group_frames=1,
+            max_pending_bytes=int(self.config.canonical_transaction_max_mutation_bytes),
+        )
+        identity = self._canonical_scientific_identity()
+        snapshots = self.root / "canonical" / "snapshots"
+        complete = []
+        if snapshots.exists():
+            candidates = tuple(snapshots.glob("snapshot-*")) + tuple(
+                snapshots.glob(".snapshot-*.previous")
+            )
+            complete = sorted(
+                (path for path in candidates if (path / "COMPLETE").is_file()),
+                key=lambda path: (
+                    path.name.removeprefix(".").removesuffix(".previous"),
+                    not path.name.startswith("."),
+                ),
+            )
+        if complete:
+            store = CanonicalStore.from_snapshot(
+                complete[-1], expected_scientific_identity=identity
+            )
+            store.enable_disk_backing(self.root / "canonical" / "chunks", resident_chunk_limit=0)
+        recovery = self.canonical_wal.recover(truncate=True)
+        if store.current_handle.canonical_applied_lsn > recovery.wal_durable_lsn:
+            raise RuntimeError("canonical snapshot is ahead of its durable WAL")
+        for frame in recovery.frames:
+            if frame.wal_lsn <= store.current_handle.canonical_applied_lsn:
+                continue
+            if frame.scientific_identity != identity:
+                raise RuntimeError("canonical WAL contains a different scientific identity")
+            overlay = store.begin_overlay(
+                frame.wal_lsn,
+                max_entries=int(self.config.canonical_transaction_max_writes),
+                max_bytes=int(self.config.canonical_transaction_max_mutation_bytes),
+            )
+            for mutation in frame.mutations:
+                collection = str(mutation["collection"])
+                key = str(mutation["key"])
+                if str(mutation.get("operation", "put")) == "delete":
+                    overlay.delete(collection, key)
+                else:
+                    overlay.put(collection, key, mutation.get("value"))
+            store.finalize_overlay(overlay)
+        self.canonical_store = store
+        self._canonical_snapshot_applied_lsn = (
+            store.current_handle.canonical_applied_lsn if complete else 0
+        )
+        self._hgt_checkpoint_lsn = 0
+        self.graph.configure_durable_commit(self._commit_canonical_graph_update)
+
+    def _canonical_scientific_identity(self) -> dict[str, str]:
+        return {
+            "scientific_config_id": self.config.scientific.config_id.value,
+            "design_version": self.config.scientific.design_version,
+        }
+
+    def write_canonical_snapshot(self, snapshot_id: int | None = None) -> Path | None:
+        if not hasattr(self, "canonical_store"):
+            return None
+        selected = self._snapshot_id if snapshot_id is None else int(snapshot_id)
+        path = self.root / "canonical" / "snapshots" / f"snapshot-{selected:08d}"
+        result = self.canonical_store.write_snapshot(
+            path, scientific_identity=self._canonical_scientific_identity()
+        )
+        self._canonical_snapshot_applied_lsn = self.canonical_store.current_handle.canonical_applied_lsn
+        return result
+
+    @staticmethod
+    def _canonical_node_value(node: CanonicalNode) -> dict[str, object]:
+        return {
+            "uid": [int(node.uid.hi), int(node.uid.lo)],
+            "level": int(node.level),
+            "memory_type": int(node.memory_type),
+            "structural_key": [int(value) for value in node.structural_key],
+            "created_watermark": int(node.created_watermark),
+        }
+
+    @staticmethod
+    def _canonical_edge_value(edge: RelationEdge) -> dict[str, object]:
+        return {
+            "source": [int(edge.source.hi), int(edge.source.lo)],
+            "relation": edge.relation.value,
+            "target": [int(edge.target.hi), int(edge.target.lo)],
+            "evidence": [[int(uid.hi), int(uid.lo)] for uid in edge.evidence_uids],
+            "authority": edge.authority.value,
+            "object_version": int(edge.object_version),
+        }
+
+    def _commit_canonical_graph_update(
+        self,
+        *,
+        proposal: MutationProposal,
+        node_updates: dict[MemoryUid, tuple[CanonicalNode, dict[str, Any]]],
+        node_deletes: dict[MemoryUid, CanonicalNode],
+        edge_updates: dict[tuple[MemoryUid, str, MemoryUid], RelationEdge | None],
+        next_generation: int,
+    ) -> None:
+        """Durably publish one validated graph transaction before live visibility."""
+        target_lsn = self.canonical_wal.wal_durable_lsn + 1
+        overlay = self.canonical_store.begin_overlay(
+            target_lsn,
+            max_entries=int(self.config.canonical_transaction_max_writes),
+            max_bytes=int(self.config.canonical_transaction_max_mutation_bytes),
+        )
+        mutations: list[dict[str, object]] = []
+
+        def put(collection: CanonicalCollection, key: str, value: object) -> None:
+            encoded = canonical_value(value)
+            overlay.put(collection, key, encoded)
+            mutations.append({"collection": collection.value, "key": key, "operation": "put", "value": encoded})
+
+        def delete(collection: CanonicalCollection, key: str) -> None:
+            overlay.delete(collection, key)
+            mutations.append({"collection": collection.value, "key": key, "operation": "delete"})
+
+        for uid, (node, payload) in sorted(node_updates.items()):
+            key = f"node:{uid.hi:016x}{uid.lo:016x}"
+            put(CanonicalCollection.GRAPH, key, self._canonical_node_value(node))
+            put(CanonicalCollection.PAYLOAD, key, dict(payload))
+            put(CanonicalCollection.LEVEL_INDEX, f"level:{int(node.level)}:{key}", key)
+        for uid, node in sorted(node_deletes.items()):
+            key = f"node:{uid.hi:016x}{uid.lo:016x}"
+            delete(CanonicalCollection.GRAPH, key)
+            delete(CanonicalCollection.PAYLOAD, key)
+            delete(CanonicalCollection.LEVEL_INDEX, f"level:{int(node.level)}:{key}")
+        for key, edge in sorted(edge_updates.items(), key=lambda row: repr(row[0])):
+            source, relation, target = key
+            store_key = f"edge:{source.hi:016x}{source.lo:016x}:{relation}:{target.hi:016x}{target.lo:016x}"
+            if edge is None:
+                delete(CanonicalCollection.GRAPH, store_key)
+                if relation == RelationType.PROVENANCE.value:
+                    delete(CanonicalCollection.PROVENANCE_INDEX, store_key)
+            else:
+                value = self._canonical_edge_value(edge)
+                put(CanonicalCollection.GRAPH, store_key, value)
+                if edge.relation is RelationType.PROVENANCE:
+                    put(CanonicalCollection.PROVENANCE_INDEX, store_key, value)
+        try:
+            self.canonical_wal.commit_overlay(
+                self.canonical_store,
+                overlay,
+                transaction_id=f"proposal-{int(proposal.proposal_uid):016x}",
+                frame_payload={
+                    "mutations": tuple(mutations),
+                    "scientific_identity": self._canonical_scientific_identity(),
+                    "work_metadata": {
+                        "rows": len(node_updates) + len(edge_updates),
+                        "writes": len(mutations),
+                        "generation": int(next_generation),
+                    },
+                },
+            )
+        except BaseException:
+            if not overlay.closed:
+                self.canonical_store.abort_overlay(overlay)
+            raise
+
+    @property
+    def canonical_state_handle(self):
+        if not hasattr(self, "canonical_store"):
+            raise RuntimeError("canonical durability migration gate is not enabled")
+        return self.canonical_store.current_handle
+
+    @property
+    def persistence_frontiers(self) -> PersistenceFrontiers:
+        if not hasattr(self, "canonical_store"):
+            return PersistenceFrontiers()
+        return PersistenceFrontiers(
+            wal_durable_lsn=self.canonical_wal.wal_durable_lsn,
+            canonical_applied_lsn=self.canonical_store.current_handle.canonical_applied_lsn,
+            snapshot_applied_lsn=self._canonical_snapshot_applied_lsn,
+            hgt_checkpoint_lsn=self._hgt_checkpoint_lsn,
+        )
+
+    def create_epoch_inference_view(self, *, sampling_epoch_id: int):
+        """Pin the complete actor-visible authority for one matched epoch."""
+        from v9.research.experiment_manifest import ExperimentManifest
+        from .epoch_inference_view import EpochInferenceView
+        from .policy_projection import build_policy_projection
+        from .scientific_modes import ScientificVisibilityMode
+
+        if self.config.scientific.scientific_visibility_mode is not ScientificVisibilityMode.MATCHED_REASONING:
+            raise RuntimeError("EpochInferenceView is required only for MATCHED_REASONING")
+        if not hasattr(self, "canonical_store"):
+            raise RuntimeError("MATCHED_REASONING requires canonical durability")
+        if self.config.experiment_manifest is None:
+            raise RuntimeError("MATCHED_REASONING requires an ExperimentManifest")
+        manifest = ExperimentManifest.load(self.config.experiment_manifest)
+        if manifest.scientific_config_id != self.config.scientific.config_id.value:
+            raise RuntimeError("ExperimentManifest ScientificConfigId changed after runtime construction")
+        projection = build_policy_projection(self.actor_policy_snapshot())
+        return EpochInferenceView(
+            store=self.canonical_store,
+            experiment_manifest_id=manifest.manifest_id.value,
+            sampling_epoch_id=int(sampling_epoch_id),
+            policy_projection=projection,
+            model_version=str(projection.snapshot.model_version),
+            stage_state=self.stage_tracker.state_dict(),
+            normalization_state=self.scale_statistics.state_dict(),
+            graph_schema_version=int(manifest.graph_schema_version),
+            feature_schema_version=int(manifest.feature_schema_version),
+            scientific_config_id=self.config.scientific.config_id.value,
+        )
 
     def _restore_hgt_checkpoint(self) -> None:
         """Restore the active accepted/candidate HGT policy from its manifest."""
@@ -772,8 +992,6 @@ class ContinuousMemoryRuntime:
                 edge = RelationEdge(node.uid, RelationType.PROVENANCE, parent, evidence)
                 writes.append(MutationWrite(edge=edge))
                 target_partitions.add(self.partitions.owner(parent))
-                edge_reference = edge_ref(edge)
-                dependencies.append(ReadDependency(edge_reference, self.graph.versions.get(edge_reference)))
 
         proposal = MutationProposal.build(
             MutationKind.UPSERT_NODE,
@@ -812,6 +1030,83 @@ class ContinuousMemoryRuntime:
         else:
             self.telemetry["rejected"] += 1
         return result.outcome.value == "ACCEPTED"
+
+    def _publish_stateful_group(
+        self,
+        rows: tuple[tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]], ...],
+    ) -> bool:
+        """Publish a bounded set of authoritative replacements in one transaction."""
+        writes: list[MutationWrite] = []
+        dependencies: list[ReadDependency] = []
+        target_partitions: set[int] = set()
+        evidence_refs: set[MemoryUid] = set()
+        for node, raw_payload, evidence in rows:
+            payload = dict(raw_payload)
+            payload.setdefault("evidence_refs", [[uid.hi, uid.lo] for uid in sorted(set(evidence))])
+            writes.append(MutationWrite(node=node, payload=payload))
+            target_partitions.add(self.partitions.owner(node.uid))
+            reference = node_ref(node.uid)
+            dependencies.append(ReadDependency(reference, self.graph.versions.get(reference)))
+            evidence_refs.update(evidence)
+            for raw_parent in payload.get("parents", []):
+                if not isinstance(raw_parent, (list, tuple)) or len(raw_parent) != 2:
+                    continue
+                parent = MemoryUid(int(raw_parent[0]), int(raw_parent[1]))
+                edge = RelationEdge(node.uid, RelationType.PROVENANCE, parent, evidence)
+                writes.append(MutationWrite(edge=edge))
+                target_partitions.add(self.partitions.owner(parent))
+        proposal = MutationProposal.build(
+            MutationKind.UPSERT_NODE,
+            target_partitions=tuple(sorted(target_partitions)),
+            read_set=ReadSet.build(
+                tuple(dependencies),
+                maximum_size=self.config.scientific.maximum_read_set_size,
+            ),
+            evidence_refs=tuple(sorted(evidence_refs)),
+            causal_watermark=self._watermark,
+            writes=tuple(writes),
+            proposal_class=ProposalClass.STATEFUL,
+        )
+        self.telemetry["proposals"] += 1
+        self.telemetry["cross_partition_transactions"] += int(len(target_partitions) > 1)
+        result = self.graph.publish(proposal)
+        if result.outcome.value == "ACCEPTED":
+            self.telemetry["accepted"] += 1
+            return True
+        if result.outcome.value == "STALE_READ_SET":
+            self.telemetry["stale"] += 1
+            self.telemetry["read_set_conflicts"] += 1
+        else:
+            self.telemetry["rejected"] += 1
+        return False
+
+    def replace_canonical_payloads(
+        self, updates: dict[MemoryUid, dict[str, Any]]
+    ) -> int:
+        """Durably replace actor-visible payload fields in bounded transactions."""
+        rows: list[tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]]] = []
+        for uid, patch in sorted(updates.items()):
+            node = self.graph.nodes.get(uid)
+            current = self.graph.payloads.get(uid)
+            if node is None or current is None:
+                continue
+            merged = dict(current)
+            merged.update(patch)
+            if merged == current:
+                continue
+            evidence = tuple(
+                MemoryUid(int(raw[0]), int(raw[1]))
+                for raw in merged.get("evidence_refs", ())
+                if isinstance(raw, (list, tuple)) and len(raw) == 2
+            )
+            rows.append((node, merged, evidence))
+        maximum = int(self.config.scientific.maximum_read_set_size)
+        applied = 0
+        for offset in range(0, len(rows), maximum):
+            chunk = tuple(rows[offset : offset + maximum])
+            if self._publish_stateful_group(chunk):
+                applied += len(chunk)
+        return applied
 
     def _defer_base_group(
         self,
@@ -958,6 +1253,7 @@ class ContinuousMemoryRuntime:
 
             dirty = tuple(self._m1n_dirty)
             self._m1n_dirty.clear()
+            dirty_rows: list[tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]]] = []
             for signature in dirty:
                 rows = self._m1n_occurrences.get(int(signature), ())
                 if not rows:
@@ -974,7 +1270,7 @@ class ContinuousMemoryRuntime:
                     for occurrence in rows
                     for uid in occurrence.provenance.evidence
                 )
-                self._publish(
+                dirty_rows.append((
                     CanonicalNode(
                         relation.uid,
                         MemoryLevel.M1,
@@ -990,8 +1286,34 @@ class ContinuousMemoryRuntime:
                         "parents": [[uid.hi, uid.lo] for uid in retained_parents],
                     },
                     retained_evidence,
-                    proposal_class=ProposalClass.STATEFUL,
-                )
+                ))
+            maximum_dependencies = int(self.config.scientific.maximum_read_set_size)
+            if not hasattr(self, "canonical_store"):
+                for node, payload, evidence in dirty_rows:
+                    self._publish(
+                        node,
+                        payload,
+                        evidence,
+                        proposal_class=ProposalClass.STATEFUL,
+                    )
+                return
+            pending_rows: list[tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]]] = []
+            pending_dependencies = 0
+            for row in dirty_rows:
+                # The normalized node is the stateful support authority. Its
+                # provenance-edge additions are commutative and do not consume
+                # optimistic read dependencies.
+                cost = 1
+                if cost > maximum_dependencies:
+                    raise ValueError("one dirty M1 row exceeds the configured read-set bound")
+                if pending_rows and pending_dependencies + cost > maximum_dependencies:
+                    self._publish_stateful_group(tuple(pending_rows))
+                    pending_rows = []
+                    pending_dependencies = 0
+                pending_rows.append(row)
+                pending_dependencies += cost
+            if pending_rows:
+                self._publish_stateful_group(tuple(pending_rows))
 
     def _ingest(self, event: TimelineEvent) -> tuple[int, ...]:
         self._formation_environments.add(int(event.identity.environment_instance_id))
@@ -1551,7 +1873,9 @@ class ContinuousMemoryRuntime:
             generation = self.graph.generation
             fixed_cut = self.state_dict()
         try:
-            return write_snapshot(self.root, fixed_cut, snapshot_id=snapshot_id, watermark=watermark, graph_generation=generation, scientific_config_id=self.config.scientific.config_id.value)
+            result = write_snapshot(self.root, fixed_cut, snapshot_id=snapshot_id, watermark=watermark, graph_generation=generation, scientific_config_id=self.config.scientific.config_id.value)
+            self.write_canonical_snapshot(snapshot_id)
+            return result
         except BaseException:
             with self._lock:
                 self.telemetry["snapshot_writes"] -= 1
@@ -1736,6 +2060,8 @@ class ContinuousMemoryRuntime:
                     self._m7[uid] = M7Strategy(uid, target_uid, int(payload["target_environment_id"]), tuple(int(value) for value in payload.get("native_actions", ())), int(payload.get("reliability_successes", 0)), int(payload.get("reliability_trials", 0)), int(payload.get("primary_valence_sum", 0)), int(payload.get("realized_cost_sum", 0)), provenance)
         for raw_uid, rows in dict(state.get("transfer_trials", {})).items():
             self._transfer_trials[MemoryUid(int(raw_uid[:16], 16), int(raw_uid[16:], 16))] = list(rows)
+        if hasattr(self, "canonical_store"):
+            self.graph.configure_durable_commit(self._commit_canonical_graph_update)
 
     def telemetry_provenance(
         self,
@@ -1946,5 +2272,7 @@ class ContinuousMemoryRuntime:
         result = self.snapshot() if normal and self.config.enable_snapshots else None
         if normal:
             self.write_scientific_report()
+        if hasattr(self, "canonical_store"):
+            self.canonical_store.close()
         self._closed = True
         return result

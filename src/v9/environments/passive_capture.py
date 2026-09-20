@@ -142,18 +142,3 @@ def install_cli_adapter_factory(cli_module: Any) -> None:
 
     cli_module.make_adapter = make_adapter_wrapped
     cli_module._v978_passive_capture_installed = True
-
-
-def install_process_factory_route(multiprocess_module: Any) -> None:
-    topology = multiprocess_module.ProcessTopology
-    if getattr(topology, "_v978_passive_capture_installed", False):
-        return
-    original = topology.start_actor
-
-    def start_actor(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if kwargs.get("adapter_factory_path") == "v9.cli:make_adapter":
-            kwargs["adapter_factory_path"] = "v9.environments.passive_capture:make_adapter"
-        return original(self, *args, **kwargs)
-
-    topology.start_actor = start_actor
-    topology._v978_passive_capture_installed = True

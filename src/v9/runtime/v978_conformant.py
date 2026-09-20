@@ -129,17 +129,18 @@ class V978ContinuousMemoryRuntime(FinalContinuousMemoryRuntime):
     def _backfill_symbol_context(self) -> None:
         rows = self._rows_with_payload(self)
         world: dict[tuple[int, int], list[tuple[int, dict[str, Any]]]] = {}
-        symbols: list[tuple[dict[str, Any], int]] = []
-        for _uid, node, payload in rows:
+        symbols: list[tuple[MemoryUid, Any, dict[str, Any], int]] = []
+        for uid, node, payload in rows:
             environment = int(payload.get("environment_instance_id", payload.get("symbol_environment_instance_id", 0)))
             episode = int(payload.get("episode_id", payload.get("symbol_episode_id", 0)))
             if payload.get("symbol_identity") is not None or payload.get("symbol_occurrence_id") is not None:
-                symbols.append((payload, int(node.created_watermark)))
+                symbols.append((uid, node, payload, int(node.created_watermark)))
             elif payload.get("action_id") is not None:
                 world.setdefault((environment, episode), []).append((int(node.created_watermark), payload))
         for values in world.values():
             values.sort(key=lambda row: row[0])
-        for payload, watermark in symbols:
+        durable_updates: dict[MemoryUid, dict[str, Any]] = {}
+        for uid, _node, payload, watermark in symbols:
             environment = int(payload.get("environment_instance_id", payload.get("symbol_environment_instance_id", 0)))
             episode = int(payload.get("episode_id", payload.get("symbol_episode_id", 0)))
             candidates = world.get((environment, episode), ())
@@ -149,8 +150,7 @@ class V978ContinuousMemoryRuntime(FinalContinuousMemoryRuntime):
             context = int(nearby.get("context_signature", 0))
             next_context = int(nearby.get("next_context_signature", context) or context)
             outcome_signature = int(nearby.get("outcome_signature", 0) or 0)
-            payload.update(
-                {
+            update = {
                     "nearby_context_signature": context,
                     "nearby_action_id": int(nearby.get("action_id", 0)),
                     "nearby_transformation_signature": int(stable_u64(context, outcome_signature, next_context, person=b"v9-symbol-nearby")),
@@ -159,7 +159,12 @@ class V978ContinuousMemoryRuntime(FinalContinuousMemoryRuntime):
                     "nearby_task_success": bool(nearby.get("task_success", False)),
                     "nearby_task_failure": bool(nearby.get("task_failure", False)),
                 }
-            )
+            if hasattr(self, "canonical_store") and uid in self.graph.payloads:
+                durable_updates[uid] = update
+            else:
+                payload.update(update)
+        if durable_updates:
+            self.replace_canonical_payloads(durable_updates)
 
     def _patch_m1n_evidence(self) -> None:
         with self._v978_evidence_lock:
@@ -168,14 +173,20 @@ class V978ContinuousMemoryRuntime(FinalContinuousMemoryRuntime):
                 (evidence.get("uid"), self._evidence_payload(signature))
                 for signature, evidence in evidence_rows.items()
             )
+        durable_updates: dict[MemoryUid, dict[str, Any]] = {}
         for uid, evidence_payload in snapshots:
             if uid in self.graph.payloads:
-                self.graph.payloads[uid].update(evidence_payload)
+                if hasattr(self, "canonical_store"):
+                    durable_updates[uid] = evidence_payload
+                else:
+                    self.graph.payloads[uid].update(evidence_payload)
             elif uid in self._deferred_base_nodes:
                 node, payload, refs = self._deferred_base_nodes[uid]
                 merged = dict(payload)
                 merged.update(evidence_payload)
                 self._deferred_base_nodes[uid] = (node, merged, refs)
+        if durable_updates:
+            self.replace_canonical_payloads(durable_updates)
 
     def flush_deferred_memory_updates(self) -> None:
         self._patch_m1n_evidence()

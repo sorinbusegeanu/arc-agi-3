@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 from pathlib import Path
 import time
@@ -13,6 +13,7 @@ from v9.memory.m1_normalized import NormalizedChannel
 from v9.telemetry import HGTInferenceSample, OptimizationSample
 from .lifecycle import run_lifecycle_maintenance
 from .parallel_memory_coordinator import run_parallel_memory_jobs
+from .scientific_modes import ScientificVisibilityMode, coerce_visibility_mode
 from .transfer_validation import run_transfer_validation_interval
 
 
@@ -60,6 +61,11 @@ def _initial_game_weight(spec: Any) -> float:
     # trajectory. Later epochs replace this prior with observed trajectory cost.
     horizon = float(_episode_horizon(spec))
     return max(1.0, horizon)
+
+
+def policy_refresh_allowed(scientific_mode: ScientificVisibilityMode | str) -> bool:
+    """Matched actors bind one epoch view and cannot refresh mid-epoch."""
+    return coerce_visibility_mode(scientific_mode) is ScientificVisibilityMode.ASYNC_DEVELOPMENT
 
 
 def _allocate_game_step_budgets(
@@ -121,6 +127,36 @@ def build_epoch_jobs(
     epoch: int,
     previous_game_results: dict[str, dict[str, int | float]] | None = None,
 ) -> list[tuple[int, Any, int, int]]:
+    if coerce_visibility_mode(
+        getattr(args, "scientific_mode", ScientificVisibilityMode.ASYNC_DEVELOPMENT)
+    ) is ScientificVisibilityMode.MATCHED_REASONING:
+        manifest_path = getattr(args, "experiment_manifest", None)
+        if not manifest_path:
+            raise ValueError("MATCHED_REASONING requires --experiment-manifest")
+        from v9.research.experiment_manifest import ExperimentManifest
+
+        manifest = ExperimentManifest.load(manifest_path)
+        by_name = {str(spec.display_name): spec for spec in specs}
+        jobs = []
+        for trial_index, trial in enumerate(manifest.interaction_opportunities.trials):
+            environment_key = trial.environment_key or trial.stable_environment_job_id
+            if environment_key not in by_name:
+                raise ValueError(f"TrialManifest environment is not selected: {environment_key}")
+            spec = by_name[environment_key]
+            options = {
+                **dict(getattr(spec, "options", {}) or {}),
+                "fixed_trial_stop_on_terminal": True,
+                "fixed_trial_id": trial.stable_environment_job_id,
+            }
+            jobs.append(
+                (
+                    trial_index + 1,
+                    replace(spec, options=options),
+                    int(trial.fixed_horizon),
+                    int(trial.environment_seed),
+                )
+            )
+        return jobs
     # Every game is one job. The coordinator runs at most --actors jobs at a
     # time and reuses a freed actor slot for the next pending game, so one actor
     # process plays one game until that game's complete budget expires.
@@ -389,6 +425,30 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         # Imported lazily to avoid the cli -> epoch_runner module cycle.
         from v9.cli import make_adapter as adapter_factory
 
+    scientific_mode = coerce_visibility_mode(
+        getattr(args, "scientific_mode", ScientificVisibilityMode.ASYNC_DEVELOPMENT)
+    )
+
+    def run_sampling_jobs(jobs: list[tuple[int, Any, int, int]], *, epoch: int, dataset: Any, common_kwargs: dict[str, Any]):
+        if scientific_mode is not ScientificVisibilityMode.MATCHED_REASONING:
+            return run_parallel_memory_jobs(runtime, jobs, hgt_dataset=dataset, **common_kwargs)
+        view = runtime.create_epoch_inference_view(sampling_epoch_id=epoch)
+        try:
+            runtime.set_telemetry_gauge("epoch_inference_view_id", view.identity.checksum)
+            runtime.set_telemetry_gauge(
+                "epoch_inference_view_canonical_lsn",
+                int(view.canonical_handle.canonical_applied_lsn),
+            )
+            return run_parallel_memory_jobs(
+                runtime,
+                jobs,
+                hgt_dataset=dataset,
+                bound_epoch_view=view,
+                **common_kwargs,
+            )
+        finally:
+            view.close()
+
     for epoch in range(1, int(args.epochs) + 1):
         jobs = build_epoch_jobs(specs, args, epoch=epoch, previous_game_results=previous_game_results)
         epoch_budget = sum(int(job[2]) for job in jobs)
@@ -413,11 +473,14 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             derivation_queue_capacity=args.derivation_queue_capacity,
             publication_queue_capacity=args.publication_queue_capacity,
             actor_view_refresh_steps=args.actor_view_refresh_steps, actor_view_refresh_ms=args.actor_view_refresh_ms,
+            allow_policy_refresh=policy_refresh_allowed(
+                getattr(args, "scientific_mode", ScientificVisibilityMode.ASYNC_DEVELOPMENT)
+            ),
         )
         if is_bootstrap:
             epoch_dataset = EpochTransitionDataset(dataset_path(args.root, epoch=epoch, branch="bootstrap"), epoch=epoch, branch="bootstrap", model_version=active_model)
             try:
-                process_results = run_parallel_memory_jobs(runtime, jobs, hgt_dataset=epoch_dataset, **common_kwargs)
+                process_results = run_sampling_jobs(jobs, epoch=epoch, dataset=epoch_dataset, common_kwargs=common_kwargs)
             finally:
                 epoch_dataset.close()
             selected_dataset_path = epoch_dataset.path
@@ -428,7 +491,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             on_dataset = EpochTransitionDataset(dataset_path(args.root, epoch=epoch, branch="hgt_on"), epoch=epoch, branch="hgt_on", model_version=active_model)
             try:
                 runtime.set_hgt_enabled(True)
-                on_results = run_parallel_memory_jobs(runtime, on_jobs, hgt_dataset=on_dataset, **common_kwargs)
+                on_results = run_sampling_jobs(on_jobs, epoch=epoch, dataset=on_dataset, common_kwargs=common_kwargs)
             finally:
                 on_dataset.close()
             on_state = runtime.capture_experiment_state()
@@ -451,7 +514,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                     # The first candidate is compared with the pre-HGT random/
                     # Hydra control policy.
                     runtime.set_hgt_enabled(False)
-                off_results = run_parallel_memory_jobs(runtime, off_jobs, hgt_dataset=off_dataset, **common_kwargs)
+                off_results = run_sampling_jobs(off_jobs, epoch=epoch, dataset=off_dataset, common_kwargs=common_kwargs)
             finally:
                 off_dataset.close()
                 runtime.set_hgt_enabled(True)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import json
 import os
 import pickle
@@ -21,6 +21,48 @@ _GROUNDING_STATE_LIMIT = 65_536
 _GROUNDING_TRIAL_ID_LIMIT = 64
 _VIABILITY_PROFILE_LIMIT = 4_096
 _ENVIRONMENTS_PER_GAME_LIMIT = 256
+
+
+@dataclass(frozen=True, slots=True)
+class V9716MigrationStatus:
+    """Feature-gated progress marker; it never changes scientific behavior."""
+
+    target_design_version: str
+    active_design_version: str
+    capabilities: tuple[tuple[str, bool], ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "target_design_version": self.target_design_version,
+            "active_design_version": self.active_design_version,
+            "capabilities": dict(self.capabilities),
+        }
+
+
+def v9716_migration_status() -> V9716MigrationStatus:
+    capabilities = (
+        ("scientific_identity_and_modes", True),
+        ("immutable_canonical_store", False),
+        ("canonical_wal", False),
+        ("persistent_signature_index", False),
+        ("transport_slab_pool", False),
+        ("canonical_work_bounds", False),
+        ("developmental_cut", False),
+        ("epoch_inference_view", False),
+        ("wal_backed_training_evidence", False),
+        ("deterministic_training_cut", False),
+        ("h17_isolation", False),
+        ("fixed_h19_trials", False),
+        ("h18_structural_prior_transform", False),
+        ("h16_grounding_controls", False),
+        ("research_prediction_registry", False),
+        ("durable_storage_governance", False),
+        ("whole_system_governor", False),
+        ("dual_mode_restart", False),
+        ("crash_reproducibility_soak", False),
+        ("legacy_cleanup_and_cutover", False),
+    )
+    return V9716MigrationStatus("9.7.16", "9.7.9", capabilities)
 
 
 class _ExperimentStateHandle:
@@ -710,7 +752,9 @@ def install_runtime_integrity(
             self._restore(captured)
 
     def snapshot(self: Any):
-        return _write_streaming_snapshot(self, chunked_snapshot)
+        result = _write_streaming_snapshot(self, chunked_snapshot)
+        self.write_canonical_snapshot(self._snapshot_id)
+        return result
 
     runtime_cls._restore = restore
     runtime_cls.apply_environment_evidence_confidence = apply_environment_evidence_confidence

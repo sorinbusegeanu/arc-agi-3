@@ -49,18 +49,4 @@ def expand_jobs_for_actor_limit(
             expanded.append((actor_id, spec, replica_steps, replica_seed))
             actor_id += 1
     return expanded
-
-
-def install_actor_job_parallelism(coordinator_module: Any) -> None:
-    if getattr(coordinator_module, "_actor_job_parallelism_installed", False):
-        return
-    original = coordinator_module.run_parallel_memory_jobs
-
-    def run_parallel_memory_jobs(runtime: Any, jobs: list[tuple[int, Any, int, int]], *, actor_limit: int, **kwargs: Any):
-        expanded = expand_jobs_for_actor_limit(jobs, actor_limit)
-        runtime.set_telemetry_gauge("sampling_jobs_before_actor_split", len(jobs))
-        runtime.set_telemetry_gauge("sampling_jobs_after_actor_split", len(expanded))
-        return original(runtime, expanded, actor_limit=actor_limit, **kwargs)
-
-    coordinator_module.run_parallel_memory_jobs = run_parallel_memory_jobs
-    coordinator_module._actor_job_parallelism_installed = True
+__all__ = ["expand_jobs_for_actor_limit"]

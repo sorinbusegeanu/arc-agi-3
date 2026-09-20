@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from v9.cognition.action_selection import adaptive_epsilon
+from v9.cognition.action_selection import adaptive_epsilon, choose_action as _choose_action
 
 
 _STATE_FLOORS = {
@@ -36,37 +36,32 @@ def viability_adjusted_epsilon(
     return max(generic, min(0.50, max(floor, float(profile_rate))))
 
 
-def install_adaptive_exploration(multiprocess_module: Any) -> None:
-    """Route actor action selection through persisted viability state."""
-    if getattr(multiprocess_module, "_viability_exploration_installed", False):
-        return
-    original_choose_action = multiprocess_module.choose_action
+def choose_action(view: Any, actions: tuple[int, ...], **kwargs: Any) -> int:
+    """Select an action with persisted viability applied explicitly."""
+    environment_id = kwargs.get("target_environment_id")
+    profile = None
+    viability = getattr(view, "viability", None)
+    if environment_id is not None and callable(viability):
+        profile = viability(int(environment_id))
+    if profile is not None:
+        counts = kwargs.get("context_action_counts") or {}
+        tried = sum(int(counts.get(int(action), 0)) > 0 for action in actions)
+        local_coverage = tried / max(1, len(actions))
+        coverage = min(float(profile.action_coverage), local_coverage) if counts else float(profile.action_coverage)
+        kwargs["epsilon"] = viability_adjusted_epsilon(
+            float(kwargs.get("epsilon", 0.0)),
+            len(actions),
+            state=str(profile.state),
+            coverage=coverage,
+            uncertainty=float(profile.policy_uncertainty),
+            learning_progress=float(profile.learning_progress),
+            profile_rate=float(profile.effective_exploration_rate),
+        )
+        kwargs["stagnation"] = max(
+            float(kwargs.get("stagnation", 0.0)),
+            max(0.0, 1.0 - max(0.0, float(profile.learning_progress))),
+        )
+    return int(_choose_action(view, actions, **kwargs))
 
-    def choose_action(view: Any, actions: tuple[int, ...], **kwargs: Any) -> int:
-        environment_id = kwargs.get("target_environment_id")
-        profile = None
-        viability = getattr(view, "viability", None)
-        if environment_id is not None and callable(viability):
-            profile = viability(int(environment_id))
-        if profile is not None:
-            counts = kwargs.get("context_action_counts") or {}
-            tried = sum(int(counts.get(int(action), 0)) > 0 for action in actions)
-            local_coverage = tried / max(1, len(actions))
-            coverage = min(float(profile.action_coverage), local_coverage) if counts else float(profile.action_coverage)
-            kwargs["epsilon"] = viability_adjusted_epsilon(
-                float(kwargs.get("epsilon", 0.0)),
-                len(actions),
-                state=str(profile.state),
-                coverage=coverage,
-                uncertainty=float(profile.policy_uncertainty),
-                learning_progress=float(profile.learning_progress),
-                profile_rate=float(profile.effective_exploration_rate),
-            )
-            kwargs["stagnation"] = max(
-                float(kwargs.get("stagnation", 0.0)),
-                max(0.0, 1.0 - max(0.0, float(profile.learning_progress))),
-            )
-        return int(original_choose_action(view, actions, **kwargs))
 
-    multiprocess_module.choose_action = choose_action
-    multiprocess_module._viability_exploration_installed = True
+__all__ = ["choose_action", "viability_adjusted_epsilon"]

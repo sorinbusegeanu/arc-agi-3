@@ -50,6 +50,10 @@ def test_sampling_prefills_distinct_actor_processes(tmp_path) -> None:
         assert int(diagnostics["actor_prefill_processes"]) == 4
         assert int(diagnostics["actor_slots_target"]) == 4
         assert int(diagnostics["peak_active_actor_processes"]) == 4
+        assert int(diagnostics["actor_produced_steps"]) == 32
+        assert int(diagnostics["causally_admitted_steps"]) == 32
+        assert int(diagnostics["publication_drained_steps"]) == 32
+        assert int(diagnostics["ingested_steps"]) == 32
         pids = {value for value in str(diagnostics["actor_process_pids"]).split(",") if value}
         assert len(pids) >= 4
         assert int(diagnostics["actor_policy_snapshot_cache_misses"]) >= 1

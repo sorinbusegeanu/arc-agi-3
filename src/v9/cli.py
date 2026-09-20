@@ -17,6 +17,10 @@ from v9.environments import ARCAdapter, ChessAdapter, GymDiscreteAdapter, GymStr
 from v9.environments.synthetic_symbolic import SyntheticSymbolicConfig
 from v9.modalities.symbols import DeterministicSymbolCodec
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig
+from v9.runtime.scientific_modes import (
+    LearnedDevelopmentalFeedbackProfile,
+    ScientificVisibilityMode,
+)
 from v9.runtime.epoch_runner import run_epochs
 from v9.runtime.trace_runner import run_trace_bundle
 from v9.runtime.retention_audit import run_retention_audit
@@ -197,12 +201,31 @@ def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--reset-persistent-identity", action="store_true")
     parser.add_argument("--no-snapshots", action="store_true")
     parser.add_argument("--no-peers", action="store_true")
+    parser.add_argument(
+        "--scientific-mode",
+        choices=tuple(mode.value for mode in ScientificVisibilityMode),
+        default=ScientificVisibilityMode.ASYNC_DEVELOPMENT.value,
+    )
+    parser.add_argument(
+        "--learned-developmental-feedback",
+        choices=tuple(profile.value for profile in LearnedDevelopmentalFeedbackProfile),
+        default=LearnedDevelopmentalFeedbackProfile.DISABLED.value,
+    )
+    parser.add_argument("--experiment-manifest", default=None, metavar="FILE")
 
 
 def _runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     scientific = ScientificConfig()
     overrides = {name: value for name, value in vars(args).items() if name.startswith("allocation_") and value is not None}
     overrides["random_seeds"] = (int(getattr(args, "seed", 0)),)
+    overrides["scientific_visibility_mode"] = getattr(
+        args, "scientific_mode", ScientificVisibilityMode.ASYNC_DEVELOPMENT.value
+    )
+    overrides["learned_developmental_feedback"] = getattr(
+        args,
+        "learned_developmental_feedback",
+        LearnedDevelopmentalFeedbackProfile.DISABLED.value,
+    )
     if hasattr(args, "validation_mode"):
         overrides["transfer_validation_mode"] = "learning_only" if args.no_automatic_experiments else args.validation_mode
         if args.max_transfer_experiments is not None:
@@ -211,7 +234,16 @@ def _runtime_config(args: argparse.Namespace) -> RuntimeConfig:
             overrides["transfer_validation_time_budget_seconds"] = args.transfer_experiment_time_budget_seconds
     if overrides:
         scientific = replace(scientific, **overrides)
-    return RuntimeConfig.from_path(args.root, shards=args.shards, stage_workers=args.stage_workers, stage_ring_capacity=args.stage_ring_capacity, shard_ring_capacity=args.shard_ring_capacity, node_capacity_per_shard=args.node_capacity_per_shard, edge_capacity_per_shard=args.edge_capacity_per_shard, action_capacity_per_shard=args.action_capacity_per_shard, snapshot_interval_seconds=args.snapshot_interval_seconds, peer_interval_seconds=args.peer_interval_seconds, enable_snapshots=not args.no_snapshots, restore=not args.no_restore, enable_peers=not args.no_peers, enable_lifecycle=getattr(args, "lifecycle", "on") == "on", reset_persistent_identity=args.reset_persistent_identity, scientific=scientific)
+    manifest_path = getattr(args, "experiment_manifest", None)
+    if manifest_path is not None:
+        from v9.research.experiment_manifest import ExperimentManifest
+
+        manifest = ExperimentManifest.load(manifest_path)
+        if manifest.scientific_config_id != scientific.config_id.value:
+            raise ValueError("ExperimentManifest ScientificConfigId does not match runtime configuration")
+        if manifest.visibility_mode is not scientific.scientific_visibility_mode:
+            raise ValueError("ExperimentManifest visibility mode does not match runtime configuration")
+    return RuntimeConfig.from_path(args.root, shards=args.shards, stage_workers=args.stage_workers, stage_ring_capacity=args.stage_ring_capacity, shard_ring_capacity=args.shard_ring_capacity, node_capacity_per_shard=args.node_capacity_per_shard, edge_capacity_per_shard=args.edge_capacity_per_shard, action_capacity_per_shard=args.action_capacity_per_shard, snapshot_interval_seconds=args.snapshot_interval_seconds, peer_interval_seconds=args.peer_interval_seconds, enable_snapshots=not args.no_snapshots, restore=not args.no_restore, enable_peers=not args.no_peers, enable_lifecycle=getattr(args, "lifecycle", "on") == "on", reset_persistent_identity=args.reset_persistent_identity, experiment_manifest=None if manifest_path is None else Path(manifest_path), enable_canonical_durability=scientific.scientific_visibility_mode is ScientificVisibilityMode.MATCHED_REASONING, scientific=scientific)
 
 
 def _actor(runtime: ContinuousMemoryRuntime, spec: EnvironmentSpec, *, actor_id: int, steps: int, seed: int, env_root: str | None, epsilon: float, progress_interval: float, verbose: bool, wait: float) -> ActorResult:

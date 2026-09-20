@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import time
 from collections import Counter
+from types import SimpleNamespace
 from typing import Any
 
-from v9.memory.identity import MemoryUid
+from v9.memory.identity import MemoryUid, stable_u64
 from v9.memory.model import MemoryLevel, MemoryType
 from v9.memory.relations import RelationEdge, RelationType
 from v9.runtime.bounded_indexes import _ensure_indexes, _remember_edge, _remember_node
@@ -132,6 +133,25 @@ def _publish_chunk(runtime: Any, rows: tuple[tuple[Any, dict[str, Any], tuple[An
             capacity = graph.edge_capacity_per_partition
             if capacity is not None and graph._edge_counts_by_partition[partition] + delta > capacity:
                 raise RuntimeError("inline low-level publication exceeded edge capacity")
+
+        durable_commit = getattr(graph, "_durable_commit", None)
+        if durable_commit is not None:
+            transaction_uid = stable_u64(
+                int(graph.generation),
+                *(f"{uid.hi}:{uid.lo}" for uid in sorted(staged_nodes)),
+                *(repr(key) for key in sorted(staged_edges, key=repr)),
+                person=b"v9-inline-wal",
+            )
+            durable_commit(
+                proposal=SimpleNamespace(proposal_uid=transaction_uid),
+                node_updates={
+                    uid: (node, payload)
+                    for uid, (node, payload, _evidence) in staged_nodes.items()
+                },
+                node_deletes={},
+                edge_updates=dict(staged_edges),
+                next_generation=graph.generation + 1,
+            )
 
         inserted_low_level = 0
         new_nodes: list[Any] = []

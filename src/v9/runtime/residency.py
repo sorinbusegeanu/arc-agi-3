@@ -6,9 +6,10 @@ import gc
 import heapq
 import math
 import time
+from types import SimpleNamespace
 from typing import Any, Iterable
 
-from v9.memory.identity import MemoryUid
+from v9.memory.identity import MemoryUid, stable_u64
 from v9.memory.model import MemoryLevel, MemoryType
 from v9.memory.provenance import DerivationProvenance
 from v9.memory.relations import RelationEdge, RelationType
@@ -166,6 +167,42 @@ def _install_graph_contract() -> None:
             for uid in deleting:
                 incident_keys.update(self._outgoing_edge_keys.get(uid, ()))
                 incident_keys.update(self._incoming_edge_keys.get(uid, ()))
+
+            if self._durable_commit is not None:
+                node_updates: dict[MemoryUid, tuple[Any, dict[str, Any]]] = {}
+                edge_updates: dict[tuple[MemoryUid, str, MemoryUid], RelationEdge | None] = {
+                    key: None for key in incident_keys
+                }
+                for source_uid in affected_sources:
+                    if source_uid in deleting:
+                        continue
+                    node = self.nodes.get(source_uid)
+                    payload = self.payloads.get(source_uid)
+                    if node is not None and payload is not None:
+                        pruned = dict(payload)
+                        _prune_payload_uid_rows(pruned, deleting)
+                        if pruned != payload:
+                            node_updates[source_uid] = (node, pruned)
+                    for key in tuple(self._outgoing_edge_keys.get(source_uid, ())):
+                        edge = self.edges.get(key)
+                        if edge is None or key in incident_keys or not edge.evidence_uids:
+                            continue
+                        filtered = tuple(uid for uid in edge.evidence_uids if uid not in deleting)
+                        if filtered != edge.evidence_uids:
+                            edge_updates[key] = replace(edge, evidence_uids=filtered)
+                self._durable_commit(
+                    proposal=SimpleNamespace(
+                        proposal_uid=stable_u64(
+                            self.generation,
+                            *(uid.hex() for uid in sorted(deleting)),
+                            person=b"v9-resident-delete-wal",
+                        )
+                    ),
+                    node_updates=node_updates,
+                    node_deletes={uid: accepted[uid][0] for uid in deleting},
+                    edge_updates=edge_updates,
+                    next_generation=self.generation + 1,
+                )
 
             removed_edge_refs = []
             removed_edges = 0

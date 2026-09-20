@@ -131,15 +131,21 @@ class FinalContinuousMemoryRuntime(CompletedContinuousMemoryRuntime):
             "nearby_task_success": bool(getattr(transition, "task_success", False)),
             "nearby_task_failure": bool(getattr(transition, "task_failure", False)),
         }
+        durable_updates: dict[MemoryUid, dict[str, Any]] = {}
         for symbol in getattr(prepared, "symbols", ()):
             uid = symbol.m0.uid
             if uid in self.graph.payloads:
-                self.graph.payloads[uid].update(contextual)
+                if hasattr(self, "canonical_store"):
+                    durable_updates[uid] = contextual
+                else:
+                    self.graph.payloads[uid].update(contextual)
             elif uid in self._deferred_base_nodes:
                 node, payload, evidence = self._deferred_base_nodes[uid]
                 merged = dict(payload)
                 merged.update(contextual)
                 self._deferred_base_nodes[uid] = (node, merged, evidence)
+        if durable_updates:
+            self.replace_canonical_payloads(durable_updates)
 
     def _configured_task(self, sequence: int, transition: EncodedTransition) -> IngestionTask:
         scientific = self.config.scientific
@@ -263,7 +269,10 @@ class FinalContinuousMemoryRuntime(CompletedContinuousMemoryRuntime):
             "symbol_source_sequence": int(occurrence.source_sequence),
         }
         if m0.uid in self.graph.payloads:
-            self.graph.payloads[m0.uid].update(payload)
+            if hasattr(self, "canonical_store"):
+                self.replace_canonical_payloads({m0.uid: payload})
+            else:
+                self.graph.payloads[m0.uid].update(payload)
         elif m0.uid in self._deferred_base_nodes:
             node, current, evidence = self._deferred_base_nodes[m0.uid]
             merged = dict(current)
@@ -464,8 +473,12 @@ class FinalContinuousMemoryRuntime(CompletedContinuousMemoryRuntime):
                     metadata["primary_valence"] = int(parent_payload["primary_valence"])
                     break
             frontier = {root}
+            durable_updates: dict[MemoryUid, dict[str, Any]] = {}
             if root in self.graph.payloads:
-                self.graph.payloads[root].update(metadata)
+                if hasattr(self, "canonical_store"):
+                    durable_updates[root] = metadata
+                else:
+                    self.graph.payloads[root].update(metadata)
             from v9.memory.model import MemoryLevel
             for level in range(2, 8):
                 memory_level = MemoryLevel(level)
@@ -474,9 +487,14 @@ class FinalContinuousMemoryRuntime(CompletedContinuousMemoryRuntime):
                     payload = self.graph.payloads.get(uid, {})
                     parent_keys = {(int(raw[0]), int(raw[1])) for raw in payload.get("parents", ()) if isinstance(raw, (list, tuple)) and len(raw) == 2}
                     if any((int(parent.hi), int(parent.lo)) in parent_keys for parent in frontier):
-                        payload.update(metadata)
+                        if hasattr(self, "canonical_store"):
+                            durable_updates[uid] = metadata
+                        else:
+                            payload.update(metadata)
                         next_frontier.add(uid)
                 frontier.update(next_frontier)
+            if durable_updates:
+                self.replace_canonical_payloads(durable_updates)
         return state
 
     def metrics(self) -> dict[str, Any]:

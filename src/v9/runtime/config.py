@@ -6,6 +6,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .scientific_modes import (
+    LearnedDevelopmentalFeedbackProfile,
+    ScientificVisibilityMode,
+    coerce_feedback_profile,
+    coerce_visibility_mode,
+)
+
 
 def canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -26,6 +33,8 @@ class ScientificConfig:
     research_contract_version: str = "0.7.0"
     design_version: str = "9.7.9"
     random_seeds: tuple[int, ...] = (0,)
+    scientific_visibility_mode: ScientificVisibilityMode = ScientificVisibilityMode.ASYNC_DEVELOPMENT
+    learned_developmental_feedback: LearnedDevelopmentalFeedbackProfile = LearnedDevelopmentalFeedbackProfile.DISABLED
 
     # Symbolic-grounding scientific identity and bounded ingestion contract.
     symbol_grounding_schema_version: int = 3
@@ -141,6 +150,8 @@ class ScientificConfig:
     )
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "scientific_visibility_mode", coerce_visibility_mode(self.scientific_visibility_mode))
+        object.__setattr__(self, "learned_developmental_feedback", coerce_feedback_profile(self.learned_developmental_feedback))
         positive = (
             self.symbol_grounding_schema_version, self.symbol_codec_version,
             self.symbol_budget_per_window, self.max_symbol_facts_per_window,
@@ -266,6 +277,14 @@ class RuntimeConfig:
     enable_lifecycle: bool = True
     peer_interval_seconds: float = 0.5
     reset_persistent_identity: bool = False
+    experiment_manifest: Path | None = None
+    enable_canonical_durability: bool = False
+    canonical_transaction_max_rows: int = 1024
+    canonical_transaction_max_input_bytes: int = 64 * 1024 * 1024
+    canonical_transaction_max_mutation_bytes: int = 64 * 1024 * 1024
+    canonical_continuation_max_bytes: int = 16 * 1024 * 1024
+    canonical_transaction_max_writes: int = 65_536
+    canonical_transaction_max_work_units: int = 1_000_000
     multiprocessing_start_method: str | None = None
     scientific: ScientificConfig = ScientificConfig()
 
@@ -274,13 +293,22 @@ class RuntimeConfig:
         return cls(Path(root), **kwargs)
 
     def __post_init__(self) -> None:
-        if min(self.shards, self.stage_workers, self.stage_ring_capacity, self.shard_ring_capacity, self.node_capacity_per_shard, self.edge_capacity_per_shard, self.action_capacity_per_shard, self.shard_batch_size) <= 0:
+        if min(self.shards, self.stage_workers, self.stage_ring_capacity, self.shard_ring_capacity, self.node_capacity_per_shard, self.edge_capacity_per_shard, self.action_capacity_per_shard, self.shard_batch_size, self.canonical_transaction_max_rows, self.canonical_transaction_max_input_bytes, self.canonical_transaction_max_mutation_bytes, self.canonical_continuation_max_bytes, self.canonical_transaction_max_writes, self.canonical_transaction_max_work_units) <= 0:
             raise ValueError("runtime counts and capacities must be positive")
         if min(self.snapshot_interval_seconds, self.peer_interval_seconds) <= 0:
             raise ValueError("runtime intervals must be positive")
+        if self.scientific.scientific_visibility_mode is ScientificVisibilityMode.MATCHED_REASONING and self.experiment_manifest is None:
+            raise ValueError("MATCHED_REASONING requires an immutable ExperimentManifest")
+        if (
+            self.scientific.scientific_visibility_mode is ScientificVisibilityMode.MATCHED_REASONING
+            and not self.enable_canonical_durability
+        ):
+            raise ValueError("MATCHED_REASONING requires canonical WAL durability and immutable handles")
 
 
 _V979_ADDITIVE_FIELDS = {
+    "scientific_visibility_mode",
+    "learned_developmental_feedback",
     "resident_m0_limit",
     "resident_m1_grounded_limit",
     "resident_low_level_target_ratio",
@@ -297,8 +325,9 @@ _V979_ADDITIVE_FIELDS = {
 }
 
 
-def _v978_manifest_compatible(existing: dict[str, Any], config: ScientificConfig) -> bool:
-    if str(existing.get("design_version", "")) != "9.7.8" or config.design_version != "9.7.9":
+def _legacy_manifest_compatible(existing: dict[str, Any], config: ScientificConfig) -> bool:
+    source_version = str(existing.get("design_version", ""))
+    if source_version not in {"9.7.8", "9.7.9"} or config.design_version != "9.7.9":
         return False
     target = config.as_dict()
     ignored = {"scientific_config_id", "design_version"} | _V979_ADDITIVE_FIELDS
@@ -317,13 +346,13 @@ def write_scientific_config_manifest(root: str | Path, config: ScientificConfig)
         existing = json.loads(target.read_text(encoding="utf-8"))
         if existing.get("scientific_config_id") == config.config_id.value:
             return target
-        if not _v978_manifest_compatible(existing, config):
+        if not _legacy_manifest_compatible(existing, config):
             raise RuntimeError("run root contains a different immutable ScientificConfig")
         migration = target.parent / "scientific_config.migration.json"
         migration.write_text(
             json.dumps(
                 {
-                    "source_design_version": "9.7.8",
+                    "source_design_version": str(existing.get("design_version", "")),
                     "source_scientific_config_id": str(existing.get("scientific_config_id", "")),
                     "target_design_version": "9.7.9",
                     "target_scientific_config_id": config.config_id.value,

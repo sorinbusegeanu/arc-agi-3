@@ -3,7 +3,7 @@
 **Version:** v9.7.16  
 **Status:** Dual-mode research-contract-aligned, reproducible-reasoning, asynchronous-development, transactionally isolated target design  
 **Research contract:** `Research_problem_statement_v070.md`  
-**Design predecessors:** Hydra v9.7.16, v9.7.12, v9.7.11, v9.7.10, v9.7.9, v9.7.8, v9.7.7, v9.7.5, v9.7.4, v9.7.3, v9.7.2, v9.7.1, v9.7, v9.6, v9.5, v9.4  
+**Design predecessors:** Hydra v9.7.15, v9.7.12, v9.7.11, v9.7.10, v9.7.9, v9.7.8, v9.7.7, v9.7.5, v9.7.4, v9.7.3, v9.7.2, v9.7.1, v9.7, v9.6, v9.5, v9.4
 **Purpose:** extend Hydra with an HGT-style heterogeneous graph transformer and a reproducible epoch-view, crash-recoverable, performance-bounded sampling/memory-update runtime whose live working set, synchronization cost, IPC cost, snapshot cost, actor-visible inference state, training evidence, evidence durability, durable-storage footprint, and whole-host memory footprint remain controlled as persistent memory grows.
 
 ---
@@ -5395,7 +5395,7 @@ Existing authoritative v9 modules remain the integration points for memory, simi
 
 # 31. Acceptance criteria
 
-v9.7.15 is operational when:
+v9.7.16 is operational when:
 
 1. Hydra builds a typed bounded GNN subgraph from published memory.
 2. The GNN runs inference on mixed M-level graphs.

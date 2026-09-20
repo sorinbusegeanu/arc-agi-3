@@ -117,6 +117,7 @@ class CompletedContinuousMemoryRuntime(_PublicContinuousMemoryRuntime):
 
     def _persist_prepared_occurrences(self, prepared: Any) -> None:
         self._index_symbol_occurrences(getattr(prepared, "symbol_occurrences", ()))
+        durable_updates: dict[MemoryUid, dict[str, Any]] = {}
         for symbol, occurrence in zip(getattr(prepared, "symbols", ()), getattr(prepared, "symbol_occurrences", ())):
             payload = {
                 "symbol_occurrence_id": [int(occurrence.occurrence_id.hi), int(occurrence.occurrence_id.lo)],
@@ -137,12 +138,17 @@ class CompletedContinuousMemoryRuntime(_PublicContinuousMemoryRuntime):
             }
             uid = symbol.m0.uid
             if uid in self.graph.payloads:
-                self.graph.payloads[uid].update(payload)
+                if hasattr(self, "canonical_store"):
+                    durable_updates[uid] = payload
+                else:
+                    self.graph.payloads[uid].update(payload)
             elif uid in self._deferred_base_nodes:
                 node, existing, evidence = self._deferred_base_nodes[uid]
                 merged = dict(existing)
                 merged.update(payload)
                 self._deferred_base_nodes[uid] = (node, merged, evidence)
+        if durable_updates:
+            self.replace_canonical_payloads(durable_updates)
 
     def _register_family_relation(self, relation: Any) -> None:
         family = int(getattr(relation, "family_signature", 0) or relation.structural_signature)
@@ -318,18 +324,27 @@ class CompletedContinuousMemoryRuntime(_PublicContinuousMemoryRuntime):
             "grounding_confidence": float(state.support / max(1e-9, state.support + state.contradiction)),
             "grounding_validation_trial_id": str(trial_id),
         }
+        durable_updates: dict[MemoryUid, dict[str, Any]] = {}
         frontier = {root}
         if root in self.graph.payloads:
-            self.graph.payloads[root].update(metadata)
+            if hasattr(self, "canonical_store"):
+                durable_updates[root] = metadata
+            else:
+                self.graph.payloads[root].update(metadata)
         for level in (MemoryLevel.M2, MemoryLevel.M3, MemoryLevel.M4, MemoryLevel.M5, MemoryLevel.M6, MemoryLevel.M7):
             next_frontier: set[MemoryUid] = set()
             for uid in self.graph.uids_at_level(level):
                 payload = self.graph.payloads.get(uid, {})
                 parents = {MemoryUid(int(raw[0]), int(raw[1])) for raw in payload.get("parents", ()) if isinstance(raw, (list, tuple)) and len(raw) == 2}
                 if parents & frontier:
-                    payload.update(metadata)
+                    if hasattr(self, "canonical_store"):
+                        durable_updates[uid] = metadata
+                    else:
+                        payload.update(metadata)
                     next_frontier.add(uid)
             frontier.update(next_frontier)
+        if durable_updates:
+            self.replace_canonical_payloads(durable_updates)
         self._actor_policy_generation += 1
         return authority
 
