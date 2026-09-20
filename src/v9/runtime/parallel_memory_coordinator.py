@@ -10,6 +10,7 @@ from typing import Any
 
 from .actor_job_parallelism import expand_jobs_for_actor_limit
 from .canonical_commit import apply_canonical_commit_batch
+from .derivation_merge import DerivationLease, DerivationLeaseManager, DerivationTaskIdentity
 from .memory_pipeline import DerivationBatchTask, DerivationResult, IngestionBatchTask, IngestionTask, PreparedCommitBatch
 from .memory_worker_topology import MemoryWorkerTopology
 from .multiprocess import ActorDone, ActorError, ProcessTopology
@@ -233,6 +234,15 @@ class MemoryPipelineService:
         self.pending_ingest_batch_rows = 0
         self.pending_ingest_batch_bytes = 0
         self.pending_derivation: deque[Any] = deque()
+        self.derivation_leases = DerivationLeaseManager(
+            pending_limit=4096,
+            inflight_limit=256,
+            completed_limit=2048,
+        )
+        self._derivation_candidates: dict[DerivationTaskIdentity, Any] = {}
+        self._derivation_lease_by_task: dict[int, DerivationLease] = {}
+        self.derivation_retries = 0
+        self.derivation_stale_results = 0
         self.ingest_results: dict[int, PreparedCommitBatch] = {}
         self.derive_results: dict[int, DerivationResult] = {}
         self.inflight: set[int] = set()
@@ -473,30 +483,75 @@ class MemoryPipelineService:
         signature = int(candidate.structural_signature)
         support = int(candidate.support)
         previous = int(self.last_support.get(signature, 0))
-        if signature in self.inflight:
-            current = self.waiting_candidates.get(signature)
-            if current is None or int(current.support) < support:
-                self.waiting_candidates[signature] = candidate
-            return
         if support <= previous:
             return
         if previous >= 2 and support < previous * 2:
             return
-        task = replace(candidate, task_id=self.derive_task_id)
-        self.derive_task_id += 1
-        self.inflight.add(signature)
-        self.pending_derivation.append(task)
+        identity = DerivationTaskIdentity(signature, support, 1)
+        self._derivation_candidates[identity] = candidate
+        self.derivation_leases.enqueue(identity)
+
+    def _expire_derivation_leases(self) -> bool:
+        expired = set(self.derivation_leases.expire())
+        if not expired:
+            return False
+        expired_tasks = {
+            task_id
+            for task_id, lease in self._derivation_lease_by_task.items()
+            if lease.identity in expired
+        }
+        for task_id in expired_tasks:
+            self._derivation_lease_by_task.pop(task_id, None)
+        if expired_tasks:
+            self.pending_derivation = deque(
+                task for task in self.pending_derivation
+                if int(task.task_id) not in expired_tasks
+            )
+        for identity in expired:
+            if not any(
+                lease.identity.signature == identity.signature
+                for lease in self._derivation_lease_by_task.values()
+            ):
+                self.inflight.discard(identity.signature)
+        self.derivation_retries += len(expired)
+        return True
+
+    def _retry_derivation_task(self, task_id: int) -> bool:
+        lease = self._derivation_lease_by_task.pop(int(task_id), None)
+        if lease is None:
+            self.derivation_stale_results += 1
+            return False
+        retried = self.derivation_leases.retry(lease)
+        if retried:
+            self.derivation_retries += 1
+        if not any(
+            current.identity.signature == lease.identity.signature
+            for current in self._derivation_lease_by_task.values()
+        ):
+            self.inflight.discard(lease.identity.signature)
+        return retried
 
     def pump_derivation_tasks(self) -> bool:
+        progressed = self._expire_derivation_leases()
         if not self.pending_derivation:
-            return False
+            for lease in self.derivation_leases.lease(count=64):
+                candidate = self._derivation_candidates.get(lease.identity)
+                if candidate is None:
+                    raise RuntimeError("leased derivation identity has no candidate payload")
+                task = replace(candidate, task_id=self.derive_task_id)
+                self.derive_task_id += 1
+                self._derivation_lease_by_task[int(task.task_id)] = lease
+                self.inflight.add(lease.identity.signature)
+                self.pending_derivation.append(task)
+        if not self.pending_derivation:
+            return progressed
         count = min(64, len(self.pending_derivation))
         tasks = tuple(islice(self.pending_derivation, 0, count))
         batch = DerivationBatchTask(int(tasks[0].task_id), int(tasks[-1].task_id), tasks)
         try:
             self.memory.derivation_queue.put_nowait(batch)
         except queue.Full:
-            return False
+            return progressed
         for _ in range(count):
             self.pending_derivation.popleft()
         return True
@@ -549,20 +604,24 @@ class MemoryPipelineService:
     def apply_ingest_ready(self) -> bool:
         plans: list[Any] = []
         input_bytes = 0
+        transaction_row_limit = min(
+            int(self.canonical_batch_size),
+            int(getattr(self.runtime.config, "canonical_transaction_max_rows", 1024)),
+        )
         while self.ingest_apply in self.ingest_results:
             batch = self.ingest_results[self.ingest_apply]
-            if plans and len(plans) + len(batch.rows) > self.canonical_batch_size:
+            if plans and len(plans) + len(batch.rows) > transaction_row_limit:
                 break
             self.ingest_results.pop(self.ingest_apply)
             plans.extend(batch.rows)
             input_bytes += int(getattr(batch, "input_bytes", 0))
             self.ingest_apply = int(batch.end_sequence) + 1
-            if len(plans) >= self.canonical_batch_size:
+            if len(plans) >= transaction_row_limit:
                 break
         if not plans:
             return False
         started = time.perf_counter()
-        result = apply_canonical_commit_batch(self.runtime, plans)
+        result = apply_canonical_commit_batch(self.runtime, plans, input_bytes=input_bytes)
         elapsed = time.perf_counter() - started
         self.canonical_apply_seconds += elapsed
         self.canonical_apply_events += len(plans)
@@ -586,6 +645,9 @@ class MemoryPipelineService:
             first = False
             if item[0] == "worker_error":
                 raise RuntimeError(f"{item[1]} worker task {item[2]} failed: {item[3]}")
+            if item[0] == "derivation_task_error":
+                progressed = self._retry_derivation_task(int(item[1])) or progressed
+                continue
             if item[0] == "derivation_batch_shm":
                 descriptor = item[3]
                 batch, _decode_ms = consume_shared_batch(descriptor)
@@ -607,23 +669,52 @@ class MemoryPipelineService:
         return progressed
 
     def apply_derivation_ready(self) -> bool:
-        rows: list[DerivationResult] = []
-        while self.derive_apply in self.derive_results:
-            row = self.derive_results.pop(self.derive_apply)
-            rows.append(row)
-            self.derive_apply += 1
-        if not rows:
+        if not self.derive_results:
             return False
-        self.runtime.apply_derivation_results_batch(rows)
-        self.derived += len(rows)
-        for row in rows:
+        progressed = False
+        handled = False
+        for task_id in sorted(tuple(self.derive_results)):
+            handled = True
+            row = self.derive_results.pop(task_id)
+            lease = self._derivation_lease_by_task.get(task_id)
+            if lease is None or not self.derivation_leases.accepts(lease):
+                self.derivation_stale_results += 1
+                continue
+            newer_support = max(
+                (
+                    identity.target_support
+                    for identity in self._derivation_candidates
+                    if identity.signature == lease.identity.signature
+                ),
+                default=lease.identity.target_support,
+            )
+            if lease.identity.target_support < newer_support:
+                self.derivation_leases.complete(lease, "STALE_RESULT")
+                self._derivation_lease_by_task.pop(task_id, None)
+                self._derivation_candidates.pop(lease.identity, None)
+                self.derivation_stale_results += 1
+                if not any(
+                    current.identity.signature == lease.identity.signature
+                    for current in self._derivation_lease_by_task.values()
+                ):
+                    self.inflight.discard(lease.identity.signature)
+                continue
+            self.runtime.apply_derivation_results_batch((row,))
+            if not self.derivation_leases.complete(lease, row):
+                raise RuntimeError("derivation lease changed during canonical publication")
+            self._derivation_lease_by_task.pop(task_id, None)
+            self.derived += 1
+            progressed = True
             signature = int(row.structural_signature)
-            self.inflight.discard(signature)
             self.last_support[signature] = int(row.support)
-            waiting = self.waiting_candidates.pop(signature, None)
-            if waiting is not None:
-                self._consider_candidate(waiting)
-        return True
+            self._derivation_candidates.pop(lease.identity, None)
+            if not any(
+                current.identity.signature == signature
+                for current in self._derivation_lease_by_task.values()
+            ):
+                self.inflight.discard(signature)
+        self.derive_apply = max(self.derive_apply, max(self.derive_results, default=0) + 1)
+        return progressed or handled
 
     def service(self) -> bool:
         progressed = self.pump_ingest_tasks()
@@ -641,6 +732,7 @@ class MemoryPipelineService:
 
     def diagnostics(self) -> dict[str, float | int]:
         rows = max(1, self.ingest_result_rows)
+        lease_pending, lease_inflight, lease_completed = self.derivation_leases.counts
         return {
             "sampled_steps": self.sampled,
             "ingested_steps": self.ingested,
@@ -668,6 +760,11 @@ class MemoryPipelineService:
             "publication_dispatch_ms": 1000.0 * self.publication_dispatch_seconds,
             "publication_dispatch_ms_per_transition": 1000.0 * self.publication_dispatch_seconds / max(1, self.publication_dispatch_rows),
             "publication_batches": self.publication_batches,
+            "derivation_lease_pending": lease_pending,
+            "derivation_lease_inflight": lease_inflight,
+            "derivation_lease_completed": lease_completed,
+            "derivation_lease_retries": self.derivation_retries,
+            "derivation_stale_results": self.derivation_stale_results,
         }
 
 
@@ -1120,7 +1217,12 @@ def run_parallel_memory_jobs(
         memory.join_ingest()
 
         last_progress_at = time.monotonic()
-        while pipeline.pending_derivation or pipeline.inflight or pipeline.derive_results:
+        while (
+            pipeline.pending_derivation
+            or pipeline.inflight
+            or pipeline.derive_results
+            or any(pipeline.derivation_leases.counts[:2])
+        ):
             progressed = pipeline.service()
             if progressed:
                 last_progress_at = time.monotonic()

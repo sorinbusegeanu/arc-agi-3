@@ -83,6 +83,19 @@ class DerivationLeaseManager:
             self._completed.popitem(last=False)
         return True
 
+    def accepts(self, lease: DerivationLease) -> bool:
+        return self._inflight.get(lease.identity) == lease
+
+    def retry(self, lease: DerivationLease) -> bool:
+        current = self._inflight.get(lease.identity)
+        if current != lease:
+            return False
+        if len(self._pending) >= self.pending_limit:
+            raise OverflowError("derivation retry would exceed pending ceiling")
+        self._inflight.pop(lease.identity)
+        self._pending[lease.identity] = lease.attempt
+        return True
+
     def expire(self) -> tuple[DerivationTaskIdentity, ...]:
         now = self._clock()
         expired = tuple(sorted(identity for identity, lease in self._inflight.items() if lease.deadline <= now))

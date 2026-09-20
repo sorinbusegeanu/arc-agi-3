@@ -26,6 +26,29 @@ class CanonicalTransactionStatus(str, Enum):
     OVERSIZED_CANONICAL_PRIMITIVE = "OVERSIZED_CANONICAL_PRIMITIVE"
 
 
+class CanonicalTransactionQuarantined(RuntimeError):
+    def __init__(
+        self,
+        status: CanonicalTransactionStatus,
+        *,
+        sequences: tuple[int, ...],
+        estimate: "CanonicalWorkEstimate",
+    ) -> None:
+        if status not in {
+            CanonicalTransactionStatus.OVERSIZED_CANONICAL_TRANSACTION,
+            CanonicalTransactionStatus.OVERSIZED_CANONICAL_PRIMITIVE,
+        }:
+            raise ValueError("only oversized canonical work can be quarantined")
+        self.status = status
+        self.sequences = tuple(int(value) for value in sequences)
+        self.estimate = estimate
+        super().__init__(
+            f"{status.value}: sequences={self.sequences} rows={estimate.rows} "
+            f"input_bytes={estimate.input_bytes} mutation_bytes={estimate.materialized_mutation_bytes} "
+            f"writes={estimate.write_count} work_units={estimate.work_units}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class CanonicalWorkEstimate:
     rows: int
@@ -277,6 +300,7 @@ __all__ = [
     "CanonicalContinuationFragment",
     "CanonicalFragmentTiming",
     "CanonicalTransaction",
+    "CanonicalTransactionQuarantined",
     "CanonicalTransactionStatus",
     "CanonicalWorkBudget",
     "CanonicalWorkEstimate",

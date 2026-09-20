@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
+import os
+import sys
 from typing import Any
 
 from v9.memory.identity import stable_u64
@@ -8,6 +11,57 @@ from .contract import BoundaryEvent, EnvironmentTransition, TaskProgress, Within
 from .schemas import ActionSchema, EnvironmentIdentity, ObservationSchema
 
 SemanticFact = tuple[int, int, int, int, float]
+
+
+def preserving_stdio_call(callable_obj: Any, *args: Any, quiet: bool = False, **kwargs: Any) -> Any:
+    """Call native environment code without surrendering process stdio ownership."""
+    sink = open(os.devnull, "w", encoding="utf-8") if quiet else None
+    saved_fds: dict[int, int] = {}
+    fallback_names: list[str] = []
+    streams = (("stdout", sys.stdout), ("stderr", sys.stderr))
+    try:
+        for name, stream in streams:
+            try:
+                stream.flush()
+                target_fd = int(stream.fileno())
+            except (AttributeError, OSError, ValueError):
+                if quiet:
+                    fallback_names.append(name)
+                continue
+            if target_fd not in saved_fds:
+                saved_fds[target_fd] = os.dup(target_fd)
+                if quiet and sink is not None:
+                    os.dup2(sink.fileno(), target_fd)
+        with ExitStack() as stack:
+            if sink is not None and "stdout" in fallback_names:
+                stack.enter_context(redirect_stdout(sink))
+            if sink is not None and "stderr" in fallback_names:
+                stack.enter_context(redirect_stderr(sink))
+            return callable_obj(*args, **kwargs)
+    finally:
+        for target_fd, saved_fd in saved_fds.items():
+            try:
+                os.dup2(saved_fd, target_fd)
+            finally:
+                os.close(saved_fd)
+        if sink is not None:
+            sink.close()
+        for name, fd in (("stdout", 1), ("stderr", 2)):
+            stream = getattr(sys, name, None)
+            try:
+                stream.flush()
+            except (AttributeError, OSError, ValueError):
+                try:
+                    replacement = os.fdopen(
+                        os.dup(fd),
+                        "w",
+                        buffering=1,
+                        encoding=getattr(stream, "encoding", None) or "utf-8",
+                        errors=getattr(stream, "errors", None) or "backslashreplace",
+                    )
+                except (OSError, ValueError):
+                    continue
+                setattr(sys, name, replacement)
 
 
 def _semantic_id(value: object) -> int:
@@ -260,4 +314,3 @@ class StructuralAdapter:
             {"before_signature": before_signature, "after_signature": after_signature},
             self._boundary, before_signature, after_signature, self._last_trace,
         )
-

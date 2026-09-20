@@ -72,6 +72,7 @@ def _block_for_result(self: MemoryPipelineService, *, timeout: float = 0.05) -> 
         self.pending_derivation
         or self.inflight
         or self.derive_results
+        or any(getattr(self, "derivation_leases", None).counts[:2])
     )
     if derivation_outstanding:
         progressed = self.drain_derivation_results(block=True, timeout=float(timeout)) or progressed
@@ -270,11 +271,11 @@ def _prioritize_commit_plan(plan: Any) -> Any:
 
 
 def _canonical_commit_without_implicit_grounding(original: Any):
-    def repaired(runtime: Any, rows: Iterable[Any]):
+    def repaired(runtime: Any, rows: Iterable[Any], **kwargs: Any):
         plans = tuple(_prioritize_commit_plan(row) for row in rows)
         states_before = dict(runtime.grounding.states)
         promotions_before = int(runtime.telemetry.get("grounding_promotions", 0))
-        result = original(runtime, plans)
+        result = original(runtime, plans, **kwargs)
         runtime.grounding.states.clear()
         runtime.grounding.states.update(states_before)
         runtime.telemetry["grounding_promotions"] = promotions_before

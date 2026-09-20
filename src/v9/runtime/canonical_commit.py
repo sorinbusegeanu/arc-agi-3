@@ -14,6 +14,13 @@ from v9.modalities.symbols import DeterministicSymbolCodec
 from .canonical_commit_derivation import derivation_candidates
 from .canonical_commit_isf import score_isf_batch
 from .canonical_commit_state import advance_stage_fast, record_normalized_fast, trim_replay_pool
+from .canonical_transaction import (
+    CanonicalTransactionQuarantined,
+    CanonicalTransactionStatus,
+    CanonicalWorkBudget,
+    CanonicalWorkEstimate,
+    _estimate_bytes,
+)
 from .memory_pipeline import CommitPlan, DerivationTask, _m1n_write
 
 
@@ -55,7 +62,12 @@ def _append_dirty_normalized(runtime: Any, relation: Any, rows: list[Any]) -> in
     return signature
 
 
-def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> CanonicalCommitResult:
+def apply_canonical_commit_batch(
+    runtime: Any,
+    rows: Iterable[CommitPlan],
+    *,
+    input_bytes: int = 0,
+) -> CanonicalCommitResult:
     plans = tuple(rows)
     if not plans:
         return CanonicalCommitResult((), ())
@@ -76,6 +88,61 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                 materialized_rows[id(symbol.aligned_normalized_write)] = symbol.aligned_normalized_write.runtime_row()
         for derived in plan.derived_relations:
             materialized_rows[id(derived.write)] = derived.write.runtime_row()
+
+    unique_rows = tuple(materialized_rows.values())
+    write_count = 0
+    mutation_bytes = 0
+    maximum_primitive_bytes = 0
+    for node, payload, evidence in unique_rows:
+        node_bytes = _estimate_bytes(
+            (int(node.uid.hi), int(node.uid.lo)),
+            {"node": node, "payload": payload, "evidence": evidence},
+        )
+        maximum_primitive_bytes = max(maximum_primitive_bytes, node_bytes)
+        mutation_bytes += node_bytes
+        write_count += 3
+        parents = {
+            (int(parent[0]), int(parent[1]))
+            for parent in payload.get("parents", ())
+            if isinstance(parent, (list, tuple)) and len(parent) == 2
+        }
+        for parent in parents:
+            edge_bytes = _estimate_bytes(
+                (int(node.uid.hi), int(node.uid.lo), parent), evidence
+            )
+            maximum_primitive_bytes = max(maximum_primitive_bytes, edge_bytes)
+            mutation_bytes += edge_bytes
+            write_count += 2
+    symbol_count = sum(len(plan.symbols) for plan in plans)
+    derived_count = sum(len(plan.derived_relations) for plan in plans)
+    grounding_operations = sum(int(plan.interaction_grounding is not None) for plan in plans)
+    estimate = CanonicalWorkEstimate(
+        rows=len(plans),
+        input_bytes=int(input_bytes),
+        materialized_mutation_bytes=mutation_bytes,
+        write_count=write_count,
+        symbol_count=symbol_count,
+        derived_relation_count=derived_count,
+        grounding_operations=grounding_operations,
+        work_units=write_count + symbol_count + derived_count + grounding_operations,
+    )
+    budget = CanonicalWorkBudget(
+        max_rows=int(runtime.config.canonical_transaction_max_rows),
+        max_input_bytes=int(runtime.config.canonical_transaction_max_input_bytes),
+        max_materialized_mutation_bytes=int(runtime.config.canonical_transaction_max_mutation_bytes),
+        max_continuation_bytes=int(runtime.config.canonical_continuation_max_bytes),
+        max_writes=int(runtime.config.canonical_transaction_max_writes),
+        max_work_units=int(runtime.config.canonical_transaction_max_work_units),
+    )
+    status = budget.status(estimate)
+    if maximum_primitive_bytes > budget.max_continuation_bytes:
+        status = CanonicalTransactionStatus.OVERSIZED_CANONICAL_PRIMITIVE
+    if status is not CanonicalTransactionStatus.READY:
+        raise CanonicalTransactionQuarantined(
+            status,
+            sequences=tuple(int(plan.sequence) for plan in plans),
+            estimate=estimate,
+        )
 
     with runtime._lock:
         lock_acquired = time.perf_counter()

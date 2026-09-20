@@ -195,3 +195,26 @@ def test_resident_deletion_fsync_failure_keeps_complete_old_handle(tmp_path: Pat
         runtime.graph.delete_low_level_nodes_batch(((target, replacement, "crash"),))
     assert target in runtime.graph.nodes
     assert runtime.canonical_state_handle == old_handle
+
+
+def test_derivation_publication_uses_wal_overlay_and_atomic_root(tmp_path: Path) -> None:
+    runtime = ContinuousMemoryRuntime(
+        RuntimeConfig.from_path(
+            tmp_path,
+            restore=False,
+            enable_snapshots=False,
+            enable_canonical_durability=True,
+        )
+    )
+    uid = MemoryUid(71, 72)
+    node = CanonicalNode(uid, MemoryLevel.M2, MemoryType.FAMILY, (73,), 1)
+    runtime._publish_derivation_rows(
+        ((node, {"structural_signature": 73, "parents": []}, ()),)
+    )
+    assert runtime.persistence_frontiers.wal_durable_lsn == 1
+    assert runtime.persistence_frontiers.canonical_applied_lsn == 1
+    assert uid in runtime.graph.nodes
+    key = f"node:{uid.hi:016x}{uid.lo:016x}"
+    assert runtime.canonical_store.read_from_handle(
+        runtime.canonical_state_handle, "graph", key
+    ) is not None

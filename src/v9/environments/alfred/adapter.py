@@ -9,7 +9,7 @@ from random import Random
 from types import SimpleNamespace
 from typing import Any, Callable, Protocol
 
-from v9.environments.base import StructuralAdapter, _fact, _semantic_id
+from v9.environments.base import StructuralAdapter, _fact, _semantic_id, preserving_stdio_call
 from v9.environments.contract import BoundaryEvent, BoundaryScope, WithinActionFrame, WithinActionTrace
 from v9.environments.schemas import ActionSchema, EnvironmentIdentity, ObservationSchema
 from v9.memory.identity import MemoryUid, stable_u64
@@ -180,13 +180,12 @@ class AlfworldTextBackend:
         return self._capture(observation, info), self._instruction, boundary
 
     def close(self) -> None:
-        # TextWorld runs inside a short-lived Hydra actor process.  Its close()
-        # path can close an inherited Python stdio wrapper (observed with
-        # CPython 3.14 free-threaded), after which multiprocessing teardown
-        # fails while flushing stderr.  TextWorld owns no external simulator
-        # process here, so process exit is the authoritative cleanup boundary.
+        environment = self._environment
         self._environment = None
         self._actions = ()
+        close = getattr(environment, "close", None)
+        if callable(close):
+            preserving_stdio_call(close)
 
 
 class AlfworldThorBackend:

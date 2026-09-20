@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
-import sys
 from typing import Any
 
-from v9.environments.base import StructuralAdapter
+from v9.environments.base import StructuralAdapter, preserving_stdio_call
 from v9.environments.contract import BoundaryEvent, BoundaryScope, WithinActionFrame, WithinActionTrace
 from v9.environments.schemas import ActionSchema, EnvironmentIdentity, ObservationSchema
 from v9.modalities.symbols import DeterministicSymbolCodec, SymbolObservation
@@ -18,31 +16,7 @@ class BabyAIObservation:
 
 
 def _quiet_native_call(callable_obj, *args, **kwargs):
-    # Redirect OS descriptors rather than replacing sys.stdout/sys.stderr.
-    # Native environment code may retain or close Python stream wrappers;
-    # replacing the globals can then leave multiprocessing with closed stdio
-    # during child-process teardown.
-    sink_fd = os.open(os.devnull, os.O_WRONLY)
-    saved_fds: dict[int, int] = {}
-    try:
-        for stream in (sys.stdout, sys.stderr):
-            try:
-                stream.flush()
-                target_fd = int(stream.fileno())
-            except (AttributeError, OSError, ValueError):
-                continue
-            if target_fd in saved_fds:
-                continue
-            saved_fds[target_fd] = os.dup(target_fd)
-            os.dup2(sink_fd, target_fd)
-        return callable_obj(*args, **kwargs)
-    finally:
-        for target_fd, saved_fd in saved_fds.items():
-            try:
-                os.dup2(saved_fd, target_fd)
-            finally:
-                os.close(saved_fd)
-        os.close(sink_fd)
+    return preserving_stdio_call(callable_obj, *args, quiet=True, **kwargs)
 
 
 class BabyAIAdapter(StructuralAdapter):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import struct
+from threading import Event, Thread
 
 from v9.runtime.canonical_wal import (
     CanonicalCommitWAL,
@@ -46,3 +47,42 @@ def test_recovery_rejects_checksummed_non_contiguous_group_identity(tmp_path) ->
     assert tuple(frame.wal_tx_id for frame in recovery.frames) == ("first",)
     assert recovery.wal_durable_lsn == 1
     assert path.stat().st_size == first_group_bytes
+
+
+def test_stalled_fsync_exposes_bounded_pending_state_and_backpressures(tmp_path) -> None:
+    entered = Event()
+    release = Event()
+    calls = 0
+
+    def slow_first_fsync(_descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(timeout=2.0)
+
+    wal = CanonicalCommitWAL(
+        tmp_path / "canonical.wal", max_pending_bytes=4096, fsync=slow_first_fsync
+    )
+    first = Thread(
+        target=lambda: wal.append_group(({"transaction_id": "first"},)), daemon=True
+    )
+    second_done = Event()
+    second = Thread(
+        target=lambda: (
+            wal.append_group(({"transaction_id": "second"},)), second_done.set()
+        ),
+        daemon=True,
+    )
+    first.start()
+    assert entered.wait(timeout=1.0)
+    assert 0 < wal.pending_bytes <= wal.max_pending_bytes
+    assert wal.pending_age_seconds >= 0.0
+    second.start()
+    assert not second_done.wait(timeout=0.05)
+    release.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+    assert second_done.is_set()
+    assert wal.pending_bytes == 0
+    assert wal.pending_age_seconds == 0.0

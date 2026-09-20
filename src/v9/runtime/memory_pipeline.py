@@ -595,6 +595,15 @@ class PreparedCommitBatch:
     end_sequence: int
     rows: tuple[Any, ...]
     input_bytes: int = 0
+    row_input_bytes: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.row_input_bytes and len(self.row_input_bytes) != len(self.rows):
+            raise ValueError("prepared commit byte measurements must match rows")
+        if any(int(value) < 0 for value in self.row_input_bytes):
+            raise ValueError("prepared commit row bytes cannot be negative")
+        if self.row_input_bytes and sum(self.row_input_bytes) != int(self.input_bytes):
+            raise ValueError("prepared commit row bytes must equal carried input bytes")
 
 
 def _m0_write(m0: Any, event: Any, context: TransitionCommitContext | None = None, occurrence: Any | None = None) -> CanonicalWrite:
@@ -847,6 +856,7 @@ def ingest_batch_worker_main(task_queue: Any, result_queue: Any, result_pool: Tr
             continue
         try:
             tasks = tuple(item.tasks)
+            measured_input_bytes = _ingestion_task_input_bytes(item)
             for offset in range(0, len(tasks), _INGEST_RESULT_CHUNK_SIZE):
                 chunk = tasks[offset : offset + _INGEST_RESULT_CHUNK_SIZE]
                 if not chunk:
@@ -858,7 +868,8 @@ def ingest_batch_worker_main(task_queue: Any, result_queue: Any, result_pool: Tr
                     int(chunk[0].sequence),
                     int(chunk[-1].sequence),
                     rows,
-                    sum(_ingestion_task_input_bytes(item)[offset : offset + len(chunk)]),
+                    sum(measured_input_bytes[offset : offset + len(chunk)]),
+                    measured_input_bytes[offset : offset + len(chunk)],
                 )
                 if result_pool is None:
                     descriptor = publish_shared_batch(
@@ -891,7 +902,15 @@ def derivation_batch_worker_main(task_queue: Any, result_queue: Any, result_pool
         if not isinstance(item, DerivationBatchTask):
             continue
         try:
-            results = tuple(derive_memory(task) for task in item.tasks)
+            completed = []
+            for task in item.tasks:
+                try:
+                    completed.append(derive_memory(task))
+                except BaseException as exc:
+                    result_queue.put(("derivation_task_error", int(task.task_id), repr(exc)))
+            results = tuple(completed)
+            if not results:
+                continue
             if result_pool is None:
                 descriptor = publish_shared_batch(
                     results,

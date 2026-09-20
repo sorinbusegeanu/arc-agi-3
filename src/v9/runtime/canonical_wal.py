@@ -5,6 +5,7 @@ import json
 import os
 import struct
 import tempfile
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
@@ -162,6 +163,8 @@ class CanonicalCommitWAL:
         self._group_id = 0
         self._durable_lsn = 0
         self._poisoned = False
+        self._pending_bytes = 0
+        self._pending_started_at = 0.0
         recovery = self.recover(truncate=True)
         self._durable_lsn = recovery.wal_durable_lsn
         self._group_id = recovery.groups
@@ -177,6 +180,15 @@ class CanonicalCommitWAL:
         """Whether this process can safely append without reopening the WAL."""
         with self._lock:
             return not self._poisoned
+
+    @property
+    def pending_bytes(self) -> int:
+        return int(self._pending_bytes)
+
+    @property
+    def pending_age_seconds(self) -> float:
+        started = float(self._pending_started_at)
+        return 0.0 if started <= 0.0 else max(0.0, time.monotonic() - started)
 
     @staticmethod
     def _write_all(handle: Any, payload: bytes) -> None:
@@ -290,6 +302,8 @@ class CanonicalCommitWAL:
                 raise OverflowError("WAL group pending-byte ceiling exceeded")
             group_id = self._group_id + 1
             encoded_group = self._encode_group(frames, group_id=group_id)
+            self._pending_bytes = total_payload
+            self._pending_started_at = time.monotonic()
             try:
                 with self.path.open("ab", buffering=0) as handle:
                     self._write_all(handle, encoded_group)
@@ -302,6 +316,9 @@ class CanonicalCommitWAL:
                 # in a newly opened WAL is the only safe way to resume.
                 self._poisoned = True
                 raise
+            finally:
+                self._pending_bytes = 0
+                self._pending_started_at = 0.0
             # The durable frontier moves only after the complete group fsync returns.
             self._durable_lsn = frames[-1].wal_lsn
             self._group_id = group_id

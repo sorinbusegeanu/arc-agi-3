@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import queue
 import time
 from collections import deque
@@ -43,6 +44,47 @@ def _batch_end_sequence(value: Any) -> int:
     return int(value.end_sequence)
 
 
+def _prepared_row_input_bytes(value: PreparedCommitBatch) -> tuple[int, ...]:
+    measured = tuple(int(row) for row in (getattr(value, "row_input_bytes", ()) or ()))
+    if measured:
+        if len(measured) != len(value.rows) or sum(measured) != int(value.input_bytes):
+            raise ValueError("prepared commit row-byte accounting mismatch")
+        return measured
+    rows = len(value.rows)
+    if rows <= 0:
+        return ()
+    base, remainder = divmod(int(getattr(value, "input_bytes", 0)), rows)
+    return tuple(base + int(index < remainder) for index in range(rows))
+
+
+def _split_prepared_batch(
+    value: PreparedCommitBatch, count: int
+) -> tuple[PreparedCommitBatch, PreparedCommitBatch | None]:
+    if not 0 < int(count) <= len(value.rows):
+        raise ValueError("prepared commit split count is outside the batch")
+    measured = _prepared_row_input_bytes(value)
+    selected_rows = tuple(value.rows[:count])
+    selected_bytes = measured[:count]
+    selected = PreparedCommitBatch(
+        int(value.start_sequence),
+        int(value.start_sequence) + int(count) - 1,
+        selected_rows,
+        sum(selected_bytes),
+        selected_bytes,
+    )
+    if count == len(value.rows):
+        return selected, None
+    remaining_bytes = measured[count:]
+    remaining = PreparedCommitBatch(
+        int(value.start_sequence) + int(count),
+        int(value.end_sequence),
+        tuple(value.rows[count:]),
+        sum(remaining_bytes),
+        remaining_bytes,
+    )
+    return selected, remaining
+
+
 def _prepared_rows_waiting(service: Any) -> int:
     return sum(
         _batch_rows(value)
@@ -66,10 +108,22 @@ class _CanonicalReducer:
             item = self.input.get()
             if item is None:
                 return
-            batch_id, plans = item
+            batch_id, plans, input_bytes = item
             started = time.perf_counter()
             try:
-                result = apply_canonical_commit_batch(self.runtime, plans)
+                parameters = inspect.signature(
+                    apply_canonical_commit_batch
+                ).parameters.values()
+                if any(
+                    parameter.name == "input_bytes"
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                ):
+                    result = apply_canonical_commit_batch(
+                        self.runtime, plans, input_bytes=int(input_bytes)
+                    )
+                else:
+                    result = apply_canonical_commit_batch(self.runtime, plans)
             except BaseException as exc:
                 # Canonical mutation failure is terminal for this reducer.  Do not
                 # process later batches after an authoritative commit has failed.
@@ -77,9 +131,15 @@ class _CanonicalReducer:
                 return
             self.output.put(("ok", batch_id, result, time.perf_counter() - started, len(plans), float(getattr(result, "lock_seconds", 0.0))))
 
-    def submit(self, batch_id: int, plans: tuple[CanonicalMutationIntent, ...]) -> bool:
+    def submit(
+        self,
+        batch_id: int,
+        plans: tuple[CanonicalMutationIntent, ...],
+        *,
+        input_bytes: int,
+    ) -> bool:
         try:
-            self.input.put_nowait((int(batch_id), plans))
+            self.input.put_nowait((int(batch_id), plans, int(input_bytes)))
         except queue.Full:
             return False
         return True
@@ -245,6 +305,14 @@ def _finish_reducer_results(service: Any) -> bool:
 
 
 def _submit_canonical_commit(service: Any, *, max_rows: int | None = None) -> bool:
+    configured_max_rows = int(
+        getattr(
+            getattr(service.runtime, "config", None),
+            "canonical_transaction_max_rows",
+            1024,
+        )
+    )
+    max_rows = configured_max_rows if max_rows is None else min(int(max_rows), configured_max_rows)
     transport_batches: list[PreparedCommitBatch] = []
     row_count = 0
     input_bytes = 0
@@ -259,11 +327,19 @@ def _submit_canonical_commit(service: Any, *, max_rows: int | None = None) -> bo
                 f"compiled intent sequence mismatch: expected start={lookup_sequence} actual={value.start_sequence}"
             )
         rows = _batch_rows(value)
-        if max_rows is not None and row_count + rows > int(max_rows):
-            break
+        split_remaining: PreparedCommitBatch | None = None
+        remaining_rows = int(max_rows) - row_count
+        if rows > remaining_rows:
+            if remaining_rows <= 0:
+                break
+            selected, split_remaining = _split_prepared_batch(value, remaining_rows)
+            value = selected
+            rows = len(selected.rows)
         if transport_batches and row_count + rows > service.canonical_batch_size:
             break
         service.ingest_results.pop(lookup_sequence)
+        if split_remaining is not None:
+            service.ingest_results[int(split_remaining.start_sequence)] = split_remaining
         transport_batches.append(value)
         row_count += rows
         input_bytes += int(getattr(value, "input_bytes", 0))
@@ -295,7 +371,9 @@ def _submit_canonical_commit(service: Any, *, max_rows: int | None = None) -> bo
         expected = int(batch.end_sequence) + 1
 
     batch_id = service._reducer_batch_id
-    if not service._canonical_reducer.submit(batch_id, tuple(plans)):
+    if not service._canonical_reducer.submit(
+        batch_id, tuple(plans), input_bytes=input_bytes
+    ):
         # Restore batches so ordered submission can be retried without loss.
         for batch in reversed(transport_batches):
             service.ingest_results[int(batch.start_sequence)] = batch

@@ -78,16 +78,16 @@ criterion implemented.
 | 61 | implemented | src/v9/tests/test_snapshot_handle_consistency.py; src/v9/tests/test_canonical_snapshot_crash_recovery.py |
 | 62 | implemented | src/v9/tests/test_hgt_materialization_atomicity.py; src/v9/tests/test_training_evidence_segments.py |
 | 63 | implemented | src/v9/tests/test_hgt_checkpoint_lsn.py; src/v9/tests/test_training_evidence_segments.py |
-| 64 | pending | Phase implementation and acceptance evidence pending |
+| 64 | implemented | src/v9/tests/test_wal_consumer_retention.py; src/v9/tests/test_live_canonical_durability.py::test_runtime_reclaims_only_snapshot_and_hgt_acknowledged_wal |
 | 65 | pending | Phase implementation and acceptance evidence pending |
 | 66 | pending | Phase implementation and acceptance evidence pending |
-| 67 | pending | Phase implementation and acceptance evidence pending |
+| 67 | implemented | src/v9/tests/test_canonical_work_budget.py; src/v9/tests/test_canonical_oversized_quarantine.py |
 | 68 | pending | Phase implementation and acceptance evidence pending |
-| 69 | pending | Phase implementation and acceptance evidence pending |
+| 69 | implemented | src/v9/tests/test_derivation_leases.py; src/v9/tests/test_derivation_retry_idempotence.py |
 | 70 | pending | Phase implementation and acceptance evidence pending |
-| 71 | pending | Phase implementation and acceptance evidence pending |
+| 71 | implemented | src/v9/tests/test_live_canonical_durability.py::test_derivation_publication_uses_wal_overlay_and_atomic_root |
 | 72 | pending | Phase implementation and acceptance evidence pending |
-| 73 | pending | Phase implementation and acceptance evidence pending |
+| 73 | implemented | src/v9/tests/test_v9716_governor_accounting.py |
 | 74 | pending | Phase implementation and acceptance evidence pending |
 | 75 | pending | Phase implementation and acceptance evidence pending |
 | 76 | pending | Phase implementation and acceptance evidence pending |

@@ -51,7 +51,13 @@ def run(*, rows: int = 4096, repeats: int = 3) -> dict[str, object]:
                 RuntimeConfig.from_path(Path(directory) / f"repeat-{repeat}", restore=False, enable_snapshots=False)
             )
             commit_started = time.perf_counter()
-            result = apply_canonical_commit_batch(runtime, plans)
+            signature_rows = []
+            transaction_rows = int(runtime.config.canonical_transaction_max_rows)
+            for offset in range(0, len(plans), transaction_rows):
+                result = apply_canonical_commit_batch(
+                    runtime, plans[offset : offset + transaction_rows]
+                )
+                signature_rows.extend(result.signature_rows)
             commit_seconds = time.perf_counter() - commit_started
             drain_started = time.perf_counter()
             runtime.flush_deferred_memory_updates()
@@ -64,7 +70,7 @@ def run(*, rows: int = 4096, repeats: int = 3) -> dict[str, object]:
                 {
                     "repeat": repeat + 1,
                     "rows": rows,
-                    "signature_rows": len(result.signature_rows),
+                    "signature_rows": len(signature_rows),
                     "commit_seconds": commit_seconds,
                     "drain_seconds": drain_seconds,
                     "total_seconds": commit_seconds + drain_seconds,
