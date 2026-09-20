@@ -64,20 +64,20 @@ criterion implemented.
 | 47 | pending | Phase implementation and acceptance evidence pending |
 | 48 | pending | Phase implementation and acceptance evidence pending |
 | 49 | pending | Phase implementation and acceptance evidence pending |
-| 50 | pending | Phase implementation and acceptance evidence pending |
-| 51 | pending | Phase implementation and acceptance evidence pending |
-| 52 | pending | Phase implementation and acceptance evidence pending |
-| 53 | pending | Phase implementation and acceptance evidence pending |
-| 54 | pending | Phase implementation and acceptance evidence pending |
-| 55 | pending | Phase implementation and acceptance evidence pending |
-| 56 | pending | Phase implementation and acceptance evidence pending |
-| 57 | pending | Phase implementation and acceptance evidence pending |
-| 58 | pending | Phase implementation and acceptance evidence pending |
-| 59 | pending | Phase implementation and acceptance evidence pending |
-| 60 | pending | Phase implementation and acceptance evidence pending |
-| 61 | pending | Phase implementation and acceptance evidence pending |
-| 62 | pending | Phase implementation and acceptance evidence pending |
-| 63 | pending | Phase implementation and acceptance evidence pending |
+| 50 | implemented | src/v9/tests/test_producer_affinity.py::test_fixed_descriptor_crosses_stage_and_shard_before_single_decode |
+| 51 | implemented | src/v9/tests/test_shm_credit_ownership.py::test_live_transport_and_compiled_result_subpools_share_one_global_ceiling |
+| 52 | implemented | src/v9/tests/test_shm_credit_ownership.py::test_compiled_result_recovery_preserves_coordinator_owned_credit |
+| 53 | implemented | src/v9/tests/test_signature_index_store.py; src/v9/tests/test_signature_index_restart.py |
+| 54 | implemented | src/v9/tests/test_batched_publication_intake.py::test_pending_batch_buffer_enforces_exact_carried_byte_high_water; src/v9/tests/test_publication_throughput.py::test_reducer_completion_releases_exact_admitted_input_bytes |
+| 55 | implemented | src/v9/tests/test_canonical_wal.py; src/v9/tests/test_wal_group_commit.py; src/v9/tests/test_wal_torn_tail.py |
+| 56 | implemented | src/v9/tests/test_persistence_frontiers.py; src/v9/tests/test_live_canonical_durability.py |
+| 57 | implemented | src/v9/tests/test_wal_replay_idempotence.py::test_wal_is_durable_before_overlay_becomes_visible; src/v9/tests/test_live_canonical_durability.py::test_live_graph_visibility_follows_wal_and_immutable_root |
+| 58 | implemented | src/v9/tests/test_canonical_fragment_visibility.py; src/v9/tests/test_canonical_continuation_fragments.py |
+| 59 | implemented | src/v9/tests/test_canonical_handle_atomicity.py; src/v9/tests/test_live_canonical_durability.py |
+| 60 | implemented | src/v9/tests/test_post_wal_pre_publish_recovery.py; src/v9/tests/test_wal_replay_idempotence.py |
+| 61 | implemented | src/v9/tests/test_snapshot_handle_consistency.py; src/v9/tests/test_canonical_snapshot_crash_recovery.py |
+| 62 | implemented | src/v9/tests/test_hgt_materialization_atomicity.py; src/v9/tests/test_training_evidence_segments.py |
+| 63 | implemented | src/v9/tests/test_hgt_checkpoint_lsn.py; src/v9/tests/test_training_evidence_segments.py |
 | 64 | pending | Phase implementation and acceptance evidence pending |
 | 65 | pending | Phase implementation and acceptance evidence pending |
 | 66 | pending | Phase implementation and acceptance evidence pending |

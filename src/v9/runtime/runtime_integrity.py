@@ -580,7 +580,10 @@ def install_runtime_integrity(
     def restore(self: Any, snapshot: dict[str, Any], *, graph_override: Any | None = None) -> None:
         self._m1n_occurrences = {}
         self._m1n_supports = {}
-        self._m1n_dirty = set()
+        # SignatureIndexStore is the persistent dirty authority. Replacing its
+        # bounded set-compatible view here would silently lose restart work.
+        if not hasattr(self, "signature_index"):
+            self._m1n_dirty = set()
         self._cross_modal_signatures = {}
         self._m2 = {}
         self._m3 = {}

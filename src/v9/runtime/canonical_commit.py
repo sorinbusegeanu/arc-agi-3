@@ -24,12 +24,12 @@ class CanonicalCommitResult:
     lock_seconds: float = 0.0
 
 
-def _append_dirty_normalized(runtime: Any, relation: Any, rows: list[Any]) -> None:
+def _append_dirty_normalized(runtime: Any, relation: Any, rows: list[Any]) -> int | None:
     if not hasattr(runtime, "canonical_store"):
-        return
+        return None
     signature = int(relation.structural_signature)
     if signature not in runtime._m1n_dirty:
-        return
+        return None
     occurrences = runtime._m1n_occurrences.get(signature, ())
     parents = tuple(uid for occurrence in occurrences for uid in occurrence.provenance.parents)
     evidence = tuple(uid for occurrence in occurrences for uid in occurrence.provenance.evidence)
@@ -46,13 +46,13 @@ def _append_dirty_normalized(runtime: Any, relation: Any, rows: list[Any]) -> No
                 "observable_relation": relation.observable_relation,
                 "channel": relation.channel.value,
                 "structural_signature": signature,
-                "support": int(runtime._m1n_supports.get(signature, len(occurrences))),
+                "support": int(runtime.signature_support(signature, len(occurrences))),
                 "parents": [[uid.hi, uid.lo] for uid in parents],
             },
             evidence,
         )
     )
-    runtime._m1n_dirty.discard(signature)
+    return signature
 
 
 def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> CanonicalCommitResult:
@@ -80,6 +80,7 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
     with runtime._lock:
         lock_acquired = time.perf_counter()
         deferred_groups: list[tuple[Any, ...]] = []
+        deferred_dirty_signatures: set[int] = set()
         signature_rows: list[tuple[int, ...]] = []
         touched_signatures: set[int] = set()
         registered_identities: dict[int, Any] = {}
@@ -138,9 +139,11 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                 if plan.relation is None or plan.normalized_write is None:
                     raise RuntimeError("interaction commit plan is incomplete")
 
-                prior_support = int(runtime._m1n_supports.get(int(plan.relation.structural_signature), 0))
+                prior_support = int(runtime.signature_support(int(plan.relation.structural_signature)))
                 signature = record_normalized_fast(runtime, plan.relation, plan.normalized_write, plan_deferred_rows, materialized_row=materialized_rows[id(plan.normalized_write)])
-                _append_dirty_normalized(runtime, plan.relation, plan_deferred_rows)
+                dirty_signature = _append_dirty_normalized(runtime, plan.relation, plan_deferred_rows)
+                if dirty_signature is not None:
+                    deferred_dirty_signatures.add(dirty_signature)
                 signatures.append(signature)
                 touched_signatures.add(signature)
                 next_stage = advance_stage_fast(runtime)
@@ -152,7 +155,7 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                         explicit_pe *= evidence_confidence
                         tp *= evidence_confidence
                         ep *= evidence_confidence
-                    recurrence = int(runtime._m1n_supports.get(signature, 0))
+                    recurrence = int(runtime.signature_support(signature))
                     recurrence_pe = 1.0 / max(1.0, float(prior_support + 1))
                     pe = abs(float(explicit_pe)) if float(explicit_pe) != 0.0 else recurrence_pe
                     isf_rows.append((ISFComponents(pvi, osi, pe, 1.0 / max(1, recurrence), tp, ep), int(runtime._watermark), int(event.identity.causal_watermark), stage_before, next_stage, logical_graph_generation))
@@ -180,14 +183,18 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                 plan_deferred_rows.extend(materialized_rows[id(write)] for write in symbol.base_writes)
 
                 signature = record_normalized_fast(runtime, symbol.relation, symbol.normalized_write, plan_deferred_rows, materialized_row=materialized_rows[id(symbol.normalized_write)])
-                _append_dirty_normalized(runtime, symbol.relation, plan_deferred_rows)
+                dirty_signature = _append_dirty_normalized(runtime, symbol.relation, plan_deferred_rows)
+                if dirty_signature is not None:
+                    deferred_dirty_signatures.add(dirty_signature)
                 signatures.append(signature)
                 touched_signatures.add(signature)
                 if symbol.aligned_relation is not None and cross_modal_used < max_cross_modal:
                     if symbol.aligned_normalized_write is None:
                         raise RuntimeError("aligned symbol commit plan is incomplete")
                     aligned_signature = record_normalized_fast(runtime, symbol.aligned_relation, symbol.aligned_normalized_write, plan_deferred_rows, materialized_row=materialized_rows[id(symbol.aligned_normalized_write)])
-                    _append_dirty_normalized(runtime, symbol.aligned_relation, plan_deferred_rows)
+                    dirty_signature = _append_dirty_normalized(runtime, symbol.aligned_relation, plan_deferred_rows)
+                    if dirty_signature is not None:
+                        deferred_dirty_signatures.add(dirty_signature)
                     signatures.append(aligned_signature)
                     touched_signatures.add(aligned_signature)
                     cross_modal_used += 1
@@ -218,7 +225,9 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                         continue
                     cross_modal_used += 1
                 signature = record_normalized_fast(runtime, derived.relation, derived.write, plan_deferred_rows, materialized_row=materialized_rows[id(derived.write)])
-                _append_dirty_normalized(runtime, derived.relation, plan_deferred_rows)
+                dirty_signature = _append_dirty_normalized(runtime, derived.relation, plan_deferred_rows)
+                if dirty_signature is not None:
+                    deferred_dirty_signatures.add(dirty_signature)
                 signatures.append(signature)
                 touched_signatures.add(signature)
 
@@ -230,7 +239,9 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
                     control = shuffled_alignment_control(proxy, previous_interaction, causal_watermark=int(runtime._watermark), occurrence=symbol.occurrence)
                     write = _m1n_write(control.relation, watermark=int(runtime._watermark), occurrence=symbol.occurrence, payload_extra=control.payload())
                     signature = record_normalized_fast(runtime, control.relation, write, plan_deferred_rows)
-                    _append_dirty_normalized(runtime, control.relation, plan_deferred_rows)
+                    dirty_signature = _append_dirty_normalized(runtime, control.relation, plan_deferred_rows)
+                    if dirty_signature is not None:
+                        deferred_dirty_signatures.add(dirty_signature)
                     signatures.append(signature)
                     touched_signatures.add(signature)
                     cross_modal_used += 1
@@ -252,6 +263,8 @@ def apply_canonical_commit_batch(runtime: Any, rows: Iterable[CommitPlan]) -> Ca
             defer_groups = getattr(runtime, "_defer_base_groups", None)
             if callable(defer_groups):
                 defer_groups(tuple(deferred_groups))
+                for signature in deferred_dirty_signatures:
+                    runtime._m1n_dirty.discard(signature)
             else:
                 runtime._defer_base_group(tuple(row for group in deferred_groups for row in group))
         trim_replay_pool(runtime)

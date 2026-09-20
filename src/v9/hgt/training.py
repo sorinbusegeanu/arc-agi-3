@@ -16,7 +16,9 @@ from v9.memory.model import MemoryLevel
 from v9.memory.relations import RelationType
 from v9.telemetry import HGTTrainingSample, ModelEvolutionSample, read_gpu_snapshot
 
-MODEL_SCHEMA_VERSION = 6
+# Authoritative on-disk tensor/objective schema. Checkpoint compatibility must
+# not depend on which runtime installer happened to be imported first.
+MODEL_SCHEMA_VERSION = 7
 MEMORY_NODE_TYPES = (
     "M0_EPISODE",
     "M1_GROUNDED_CONTINGENCY",
@@ -797,7 +799,7 @@ def rollback_hgt_model(runtime: Any, *, root: str | Path) -> str | None:
         return None
     torch, _, _ = _require_torch()
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    if int(checkpoint.get("model_schema_version", 0)) != MODEL_SCHEMA_VERSION:
+    if not isinstance(checkpoint, dict):
         return None
     action_scores = {
         int(environment): {int(action): float(score) for action, score in actions.items()}
@@ -882,6 +884,56 @@ def _load_self_describing_model(checkpoint: dict[str, Any], device: Any):
     ).model.to(device)
     model.load_state_dict(checkpoint["model_state"])
     return model, architecture
+
+
+def _load_compatible_training_parent(
+    checkpoint: object,
+    *,
+    device: Any,
+    model: Any,
+    current_architecture: dict[str, Any],
+    runtime: Any,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Resume compatible tensors while retaining older parents for behavior.
+
+    Action-score policies remain readable across HGT tensor schema changes.
+    Model and optimizer tensors do not, so an accepted older checkpoint stays
+    available for matched evaluation and rollback while training starts fresh.
+    """
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError("HGT checkpoint payload is not a mapping")
+    try:
+        checkpoint_schema = int(checkpoint.get("model_schema_version", 0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("HGT checkpoint has an invalid schema version") from exc
+    if checkpoint_schema != MODEL_SCHEMA_VERSION:
+        runtime.set_telemetry_gauge("hgt_training_parent_behavior_only", 1)
+        runtime.set_telemetry_gauge("hgt_training_parent_schema_version", checkpoint_schema)
+        runtime.set_telemetry_gauge("hgt_training_schema_version", MODEL_SCHEMA_VERSION)
+        return None, None
+
+    parent_model, parent_architecture = _load_self_describing_model(checkpoint, device)
+    same_architecture = all(
+        parent_architecture[key] == current_architecture[key]
+        for key in ("metadata", "input_dim", "hidden_dim", "layers", "heads")
+    )
+    if same_architecture:
+        model.load_state_dict(parent_model.state_dict())
+        resumable = checkpoint
+    else:
+        _migrate_model_state(
+            parent_model,
+            parent_architecture["metadata"],
+            model,
+            current_architecture["metadata"],
+        )
+        runtime.set_telemetry_gauge("hgt_architecture_evolved", 1)
+        runtime.set_telemetry_gauge("hgt_parent_metadata_edge_types", len(parent_architecture["metadata"][1]))
+        runtime.set_telemetry_gauge("hgt_current_metadata_edge_types", len(current_architecture["metadata"][1]))
+        resumable = dict(checkpoint)
+        resumable["optimizer_state"] = None
+    del parent_model
+    return resumable, parent_architecture
 
 
 def _migrate_model_state(source_model: Any, source_metadata: tuple[list[str], list[tuple[str, str, str]]], target_model: Any, target_metadata: tuple[list[str], list[tuple[str, str, str]]]) -> None:
@@ -1053,8 +1105,6 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         parent_checkpoint = f"models/{parent_version}.pt"
     checkpoint_state = None
     parent_architecture = None
-    if int(manifest.get("model_schema_version", 0)) != MODEL_SCHEMA_VERSION:
-        parent_version = parent_checkpoint = None
 
     model = _HGTWrapper(
         metadata,
@@ -1066,9 +1116,11 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     if parent_checkpoint:
         checkpoint_path = Path(root) / str(parent_checkpoint)
         if checkpoint_path.exists():
-            checkpoint_state = torch.load(checkpoint_path, map_location=device)
+            # Inspect compatibility on CPU so a behavior-only legacy parent
+            # cannot consume accelerator memory before being rejected for
+            # tensor resumption.
+            loaded_checkpoint = torch.load(checkpoint_path, map_location="cpu")
             try:
-                parent_model, parent_architecture = _load_self_describing_model(checkpoint_state, device)
                 current_architecture = {
                     "metadata": metadata,
                     "input_dim": 64,
@@ -1076,20 +1128,13 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
                     "layers": int(config.hgt_layers),
                     "heads": int(config.hgt_heads),
                 }
-                same_architecture = all(
-                    parent_architecture[key] == current_architecture[key]
-                    for key in ("metadata", "input_dim", "hidden_dim", "layers", "heads")
+                checkpoint_state, parent_architecture = _load_compatible_training_parent(
+                    loaded_checkpoint,
+                    device=device,
+                    model=model,
+                    current_architecture=current_architecture,
+                    runtime=runtime,
                 )
-                if same_architecture:
-                    model.load_state_dict(parent_model.state_dict())
-                else:
-                    _migrate_model_state(parent_model, parent_architecture["metadata"], model, metadata)
-                    runtime.set_telemetry_gauge("hgt_architecture_evolved", 1)
-                    runtime.set_telemetry_gauge("hgt_parent_metadata_edge_types", len(parent_architecture["metadata"][1]))
-                    runtime.set_telemetry_gauge("hgt_current_metadata_edge_types", len(metadata[1]))
-                    checkpoint_state = dict(checkpoint_state)
-                    checkpoint_state["optimizer_state"] = None
-                del parent_model
             except (RuntimeError, KeyError, TypeError, ValueError) as exc:
                 raise RuntimeError(f"accepted HGT checkpoint {checkpoint_path} is incompatible or corrupt: {exc}") from exc
     try:

@@ -27,6 +27,13 @@ class SlabOwnership(str, Enum):
     COORDINATOR_OWNED = "coordinator_owned"
 
 
+_OWNERSHIP_CODE = {
+    SlabOwnership.GRANT_FREE: 0,
+    SlabOwnership.WORKER_OWNED: 1,
+    SlabOwnership.COORDINATOR_OWNED: 2,
+}
+
+
 _DESCRIPTOR = struct.Struct(">64sIIIIQQQQ32s")
 
 
@@ -115,6 +122,7 @@ class TransportSlabPool:
         slab_bytes: int = 16 * 1024 * 1024,
         global_byte_ceiling: int = 128 * 1024 * 1024,
         ownership_epoch: int = 0,
+        multiprocessing_context: Any | None = None,
     ) -> None:
         if min(slab_count, slab_bytes, global_byte_ceiling) <= 0:
             raise ValueError("transport slab bounds must be positive")
@@ -124,11 +132,35 @@ class TransportSlabPool:
         self.slab_bytes = int(slab_bytes)
         self.global_byte_ceiling = int(global_byte_ceiling)
         self.ownership_epoch = int(ownership_epoch)
-        self._lock = RLock()
+        self._lock = RLock() if multiprocessing_context is None else multiprocessing_context.RLock()
         self._slabs = tuple(shared_memory.SharedMemory(create=True, size=self.slab_bytes) for _ in range(self.slab_count))
-        self._ownership = [SlabOwnership.GRANT_FREE for _ in self._slabs]
-        self._lengths = [0 for _ in self._slabs]
+        self._slab_names = tuple(slab.name for slab in self._slabs)
+        if multiprocessing_context is None:
+            self._ownership = [_OWNERSHIP_CODE[SlabOwnership.GRANT_FREE] for _ in self._slabs]
+            self._lengths = [0 for _ in self._slabs]
+        else:
+            self._ownership = multiprocessing_context.Array("B", self.slab_count, lock=False)
+            self._lengths = multiprocessing_context.Array("Q", self.slab_count, lock=False)
+        self._owns_slabs = True
         self._closed = False
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_slabs"] = None
+        state["_owns_slabs"] = False
+        state["_closed"] = False
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._slabs = [None for _ in self._slab_names]
+
+    def _slab(self, index: int) -> shared_memory.SharedMemory:
+        slab = self._slabs[index]
+        if slab is None:
+            slab = shared_memory.SharedMemory(name=self._slab_names[index], create=False)
+            self._slabs[index] = slab
+        return slab
 
     @property
     def tracked_bytes(self) -> int:
@@ -137,7 +169,11 @@ class TransportSlabPool:
     def ownership_bytes(self) -> dict[str, int]:
         with self._lock:
             return {
-                state.value: sum(self.slab_bytes for value in self._ownership if value is state)
+                state.value: sum(
+                    self.slab_bytes
+                    for value in self._ownership
+                    if int(value) == _OWNERSHIP_CODE[state]
+                )
                 for state in SlabOwnership
             }
 
@@ -155,14 +191,20 @@ class TransportSlabPool:
         with self._lock:
             if self._closed:
                 raise RuntimeError("transport slab pool is closed")
-            try:
-                index = self._ownership.index(SlabOwnership.GRANT_FREE)
-            except ValueError as exc:
-                raise BufferError("transport slab pool has no free credit") from exc
-            slab = self._slabs[index]
+            index = next(
+                (
+                    candidate
+                    for candidate, owner in enumerate(self._ownership)
+                    if int(owner) == _OWNERSHIP_CODE[SlabOwnership.GRANT_FREE]
+                ),
+                None,
+            )
+            if index is None:
+                raise BufferError("transport slab pool has no free credit")
+            slab = self._slab(index)
             slab.buf[: len(payload)] = payload
             self._lengths[index] = len(payload)
-            self._ownership[index] = SlabOwnership.WORKER_OWNED
+            self._ownership[index] = _OWNERSHIP_CODE[SlabOwnership.WORKER_OWNED]
             return TransportSlabDescriptor(
                 slab.name,
                 index,
@@ -179,17 +221,17 @@ class TransportSlabPool:
     def transfer_to_coordinator(self, descriptor: TransportSlabDescriptor) -> None:
         with self._lock:
             self._validate_local(descriptor)
-            if self._ownership[descriptor.slab_index] is not SlabOwnership.WORKER_OWNED:
+            if int(self._ownership[descriptor.slab_index]) != _OWNERSHIP_CODE[SlabOwnership.WORKER_OWNED]:
                 raise RuntimeError("only worker-owned slabs can transfer to coordinator")
-            self._ownership[descriptor.slab_index] = SlabOwnership.COORDINATOR_OWNED
+            self._ownership[descriptor.slab_index] = _OWNERSHIP_CODE[SlabOwnership.COORDINATOR_OWNED]
 
     def read(self, descriptor: TransportSlabDescriptor) -> bytes:
         with self._lock:
             self._validate_local(descriptor)
-            if self._ownership[descriptor.slab_index] is SlabOwnership.GRANT_FREE:
+            if int(self._ownership[descriptor.slab_index]) == _OWNERSHIP_CODE[SlabOwnership.GRANT_FREE]:
                 raise RuntimeError("cannot read a free transport slab")
             payload = bytes(
-                self._slabs[descriptor.slab_index].buf[
+                self._slab(descriptor.slab_index).buf[
                     descriptor.offset : descriptor.offset + descriptor.length
                 ]
             )
@@ -200,9 +242,9 @@ class TransportSlabPool:
     def release(self, descriptor: TransportSlabDescriptor, *, owner: SlabOwnership) -> None:
         with self._lock:
             self._validate_local(descriptor)
-            if self._ownership[descriptor.slab_index] is not owner:
+            if int(self._ownership[descriptor.slab_index]) != _OWNERSHIP_CODE[owner]:
                 raise RuntimeError("transport slab release ownership mismatch")
-            self._ownership[descriptor.slab_index] = SlabOwnership.GRANT_FREE
+            self._ownership[descriptor.slab_index] = _OWNERSHIP_CODE[SlabOwnership.GRANT_FREE]
             self._lengths[descriptor.slab_index] = 0
 
     def _validate_local(self, descriptor: TransportSlabDescriptor) -> None:
@@ -210,7 +252,7 @@ class TransportSlabPool:
             raise RuntimeError("stale transport ownership epoch")
         if not 0 <= descriptor.slab_index < self.slab_count:
             raise ValueError("transport slab index is outside the pool")
-        if descriptor.slab_name != self._slabs[descriptor.slab_index].name:
+        if descriptor.slab_name != self._slab_names[descriptor.slab_index]:
             raise ValueError("transport descriptor does not belong to this pool")
         if descriptor.offset + descriptor.length > self.slab_bytes:
             raise ValueError("transport descriptor range exceeds slab")
@@ -222,11 +264,14 @@ class TransportSlabPool:
             if self._closed:
                 return
             for slab in self._slabs:
+                if slab is None:
+                    continue
                 slab.close()
-                try:
-                    slab.unlink()
-                except FileNotFoundError:
-                    pass
+                if self._owns_slabs:
+                    try:
+                        slab.unlink()
+                    except FileNotFoundError:
+                        pass
             self._closed = True
 
     def recover_worker_death(self) -> int:
@@ -234,8 +279,8 @@ class TransportSlabPool:
         with self._lock:
             recovered = 0
             for index, owner in enumerate(self._ownership):
-                if owner is SlabOwnership.WORKER_OWNED:
-                    self._ownership[index] = SlabOwnership.GRANT_FREE
+                if int(owner) == _OWNERSHIP_CODE[SlabOwnership.WORKER_OWNED]:
+                    self._ownership[index] = _OWNERSHIP_CODE[SlabOwnership.GRANT_FREE]
                     self._lengths[index] = 0
                     recovered += self.slab_bytes
             return recovered
@@ -270,6 +315,22 @@ class ProducerCausalAdmission:
         self._states: dict[int, _ProducerAdmissionState] = {}
         self._held_rows = 0
         self._held_bytes = 0
+
+    @property
+    def held_rows(self) -> int:
+        return self._held_rows
+
+    @property
+    def held_bytes(self) -> int:
+        return self._held_bytes
+
+    def first_gap(self) -> tuple[int, int] | None:
+        pending = [
+            (producer, state.next_sequence)
+            for producer, state in self._states.items()
+            if state.held
+        ]
+        return min(pending) if pending else None
 
     def admit(self, descriptor: TransportSlabDescriptor, *, now: float | None = None) -> tuple[TransportSlabDescriptor, ...]:
         timestamp = time.monotonic() if now is None else float(now)
@@ -331,6 +392,33 @@ class ProducerAffinityRouter:
     def shard_for(self, producer_id: int) -> int:
         raw = int(producer_id).to_bytes(16, "big", signed=False)
         return int.from_bytes(hashlib.blake2b(raw, digest_size=8, person=b"v9-affinity").digest(), "big") % self.shards
+
+
+def encode_transport_rows(rows: tuple[Any, ...]) -> bytes:
+    if not rows:
+        raise ValueError("transport payload requires at least one row")
+    return pickle.dumps(rows, protocol=5)
+
+
+def encode_transport_value(value: Any) -> bytes:
+    return pickle.dumps(value, protocol=5)
+
+
+def decode_transport_value(payload: bytes | memoryview) -> Any:
+    return pickle.loads(payload)
+
+
+def decode_transport_rows(payload: bytes, descriptor: TransportSlabDescriptor) -> tuple[Any, ...]:
+    rows = pickle.loads(payload)
+    if not isinstance(rows, tuple) or len(rows) != descriptor.rows:
+        raise RuntimeError("transport slab row count mismatch")
+    sequences = tuple(int(getattr(row, "producer_sequence")) for row in rows)
+    expected = tuple(range(descriptor.start_sequence, descriptor.end_sequence + 1))
+    if sequences != expected:
+        raise RuntimeError("transport slab causal range mismatch")
+    if any(int(getattr(row, "actor_id")) != descriptor.producer_id for row in rows):
+        raise RuntimeError("transport slab producer mismatch")
+    return rows
 
 
 def publish_shared_batch(value: Any, *, start_sequence: int, end_sequence: int, rows: int) -> SharedBatchDescriptor:

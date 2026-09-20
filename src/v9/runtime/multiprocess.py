@@ -5,6 +5,7 @@ import contextlib
 import importlib
 import logging
 import os
+import sys
 import traceback
 import warnings
 import multiprocessing as mp
@@ -18,11 +19,20 @@ from v9.runtime.adaptive_exploration import choose_action
 from v9.cognition.planning import choose_strategy, replan
 from v9.cognition.outcome_selection import select_target_outcome
 from v9.memory.identity import stable_u64
-from .shared_batch_transport import ProducerAffinityRouter
+from .shared_batch_transport import (
+    ProducerAffinityRouter,
+    ProducerCausalAdmission,
+    SlabOwnership,
+    TransportSlabDescriptor,
+    TransportSlabPool,
+    encode_transport_rows,
+)
 
 
 _FORKSERVER_READY = False
 _PROCESS_JOIN_TIMEOUT_SECONDS = 5.0
+_TRANSPORT_SLAB_BYTES = 2 * 1024 * 1024
+_TRANSPORT_GLOBAL_BYTES = 128 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,21 +217,83 @@ def _flush_child_queue(queue_obj: Any) -> None:
         pass
 
 
+@contextlib.contextmanager
+def _silence_actor_output():
+    """Silence an actor without replacing or owning Python's stdio objects.
+
+    ``multiprocessing`` flushes ``sys.stdout`` and ``sys.stderr`` after the
+    process target returns.  Pointing either global at an actor-owned file and
+    closing that file first can therefore make process teardown fail with
+    ``ValueError('I/O operation on closed file.')`` and ``lost sys.stderr``.
+    Redirect the underlying descriptors instead, then restore them before the
+    target returns so the multiprocessing bootstrap retains live streams.
+    """
+
+    sink_fd = os.open(os.devnull, os.O_WRONLY)
+    saved_fds: dict[int, int] = {}
+    streams = (sys.stdout, sys.stderr)
+    try:
+        for stream in streams:
+            try:
+                stream.flush()
+                target_fd = int(stream.fileno())
+            except (AttributeError, OSError, ValueError):
+                continue
+            if target_fd in saved_fds:
+                continue
+            saved_fds[target_fd] = os.dup(target_fd)
+            os.dup2(sink_fd, target_fd)
+        yield
+    finally:
+        for stream in streams:
+            try:
+                stream.flush()
+            except (AttributeError, OSError, ValueError):
+                pass
+        for target_fd, saved_fd in saved_fds.items():
+            try:
+                os.dup2(saved_fd, target_fd)
+            finally:
+                os.close(saved_fd)
+        os.close(sink_fd)
+
+
 def _put_counted_stage_batch(
     stage_queue: Any,
     counters: Any,
     counter_index: int,
     envelope: TransitionBatchEnvelope,
+    transport_pool: TransportSlabPool | None = None,
 ) -> None:
-    stage_queue.put(envelope)
+    queued: object = envelope
+    descriptor: TransportSlabDescriptor | None = None
+    if transport_pool is not None:
+        payload = encode_transport_rows(envelope.transitions)
+        while descriptor is None:
+            try:
+                descriptor = transport_pool.write(
+                    payload,
+                    producer_id=envelope.producer_id,
+                    start_sequence=envelope.start_sequence,
+                    end_sequence=envelope.end_sequence,
+                    rows=len(envelope.transitions),
+                )
+            except BufferError:
+                time.sleep(0.001)
+        queued = descriptor.pack()
+    try:
+        stage_queue.put(queued)
+    except BaseException:
+        if descriptor is not None and transport_pool is not None:
+            transport_pool.release(descriptor, owner=SlabOwnership.WORKER_OWNED)
+        raise
     if counters is not None:
         counters[int(counter_index)] = int(counters[int(counter_index)]) + len(envelope.transitions)
 
 
-def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, initial_policy: ActorPolicySnapshot, policy_updates: Any, epsilon: float, stagnation: float = 0.0, policy_refresh_steps: int = 32, policy_refresh_ms: float = 100.0, policy_refresh_enabled: bool = True, stage_queue: Any, result_queue: Any, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, production_counters: Any = None, counter_index: int = 0, epoch_inference_view_id: str = "") -> None:
+def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, initial_policy: ActorPolicySnapshot, policy_updates: Any, epsilon: float, stagnation: float = 0.0, policy_refresh_steps: int = 32, policy_refresh_ms: float = 100.0, policy_refresh_enabled: bool = True, stage_queue: Any, result_queue: Any, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, production_counters: Any = None, counter_index: int = 0, epoch_inference_view_id: str = "", transport_pool: TransportSlabPool | None = None) -> None:
     game_id = str(getattr(spec, "display_name", getattr(spec, "game_id", "unknown")))
     adapter = None
-    devnull = open(os.devnull, "w", encoding="utf-8")
     completion_sent = False
     pending_transitions: list[EncodedTransition] = []
 
@@ -236,13 +308,14 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
             TransitionBatchEnvelope(
                 int(actor_id), int(rows[0].producer_sequence), int(rows[-1].producer_sequence), rows
             ),
+            transport_pool,
         )
         pending_transitions.clear()
 
     try:
         logging.disable(logging.INFO)
         warnings.filterwarnings("ignore")
-        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+        with _silence_actor_output():
             factory = _load_factory(adapter_factory_path)
             adapter = factory(spec, seed=seed, env_root=env_root, alfred_backend_factory=alfred_backend_factory)
             identity = adapter.identity()
@@ -530,11 +603,10 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
             close = getattr(adapter, "close", None)
             if callable(close):
                 try:
-                    with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                    with _silence_actor_output():
                         close()
                 except BaseException:
                     pass
-        devnull.close()
 
 
 def stage_worker_main(stage_queue: Any, shard_queues: tuple[Any, ...]) -> None:
@@ -550,6 +622,11 @@ def stage_worker_main(stage_queue: Any, shard_queues: tuple[Any, ...]) -> None:
                 int(item.producer_sequence),
                 (item,),
             )
+        if isinstance(item, bytes) and len(item) == TransportSlabDescriptor.binary_size():
+            descriptor = TransportSlabDescriptor.unpack(item)
+            shard = router.shard_for(int(descriptor.producer_id))
+            shard_queues[shard].put(item)
+            continue
         if not isinstance(item, TransitionBatchEnvelope):
             continue
         shard = router.shard_for(int(item.producer_id))
@@ -570,6 +647,11 @@ def shard_worker_main(
     held_by_producer: dict[int, dict[int, EncodedTransition]] = {}
     gap_started_by_producer: dict[int, float] = {}
     held_rows = 0
+    descriptor_admission = ProducerCausalAdmission(
+        gap_rows_limit=int(reorder_row_limit),
+        gap_bytes_limit=_TRANSPORT_GLOBAL_BYTES,
+        gap_timeout_seconds=float(gap_timeout_seconds),
+    )
 
     def admit(item: EncodedTransition) -> tuple[EncodedTransition, ...]:
         nonlocal held_rows
@@ -610,6 +692,11 @@ def shard_worker_main(
         try:
             item = shard_queue.get(timeout=min(0.1, float(gap_timeout_seconds)))
         except queue.Empty:
+            try:
+                descriptor_admission.check_gap_timeouts()
+            except TimeoutError as exc:
+                publication_queue.put(("shard_error", int(shard_id), int(sequence), str(exc)))
+                return
             now = time.monotonic()
             expired = sorted(
                 producer
@@ -630,10 +717,13 @@ def shard_worker_main(
                 return
             continue
         if isinstance(item, WorkerStop):
-            if held_rows:
+            descriptor_gap = descriptor_admission.first_gap()
+            if held_rows or descriptor_gap is not None:
                 missing = min(
-                    (producer, next_by_producer.get(producer, 1))
-                    for producer in held_by_producer
+                    tuple(
+                        (producer, next_by_producer.get(producer, 1))
+                        for producer in held_by_producer
+                    ) + (() if descriptor_gap is None else (descriptor_gap,))
                 )
                 publication_queue.put(
                     (
@@ -646,6 +736,19 @@ def shard_worker_main(
                 return
             publication_queue.put(("shard_done", int(shard_id), int(sequence)))
             return
+        if isinstance(item, bytes) and len(item) == TransportSlabDescriptor.binary_size():
+            descriptor = TransportSlabDescriptor.unpack(item)
+            try:
+                ready_descriptors = descriptor_admission.admit(descriptor)
+            except (OverflowError, RuntimeError) as exc:
+                publication_queue.put(("shard_error", int(shard_id), int(sequence), str(exc)))
+                return
+            for ready_descriptor in ready_descriptors:
+                sequence += int(ready_descriptor.rows)
+                publication_queue.put(
+                    ("transition_slab", int(shard_id), int(sequence), ready_descriptor.pack())
+                )
+            continue
         if isinstance(item, EncodedTransition):
             item = TransitionBatchEnvelope(
                 int(item.actor_id),
@@ -679,6 +782,14 @@ class ProcessTopology:
         self.stage_workers = int(stage_workers)
         self.shards = int(shards)
         self.queue_capacity = int(queue_capacity)
+        slab_count = min(32, max(8, self.actors))
+        self.transport_pool = TransportSlabPool(
+            slab_count=slab_count,
+            slab_bytes=_TRANSPORT_SLAB_BYTES,
+            global_byte_ceiling=_TRANSPORT_GLOBAL_BYTES,
+            ownership_epoch=time.time_ns() & ((1 << 64) - 1),
+            multiprocessing_context=self.ctx,
+        )
         self.stage_queue = self.ctx.Queue(maxsize=self.queue_capacity)
         self.publication_queue = self.ctx.Queue(maxsize=self.queue_capacity)
         self.result_queue = self.ctx.Queue(maxsize=max(64, int(actors) * 2))
@@ -730,6 +841,7 @@ class ProcessTopology:
                 "production_counters": self._actor_production_counters,
                 "counter_index": int(index),
                 "epoch_inference_view_id": str(epoch_inference_view_id),
+                "transport_pool": self.transport_pool,
             },
             name=f"v9-actor-{actor_id}",
         )
@@ -805,6 +917,8 @@ class ProcessTopology:
             _close_queue(queue_obj, drain=drain)
         for process in (*self.actor_processes, *self.stage_processes, *self.shard_processes):
             _close_process(process)
+        self.transport_pool.recover_worker_death()
+        self.transport_pool.close()
 
     @property
     def process_count(self) -> int:
@@ -813,3 +927,7 @@ class ProcessTopology:
     @property
     def produced_steps(self) -> int:
         return sum(int(value) for value in self._actor_production_counters)
+
+    @property
+    def tracked_shm_bytes(self) -> int:
+        return self.transport_pool.tracked_bytes

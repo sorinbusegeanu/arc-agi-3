@@ -4,8 +4,9 @@ import queue
 
 import pytest
 
-from v9.runtime.multiprocess import EncodedTransition, ProcessTopology, TransitionBatchEnvelope, WorkerStop, shard_worker_main, stage_worker_main
-from v9.runtime.shared_batch_transport import ProducerAffinityRouter
+from v9.runtime.multiprocess import EncodedTransition, ProcessTopology, TransitionBatchEnvelope, WorkerStop, _put_counted_stage_batch, shard_worker_main, stage_worker_main
+from v9.runtime.parallel_memory_coordinator import _drain_publication_batch
+from v9.runtime.shared_batch_transport import ProducerAffinityRouter, SlabOwnership
 
 
 def _transition(sequence: int, *, actor_id: int = 1) -> EncodedTransition:
@@ -94,6 +95,44 @@ def test_envelope_protocol_crosses_stage_and_shard_processes() -> None:
             elif item[0] == "shard_done":
                 completed += 1
         assert tuple(published) == rows
+    finally:
+        topology.terminate()
+        topology.close(drain=True)
+
+
+def test_fixed_descriptor_crosses_stage_and_shard_before_single_decode() -> None:
+    topology = ProcessTopology(
+        actors=0,
+        stage_workers=1,
+        shards=1,
+        queue_capacity=8,
+        start_method="spawn",
+    )
+    rows = tuple(_transition(sequence, actor_id=41) for sequence in range(1, 4))
+    envelope = TransitionBatchEnvelope(41, 1, 3, rows)
+    try:
+        topology.start_workers()
+        _put_counted_stage_batch(
+            topology.stage_queue,
+            None,
+            0,
+            envelope,
+            topology.transport_pool,
+        )
+        topology.signal_stage_stop()
+        topology.join_stage_workers()
+        topology.stop_shard_workers()
+        topology.join_shard_workers()
+
+        restored, completed = _drain_publication_batch(
+            topology.publication_queue,
+            8,
+            transport_pool=topology.transport_pool,
+            preserve_shard_done=False,
+        )
+        assert restored == rows
+        assert completed == (0,)
+        assert topology.transport_pool.ownership_bytes()[SlabOwnership.GRANT_FREE.value] == topology.tracked_shm_bytes
     finally:
         topology.terminate()
         topology.close(drain=True)

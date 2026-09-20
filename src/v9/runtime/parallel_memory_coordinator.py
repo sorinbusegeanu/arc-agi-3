@@ -13,7 +13,15 @@ from .canonical_commit import apply_canonical_commit_batch
 from .memory_pipeline import DerivationBatchTask, DerivationResult, IngestionBatchTask, IngestionTask, PreparedCommitBatch
 from .memory_worker_topology import MemoryWorkerTopology
 from .multiprocess import ActorDone, ActorError, ProcessTopology
-from .shared_batch_transport import consume_shared_batch
+from .shared_batch_transport import (
+    SlabOwnership,
+    TransportSlabDescriptor,
+    TransportSlabPool,
+    consume_shared_batch,
+    decode_transport_rows,
+    decode_transport_value,
+    encode_transport_rows,
+)
 
 
 _ACTOR_COMPLETION_GRACE_SECONDS = 2.0
@@ -43,13 +51,19 @@ def _drain_publication_batch(
     publication_queue: Any,
     budget: int,
     *,
+    transport_pool: TransportSlabPool | None = None,
     preserve_shard_done: bool = True,
     first_timeout: float = 0.0,
+    byte_budget: int | None = None,
+    carried_bytes: list[int] | None = None,
 ) -> tuple[tuple[Any, ...], tuple[int, ...]]:
     transitions: list[Any] = []
     shard_done: list[int] = []
     marker_items: list[Any] = []
+    payload_bytes = 0
     for index in range(max(0, int(budget))):
+        if transitions and byte_budget is not None and payload_bytes >= int(byte_budget):
+            break
         try:
             if index == 0 and float(first_timeout) > 0.0:
                 item = publication_queue.get(timeout=float(first_timeout))
@@ -59,8 +73,22 @@ def _drain_publication_batch(
             break
         if item[0] == "transition":
             transitions.append(item[3])
+            payload_bytes += len(encode_transport_rows((item[3],)))
         elif item[0] == "transition_batch":
             transitions.extend(item[3].transitions)
+            payload_bytes += len(encode_transport_rows(tuple(item[3].transitions)))
+        elif item[0] == "transition_slab":
+            if transport_pool is None:
+                raise RuntimeError("transport slab publication requires its owning pool")
+            descriptor = TransportSlabDescriptor.unpack(item[3])
+            payload_bytes += int(descriptor.length)
+            transport_pool.transfer_to_coordinator(descriptor)
+            try:
+                transitions.extend(
+                    decode_transport_rows(transport_pool.read(descriptor), descriptor)
+                )
+            finally:
+                transport_pool.release(descriptor, owner=SlabOwnership.COORDINATOR_OWNED)
         elif item[0] == "shard_error":
             raise RuntimeError(str(item[3]))
         elif item[0] == "shard_done":
@@ -72,7 +100,20 @@ def _drain_publication_batch(
     if preserve_shard_done:
         for item in marker_items:
             publication_queue.put(item)
+    if carried_bytes is not None:
+        carried_bytes.append(int(payload_bytes))
     return tuple(transitions), tuple(shard_done)
+
+
+def _consume_transport_value(pool: TransportSlabPool, packed: bytes) -> tuple[Any, TransportSlabDescriptor, float]:
+    descriptor = TransportSlabDescriptor.unpack(packed)
+    pool.transfer_to_coordinator(descriptor)
+    started = time.perf_counter()
+    try:
+        value = decode_transport_value(pool.read(descriptor))
+    finally:
+        pool.release(descriptor, owner=SlabOwnership.COORDINATOR_OWNED)
+    return value, descriptor, 1000.0 * (time.perf_counter() - started)
 
 
 class _AsyncHGTWriter:
@@ -190,6 +231,7 @@ class MemoryPipelineService:
         self.pending_ingest: deque[IngestionTask] = deque()
         self.pending_ingest_batches: deque[IngestionBatchTask] = deque()
         self.pending_ingest_batch_rows = 0
+        self.pending_ingest_batch_bytes = 0
         self.pending_derivation: deque[Any] = deque()
         self.ingest_results: dict[int, PreparedCommitBatch] = {}
         self.derive_results: dict[int, DerivationResult] = {}
@@ -205,6 +247,12 @@ class MemoryPipelineService:
         self.derive_apply = 1
         self.watermark_cursor = int(runtime.watermark)
         self.ingest_local_high_water = max(1024, int(ingest_queue_capacity) * 2)
+        runtime_config = getattr(runtime, "config", None)
+        self.ingest_local_byte_high_water = max(
+            1,
+            int(getattr(runtime_config, "canonical_transaction_max_input_bytes", 64 * 1024 * 1024)),
+        )
+        self.outstanding_ingest_bytes = 0
         self.ipc_batch_size = 256
         self.canonical_batch_size = 256
         self.last_canonical_ingest_batch = 0
@@ -224,7 +272,35 @@ class MemoryPipelineService:
         self.publication_dispatch_rows = 0
         self.publication_batches = 0
 
+    @staticmethod
+    def _split_input_bytes(total_bytes: int, rows: int) -> tuple[int, ...]:
+        if rows <= 0 or total_bytes < 0:
+            raise ValueError("input byte allocation requires non-negative bytes and positive rows")
+        base, remainder = divmod(int(total_bytes), int(rows))
+        return tuple(base + int(index < remainder) for index in range(int(rows)))
+
+    def _check_ingest_admission(self, rows: int, input_bytes: int) -> None:
+        outstanding_rows = max(0, int(self.sampled) - int(self.ingested))
+        if outstanding_rows + int(rows) > int(self.ingest_local_high_water):
+            raise RuntimeError(
+                f"publication batch exceeds bounded ingest high-water: outstanding={outstanding_rows} "
+                f"incoming={rows} high_water={self.ingest_local_high_water}"
+            )
+        if self.outstanding_ingest_bytes + int(input_bytes) > int(self.ingest_local_byte_high_water):
+            raise RuntimeError(
+                "publication batch exceeds bounded ingest byte high-water: "
+                f"outstanding={self.outstanding_ingest_bytes} incoming={input_bytes} "
+                f"high_water={self.ingest_local_byte_high_water}"
+            )
+
+    def release_ingest_input_bytes(self, input_bytes: int) -> None:
+        self.outstanding_ingest_bytes -= int(input_bytes)
+        if self.outstanding_ingest_bytes < 0:
+            raise RuntimeError("outstanding ingest byte accounting underflow")
+
     def dispatch_transition(self, transition: Any) -> None:
+        input_bytes = len(encode_transport_rows((transition,)))
+        self._check_ingest_admission(1, input_bytes)
         self.sampled += 1
         canonical_sequence = self.runtime.reserve_producer_sequence(int(transition.actor_id), int(transition.producer_sequence))
         if canonical_sequence != int(transition.producer_sequence):
@@ -249,20 +325,29 @@ class MemoryPipelineService:
                 int(scientific.symbol_window_time_span),
                 str(scientific.symbol_codec_name),
                 int(scientific.symbol_codec_version),
+                input_bytes,
             )
         )
+        self.outstanding_ingest_bytes += input_bytes
         self.watermark_cursor += symbol_count
 
-    def dispatch_transitions_batch(self, transitions: tuple[Any, ...]) -> int:
+    def dispatch_transitions_batch(
+        self,
+        transitions: tuple[Any, ...],
+        *,
+        carried_bytes: int | None = None,
+    ) -> int:
         transitions = tuple(transitions)
         if not transitions:
             return 0
-        outstanding = max(0, int(self.sampled) - int(self.ingested))
-        if outstanding + len(transitions) > int(self.ingest_local_high_water):
-            raise RuntimeError(
-                f"publication batch exceeds bounded ingest high-water: outstanding={outstanding} "
-                f"incoming={len(transitions)} high_water={self.ingest_local_high_water}"
-            )
+        input_bytes = (
+            len(encode_transport_rows(transitions))
+            if carried_bytes is None
+            else int(carried_bytes)
+        )
+        if input_bytes <= 0:
+            raise ValueError("non-empty publication batches require positive carried bytes")
+        self._check_ingest_admission(len(transitions), input_bytes)
 
         dispatch_started = time.perf_counter()
         sequence_started = time.perf_counter()
@@ -303,6 +388,7 @@ class MemoryPipelineService:
         self.watermark_allocation_seconds += time.perf_counter() - watermark_started
 
         build_started = time.perf_counter()
+        task_input_bytes = self._split_input_bytes(input_bytes, len(prepared))
         tasks = tuple(
             IngestionTask(
                 first_sequence + index,
@@ -315,11 +401,17 @@ class MemoryPipelineService:
                 int(scientific.symbol_window_time_span),
                 str(scientific.symbol_codec_name),
                 int(scientific.symbol_codec_version),
+                task_input_bytes[index],
             )
             for index, transition in enumerate(prepared)
         )
         batches = tuple(
-            IngestionBatchTask(chunk[0].sequence, chunk[-1].sequence, chunk)
+            IngestionBatchTask(
+                chunk[0].sequence,
+                chunk[-1].sequence,
+                chunk,
+                task_input_bytes[start : start + len(chunk)],
+            )
             for start in range(0, len(tasks), max(1, int(self.ipc_batch_size)))
             for chunk in (tasks[start : start + max(1, int(self.ipc_batch_size))],)
         )
@@ -338,8 +430,12 @@ class MemoryPipelineService:
             rows = len(batch.tasks)
             if self.pending_ingest_batch_rows + rows > int(self.ingest_local_high_water):
                 raise RuntimeError("bounded pending ingest-batch buffer exceeded")
+            if self.pending_ingest_batch_bytes + batch.input_bytes > int(self.ingest_local_byte_high_water):
+                raise RuntimeError("bounded pending ingest-batch byte buffer exceeded")
             self.pending_ingest_batches.append(batch)
             self.pending_ingest_batch_rows += rows
+            self.pending_ingest_batch_bytes += batch.input_bytes
+        self.outstanding_ingest_bytes += input_bytes
         self.publication_to_ingest_queue_seconds += time.perf_counter() - enqueue_started
         self.publication_dispatch_seconds += time.perf_counter() - dispatch_started
         self.publication_dispatch_rows += len(tasks)
@@ -355,14 +451,16 @@ class MemoryPipelineService:
                 return False
             self.pending_ingest_batches.popleft()
             self.pending_ingest_batch_rows -= len(batch.tasks)
-            if self.pending_ingest_batch_rows < 0:
+            self.pending_ingest_batch_bytes -= int(batch.input_bytes)
+            if self.pending_ingest_batch_rows < 0 or self.pending_ingest_batch_bytes < 0:
                 raise RuntimeError("pending ingest-batch accounting underflow")
             return True
         if not self.pending_ingest:
             return False
         count = min(self.ipc_batch_size, len(self.pending_ingest))
         tasks = tuple(islice(self.pending_ingest, 0, count))
-        batch = IngestionBatchTask(tasks[0].sequence, tasks[-1].sequence, tasks)
+        task_bytes = tuple(int(task.input_bytes) for task in tasks)
+        batch = IngestionBatchTask(tasks[0].sequence, tasks[-1].sequence, tasks, task_bytes)
         try:
             self.memory.ingest_queue.put_nowait(batch)
         except queue.Full:
@@ -425,6 +523,18 @@ class MemoryPipelineService:
                 self.ingest_result_encode_ms += float(descriptor.encode_ms)
                 self.ingest_result_decode_ms += float(decode_ms)
                 progressed = True
+            elif item[0] == "ingest_batch_slab":
+                batch, descriptor, decode_ms = _consume_transport_value(
+                    self.memory.ingest_result_pool,
+                    item[4],
+                )
+                self.ingest_results[int(item[1])] = batch
+                self.ingest_result_batches += 1
+                self.ingest_result_rows += int(descriptor.rows)
+                self.ingest_result_bytes += int(descriptor.length)
+                self.ingest_result_encode_ms += float(item[5])
+                self.ingest_result_decode_ms += float(decode_ms)
+                progressed = True
             elif item[0] == "ingest_batch":
                 batch = item[3]
                 self.ingest_results[int(item[1])] = batch
@@ -438,12 +548,14 @@ class MemoryPipelineService:
 
     def apply_ingest_ready(self) -> bool:
         plans: list[Any] = []
+        input_bytes = 0
         while self.ingest_apply in self.ingest_results:
             batch = self.ingest_results[self.ingest_apply]
             if plans and len(plans) + len(batch.rows) > self.canonical_batch_size:
                 break
             self.ingest_results.pop(self.ingest_apply)
             plans.extend(batch.rows)
+            input_bytes += int(getattr(batch, "input_bytes", 0))
             self.ingest_apply = int(batch.end_sequence) + 1
             if len(plans) >= self.canonical_batch_size:
                 break
@@ -456,6 +568,7 @@ class MemoryPipelineService:
         self.canonical_apply_events += len(plans)
         self.last_canonical_ingest_batch = len(plans)
         self.ingested += len(plans)
+        self.release_ingest_input_bytes(input_bytes)
         for candidate in result.derivation_candidates:
             self._consider_candidate(candidate)
         backlog = max(len(self.pending_ingest), len(self.ingest_results), max(0, self.sampled - self.ingested))
@@ -476,6 +589,14 @@ class MemoryPipelineService:
             if item[0] == "derivation_batch_shm":
                 descriptor = item[3]
                 batch, _decode_ms = consume_shared_batch(descriptor)
+                for row in batch:
+                    self.derive_results[int(row.task_id)] = row
+                progressed = True
+            elif item[0] == "derivation_batch_slab":
+                batch, _descriptor, _decode_ms = _consume_transport_value(
+                    self.memory.derivation_result_pool,
+                    item[3],
+                )
                 for row in batch:
                     self.derive_results[int(row.task_id)] = row
                 progressed = True
@@ -537,6 +658,9 @@ class MemoryPipelineService:
             "decode_ms_per_transition": self.ingest_result_decode_ms / rows,
             "pending_ingest_batches": len(self.pending_ingest_batches),
             "pending_ingest_batch_rows": self.pending_ingest_batch_rows,
+            "pending_ingest_batch_bytes": self.pending_ingest_batch_bytes,
+            "outstanding_ingest_bytes": self.outstanding_ingest_bytes,
+            "ingest_byte_high_water": self.ingest_local_byte_high_water,
             "producer_sequence_batch_ms": 1000.0 * self.producer_sequence_batch_seconds,
             "watermark_allocation_ms": 1000.0 * self.watermark_allocation_seconds,
             "ingestion_task_build_ms": 1000.0 * self.ingestion_task_build_seconds,
@@ -627,6 +751,12 @@ def run_parallel_memory_jobs(
 
     runtime.set_telemetry_gauge("actor_slots_target", target_actor_slots)
     runtime.set_telemetry_gauge("actor_process_start_method", topology.actor_start_method)
+    tracked_shm_bytes = topology.tracked_shm_bytes + memory.tracked_shm_bytes
+    runtime.set_telemetry_gauge("transport_tracked_shm_bytes", topology.tracked_shm_bytes)
+    runtime.set_telemetry_gauge("compiled_result_tracked_shm_bytes", memory.tracked_shm_bytes)
+    runtime.set_telemetry_gauge("tracked_shm_bytes", tracked_shm_bytes)
+    runtime.set_telemetry_gauge("transport_descriptor_bytes", TransportSlabDescriptor.binary_size())
+    runtime.__dict__["_tracked_shm_bytes"] = tracked_shm_bytes
 
     def actor_produced_steps() -> int:
         return int(getattr(topology, "produced_steps", pipeline.sampled))
@@ -686,14 +816,19 @@ def run_parallel_memory_jobs(
             launched += 1
         return launched
 
-    def dispatch_published_transitions(transitions: tuple[Any, ...]) -> int:
+    def dispatch_published_transitions(transitions: tuple[Any, ...], carried_bytes: int) -> int:
         nonlocal publication_dispatch_seconds, publication_batches, last_publication_batch_size
         if not transitions:
             return 0
         started = time.perf_counter()
         if hgt_writer is not None:
             hgt_writer.submit(transitions)
-        accepted = int(pipeline.dispatch_transitions_batch(transitions))
+        accepted = int(
+            pipeline.dispatch_transitions_batch(
+                transitions,
+                carried_bytes=int(carried_bytes),
+            )
+        )
         if accepted != len(transitions):
             raise RuntimeError(f"publication batch dispatch mismatch: expected={len(transitions)} accepted={accepted}")
         publication_dispatch_seconds += time.perf_counter() - started
@@ -704,19 +839,28 @@ def run_parallel_memory_jobs(
     def drain_publication_queue() -> int:
         nonlocal publication_queue_drain_seconds, publication_queue_drain_rows
         available = int(pipeline.ingest_local_high_water) - max(0, int(pipeline.sampled) - int(pipeline.ingested))
-        if available < 64:
+        available_bytes = int(pipeline.ingest_local_byte_high_water) - int(pipeline.outstanding_ingest_bytes)
+        if available < 64 or available_bytes < int(topology.transport_pool.slab_bytes):
             return 0
         backlog = max(0, actor_produced_steps() - int(pipeline.sampled))
         # A transport envelope contains at most 64 rows. Reserve its maximum
         # possible overshoot before removing it from the multiprocessing queue.
         budget = min(int(available) - 63, _adaptive_publication_batch_size(backlog))
+        byte_budget = max(1, available_bytes - int(topology.transport_pool.slab_bytes) + 1)
+        carried_bytes: list[int] = []
         started = time.perf_counter()
-        transitions, _ = _drain_publication_batch(topology.publication_queue, budget)
+        transitions, _ = _drain_publication_batch(
+            topology.publication_queue,
+            budget,
+            transport_pool=topology.transport_pool,
+            byte_budget=byte_budget,
+            carried_bytes=carried_bytes,
+        )
         publication_queue_drain_seconds += time.perf_counter() - started
         publication_queue_drain_rows += len(transitions)
         if not transitions:
             return 0
-        return dispatch_published_transitions(transitions)
+        return dispatch_published_transitions(transitions, carried_bytes[0])
 
     def service_publication_priority() -> bool:
         progressed = False
@@ -914,7 +1058,8 @@ def run_parallel_memory_jobs(
         completed_shards: set[int] = set()
         while shard_done < int(shards):
             available = int(pipeline.ingest_local_high_water) - max(0, int(pipeline.sampled) - int(pipeline.ingested))
-            if available < 64:
+            available_bytes = int(pipeline.ingest_local_byte_high_water) - int(pipeline.outstanding_ingest_bytes)
+            if available < 64 or available_bytes < int(topology.transport_pool.slab_bytes):
                 progressed = pipeline.service()
                 if not progressed:
                     pipeline.block_for_result(timeout=0.05)
@@ -923,14 +1068,22 @@ def run_parallel_memory_jobs(
                 continue
             backlog = max(0, actor_produced_steps() - int(pipeline.sampled))
             budget = min(int(available) - 63, _adaptive_publication_batch_size(backlog))
+            byte_budget = max(1, available_bytes - int(topology.transport_pool.slab_bytes) + 1)
+            carried_bytes: list[int] = []
             started = time.perf_counter()
             transitions, completed = _drain_publication_batch(
-                topology.publication_queue, budget, preserve_shard_done=False, first_timeout=0.05
+                topology.publication_queue,
+                budget,
+                transport_pool=topology.transport_pool,
+                preserve_shard_done=False,
+                first_timeout=0.05,
+                byte_budget=byte_budget,
+                carried_bytes=carried_bytes,
             )
             publication_queue_drain_seconds += time.perf_counter() - started
             publication_queue_drain_rows += len(transitions)
             if transitions:
-                dispatch_published_transitions(transitions)
+                dispatch_published_transitions(transitions, carried_bytes[0])
                 last_shard_progress = time.monotonic()
             for shard_id in completed:
                 completed_shards.add(int(shard_id))
@@ -1030,3 +1183,4 @@ def run_parallel_memory_jobs(
             shutdown_parallel_pipeline()
         memory.close(drain=clean_shutdown)
         topology.close(drain=clean_shutdown)
+        runtime.__dict__["_tracked_shm_bytes"] = 0

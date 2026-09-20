@@ -594,10 +594,26 @@ def install_environment_viability(runtime_cls: type, pipeline_cls: type) -> None
             observe(transition, watermark=int(self.watermark_cursor) + 1)
         return original_pipeline_dispatch(self, transition)
 
-    def pipeline_dispatch_batch(self: Any, transitions: Iterable[Any]) -> int:
+    def pipeline_dispatch_batch(
+        self: Any,
+        transitions: Iterable[Any],
+        *,
+        carried_bytes: int | None = None,
+    ) -> int:
         rows = tuple(transitions)
+        if not rows:
+            return 0
+        if carried_bytes is None:
+            from v9.runtime.shared_batch_transport import encode_transport_rows
+
+            measured_bytes = len(encode_transport_rows(rows))
+        else:
+            measured_bytes = int(carried_bytes)
+        # Admission must precede viability mutation so a rejected publication
+        # cannot leave actor-visible developmental evidence behind.
+        self._check_ingest_admission(len(rows), measured_bytes)
         observe = getattr(self.runtime, "observe_environment_transition", None)
-        if callable(observe) and rows:
+        if callable(observe):
             scientific = self.runtime.config.scientific
             grounded = bool(scientific.symbolic_grounding_enabled)
             symbol_limit = min(
@@ -610,7 +626,13 @@ def install_environment_viability(runtime_cls: type, pipeline_cls: type) -> None
                 observe(transition, watermark=cursor)
                 if grounded:
                     cursor += min(len(tuple(getattr(transition, "symbols", ()))), symbol_limit)
-        return int(original_pipeline_dispatch_batch(self, rows))
+        return int(
+            original_pipeline_dispatch_batch(
+                self,
+                rows,
+                carried_bytes=measured_bytes,
+            )
+        )
 
     runtime_cls.__init__ = runtime_init
     runtime_cls._restore = restore

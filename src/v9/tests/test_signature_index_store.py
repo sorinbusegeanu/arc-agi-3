@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from v9.runtime.signature_index import SignatureIndexStore
+from v9.runtime.signature_index import PersistentDirtySignatureWindow, SignatureIndexStore
 
 
 def test_signature_index_resident_state_is_bounded(tmp_path) -> None:
@@ -23,3 +23,17 @@ def test_signature_index_supports_full_uint64_identity(tmp_path) -> None:
         store.observe(signature)
         store.flush()
         assert store.get(signature).support == 1
+
+
+def test_dirty_window_length_is_o1_and_does_not_flush_sqlite(tmp_path, monkeypatch) -> None:
+    store = SignatureIndexStore(tmp_path / "signatures.sqlite")
+    try:
+        supports = {10: 2}
+        dirty = PersistentDirtySignatureWindow(store, lambda signature: supports[signature])
+        dirty.add(10)
+        monkeypatch.setattr(store, "flush", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("flush")))
+        assert len(dirty) == 1
+        assert 10 in dirty
+    finally:
+        monkeypatch.undo()
+        store.close()

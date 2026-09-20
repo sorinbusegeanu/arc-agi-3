@@ -5,6 +5,13 @@ from typing import Any
 
 from .memory_pipeline import derivation_batch_worker_main, ingest_batch_worker_main
 from .multiprocess import WorkerStop
+from .shared_batch_transport import TransportSlabPool
+
+
+_INGEST_RESULT_SLAB_COUNT = 6
+_INGEST_RESULT_SLAB_BYTES = 8 * 1024 * 1024
+_DERIVATION_RESULT_SLAB_COUNT = 4
+_DERIVATION_RESULT_SLAB_BYTES = 4 * 1024 * 1024
 
 
 def _close_queue(queue_obj: Any, *, drain: bool) -> None:
@@ -56,6 +63,21 @@ class MemoryWorkerTopology:
         self.ingest_result_queue = ctx.Queue(maxsize=ingest_results)
         self.derivation_result_queue = ctx.Queue(maxsize=derivation_results)
         self.result_queue = self.ingest_result_queue
+        epoch = time.time_ns() & ((1 << 64) - 1)
+        self.ingest_result_pool = TransportSlabPool(
+            slab_count=_INGEST_RESULT_SLAB_COUNT,
+            slab_bytes=_INGEST_RESULT_SLAB_BYTES,
+            global_byte_ceiling=_INGEST_RESULT_SLAB_COUNT * _INGEST_RESULT_SLAB_BYTES,
+            ownership_epoch=epoch,
+            multiprocessing_context=ctx,
+        )
+        self.derivation_result_pool = TransportSlabPool(
+            slab_count=_DERIVATION_RESULT_SLAB_COUNT,
+            slab_bytes=_DERIVATION_RESULT_SLAB_BYTES,
+            global_byte_ceiling=_DERIVATION_RESULT_SLAB_COUNT * _DERIVATION_RESULT_SLAB_BYTES,
+            ownership_epoch=(epoch + 1) & ((1 << 64) - 1),
+            multiprocessing_context=ctx,
+        )
         self.ingest_processes: list[Any] = []
         self.derivation_processes: list[Any] = []
         self._closed = False
@@ -64,7 +86,7 @@ class MemoryWorkerTopology:
         for index in range(self.ingest_workers):
             process = self.ctx.Process(
                 target=ingest_batch_worker_main,
-                args=(self.ingest_queue, self.ingest_result_queue),
+                args=(self.ingest_queue, self.ingest_result_queue, self.ingest_result_pool, index),
                 name=f"v9-ingest-{index}",
             )
             process.start()
@@ -72,7 +94,7 @@ class MemoryWorkerTopology:
         for index in range(self.derivation_workers):
             process = self.ctx.Process(
                 target=derivation_batch_worker_main,
-                args=(self.derivation_queue, self.derivation_result_queue),
+                args=(self.derivation_queue, self.derivation_result_queue, self.derivation_result_pool, index),
                 name=f"v9-derive-{index}",
             )
             process.start()
@@ -127,6 +149,14 @@ class MemoryWorkerTopology:
             _close_queue(queue_obj, drain=drain)
         for process in self.ingest_processes + self.derivation_processes:
             _close_process(process)
+        self.ingest_result_pool.recover_worker_death()
+        self.derivation_result_pool.recover_worker_death()
+        self.ingest_result_pool.close()
+        self.derivation_result_pool.close()
+
+    @property
+    def tracked_shm_bytes(self) -> int:
+        return self.ingest_result_pool.tracked_bytes + self.derivation_result_pool.tracked_bytes
 
     @staticmethod
     def _safe_qsize(queue_obj: Any) -> int:

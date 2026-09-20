@@ -82,7 +82,7 @@ def test_hgt_graph_builder_accepts_immutable_read_view_edges(monkeypatch) -> Non
     assert ("M0_EPISODE", "PROVENANCE", "M1_NORMALIZED_RELATION") in edge_indexes
 
 
-def test_hgt_behavior_rollback_restores_parent_policy(tmp_path) -> None:
+def test_hgt_behavior_rollback_restores_older_schema_parent_policy(tmp_path) -> None:
     import json
     torch = pytest.importorskip("torch")
 
@@ -93,7 +93,7 @@ def test_hgt_behavior_rollback_restores_parent_policy(tmp_path) -> None:
     current = "hgt-000002"
     torch.save(
         {
-            "model_schema_version": training.MODEL_SCHEMA_VERSION,
+            "model_schema_version": training.MODEL_SCHEMA_VERSION - 2,
             "validation_loss": 0.5,
             "validation_accuracy": 0.7,
             "action_scores": {7: {1: 0.9, 2: 0.1}},

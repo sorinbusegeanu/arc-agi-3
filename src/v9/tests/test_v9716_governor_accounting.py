@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from v9.runtime import ScientificConfig
 from v9.runtime.memory_governor import MemoryGovernorState, RuntimeMemoryGovernor
+from v9.runtime.residency import ResidentMemoryManager
 
 
 def test_accounting_categories_are_disjoint_and_reconciled() -> None:
@@ -19,3 +21,14 @@ def test_memavailable_emergency_floor_forces_hard_drain() -> None:
     governor = RuntimeMemoryGovernor(ScientificConfig())
     with patch("v9.runtime.memory_governor._process_tree_memory", return_value=(10, 10, 0)), patch("v9.runtime.memory_governor._mem_available_bytes", return_value=100):
         assert governor.sample(mem_available_emergency_floor_bytes=101).state is MemoryGovernorState.HARD_PRESSURE_DRAIN
+
+
+def test_residency_governor_accounts_live_transport_shm() -> None:
+    captured = {}
+    manager = object.__new__(ResidentMemoryManager)
+    manager.runtime = SimpleNamespace(_tracked_shm_bytes=64 * 1024 * 1024)
+    manager.backlog = lambda: 17
+    manager.governor = SimpleNamespace(sample=lambda **kwargs: captured.update(kwargs) or "snapshot")
+
+    assert manager.sample_memory() == "snapshot"
+    assert captured == {"backlog": 17, "tracked_shm_bytes": 64 * 1024 * 1024}

@@ -13,8 +13,8 @@ from v9.runtime.canonical_commit import apply_canonical_commit_batch
 from v9.benchmarks.ingestion_drain import _plans
 
 
-def _proposal(partitions: int = 1) -> MutationProposal:
-    uid = MemoryUid(7, 9)
+def _proposal(partitions: int = 1, *, ordinal: int = 0) -> MutationProposal:
+    uid = MemoryUid(7, 9 + int(ordinal))
     return MutationProposal.build(
         MutationKind.UPSERT_NODE,
         target_partitions=(uid.shard(partitions),),
@@ -24,7 +24,7 @@ def _proposal(partitions: int = 1) -> MutationProposal:
         writes=(
             MutationWrite(
                 node=CanonicalNode(uid, MemoryLevel.M2, MemoryType.FAMILY, (11,), 1),
-                payload={"support": 1},
+                payload={"support": 1, "ordinal": int(ordinal)},
             ),
         ),
     )
@@ -75,6 +75,25 @@ def test_runtime_restores_exact_canonical_snapshot_and_wal_frontier(tmp_path: Pa
     assert restored.persistence_frontiers.wal_durable_lsn == 1
     assert restored.persistence_frontiers.snapshot_applied_lsn == 1
     assert MemoryUid(7, 9) in restored.graph.nodes
+
+
+def test_runtime_reclaims_only_snapshot_and_hgt_acknowledged_wal(tmp_path: Path) -> None:
+    runtime = ContinuousMemoryRuntime(
+        RuntimeConfig.from_path(tmp_path, restore=False, enable_canonical_durability=True)
+    )
+    for ordinal in range(3):
+        runtime.graph.publish(_proposal(runtime.graph.partition_count, ordinal=ordinal))
+    runtime.snapshot()
+    assert runtime.reclaim_canonical_wal() == 0
+
+    runtime.advance_hgt_checkpoint(2)
+    assert runtime.reclaim_canonical_wal() == 2
+    assert tuple(frame.wal_lsn for frame in runtime.canonical_wal.recover().frames) == (3,)
+    restored = ContinuousMemoryRuntime(
+        RuntimeConfig.from_path(tmp_path, enable_canonical_durability=True)
+    )
+    assert restored.canonical_wal.wal_reclaim_lsn == 2
+    assert restored.persistence_frontiers.hgt_checkpoint_lsn == 2
 
 
 def test_runtime_restores_preserved_snapshot_after_interrupted_directory_swap(tmp_path: Path) -> None:

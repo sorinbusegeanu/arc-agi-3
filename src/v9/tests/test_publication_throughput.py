@@ -251,7 +251,8 @@ def test_compiled_batch_start_and_row_sequences_are_validated() -> None:
 
 def test_final_shard_drain_uses_normal_transition_handler_and_backpressure() -> None:
     source = (Path(__file__).parents[1] / "runtime" / "parallel_memory_coordinator.py").read_text()
-    assert source.count("dispatch_published_transitions(transitions)") >= 2
+    assert source.count("dispatch_published_transitions(transitions, carried_bytes[0])") >= 2
+    assert "carried_bytes=int(carried_bytes)" in source
     assert "final shard transition drain stalled under ingestion backpressure" in source
     assert "hgt_writer.submit(transitions)" in source
     assert "hgt_dataset.append(" not in source
@@ -319,6 +320,29 @@ def test_reducer_completion_order_is_enforced() -> None:
     with pytest.raises(RuntimeError, match="completion out of order"):
         publication_throughput._finish_reducer_results(service)
     service._reducer_inflight.clear()
+    service.shutdown_parallel_pipeline()
+
+
+def test_reducer_completion_releases_exact_admitted_input_bytes(monkeypatch) -> None:
+    monkeypatch.setattr(
+        publication_throughput,
+        "apply_canonical_commit_batch",
+        lambda _runtime, _plans: CanonicalCommitResult((), ()),
+    )
+    runtime = SimpleNamespace(watermark=0)
+    service = MemoryPipelineService(runtime, SimpleNamespace(), ingest_queue_capacity=128)
+    plan = CommitPlan(1, None, None, None, None, (), None, (), None, (), None, "", None)
+    service.outstanding_ingest_bytes = 137
+    service.ingest_results[1] = PreparedCommitBatch(1, 1, (plan,), input_bytes=137)
+
+    assert service.apply_ingest_ready()
+    deadline = time.monotonic() + 2.0
+    while service.ingested < 1 and time.monotonic() < deadline:
+        service.apply_ingest_ready()
+        time.sleep(0.005)
+
+    assert service.ingested == 1
+    assert service.outstanding_ingest_bytes == 0
     service.shutdown_parallel_pipeline()
 
 

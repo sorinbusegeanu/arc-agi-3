@@ -62,6 +62,7 @@ from .partitions import PartitionMap
 from .publication import CanonicalGraph, edge_ref, node_ref
 from .read_view import ReadView
 from .rings import MultimodalTimeline
+from .signature_index import PersistentDirtySignatureWindow, SignatureIndexStore
 from .snapshot_backend import SnapshotResult, assert_native_root, latest_snapshot, load_snapshot, load_snapshot_direct, load_graph_shard, decode_graph_shard, write_snapshot
 
 
@@ -103,7 +104,16 @@ class ContinuousMemoryRuntime:
         self._lock = RLock()
         self._m1n_occurrences: dict[int, list[M1NormalizedRelation]] = {}
         self._m1n_supports: dict[int, int] = {}
-        self._m1n_dirty: set[int] = set()
+        self.signature_index = SignatureIndexStore(
+            self.root / "indexes" / "signatures.sqlite",
+            delta_limit=4096,
+            page_cache_limit=1024,
+            dirty_window_limit=4096,
+        )
+        self._m1n_dirty = PersistentDirtySignatureWindow(
+            self.signature_index,
+            lambda signature: int(self._m1n_supports.get(int(signature), 0)),
+        )
         self._cross_modal_signatures: dict[int, None] = {}
         self._actor_action_supports: dict[int, float] = {}
         self._actor_policy_generation = 0
@@ -133,6 +143,7 @@ class ContinuousMemoryRuntime:
         self._hgt_context_action_scores: dict[int, dict[int, dict[int, float]]] = {}
         self._environment_ids_by_game: dict[str, set[int]] = {}
         self._memory_uids_by_environment: dict[int, set[MemoryUid]] | None = None
+
         self.telemetry: dict[str, int] = {
             "events": 0, "proposals": 0, "accepted": 0, "stale": 0,
             "rejected": 0, "cross_partition_transactions": 0,
@@ -170,6 +181,12 @@ class ContinuousMemoryRuntime:
             self._restore_hgt_checkpoint()
         if config.enable_canonical_durability:
             self._initialize_canonical_durability()
+
+    def signature_support(self, signature: int, default: int = 0) -> int:
+        selected = int(signature)
+        cached = int(self._m1n_supports.get(selected, default))
+        persistent = int(self.signature_index.get(selected).support)
+        return max(cached, persistent)
 
     def _initialize_canonical_durability(self) -> None:
         """Compose the WAL and immutable canonical root into graph publication."""
@@ -230,6 +247,19 @@ class ContinuousMemoryRuntime:
             store.current_handle.canonical_applied_lsn if complete else 0
         )
         self._hgt_checkpoint_lsn = 0
+        self.canonical_wal.register_durable_consumer(
+            "canonical_snapshot", self._canonical_snapshot_applied_lsn
+        )
+        if self.canonical_wal.durable_consumer_checkpoint(
+            "canonical_snapshot"
+        ) != self._canonical_snapshot_applied_lsn:
+            raise RuntimeError("WAL snapshot-consumer checkpoint has no matching canonical snapshot")
+        self.canonical_wal.register_durable_consumer(
+            "hgt_training_evidence", self._hgt_checkpoint_lsn
+        )
+        self._hgt_checkpoint_lsn = self.canonical_wal.durable_consumer_checkpoint(
+            "hgt_training_evidence"
+        )
         self.graph.configure_durable_commit(self._commit_canonical_graph_update)
 
     def _canonical_scientific_identity(self) -> dict[str, str]:
@@ -247,7 +277,23 @@ class ContinuousMemoryRuntime:
             path, scientific_identity=self._canonical_scientific_identity()
         )
         self._canonical_snapshot_applied_lsn = self.canonical_store.current_handle.canonical_applied_lsn
+        self.canonical_wal.update_durable_consumer(
+            "canonical_snapshot", self._canonical_snapshot_applied_lsn
+        )
         return result
+
+    def advance_hgt_checkpoint(self, checkpoint_lsn: int) -> None:
+        """Record an atomically manifested contiguous training-evidence frontier."""
+        if not hasattr(self, "canonical_wal"):
+            raise RuntimeError("canonical durability migration gate is not enabled")
+        selected = int(checkpoint_lsn)
+        self.canonical_wal.update_durable_consumer("hgt_training_evidence", selected)
+        self._hgt_checkpoint_lsn = selected
+
+    def reclaim_canonical_wal(self) -> int:
+        if not hasattr(self, "canonical_wal"):
+            return 0
+        return self.canonical_wal.reclaim_prefix()
 
     @staticmethod
     def _canonical_node_value(node: CanonicalNode) -> dict[str, object]:
@@ -873,7 +919,7 @@ class ContinuousMemoryRuntime:
             self.evidence.append("DEVELOPMENTAL_STAGE", self._watermark, {"interval_id": stage_snapshot.interval_id, "stage": int(stage_snapshot.stage), "next_stage": int(stage_snapshot.next_stage), "evidence": asdict(stage_snapshot.evidence)})
             if isinstance(event, InteractionEvent):
                 experience = event.experience
-                recurrence = self._m1n_supports.get(stable_u64(f"ACTION:{experience.action_id}:FAMILY:{experience.family_signature}:OUTCOME:{experience.outcome_signature}", NormalizedChannel.WORLD.value, person=b"v9-m1-normalized"), 0)
+                recurrence = self.signature_support(stable_u64(f"ACTION:{experience.action_id}:FAMILY:{experience.family_signature}:OUTCOME:{experience.outcome_signature}", NormalizedChannel.WORLD.value, person=b"v9-m1-normalized"))
                 recurrence_surprise = 1.0 / max(1.0, float(recurrence))
                 prediction_error = abs(float(experience.prediction_error)) if float(experience.prediction_error) != 0.0 else recurrence_surprise
                 decision = self.isf.score(
@@ -912,7 +958,7 @@ class ContinuousMemoryRuntime:
             return stable_u64(event.vocabulary_id.value, event.stream_id.value, event.symbol_id.value, event.position, person=b"v9-symbol-payload")
         return stable_u64(event.observation_schema_id, event.observation_signature, person=b"v9-world-payload")
 
-    def _publish(self, node: CanonicalNode, payload: dict[str, Any], evidence: tuple[MemoryUid, ...], *, proposal_class: ProposalClass = ProposalClass.ADDITIVE, mutation_kind: MutationKind = MutationKind.UPSERT_NODE) -> None:
+    def _publish(self, node: CanonicalNode, payload: dict[str, Any], evidence: tuple[MemoryUid, ...], *, proposal_class: ProposalClass = ProposalClass.ADDITIVE, mutation_kind: MutationKind = MutationKind.UPSERT_NODE) -> bool:
         payload = dict(payload)
         payload.setdefault("evidence_refs", [[uid.hi, uid.lo] for uid in sorted(set(evidence))])
 
@@ -968,6 +1014,7 @@ class ContinuousMemoryRuntime:
             self.telemetry["read_set_conflicts"] += 1
         else:
             self.telemetry["rejected"] += 1
+        return result.outcome.value == "ACCEPTED"
 
     def _publish_group(
         self,
@@ -1135,7 +1182,7 @@ class ContinuousMemoryRuntime:
             self._cross_modal_signatures[signature_key] = None
             while len(self._cross_modal_signatures) > 8192:
                 self._cross_modal_signatures.pop(next(iter(self._cross_modal_signatures)))
-        support = self._m1n_supports.get(relation.structural_signature, 0) + 1
+        support = self.signature_support(relation.structural_signature) + 1
         self._m1n_supports[relation.structural_signature] = support
         observable = str(relation.observable_relation)
         parts = observable.split(":")
@@ -1252,14 +1299,13 @@ class ContinuousMemoryRuntime:
                         self.telemetry["rejected"] += 1
 
             dirty = tuple(self._m1n_dirty)
-            self._m1n_dirty.clear()
-            dirty_rows: list[tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]]] = []
+            dirty_rows: list[tuple[int, tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]]]] = []
             for signature in dirty:
                 rows = self._m1n_occurrences.get(int(signature), ())
                 if not rows:
                     continue
                 relation = rows[0]
-                support = int(self._m1n_supports.get(int(signature), len(rows)))
+                support = self.signature_support(int(signature), len(rows))
                 retained_parents = tuple(
                     uid
                     for occurrence in rows
@@ -1270,7 +1316,7 @@ class ContinuousMemoryRuntime:
                     for occurrence in rows
                     for uid in occurrence.provenance.evidence
                 )
-                dirty_rows.append((
+                dirty_rows.append((signature, (
                     CanonicalNode(
                         relation.uid,
                         MemoryLevel.M1,
@@ -1286,20 +1332,21 @@ class ContinuousMemoryRuntime:
                         "parents": [[uid.hi, uid.lo] for uid in retained_parents],
                     },
                     retained_evidence,
-                ))
+                )))
             maximum_dependencies = int(self.config.scientific.maximum_read_set_size)
             if not hasattr(self, "canonical_store"):
-                for node, payload, evidence in dirty_rows:
-                    self._publish(
+                for signature, (node, payload, evidence) in dirty_rows:
+                    if self._publish(
                         node,
                         payload,
                         evidence,
                         proposal_class=ProposalClass.STATEFUL,
-                    )
+                    ):
+                        self._m1n_dirty.discard(signature)
                 return
-            pending_rows: list[tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]]] = []
+            pending_rows: list[tuple[int, tuple[CanonicalNode, dict[str, Any], tuple[MemoryUid, ...]]]] = []
             pending_dependencies = 0
-            for row in dirty_rows:
+            for signature, row in dirty_rows:
                 # The normalized node is the stateful support authority. Its
                 # provenance-edge additions are commutative and do not consume
                 # optimistic read dependencies.
@@ -1307,13 +1354,17 @@ class ContinuousMemoryRuntime:
                 if cost > maximum_dependencies:
                     raise ValueError("one dirty M1 row exceeds the configured read-set bound")
                 if pending_rows and pending_dependencies + cost > maximum_dependencies:
-                    self._publish_stateful_group(tuple(pending_rows))
+                    if self._publish_stateful_group(tuple(row for _, row in pending_rows)):
+                        for pending_signature, _ in pending_rows:
+                            self._m1n_dirty.discard(pending_signature)
                     pending_rows = []
                     pending_dependencies = 0
-                pending_rows.append(row)
+                pending_rows.append((signature, row))
                 pending_dependencies += cost
             if pending_rows:
-                self._publish_stateful_group(tuple(pending_rows))
+                if self._publish_stateful_group(tuple(row for _, row in pending_rows)):
+                    for pending_signature, _ in pending_rows:
+                        self._m1n_dirty.discard(pending_signature)
 
     def _ingest(self, event: TimelineEvent) -> tuple[int, ...]:
         self._formation_environments.add(int(event.identity.environment_instance_id))
@@ -1484,7 +1535,7 @@ class ContinuousMemoryRuntime:
                 )
                 if before_grounding is None or int(after_grounding.maturity) > int(before_grounding.maturity):
                     self.telemetry["grounding_promotions"] += 1
-            prior_support = int(self._m1n_supports.get(int(m1n.structural_signature), 0))
+            prior_support = self.signature_support(int(m1n.structural_signature))
             normalized_extra = {}
             if transition.semantic_before:
                 normalized_extra["semantic_before"] = [list(row) for row in transition.semantic_before]
@@ -1529,7 +1580,7 @@ class ContinuousMemoryRuntime:
                     },
                 )
             experience = event.experience
-            recurrence = self._m1n_supports.get(signature, 0)
+            recurrence = self.signature_support(signature)
             recurrence_surprise = 1.0 / max(1.0, float(prior_support + 1))
             decision = self.isf.score(
                 ISFComponents(
@@ -1567,7 +1618,7 @@ class ContinuousMemoryRuntime:
 
         with self._lock:
             rows = tuple(self._m1n_occurrences.get(int(signature), ()))
-            support = int(self._m1n_supports.get(int(signature), len(rows)))
+            support = self.signature_support(int(signature), len(rows))
             distinct_evidence = {
                 evidence_uid
                 for row in rows
@@ -1658,7 +1709,7 @@ class ContinuousMemoryRuntime:
     def _develop(self, signatures: tuple[int, ...] = ()) -> None:
         for signature in tuple(sorted(set(signatures)))[: self.config.scientific.replay_candidates_per_interval]:
             rows = tuple(self._m1n_occurrences[signature])
-            support = self._m1n_supports.get(signature, len(rows))
+            support = self.signature_support(signature, len(rows))
             if len(rows) < 2 or support < 2:
                 continue
             family = form_families(rows)[0]
@@ -2000,6 +2051,30 @@ class ContinuousMemoryRuntime:
             dummy = M1NormalizedRelation(node, str(payload["observable_relation"]), NormalizedChannel(str(payload["channel"])), int(signature), DerivationProvenance((dummy_parent_uid,), evidence_refs))
             self._m1n_occurrences[int(signature)] = [dummy] if int(count) > 0 else []
         self._m1n_supports = {int(key): int(value) for key, value in dict(state.get("m1n_supports", state.get("m1n_occurrences", {}))).items()}
+        for record in self.signature_index.dirty_window():
+            signature = int(record.signature)
+            self._m1n_supports[signature] = max(
+                int(self._m1n_supports.get(signature, 0)), int(record.support)
+            )
+            if signature in self._m1n_occurrences:
+                continue
+            uid = normalized_by_signature.get(signature)
+            if uid is None:
+                continue
+            payload = self.graph.payloads[uid]
+            evidence_refs = tuple(
+                MemoryUid(int(raw[0]), int(raw[1]))
+                for raw in payload.get("evidence_refs", [[uid.hi, uid.lo]])
+            )
+            self._m1n_occurrences[signature] = [
+                M1NormalizedRelation(
+                    uid,
+                    str(payload["observable_relation"]),
+                    NormalizedChannel(str(payload["channel"])),
+                    signature,
+                    DerivationProvenance((uid,), evidence_refs),
+                )
+            ]
         self._cross_modal_signatures = {int(value): None for value in state.get("cross_modal_signatures", [])}
         self._actor_action_supports = {}
         self._actor_policy_generation = self.graph.generation
@@ -2274,5 +2349,6 @@ class ContinuousMemoryRuntime:
             self.write_scientific_report()
         if hasattr(self, "canonical_store"):
             self.canonical_store.close()
+        self.signature_index.close()
         self._closed = True
         return result

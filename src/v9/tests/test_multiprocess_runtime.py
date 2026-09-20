@@ -1,11 +1,35 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 
 import pytest
 
 from v9.cli import build_parser, run_continuous
+
+
+def test_actor_output_suppression_preserves_live_python_streams(capfd) -> None:
+    from v9.runtime.multiprocess import _silence_actor_output
+
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    with _silence_actor_output():
+        assert sys.stdout is original_stdout
+        assert sys.stderr is original_stderr
+        assert not sys.stdout.closed
+        assert not sys.stderr.closed
+        os.write(sys.stdout.fileno(), b"actor stdout must be silent\n")
+        os.write(sys.stderr.fileno(), b"actor stderr must be silent\n")
+
+    assert sys.stdout is original_stdout
+    assert sys.stderr is original_stderr
+    assert not sys.stdout.closed
+    assert not sys.stderr.closed
+    captured = capfd.readouterr()
+    assert "actor stdout must be silent" not in captured.out
+    assert "actor stderr must be silent" not in captured.err
 
 
 def test_process_topology_is_reported(tmp_path) -> None:

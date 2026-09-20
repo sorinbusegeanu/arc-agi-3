@@ -22,7 +22,12 @@ from v9.modalities.contract import InteractionEvent, PassiveSymbolEvent, SYMBOL_
 from v9.modalities.symbols import DeterministicSymbolCodec, SymbolOccurrence, SymbolTemporalPhase
 
 from .multiprocess import EncodedTransition, WorkerStop
-from .shared_batch_transport import publish_shared_batch
+from .shared_batch_transport import (
+    SlabOwnership,
+    TransportSlabPool,
+    encode_transport_value,
+    publish_shared_batch,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +42,7 @@ class IngestionTask:
     symbol_window_time_span: int = 64
     symbol_codec_name: str = "deterministic-opaque"
     symbol_codec_version: int = 1
+    input_bytes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,6 +378,35 @@ class IngestionBatchTask:
     start_sequence: int
     end_sequence: int
     tasks: tuple[IngestionTask, ...]
+    task_input_bytes: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.task_input_bytes and len(self.task_input_bytes) != len(self.tasks):
+            raise ValueError("ingestion task byte measurements must match task rows")
+        if any(int(value) < 0 for value in self.task_input_bytes):
+            raise ValueError("ingestion task byte measurements cannot be negative")
+
+    @property
+    def input_bytes(self) -> int:
+        return sum(_ingestion_task_input_bytes(self))
+
+
+def _ingestion_task_input_bytes(batch: IngestionBatchTask) -> tuple[int, ...]:
+    """Read byte metadata from current and already-in-flight batch objects.
+
+    A long-running coordinator can have queued a slotted dataclass instance
+    before this additive field was deployed, then spawn a worker importing the
+    newer class.  Unpickling preserves the older state and leaves the new slot
+    unset, so all worker-side reads must tolerate that rolling boundary.
+    """
+
+    tasks = tuple(batch.tasks)
+    measured = tuple(int(value) for value in (getattr(batch, "task_input_bytes", ()) or ()))
+    if measured:
+        if len(measured) != len(tasks):
+            raise ValueError("ingestion task byte measurements must match task rows")
+        return measured
+    return tuple(int(getattr(task, "input_bytes", 0)) for task in tasks)
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,6 +594,7 @@ class PreparedCommitBatch:
     start_sequence: int
     end_sequence: int
     rows: tuple[Any, ...]
+    input_bytes: int = 0
 
 
 def _m0_write(m0: Any, event: Any, context: TransitionCommitContext | None = None, occurrence: Any | None = None) -> CanonicalWrite:
@@ -759,13 +795,49 @@ def prepare_commit_batch(batch: IngestionBatchTask) -> PreparedCommitBatch:
     rows = tuple(build_commit_plan(prepare_ingestion(task)) for task in batch.tasks)
     if rows[0].sequence != int(batch.start_sequence) or rows[-1].sequence != int(batch.end_sequence):
         raise RuntimeError("prepared commit batch sequence mismatch")
-    return PreparedCommitBatch(int(batch.start_sequence), int(batch.end_sequence), rows)
+    return PreparedCommitBatch(
+        int(batch.start_sequence), int(batch.end_sequence), rows, int(batch.input_bytes)
+    )
 
 
 _INGEST_RESULT_CHUNK_SIZE = 128
 
 
-def ingest_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
+def _publish_compiled_result(
+    result_queue: Any,
+    pool: TransportSlabPool,
+    value: Any,
+    *,
+    producer_id: int,
+    start_sequence: int,
+    end_sequence: int,
+    rows: int,
+    message: tuple[Any, ...],
+) -> None:
+    encode_started = time.perf_counter()
+    payload = encode_transport_value(value)
+    descriptor = None
+    while descriptor is None:
+        try:
+            descriptor = pool.write(
+                payload,
+                producer_id=int(producer_id),
+                start_sequence=int(start_sequence),
+                end_sequence=int(end_sequence),
+                rows=int(rows),
+            )
+        except BufferError:
+            time.sleep(0.001)
+    try:
+        result_queue.put(
+            (*message, descriptor.pack(), 1000.0 * (time.perf_counter() - encode_started))
+        )
+    except BaseException:
+        pool.release(descriptor, owner=SlabOwnership.WORKER_OWNED)
+        raise
+
+
+def ingest_batch_worker_main(task_queue: Any, result_queue: Any, result_pool: TransportSlabPool | None = None, worker_id: int = 0) -> None:
     """Compile immutable canonical mutation intents in parallel ingest processes."""
     while True:
         item = task_queue.get()
@@ -786,19 +858,32 @@ def ingest_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
                     int(chunk[0].sequence),
                     int(chunk[-1].sequence),
                     rows,
+                    sum(_ingestion_task_input_bytes(item)[offset : offset + len(chunk)]),
                 )
-                descriptor = publish_shared_batch(
-                    result,
-                    start_sequence=result.start_sequence,
-                    end_sequence=result.end_sequence,
-                    rows=len(result.rows),
-                )
-                result_queue.put(("ingest_batch_shm", result.start_sequence, result.end_sequence, descriptor, compile_ms))
+                if result_pool is None:
+                    descriptor = publish_shared_batch(
+                        result,
+                        start_sequence=result.start_sequence,
+                        end_sequence=result.end_sequence,
+                        rows=len(result.rows),
+                    )
+                    result_queue.put(("ingest_batch_shm", result.start_sequence, result.end_sequence, descriptor, compile_ms))
+                else:
+                    _publish_compiled_result(
+                        result_queue,
+                        result_pool,
+                        result,
+                        producer_id=int(worker_id),
+                        start_sequence=result.start_sequence,
+                        end_sequence=result.end_sequence,
+                        rows=len(result.rows),
+                        message=("ingest_batch_slab", result.start_sequence, result.end_sequence, compile_ms),
+                    )
         except BaseException as exc:
             result_queue.put(("worker_error", "ingest", int(item.start_sequence), repr(exc)))
 
 
-def derivation_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
+def derivation_batch_worker_main(task_queue: Any, result_queue: Any, result_pool: TransportSlabPool | None = None, worker_id: int = 0) -> None:
     while True:
         item = task_queue.get()
         if isinstance(item, WorkerStop):
@@ -807,12 +892,24 @@ def derivation_batch_worker_main(task_queue: Any, result_queue: Any) -> None:
             continue
         try:
             results = tuple(derive_memory(task) for task in item.tasks)
-            descriptor = publish_shared_batch(
-                results,
-                start_sequence=item.start_task_id,
-                end_sequence=item.end_task_id,
-                rows=len(results),
-            )
-            result_queue.put(("derivation_batch_shm", item.start_task_id, item.end_task_id, descriptor))
+            if result_pool is None:
+                descriptor = publish_shared_batch(
+                    results,
+                    start_sequence=item.start_task_id,
+                    end_sequence=item.end_task_id,
+                    rows=len(results),
+                )
+                result_queue.put(("derivation_batch_shm", item.start_task_id, item.end_task_id, descriptor))
+            else:
+                _publish_compiled_result(
+                    result_queue,
+                    result_pool,
+                    results,
+                    producer_id=int(worker_id),
+                    start_sequence=item.start_task_id,
+                    end_sequence=item.end_task_id,
+                    rows=len(results),
+                    message=("derivation_batch_slab", item.start_task_id, item.end_task_id),
+                )
         except BaseException as exc:
             result_queue.put(("worker_error", "derivation", int(item.start_task_id), repr(exc)))

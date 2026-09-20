@@ -76,7 +76,7 @@ def install_pressure_control(runtime_cls: type, graph_cls: type, resident_manage
 
     def publish_telemetry(self: Any) -> None:
         original_manager_publish(self)
-        snapshot = self._last_snapshot or self.governor.sample(backlog=self.backlog())
+        snapshot = self._last_snapshot or self.sample_memory()
         budget = pressure_budget(snapshot.state)
         graph = self.runtime.graph
         graph._memory_pressure_state = snapshot.state
@@ -92,7 +92,7 @@ def install_pressure_control(runtime_cls: type, graph_cls: type, resident_manage
             })
 
     def maybe_compact(self: Any, *, force: bool = False) -> int:
-        snapshot = self.governor.sample(backlog=self.backlog())
+        snapshot = self.sample_memory()
         self._last_snapshot = snapshot
         self.runtime.graph._memory_pressure_state = snapshot.state
         return original_manager_compact(self, force=force or snapshot.state is MemoryGovernorState.HARD_PRESSURE_DRAIN)
@@ -101,7 +101,7 @@ def install_pressure_control(runtime_cls: type, graph_cls: type, resident_manage
         manager = getattr(self, "_resident_memory", None)
         if manager is None:
             return _POLICIES[MemoryGovernorState.NORMAL]
-        snapshot = manager.governor.sample(backlog=manager.backlog())
+        snapshot = manager.sample_memory()
         manager._last_snapshot = snapshot
         self.graph._memory_pressure_state = snapshot.state
         return pressure_budget(snapshot.state)

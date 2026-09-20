@@ -9,6 +9,7 @@ from v9.hgt.training import (
     MODEL_SCHEMA_VERSION,
     _architecture_sidecar_path,
     _checkpoint_architecture,
+    _load_compatible_training_parent,
     _write_architecture_sidecar,
 )
 
@@ -71,6 +72,28 @@ class HGTSelfDescribingCheckpointTests(unittest.TestCase):
                 "layers": 3,
                 "heads": 4,
             })
+
+    def test_older_accepted_checkpoint_is_behavior_only_training_parent(self):
+        class Runtime:
+            def __init__(self):
+                self.gauges = {}
+
+            def set_telemetry_gauge(self, name, value):
+                self.gauges[name] = value
+
+        runtime = Runtime()
+        checkpoint, architecture = _load_compatible_training_parent(
+            {"model_schema_version": MODEL_SCHEMA_VERSION - 2, "model_state": object()},
+            device=object(),
+            model=object(),
+            current_architecture={},
+            runtime=runtime,
+        )
+        self.assertIsNone(checkpoint)
+        self.assertIsNone(architecture)
+        self.assertEqual(runtime.gauges["hgt_training_parent_behavior_only"], 1)
+        self.assertEqual(runtime.gauges["hgt_training_parent_schema_version"], MODEL_SCHEMA_VERSION - 2)
+        self.assertEqual(runtime.gauges["hgt_training_schema_version"], MODEL_SCHEMA_VERSION)
 
 
 if __name__ == "__main__":

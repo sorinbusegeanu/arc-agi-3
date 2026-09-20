@@ -128,10 +128,8 @@ def install(training_module: Any) -> None:
     if getattr(training_module, "_v978_symbol_graph_installed", False):
         return
 
-    # Schema 7 explicitly invalidates pre-v9.7.8 objective/relation tensor layouts.
-    # Same-schema relation-count changes remain migratable by edge identity in
-    # training._migrate_model_state.
-    training_module.MODEL_SCHEMA_VERSION = HGT_V978_MODEL_SCHEMA_VERSION
+    if int(training_module.MODEL_SCHEMA_VERSION) != HGT_V978_MODEL_SCHEMA_VERSION:
+        raise RuntimeError("canonical SYMBOL graph and HGT training schema versions disagree")
     original_graph = training_module.build_hgt_graph
     original_loss = training_module._loss
     original_train = training_module.train_hgt_epoch

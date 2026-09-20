@@ -76,7 +76,7 @@ def record_normalized_fast(runtime: Any, relation: Any, initial_write: Canonical
         while len(runtime._cross_modal_signatures) > 8192:
             runtime._cross_modal_signatures.pop(next(iter(runtime._cross_modal_signatures)))
     was_stable = len(occurrences) >= 2
-    support = int(runtime._m1n_supports.get(signature, 0)) + 1
+    support = int(runtime.signature_support(signature)) + 1
     runtime._m1n_supports[signature] = support
 
     cache = runtime._normalized_action_cache

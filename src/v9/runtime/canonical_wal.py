@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import struct
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
@@ -151,6 +152,7 @@ class CanonicalCommitWAL:
             raise ValueError("WAL group bounds must be positive")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._consumer_path = self.path.with_name(f"{self.path.name}.consumers.json")
         self.max_group_frames = int(max_group_frames)
         self.max_pending_bytes = int(max_pending_bytes)
         self.max_durable_consumers = int(max_durable_consumers)
@@ -163,6 +165,7 @@ class CanonicalCommitWAL:
         recovery = self.recover(truncate=True)
         self._durable_lsn = recovery.wal_durable_lsn
         self._group_id = recovery.groups
+        self._durable_consumers = self._load_durable_consumers()
 
     @property
     def wal_durable_lsn(self) -> int:
@@ -183,6 +186,56 @@ class CanonicalCommitWAL:
             if written is None or written <= 0:
                 raise OSError("canonical WAL write made no progress")
             view = view[written:]
+
+    @staticmethod
+    def _encode_group(
+        frames: tuple[CanonicalCommitFrame, ...], *, group_id: int
+    ) -> bytes:
+        if not frames:
+            raise ValueError("cannot encode an empty WAL group")
+        previous = int(frames[0].previous_lsn)
+        payloads = tuple(_json_bytes(frame.payload()) for frame in frames)
+        for frame in frames:
+            if frame.previous_lsn != previous or frame.wal_lsn != previous + 1:
+                raise ValueError("WAL group frames are not contiguous")
+            previous = frame.wal_lsn
+        total_payload = sum(len(payload) for payload in payloads)
+        header_core = struct.pack(
+            ">8sIQQIQ",
+            _HEADER_MAGIC,
+            _VERSION,
+            int(group_id),
+            int(frames[0].previous_lsn),
+            len(frames),
+            total_payload,
+        )
+        encoded_header = _HEADER.pack(
+            _HEADER_MAGIC,
+            _VERSION,
+            int(group_id),
+            int(frames[0].previous_lsn),
+            len(frames),
+            total_payload,
+            _checksum(header_core),
+        )
+        encoded_frames = tuple(
+            _FRAME.pack(
+                _FRAME_MAGIC,
+                frame.wal_lsn,
+                frame.previous_lsn,
+                len(payload),
+                bytes.fromhex(frame.checksum),
+            )
+            + payload
+            for frame, payload in zip(frames, payloads)
+        )
+        body = encoded_header + b"".join(encoded_frames)
+        return body + _FOOTER.pack(
+            _FOOTER_MAGIC,
+            int(group_id),
+            frames[-1].wal_lsn,
+            _checksum(body),
+        )
 
     def _prepare_frames(
         self, rows: Iterable[CanonicalCommitFrame | Mapping[str, Any]]
@@ -236,37 +289,10 @@ class CanonicalCommitWAL:
             if total_payload > self.max_pending_bytes:
                 raise OverflowError("WAL group pending-byte ceiling exceeded")
             group_id = self._group_id + 1
-            header_core = struct.pack(">8sIQQIQ", _HEADER_MAGIC, _VERSION, group_id, self._durable_lsn, len(frames), total_payload)
-            header_checksum = _checksum(header_core)
-            encoded_header = _HEADER.pack(
-                _HEADER_MAGIC,
-                _VERSION,
-                group_id,
-                self._durable_lsn,
-                len(frames),
-                total_payload,
-                header_checksum,
-            )
-            encoded_frames = []
-            for frame, payload in zip(frames, payloads):
-                encoded_frames.append(
-                    _FRAME.pack(
-                        _FRAME_MAGIC,
-                        frame.wal_lsn,
-                        frame.previous_lsn,
-                        len(payload),
-                        bytes.fromhex(frame.checksum),
-                    )
-                    + payload
-                )
-            group_checksum = _checksum(encoded_header + b"".join(encoded_frames))
-            footer = _FOOTER.pack(_FOOTER_MAGIC, group_id, frames[-1].wal_lsn, group_checksum)
+            encoded_group = self._encode_group(frames, group_id=group_id)
             try:
                 with self.path.open("ab", buffering=0) as handle:
-                    self._write_all(handle, encoded_header)
-                    for encoded_frame in encoded_frames:
-                        self._write_all(handle, encoded_frame)
-                    self._write_all(handle, footer)
+                    self._write_all(handle, encoded_group)
                     handle.flush()
                     self._fsync(handle.fileno())
             except BaseException:
@@ -295,6 +321,11 @@ class CanonicalCommitWAL:
                 group_start = offset
                 try:
                     magic, version, group_id, previous_lsn, frame_count, payload_bytes, header_checksum = _HEADER.unpack_from(data, offset)
+                    if groups == 0 and group_id == 1:
+                        # A reclaimed WAL begins at the first frame still needed
+                        # by every registered durable consumer. Its header keeps
+                        # the removed prefix's final LSN as the causal anchor.
+                        expected_previous = int(previous_lsn)
                     if (
                         magic != _HEADER_MAGIC
                         or version != _VERSION
@@ -375,13 +406,67 @@ class CanonicalCommitWAL:
             after_durable(durable)
         return store.finalize_overlay(overlay)
 
+    def _load_durable_consumers(self) -> dict[str, int]:
+        if not self._consumer_path.exists():
+            return {}
+        raw = json.loads(self._consumer_path.read_text(encoding="utf-8"))
+        if int(raw.get("schema_version", 0)) != 1:
+            raise RuntimeError("unsupported WAL durable-consumer registry schema")
+        consumers = {
+            str(name): int(checkpoint)
+            for name, checkpoint in dict(raw.get("consumers", {})).items()
+        }
+        if len(consumers) > self.max_durable_consumers:
+            raise RuntimeError("WAL durable-consumer registry exceeds configured bound")
+        if any(
+            not name or not 0 <= checkpoint <= self._durable_lsn
+            for name, checkpoint in consumers.items()
+        ):
+            raise RuntimeError("WAL durable-consumer registry has an invalid checkpoint")
+        return consumers
+
+    def _persist_durable_consumers(self, consumers: Mapping[str, int]) -> None:
+        payload = _json_bytes(
+            {"schema_version": 1, "consumers": dict(sorted(consumers.items()))}
+        ) + b"\n"
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=self.path.parent,
+                prefix=f".{self._consumer_path.name}.",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                self._write_all(handle, payload)
+                handle.flush()
+                self._fsync(handle.fileno())
+            os.replace(temporary_path, self._consumer_path)
+            directory_fd = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                self._fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
     def register_durable_consumer(self, name: str, checkpoint_lsn: int = 0) -> None:
         if not name or not 0 <= checkpoint_lsn <= self.wal_durable_lsn:
             raise ValueError("invalid WAL durable-consumer checkpoint")
         with self._lock:
             if name not in self._durable_consumers and len(self._durable_consumers) >= self.max_durable_consumers:
                 raise OverflowError("WAL durable-consumer count ceiling exceeded")
-            self._durable_consumers[name] = int(checkpoint_lsn)
+            previous = self._durable_consumers.get(name)
+            if previous is not None:
+                if checkpoint_lsn == 0:
+                    return
+                if checkpoint_lsn < previous:
+                    raise ValueError("durable-consumer checkpoint cannot move backward")
+            updated = dict(self._durable_consumers)
+            updated[name] = int(checkpoint_lsn)
+            self._persist_durable_consumers(updated)
+            self._durable_consumers = updated
 
     def update_durable_consumer(self, name: str, checkpoint_lsn: int) -> None:
         with self._lock:
@@ -390,12 +475,90 @@ class CanonicalCommitWAL:
                 raise KeyError(name)
             if not previous <= checkpoint_lsn <= self._durable_lsn:
                 raise ValueError("durable-consumer checkpoints must advance within durable WAL")
-            self._durable_consumers[name] = int(checkpoint_lsn)
+            updated = dict(self._durable_consumers)
+            updated[name] = int(checkpoint_lsn)
+            self._persist_durable_consumers(updated)
+            self._durable_consumers = updated
 
     @property
     def wal_reclaim_lsn(self) -> int:
         with self._lock:
             return min(self._durable_consumers.values(), default=0)
+
+    def durable_consumer_checkpoint(self, name: str) -> int:
+        with self._lock:
+            if name not in self._durable_consumers:
+                raise KeyError(name)
+            return int(self._durable_consumers[name])
+
+    def reclaim_prefix(self) -> int:
+        """Atomically remove frames no registered durable consumer still needs."""
+        with self._lock:
+            if self._poisoned:
+                raise RuntimeError("cannot reclaim a poisoned WAL before reopening it")
+            reclaim_lsn = self.wal_reclaim_lsn
+            if reclaim_lsn <= 0:
+                return 0
+            recovery = self.recover(truncate=True)
+            frames = recovery.frames
+            if len(frames) <= 1:
+                return 0
+            removable = 0
+            while removable < len(frames) - 1 and frames[removable].wal_lsn <= reclaim_lsn:
+                removable += 1
+            if removable == 0:
+                return 0
+            retained = frames[removable:]
+            groups: list[tuple[CanonicalCommitFrame, ...]] = []
+            pending: list[CanonicalCommitFrame] = []
+            pending_bytes = 0
+            for frame in retained:
+                payload_bytes = len(_json_bytes(frame.payload()))
+                if pending and (
+                    len(pending) >= self.max_group_frames
+                    or pending_bytes + payload_bytes > self.max_pending_bytes
+                ):
+                    groups.append(tuple(pending))
+                    pending = []
+                    pending_bytes = 0
+                pending.append(frame)
+                pending_bytes += payload_bytes
+            if pending:
+                groups.append(tuple(pending))
+            encoded = b"".join(
+                self._encode_group(group, group_id=index)
+                for index, group in enumerate(groups, start=1)
+            )
+            temporary_path: Path | None = None
+            replaced = False
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", dir=self.path.parent, prefix=f".{self.path.name}.reclaim-", delete=False
+                ) as handle:
+                    temporary_path = Path(handle.name)
+                    self._write_all(handle, encoded)
+                    handle.flush()
+                    self._fsync(handle.fileno())
+                os.replace(temporary_path, self.path)
+                replaced = True
+                directory_fd = os.open(self.path.parent, os.O_RDONLY)
+                try:
+                    self._fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except BaseException:
+                # Once replacement occurred, the directory-entry durability is
+                # indeterminate to this process. Reopen/recovery is required
+                # before another append can safely choose a group identity.
+                if replaced:
+                    self._poisoned = True
+                raise
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+            self._group_id = len(groups)
+            self._durable_lsn = retained[-1].wal_lsn
+            return removable
 
 
 def recover_canonical_store(

@@ -7,6 +7,8 @@ import queue
 from threading import RLock
 from types import SimpleNamespace
 
+import pytest
+
 from v9.hgt.epoch_dataset import EpochTransitionDataset
 from v9.runtime import ContinuousMemoryRuntime
 from v9.runtime.memory_pipeline import IngestionBatchTask
@@ -150,6 +152,73 @@ def test_pending_batch_buffer_is_hard_bounded() -> None:
             raise AssertionError("expected bounded high-water rejection")
     finally:
         service.shutdown_parallel_pipeline()
+
+
+def test_pending_batch_buffer_enforces_exact_carried_byte_high_water() -> None:
+    service = _service(capacity=1)
+    try:
+        service.ingest_local_byte_high_water = 10
+        service.memory.ingest_queue.put_nowait("occupied")
+        service.dispatch_transitions_batch(
+            (Transition(1, 1), Transition(1, 2)),
+            carried_bytes=10,
+        )
+        assert service.pending_ingest_batch_rows == 2
+        assert service.pending_ingest_batch_bytes == 10
+        assert service.outstanding_ingest_bytes == 10
+
+        sampled = service.sampled
+        ingest_sequence = service.ingest_sequence
+        with pytest.raises(RuntimeError, match="byte high-water"):
+            service.dispatch_transitions_batch((Transition(1, 3),), carried_bytes=1)
+        assert service.sampled == sampled
+        assert service.ingest_sequence == ingest_sequence
+        assert service.outstanding_ingest_bytes == 10
+
+        assert service.memory.ingest_queue.get_nowait() == "occupied"
+        assert service.pump_ingest_tasks()
+        queued = service.memory.ingest_queue.get_nowait()
+        assert queued.input_bytes == 10
+        assert service.pending_ingest_batch_bytes == 0
+    finally:
+        service.shutdown_parallel_pipeline()
+
+
+def test_ingest_worker_accepts_batch_state_created_before_byte_field(monkeypatch) -> None:
+    from v9.runtime import memory_pipeline
+
+    task = SimpleNamespace(sequence=1)
+    legacy = object.__new__(IngestionBatchTask)
+    object.__setattr__(legacy, "start_sequence", 1)
+    object.__setattr__(legacy, "end_sequence", 1)
+    object.__setattr__(legacy, "tasks", (task,))
+    assert not hasattr(legacy, "task_input_bytes")
+
+    monkeypatch.setattr(memory_pipeline, "prepare_ingestion", lambda value: value)
+    monkeypatch.setattr(memory_pipeline, "build_commit_plan", lambda value: value)
+    prepared = memory_pipeline.prepare_commit_batch(legacy)
+
+    assert prepared.input_bytes == 0
+    assert prepared.rows == (task,)
+
+    captured = []
+    monkeypatch.setattr(
+        memory_pipeline,
+        "_publish_compiled_result",
+        lambda _queue, _pool, value, **_kwargs: captured.append(value),
+    )
+    task_queue = queue.Queue()
+    task_queue.put(legacy)
+    from v9.runtime.multiprocess import WorkerStop
+
+    task_queue.put(WorkerStop())
+    memory_pipeline.ingest_batch_worker_main(
+        task_queue,
+        queue.Queue(),
+        result_pool=object(),
+    )
+    assert len(captured) == 1
+    assert captured[0].input_bytes == 0
 
 
 def test_publication_queue_batch_drain_exceeds_old_512_limit() -> None:

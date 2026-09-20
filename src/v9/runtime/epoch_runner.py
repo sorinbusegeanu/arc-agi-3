@@ -349,7 +349,7 @@ def _record_symbol_prediction_evidence(runtime: Any, *, limit: int = 128, scan_b
         relation = rows[0]
         if relation.channel is not NormalizedChannel.CROSS_MODAL:
             continue
-        cross_support = int(runtime._m1n_supports.get(int(signature), len(rows)))
+        cross_support = int(runtime.signature_support(int(signature), len(rows)))
         world_support = 0
         for parent in relation.provenance.parents:
             payload = runtime.graph.payloads.get(parent)

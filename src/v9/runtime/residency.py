@@ -411,6 +411,12 @@ class ResidentMemoryManager:
             runtime.graph.retired_tombstones.clear()
         self.last_insert_check = int(runtime.graph.low_level_nodes_inserted_total)
 
+    def sample_memory(self):
+        return self.governor.sample(
+            backlog=self.backlog(),
+            tracked_shm_bytes=max(0, int(self.runtime.__dict__.get("_tracked_shm_bytes", 0))),
+        )
+
     def _recount_graph(self) -> None:
         graph = self.runtime.graph
         graph._resident_m0_count = len(graph._uids_by_level[MemoryLevel.M0])
@@ -637,7 +643,7 @@ class ResidentMemoryManager:
         interval_due = inserts - self.last_insert_check >= int(self.scientific.resident_compaction_check_interval)
         m0, m1g = self.counts()
         hard_limit = m0 > int(self.scientific.resident_m0_limit) or m1g > int(self.scientific.resident_m1_grounded_limit)
-        snapshot = self.governor.sample(backlog=self.backlog())
+        snapshot = self.sample_memory()
         self._last_snapshot = snapshot
         pressure = snapshot.state in {MemoryGovernorState.COMPACTING, MemoryGovernorState.HARD_PRESSURE_DRAIN}
         if not (force or interval_due or hard_limit or pressure):
@@ -663,7 +669,7 @@ class ResidentMemoryManager:
         pre_m0, pre_m1g = self.counts()
         before_deleted = int(self.runtime.graph.low_level_nodes_deleted_total)
         before_edges = int(self.runtime.graph.low_level_edges_deleted_total)
-        before_memory = self.governor.sample(backlog=self.backlog())
+        before_memory = self.sample_memory()
         passes = 0
         while self.backlog() > 0 and passes < 128:
             passes += 1
@@ -671,7 +677,7 @@ class ResidentMemoryManager:
                 break
         gc.collect()
         post_m0, post_m1g = self.counts()
-        after_memory = self.governor.sample(backlog=self.backlog())
+        after_memory = self.sample_memory()
         self._last_snapshot = after_memory
         self.startup_compaction_seconds = time.perf_counter() - started
         result: dict[str, int | float] = {
@@ -690,7 +696,7 @@ class ResidentMemoryManager:
 
     def _publish_telemetry(self) -> None:
         graph = self.runtime.graph
-        snapshot = self._last_snapshot or self.governor.sample(backlog=self.backlog())
+        snapshot = self._last_snapshot or self.sample_memory()
         m0, m1g = self.counts()
         target_m0, target_m1g = self.targets()
         gauges = getattr(self.runtime.unified_telemetry, "gauges", None)
@@ -719,7 +725,7 @@ class ResidentMemoryManager:
 
     def metrics(self) -> dict[str, int | float | str]:
         self._publish_telemetry()
-        snapshot = self._last_snapshot or self.governor.sample(backlog=self.backlog())
+        snapshot = self._last_snapshot or self.sample_memory()
         m0, m1g = self.counts()
         return {
             "M0_resident": m0,
@@ -828,7 +834,7 @@ def _install_runtime_contract(runtime_cls: type) -> None:
     def apply_prepared_ingestion_batch(self: Any, rows: Iterable[Any]):
         prepared_rows = tuple(rows)
         manager = getattr(self, "_resident_memory", None)
-        if manager is not None and manager.governor.sample(backlog=manager.backlog()).state is MemoryGovernorState.HARD_PRESSURE_DRAIN:
+        if manager is not None and manager.sample_memory().state is MemoryGovernorState.HARD_PRESSURE_DRAIN:
             manager.maybe_compact(force=True)
         result = original_apply_batch(self, prepared_rows)
         # Add boundary outcome evidence to the deferred M0 payload so retention

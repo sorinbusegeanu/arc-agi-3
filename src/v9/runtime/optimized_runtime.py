@@ -165,7 +165,7 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
             self._cross_modal_signatures[signature] = None
             while len(self._cross_modal_signatures) > 8192:
                 self._cross_modal_signatures.pop(next(iter(self._cross_modal_signatures)))
-        support = int(self._m1n_supports.get(signature, 0)) + 1
+        support = int(self.signature_support(signature)) + 1
         self._m1n_supports[signature] = support
         if signature not in self._normalized_action_cache:
             observable = str(relation.observable_relation)
@@ -333,12 +333,12 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                     }
                     deferred_rows.extend(((m0_node, m0_payload, (m0.uid,)), (m1g_node, m1g_payload, (m0.uid,))))
                     self._latest_interaction_grounding[(m1g.environment_instance_id, m1g.episode_id)] = m1g
-                    prior_support = int(self._m1n_supports.get(int(m1n.structural_signature), 0))
+                    prior_support = int(self.signature_support(int(m1n.structural_signature)))
                     signature = self._record_normalized_deferred_batch(m1n, deferred_rows, transition)
                     signatures.append(signature)
                     next_stage = self._advance_stage_interval_batch()
                     experience = event.experience
-                    recurrence = int(self._m1n_supports.get(signature, 0))
+                    recurrence = int(self.signature_support(signature))
                     recurrence_surprise = 1.0 / max(1.0, float(prior_support + 1))
                     prediction_error = abs(float(experience.prediction_error)) if float(experience.prediction_error) != 0.0 else recurrence_surprise
                     # Deferred batch publication must preserve the graph generation
@@ -553,6 +553,7 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
             restore_snapshot = dict(snapshot)
             restore_snapshot["state"] = restore_state
             super()._restore(restore_snapshot, graph_override=graph_override)
+            persistent_occurrences = dict(self._m1n_occurrences)
 
             normalized_by_signature: dict[int, MemoryUid] = {}
             for uid, node in self.graph.nodes.items():
@@ -567,7 +568,12 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                 if current is None or uid < current:
                     normalized_by_signature[signature] = uid
 
-            self._m1n_occurrences = {}
+            saved_signatures = {int(signature) for signature in saved_occurrences}
+            self._m1n_occurrences = {
+                signature: rows
+                for signature, rows in persistent_occurrences.items()
+                if int(signature) not in saved_signatures
+            }
             for raw_signature, count in saved_occurrences.items():
                 signature = int(raw_signature)
                 uid = normalized_by_signature.get(signature)

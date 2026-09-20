@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections import OrderedDict
+from collections.abc import Callable, Iterator, MutableSet
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
@@ -62,6 +63,10 @@ class SignatureIndexStore:
         self._connection.commit()
         self._delta: OrderedDict[int, SignatureIndexRecord] = OrderedDict()
         self._cache: OrderedDict[int, SignatureIndexRecord] = OrderedDict()
+        row = self._connection.execute(
+            "SELECT COUNT(*) FROM signatures WHERE derivation_dirty=1"
+        ).fetchone()
+        self._dirty_count = 0 if row is None else int(row[0])
 
     def close(self) -> None:
         with self._lock:
@@ -142,6 +147,7 @@ class SignatureIndexStore:
                 support > current.last_derived_support,
                 max(current.priority, support - contradiction if priority is None else int(priority)),
             )
+            self._dirty_count += int(record.derivation_dirty) - int(current.derivation_dirty)
             self._delta[current.signature] = record
             self._delta.move_to_end(current.signature)
             self._cache_record(record)
@@ -163,9 +169,38 @@ class SignatureIndexStore:
                 current.support > last,
                 current.priority,
             )
+            self._dirty_count += int(record.derivation_dirty) - int(current.derivation_dirty)
             self._delta[current.signature] = record
             self._cache_record(record)
             return record
+
+    def mark_dirty(self, signature: int, support: int) -> SignatureIndexRecord:
+        """Persist a monotonic support advance as pending derivation work."""
+        with self._lock:
+            current = self.get(signature)
+            selected_support = int(support)
+            if selected_support < current.support:
+                raise ValueError("signature support cannot move backward")
+            record = SignatureIndexRecord(
+                current.signature,
+                selected_support,
+                current.contradiction_support,
+                current.last_derived_support,
+                selected_support > current.last_derived_support,
+                max(current.priority, selected_support - current.contradiction_support),
+            )
+            self._dirty_count += int(record.derivation_dirty) - int(current.derivation_dirty)
+            self._delta[current.signature] = record
+            self._delta.move_to_end(current.signature)
+            self._cache_record(record)
+            if len(self._delta) >= self.delta_limit:
+                self.flush(max_entries=max(1, self.delta_limit // 2))
+            return record
+
+    @property
+    def dirty_count(self) -> int:
+        with self._lock:
+            return int(self._dirty_count)
 
     def flush(self, *, max_entries: int | None = None) -> int:
         with self._lock:
@@ -240,4 +275,49 @@ class SignatureIndexStore:
             return tuple(self._cache_record(self._from_row(row, int(row[0]))) for row in rows)
 
 
-__all__ = ["SignatureIndexRecord", "SignatureIndexStore"]
+class PersistentDirtySignatureWindow(MutableSet[int]):
+    """Set-compatible bounded view over persistent dirty signature authority."""
+
+    def __init__(
+        self,
+        store: SignatureIndexStore,
+        support_lookup: Callable[[int], int],
+    ) -> None:
+        self.store = store
+        self._support_lookup = support_lookup
+
+    def __contains__(self, signature: object) -> bool:
+        try:
+            selected = int(signature)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return False
+        return self.store.get(selected).derivation_dirty
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(tuple(row.signature for row in self.store.dirty_window()))
+
+    def __len__(self) -> int:
+        return self.store.dirty_count
+
+    def add(self, signature: int) -> None:
+        selected = int(signature)
+        support = max(self.store.get(selected).support, int(self._support_lookup(selected)))
+        self.store.mark_dirty(selected, support)
+
+    def discard(self, signature: int) -> None:
+        selected = int(signature)
+        current = self.store.get(selected)
+        if current.derivation_dirty:
+            self.store.mark_derived(selected, current.support)
+
+    def clear(self) -> None:
+        # One bounded window is cleared per drain. Additional persistent rows
+        # remain dirty for the next bounded derivation pass.
+        for row in self.store.dirty_window():
+            self.store.mark_derived(row.signature, row.support)
+
+__all__ = [
+    "PersistentDirtySignatureWindow",
+    "SignatureIndexRecord",
+    "SignatureIndexStore",
+]
