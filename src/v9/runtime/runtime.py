@@ -1424,6 +1424,10 @@ class ContinuousMemoryRuntime:
                     generation, watermark, signature_supports, pending
                 ):
                     continue
+                current_dirty = set(self._m1n_dirty)
+                prepared = tuple(
+                    row for row in prepared if int(row[0]) in current_dirty
+                )
                 self._commit_consolidation_cut_locked(pending, prepared)
                 return
 
