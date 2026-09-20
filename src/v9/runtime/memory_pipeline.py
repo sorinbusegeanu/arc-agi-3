@@ -339,7 +339,10 @@ def ingest_worker_main(task_queue: Any, result_queue: Any) -> None:
 def derive_memory(task: DerivationTask) -> DerivationResult:
     if len(task.rows) < 2 or task.support < 2:
         raise ValueError("derivation requires recurrent M1 support")
-    family = form_families(task.rows)[0]
+    families = form_families(task.rows)
+    if not families:
+        raise ValueError("derivation requires at least one formable recurrent family")
+    family = families[0]
     family = replace(family, recurrence=int(task.support), compression_benefit=float(task.support - 1))
     roles = form_roles(
         (family,),
