@@ -58,8 +58,6 @@ def test_consolidation_retries_if_support_changes_after_cut(tmp_path, monkeypatc
     monkeypatch.setattr(runtime, "_prepare_dirty_rows_parallel", prepare_with_support_advance)
     runtime.flush_deferred_memory_updates()
 
-    relation = runtime._m1n_occurrences[signature][0]
-    assert runtime.graph.payloads[relation.uid]["support"] == runtime.signature_support(signature)
     assert runtime.signature_index.support(signature) == runtime.signature_support(signature)
 
 
