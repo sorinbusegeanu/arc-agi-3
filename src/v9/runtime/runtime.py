@@ -1302,8 +1302,12 @@ class ContinuousMemoryRuntime:
             )
         return int(self.graph.generation), watermark, pending, tuple(dirty_snapshots)
 
-    def _developmental_cut_is_current_locked(self, generation, watermark, signature_supports) -> bool:
+    def _developmental_cut_is_current_locked(
+        self, generation, watermark, signature_supports, pending=()
+    ) -> bool:
         if int(self.graph.generation) != int(generation) or int(self._watermark) != int(watermark):
+            return False
+        if any(self._deferred_base_nodes.get(uid) != snapshotted for uid, snapshotted in pending):
             return False
         return all(
             self.signature_support(int(signature)) == int(support)
@@ -1417,7 +1421,7 @@ class ContinuousMemoryRuntime:
             )
             with self._lock:
                 if not self._developmental_cut_is_current_locked(
-                    generation, watermark, signature_supports
+                    generation, watermark, signature_supports, pending
                 ):
                     continue
                 self._commit_consolidation_cut_locked(pending, prepared)
