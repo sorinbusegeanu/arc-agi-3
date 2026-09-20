@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from v9 import ContinuousMemoryRuntime, RuntimeConfig
+from v9.memory.model import MemoryLevel
 
 
 def _runtime(tmp_path):
@@ -62,7 +63,7 @@ def test_replay_retries_if_authoritative_cut_changes(tmp_path, monkeypatch) -> N
     runtime = _runtime(tmp_path)
     _seed_recurrent_signature(runtime)
     runtime.flush_deferred_memory_updates()
-    before_m0 = runtime.graph.memory_count(runtime.graph.nodes[next(iter(runtime.graph.nodes))].level.__class__.M0)
+    before_m0 = runtime.graph.memory_count(MemoryLevel.M0)
     original = runtime._derive_tasks_parallel
     calls = 0
 
@@ -80,4 +81,4 @@ def test_replay_retries_if_authoritative_cut_changes(tmp_path, monkeypatch) -> N
 
     assert calls >= 2
     assert result.selected >= 1
-    assert runtime.graph.memory_count(runtime.graph.nodes[next(iter(runtime.graph.nodes))].level.__class__.M0) == before_m0
+    assert runtime.graph.memory_count(MemoryLevel.M0) == before_m0
