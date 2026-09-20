@@ -1696,7 +1696,13 @@ class ContinuousMemoryRuntime:
                 for row in rows
                 for evidence_uid in row.provenance.evidence
             }
+            # Restored compacted occurrence rows can retain authoritative support
+            # while carrying only one representative relation. They are sufficient
+            # for support accounting, but not for family re-formation.
             if len(rows) < 2 or support < 2 or len(distinct_evidence) < 2:
+                return None
+            from v9.cognition.compression import form_families
+            if not form_families(rows):
                 return None
             return DerivationTask(
                 int(task_id),
