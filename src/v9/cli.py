@@ -22,6 +22,8 @@ from v9.runtime.scientific_modes import (
     ScientificVisibilityMode,
 )
 from v9.runtime.epoch_runner import run_epochs
+from v9.runtime.snapshot import latest_snapshot
+from v9.runtime.transfer_validation import run_transfer_validation_interval
 from v9.runtime.trace_runner import run_trace_bundle
 from v9.runtime.retention_audit import run_retention_audit
 from v9.telemetry import MetricsHTTPServer
@@ -295,7 +297,6 @@ def _actor(runtime: ContinuousMemoryRuntime, spec: EnvironmentSpec, *, actor_id:
 
 
 def _trajectory_rows(root: Path) -> list[dict[str, Any]]:
-    from v9.runtime.snapshot import latest_snapshot
     path = latest_snapshot(root)
     if path is None:
         return []
@@ -304,7 +305,78 @@ def _trajectory_rows(root: Path) -> list[dict[str, Any]]:
     return [dict(row) for row in nodes if int(row.get("level", -1)) == 7]
 
 
+def _persisted_epoch(root: Path) -> int:
+    summary_path = root / "v9_run_summary.json"
+    if not summary_path.is_file():
+        return 0
+    try:
+        rows = json.loads(summary_path.read_text(encoding="utf-8")).get("epochs", ())
+        return max((int(row.get("epoch", 0)) for row in rows), default=0)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return 0
+
+
+def _run_transfer_validation(args: argparse.Namespace, specs: tuple[EnvironmentSpec, ...]) -> int:
+    root = Path(args.root)
+    if args.no_restore:
+        raise ValueError("--transfer-validation requires persisted state; remove --no-restore")
+    if args.no_snapshots:
+        raise ValueError("--transfer-validation must persist its evidence; remove --no-snapshots")
+    if latest_snapshot(root) is None:
+        raise RuntimeError(f"--transfer-validation requires an existing completed snapshot under {root}")
+
+    runtime = ContinuousMemoryRuntime(_runtime_config(args))
+    runtime.start()
+    try:
+        epoch = _persisted_epoch(root)
+        model_version = str(runtime.unified_telemetry.model_version or "untrained")
+        result = run_transfer_validation_interval(
+            runtime,
+            specs,
+            args,
+            epoch=epoch,
+            adapter_factory=make_adapter,
+        )
+        runtime.wait_quiescent(args.drain_timeout)
+        final = runtime.close(normal=True, timeout=args.final_save_timeout)
+        summary = {
+            "epoch": epoch,
+            "games": [spec.display_name for spec in specs],
+            "model_version": model_version,
+            "scientific_config_id": runtime.config.scientific.config_id.value,
+            "validation_configuration": {
+                "mode": runtime.config.scientific.transfer_validation_mode,
+                "trials_per_interval": runtime.config.scientific.transfer_validation_trials_per_interval,
+                "workers": runtime.config.scientific.transfer_validation_workers,
+                "time_budget_seconds": runtime.config.scientific.transfer_validation_time_budget_seconds,
+            },
+            "validation": asdict(result),
+            "metrics": runtime.metrics(),
+            "snapshot": None if final is None else {**asdict(final), "path": str(final.path)},
+        }
+        target = root / "transfer_validation_summary.json"
+        target.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(
+            f"{time.strftime('[%H:%M]')} transfer validation complete "
+            f"model={model_version} attempted={result.attempted} completed={result.completed} "
+            f"passed={result.passed} validated={result.validated_concepts} "
+            f"report={target}",
+            flush=True,
+        )
+        return 0
+    except BaseException:
+        runtime.close(normal=False)
+        raise
+
+
 def run_continuous(args: argparse.Namespace) -> int:
+    if args.transfer_validation and (
+        args.trace
+        or args.trace_retention is not None
+        or args.show_best_trajectory
+        or args.save_best_trajectory
+    ):
+        raise ValueError("--transfer-validation cannot be combined with trace or trajectory modes")
     if getattr(args, "trace_retention", None) is not None:
         trace_bundle = (
             Path(args.trace_retention)
@@ -325,11 +397,7 @@ def run_continuous(args: argparse.Namespace) -> int:
         Path(args.save_best_trajectory).write_text(json.dumps(_trajectory_rows(Path(args.root)), indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return 0
     if not args.games:
-        raise ValueError("--games is required for a normal continuous run")
-    if args.actors <= 0 or args.steps_per_game <= 0 or args.min_episode_opportunities <= 0 or args.epochs <= 0 or args.hgt_training_epochs <= 0 or args.hgt_learning_rate <= 0 or args.graph_check <= 0 or args.wait < 0 or args.progress_interval_seconds <= 0 or not 0 <= args.epsilon <= 1:
-        raise ValueError("actors, steps-per-game, graph-check and progress interval must be positive; wait and epsilon must be valid")
-    if min(args.ingest_workers, args.derivation_workers, args.ingest_queue_capacity, args.derivation_queue_capacity, args.publication_queue_capacity, args.actor_view_refresh_steps) <= 0 or args.actor_view_refresh_ms <= 0:
-        raise ValueError("memory worker counts, queue capacities and actor policy refresh controls must be positive")
+        raise ValueError("--games is required for continuous run or transfer validation")
     specs = _configure_alfred_specs(
         resolve_game_specs(args.games, curriculum_config=args.curriculum_config),
         mode=getattr(args, "alfred_mode", None),
@@ -365,6 +433,12 @@ def run_continuous(args: argparse.Namespace) -> int:
         else (curriculum_modes[0] if len(curriculum_modes) == 1 else args.validation_mode)
     )
     args.validation_mode = effective_validation_mode
+    if args.transfer_validation:
+        return _run_transfer_validation(args, specs)
+    if args.actors <= 0 or args.steps_per_game <= 0 or args.min_episode_opportunities <= 0 or args.epochs <= 0 or args.hgt_training_epochs <= 0 or args.hgt_learning_rate <= 0 or args.graph_check <= 0 or args.wait < 0 or args.progress_interval_seconds <= 0 or not 0 <= args.epsilon <= 1:
+        raise ValueError("actors, steps-per-game, graph-check and progress interval must be positive; wait and epsilon must be valid")
+    if min(args.ingest_workers, args.derivation_workers, args.ingest_queue_capacity, args.derivation_queue_capacity, args.publication_queue_capacity, args.actor_view_refresh_steps) <= 0 or args.actor_view_refresh_ms <= 0:
+        raise ValueError("memory worker counts, queue capacities and actor policy refresh controls must be positive")
     runtime = ContinuousMemoryRuntime(_runtime_config(args))
     runtime.set_telemetry_gauge("curriculum_validation_mode", effective_validation_mode)
     runtime.start()
@@ -399,7 +473,7 @@ def run_continuous(args: argparse.Namespace) -> int:
         runtime.wait_quiescent(args.drain_timeout)
         final = runtime.close(normal=True, timeout=args.final_save_timeout)
         metrics = runtime.metrics()
-        summary = {"games": list(games), "epochs": [asdict(row) for row in epoch_results], "actors": [asdict(row) for row in results], "automatic_transfer_experiments": {"mode": effective_validation_mode, "budget": runtime.config.scientific.transfer_validation_trials_per_interval, "attempted": 0, "completed": 0, "passed": 0, "blocker": "no eligible target exposes exact snapshot/restore support" if effective_validation_mode != "learning_only" else None}, "hypotheses": runtime.scientific_statuses(), "metrics": metrics, "final_snapshot": None if final is None else {**asdict(final), "path": str(final.path)}}
+        summary = {"games": list(games), "epochs": [asdict(row) for row in epoch_results], "actors": [asdict(row) for row in results], "automatic_transfer_experiments": {"mode": effective_validation_mode, "budget": runtime.config.scientific.transfer_validation_trials_per_interval, "attempted": 0, "completed": 0, "passed": 0, "blocker": "run separately with --transfer-validation"}, "hypotheses": runtime.scientific_statuses(), "metrics": metrics, "final_snapshot": None if final is None else {**asdict(final), "path": str(final.path)}}
         target = Path(args.root) / "v9_run_summary.json"
         target.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return 0
@@ -477,6 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--transfer-experiment-time-budget-seconds", type=float, default=None)
     continuous.add_argument("--validation-mode", choices=("learning_only", "validation_budgeted", "validation_full"), default="validation_budgeted")
     continuous.add_argument("--no-automatic-experiments", action="store_true")
+    continuous.add_argument("--transfer-validation", action="store_true", help="validate transfer evidence from persisted state and exit without training")
     smoke = sub.add_parser("smoke")
     _add_runtime_arguments(smoke)
     smoke.add_argument("--events", type=int, default=1000)

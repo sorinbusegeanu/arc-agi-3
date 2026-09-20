@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
 from v9.runtime.reset_memory import RESET_MEMORY_ENV
 
@@ -102,3 +104,18 @@ def test_module_entrypoint_consumes_reset_memory_flag(monkeypatch) -> None:
     assert "--reset-memory" not in sys.argv
     assert sys.argv[-2:] == ["--games", "step1"]
     assert __import__("os").environ[RESET_MEMORY_ENV] == "1"
+
+
+def test_module_entrypoint_rejects_reset_during_transfer_validation(monkeypatch) -> None:
+    import sys
+    from v9.__main__ import _consume_reset_memory_flag
+
+    monkeypatch.delenv(RESET_MEMORY_ENV, raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["python", "continuous-run", "--reset-memory", "--transfer-validation", "--games", "step1"],
+    )
+    with pytest.raises(SystemExit, match="cannot be combined"):
+        _consume_reset_memory_flag()
+    assert __import__("os").environ.get(RESET_MEMORY_ENV) is None

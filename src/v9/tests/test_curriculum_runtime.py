@@ -72,7 +72,18 @@ def test_legacy_game_selectors_remain_supported() -> None:
     assert len(mix) == 5
 
 
-def test_step1_continuous_run_executes_curriculum(tmp_path) -> None:
+def test_step1_continuous_run_executes_curriculum(tmp_path, monkeypatch) -> None:
+    from v9.runtime import epoch_runner
+
+    def unexpected_transfer_validation(*_args, **_kwargs):
+        raise AssertionError("normal continuous-run invoked transfer validation")
+
+    monkeypatch.setattr(
+        epoch_runner,
+        "run_transfer_validation_interval",
+        unexpected_transfer_validation,
+        raising=False,
+    )
     root = tmp_path / "step1"
     args = build_parser().parse_args([
         "continuous-run",

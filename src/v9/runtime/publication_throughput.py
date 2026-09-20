@@ -8,7 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Thread
 from typing import Any
 
-from .canonical_commit import apply_canonical_commit_batch
+from .canonical_commit import apply_canonical_commit_batch, canonical_commit_prefix_length
 from .memory_pipeline import CanonicalMutationIntent, PreparedCommitBatch
 from .parallel_memory_coordinator import _adaptive_canonical_batch_size
 from .shared_batch_transport import (
@@ -350,12 +350,14 @@ def _submit_canonical_commit(service: Any, *, max_rows: int | None = None) -> bo
         return False
 
     plans: list[CanonicalMutationIntent] = []
+    plan_input_bytes: list[int] = []
     expected = None
     for batch in transport_batches:
+        measured_input_bytes = _prepared_row_input_bytes(batch)
         if expected is not None and int(batch.start_sequence) != expected:
             raise RuntimeError(f"compiled intent sequence gap: expected={expected} actual={batch.start_sequence}")
         row_sequence = int(batch.start_sequence)
-        for row in batch.rows:
+        for row, row_bytes in zip(batch.rows, measured_input_bytes, strict=True):
             if not isinstance(row, CanonicalMutationIntent):
                 raise TypeError(f"ingest workers must emit CanonicalMutationIntent, got {type(row).__name__}")
             if int(row.sequence) != row_sequence:
@@ -363,12 +365,45 @@ def _submit_canonical_commit(service: Any, *, max_rows: int | None = None) -> bo
                     f"compiled intent row sequence mismatch: expected={row_sequence} actual={row.sequence}"
                 )
             plans.append(row)
+            plan_input_bytes.append(int(row_bytes))
             row_sequence += 1
         if row_sequence - 1 != int(batch.end_sequence):
             raise RuntimeError(
                 f"compiled intent batch end mismatch: expected={row_sequence - 1} actual={batch.end_sequence}"
             )
         expected = int(batch.end_sequence) + 1
+
+    admitted = canonical_commit_prefix_length(
+        service.runtime,
+        plans,
+        row_input_bytes=plan_input_bytes,
+    )
+    if admitted < len(plans):
+        remaining = PreparedCommitBatch(
+            int(plans[admitted].sequence),
+            int(plans[-1].sequence),
+            tuple(plans[admitted:]),
+            sum(plan_input_bytes[admitted:]),
+            tuple(plan_input_bytes[admitted:]),
+        )
+        if int(remaining.start_sequence) in service.ingest_results:
+            raise RuntimeError(
+                f"canonical budget split collides at sequence {remaining.start_sequence}"
+            )
+        service.ingest_results[int(remaining.start_sequence)] = remaining
+        plans = plans[:admitted]
+        plan_input_bytes = plan_input_bytes[:admitted]
+        input_bytes = sum(plan_input_bytes)
+        service.ingest_apply = int(remaining.start_sequence)
+        transport_batches = [
+            PreparedCommitBatch(
+                int(plans[0].sequence),
+                int(plans[-1].sequence),
+                tuple(plans),
+                int(input_bytes),
+                tuple(plan_input_bytes),
+            )
+        ]
 
     batch_id = service._reducer_batch_id
     if not service._canonical_reducer.submit(

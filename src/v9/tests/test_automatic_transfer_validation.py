@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import v9.cli as cli
 from v9.environments.contract import BoundaryEvent, BoundaryScope
 from v9.environments.schemas import ActionSchema, EnvironmentIdentity, ObservationSchema
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig
-from v9.runtime.transfer_validation import _balance_transfer_candidates, run_transfer_validation_interval
+from v9.runtime.transfer_validation import (
+    TransferValidationStats,
+    _balance_transfer_candidates,
+    run_transfer_validation_interval,
+)
 
 
 def _runtime_with_concept(root: Path) -> ContinuousMemoryRuntime:
@@ -185,3 +191,86 @@ def test_transfer_candidates_are_round_robin_balanced_by_environment_type() -> N
     )
     balanced = _balance_transfer_candidates(rows)
     assert [row["id"] for row in balanced] == ["a1", "c1", "b1", "a2", "b2", "a3"]
+
+
+def test_transfer_validation_cli_restores_validates_persists_and_exits(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "persisted"
+    snapshot = root / "snapshots" / "snapshot-1"
+    snapshot.mkdir(parents=True)
+    (snapshot / "COMPLETE").write_text("complete\n", encoding="utf-8")
+    (root / "v9_run_summary.json").write_text(
+        json.dumps({"epochs": [{"epoch": 7}]}) + "\n",
+        encoding="utf-8",
+    )
+    model_dir = root / "models"
+    model_dir.mkdir()
+    manifest = model_dir / "hgt_manifest.json"
+    manifest.write_text('{"accepted_model_version":"hgt-000007"}\n', encoding="utf-8")
+    manifest_before = manifest.read_bytes()
+    calls: dict[str, object] = {}
+
+    class FakeRuntime:
+        def __init__(self, config):
+            calls["config"] = config
+            self.config = config
+            self.unified_telemetry = SimpleNamespace(model_version="hgt-000007")
+            self.closed = False
+
+        def start(self):
+            calls["started"] = True
+
+        def wait_quiescent(self, timeout):
+            calls["quiescent_timeout"] = timeout
+
+        def metrics(self):
+            return {"validation_only": True}
+
+        def close(self, *, normal=True, timeout=300.0):
+            calls["close"] = (normal, timeout)
+            self.closed = True
+            return None
+
+        def replay_once(self):
+            raise AssertionError("validation-only mode invoked replay")
+
+    def validate(runtime, specs, args, *, epoch, adapter_factory):
+        calls["validation"] = (runtime, specs, args, epoch, adapter_factory)
+        return TransferValidationStats(3, 2, 1, 1, None)
+
+    def unexpected_epochs(*_args, **_kwargs):
+        raise AssertionError("validation-only mode invoked sampling/training epochs")
+
+    monkeypatch.setattr(cli, "ContinuousMemoryRuntime", FakeRuntime)
+    monkeypatch.setattr(cli, "run_transfer_validation_interval", validate)
+    monkeypatch.setattr(cli, "run_epochs", unexpected_epochs)
+    monkeypatch.setattr(cli, "latest_snapshot", lambda _root: snapshot)
+
+    args = cli.build_parser().parse_args(
+        [
+            "continuous-run",
+            "--root",
+            str(root),
+            "--games",
+            "synthetic",
+            "--transfer-validation",
+            "--no-dashboard",
+        ]
+    )
+    assert cli.run_continuous(args) == 0
+
+    config = calls["config"]
+    assert config.restore is True
+    assert calls["started"] is True
+    assert calls["validation"][3] == 7
+    assert calls["validation"][4] is cli.make_adapter
+    assert calls["close"] == (True, args.final_save_timeout)
+    assert manifest.read_bytes() == manifest_before
+    report = json.loads((root / "transfer_validation_summary.json").read_text(encoding="utf-8"))
+    assert report["model_version"] == "hgt-000007"
+    assert report["validation"] == {
+        "attempted": 3,
+        "blocker": None,
+        "completed": 2,
+        "passed": 1,
+        "validated_concepts": 1,
+    }

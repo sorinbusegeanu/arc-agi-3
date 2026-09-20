@@ -10,6 +10,8 @@ logging.disable(logging.INFO)
 def _consume_reset_memory_flag() -> None:
     if "--reset-memory" not in sys.argv:
         return
+    if "--transfer-validation" in sys.argv:
+        raise SystemExit("--transfer-validation cannot be combined with --reset-memory")
     sys.argv[:] = [value for value in sys.argv if value != "--reset-memory"]
     os.environ["ARC_AGI3_V9_RESET_MEMORY"] = "1"
 
