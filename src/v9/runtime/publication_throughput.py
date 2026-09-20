@@ -404,6 +404,7 @@ def _submit_canonical_commit(service: Any, *, max_rows: int | None = None) -> bo
                 tuple(plan_input_bytes),
             )
         ]
+        row_count = len(plans)
 
     batch_id = service._reducer_batch_id
     if not service._canonical_reducer.submit(

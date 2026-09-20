@@ -57,6 +57,12 @@ from .canonical_store import CanonicalStore, canonical_value
 from .canonical_transaction import CanonicalCollection
 from .canonical_wal import CanonicalCommitWAL, PersistenceFrontiers
 from .config import RuntimeConfig, write_scientific_config_manifest
+from .developmental_cut import (
+    DevelopmentalCut,
+    DevelopmentalCutResult,
+    DevelopmentalCutSession,
+    DevelopmentalMutationGate,
+)
 from .lifecycle import LifecycleRegistry
 from .partitions import PartitionMap
 from .publication import CanonicalGraph, edge_ref, node_ref
@@ -79,6 +85,11 @@ class ContinuousMemoryRuntime:
         self.partitions = PartitionMap(config.shards)
         self.graph = CanonicalGraph(config.shards, node_capacity_per_partition=config.node_capacity_per_shard, edge_capacity_per_partition=config.edge_capacity_per_shard, applied_proposal_capacity=config.action_capacity_per_shard * config.shards)
         scientific = config.scientific
+        self.developmental_cut = DevelopmentalCut()
+        self.developmental_mutation_gate = DevelopmentalMutationGate(
+            scientific.scientific_visibility_mode
+        )
+        self._active_developmental_cut_session: DevelopmentalCutSession | None = None
         self.timeline = MultimodalTimeline(capacity=scientific.passive_event_queue_depth, symbol_budget=scientific.symbol_budget_per_window, symbol_payload_bytes=scientific.symbol_payload_bytes)
         self.environments = EnvironmentRegistry()
         self.lifecycle = LifecycleRegistry()
@@ -431,6 +442,57 @@ class ContinuousMemoryRuntime:
             feature_schema_version=int(manifest.feature_schema_version),
             scientific_config_id=self.config.scientific.config_id.value,
         )
+
+    def begin_developmental_cut(self, *, sampling_epoch_id: int) -> DevelopmentalCutSession:
+        """Pin the canonical evidence root for one matched developmental cut."""
+        from v9.research.experiment_manifest import ExperimentManifest
+        from .scientific_modes import ScientificVisibilityMode
+
+        if self.config.scientific.scientific_visibility_mode is not ScientificVisibilityMode.MATCHED_REASONING:
+            raise RuntimeError("DevelopmentalCut sessions are required only for MATCHED_REASONING")
+        if not hasattr(self, "canonical_store"):
+            raise RuntimeError("MATCHED_REASONING developmental cuts require canonical durability")
+        if self.config.experiment_manifest is None:
+            raise RuntimeError("MATCHED_REASONING requires an ExperimentManifest")
+        manifest = ExperimentManifest.load(self.config.experiment_manifest)
+        if manifest.scientific_config_id != self.config.scientific.config_id.value:
+            raise RuntimeError("ExperimentManifest ScientificConfigId changed after runtime construction")
+        if self._active_developmental_cut_session is not None:
+            raise RuntimeError("a developmental cut is already active")
+        pinned = self.canonical_store.pin()
+        evidence_cut_id = f"{manifest.manifest_id.value}:epoch:{int(sampling_epoch_id)}"
+        session = DevelopmentalCutSession(
+            cut=self.developmental_cut,
+            gate=self.developmental_mutation_gate,
+            evidence_cut_id=evidence_cut_id,
+            pinned_handle=pinned,
+        )
+        self._active_developmental_cut_session = session
+        return session
+
+    def persist_developmental_cut(self, result: DevelopmentalCutResult) -> Path:
+        """Atomically publish one immutable developmental-cut manifest."""
+        directory = self.root / "developmental_cuts"
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / f"cut-{result.manifest_id}.json"
+        temporary = directory / f".{target.name}.tmp"
+        payload = json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":"))
+        temporary.write_text(payload + "\n", encoding="utf-8")
+        os.replace(temporary, target)
+        latest = directory / "latest.json"
+        latest_temporary = directory / ".latest.json.tmp"
+        latest_temporary.write_text(payload + "\n", encoding="utf-8")
+        os.replace(latest_temporary, latest)
+        self.set_telemetry_gauge("developmental_cut_manifest_id", result.manifest_id)
+        self.set_telemetry_gauge("developmental_cut_base_handle", result.base_handle_checksum)
+        self._active_developmental_cut_session = None
+        return target
+
+    def abort_developmental_cut(self) -> None:
+        session = self._active_developmental_cut_session
+        if session is not None:
+            session.abort()
+            self._active_developmental_cut_session = None
 
     def _restore_hgt_checkpoint(self) -> None:
         """Restore the active accepted/candidate HGT policy from its manifest."""
@@ -2499,6 +2561,7 @@ class ContinuousMemoryRuntime:
         del timeout
         if self._closed:
             return None
+        self.abort_developmental_cut()
         self.evidence.flush()
         result = self.snapshot() if normal and self.config.enable_snapshots else None
         if normal:

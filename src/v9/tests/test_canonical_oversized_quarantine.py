@@ -106,6 +106,7 @@ def test_publication_admits_safe_prefix_before_expanded_work_exceeds_budget() ->
     assert len(submitted) == 1
     assert tuple(row.sequence for row in submitted[0][1]) == (1,)
     assert submitted[0][2] == 10
+    assert service._reducer_inflight[1][0] == 1
     assert service.ingest_apply == 2
     remainder = service.ingest_results[2]
     assert tuple(row.sequence for row in remainder.rows) == (2, 3)

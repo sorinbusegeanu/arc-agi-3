@@ -11,6 +11,7 @@ from v9.hgt.epoch_dataset import EpochTransitionDataset, dataset_path
 from v9.hgt.matched_evaluation import matched_jobs, select_matched_branch
 from v9.memory.m1_normalized import NormalizedChannel
 from v9.telemetry import HGTInferenceSample, OptimizationSample
+from .developmental_cut import DevelopmentalWorkStatus
 from .lifecycle import run_lifecycle_maintenance
 from .parallel_memory_coordinator import run_parallel_memory_jobs
 from .scientific_modes import ScientificVisibilityMode, coerce_visibility_mode
@@ -549,7 +550,19 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         post_sampling_started = time.perf_counter()
         runtime.wait_quiescent(args.drain_timeout)
         quiescent_done = time.perf_counter()
-        runtime.flush_deferred_memory_updates()
+        developmental_session = (
+            runtime.begin_developmental_cut(sampling_epoch_id=epoch)
+            if scientific_mode is ScientificVisibilityMode.MATCHED_REASONING
+            else None
+        )
+        if developmental_session is None:
+            runtime.flush_deferred_memory_updates()
+        else:
+            developmental_session.run(
+                "m1_maturation",
+                runtime.flush_deferred_memory_updates,
+                stable_key=f"epoch:{epoch}:deferred-memory",
+            )
         flush_done = time.perf_counter()
         runtime.set_telemetry_gauge("post_sampling_wait_quiescent_seconds", quiescent_done - post_sampling_started)
         runtime.set_telemetry_gauge("post_sampling_flush_seconds", flush_done - quiescent_done)
@@ -590,7 +603,19 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         for game, confidence in confidence_by_game.items():
             for environment_id in environment_ids_by_game.get(game, ()):
                 environment_confidence[int(environment_id)] = float(confidence)
-        confidence_updates = runtime.apply_environment_evidence_confidence(environment_confidence)
+        if developmental_session is None:
+            confidence_updates = runtime.apply_environment_evidence_confidence(environment_confidence)
+        else:
+            confidence_updates = developmental_session.run(
+                "context_refinement",
+                lambda: runtime.apply_environment_evidence_confidence(environment_confidence),
+                stable_key=f"epoch:{epoch}:environment-confidence",
+                status=lambda changed: (
+                    DevelopmentalWorkStatus.APPLIED
+                    if int(changed) > 0
+                    else DevelopmentalWorkStatus.NO_CHANGE
+                ),
+            )
         runtime.set_telemetry_gauge("environment_confidence_memory_updates", int(confidence_updates))
         _append_environment_viability(args.root, epoch=epoch, profiles=viability_profiles)
         runtime.set_telemetry_gauge("viability_anomalies", sum(1 for row in viability_profiles.values() if row["state"] == "VIABILITY_ANOMALY"))
@@ -636,7 +661,19 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             )
 
         replay_started = time.perf_counter()
-        replay_result = runtime.replay_once()
+        if developmental_session is None:
+            replay_result = runtime.replay_once()
+        else:
+            replay_result = developmental_session.run(
+                "replay_allocation_metadata",
+                runtime.replay_once,
+                stable_key=f"epoch:{epoch}:replay",
+                status=lambda result: (
+                    DevelopmentalWorkStatus.APPLIED
+                    if int(result.processed) > 0 or int(result.new_memories) > 0 or int(result.revisions) > 0
+                    else DevelopmentalWorkStatus.NO_CHANGE
+                ),
+            )
         replay_done = time.perf_counter()
         runtime.set_telemetry_gauge("post_sampling_replay_seconds", replay_done - replay_started)
         runtime.set_telemetry_gauge("replay_selected_epoch", int(replay_result.selected))
@@ -726,7 +763,16 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                     target_environment_family=str(game_id),
                 )
             )
-            runtime.record_replanning_evidence(improved_efficiency=improved)
+            if developmental_session is None:
+                runtime.record_replanning_evidence(improved_efficiency=improved)
+            else:
+                developmental_session.run(
+                    "m7_strategy_replanning",
+                    lambda improved=improved: runtime.record_replanning_evidence(
+                        improved_efficiency=improved
+                    ),
+                    stable_key=f"epoch:{epoch}:game:{game_id}",
+                )
             previous_game_cost[game_id] = optimized_cost
 
         total_successes = sum(int(row["wins"]) for row in game_level["current_run_game_results"].values())
@@ -748,12 +794,35 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         # HGT metrics. Newly dormant memories affect the next epoch, not the model
         # evaluation used to decide whether forgetting is safe this epoch.
         lifecycle_started = time.perf_counter()
-        lifecycle_result = run_lifecycle_maintenance(runtime, dormancy_grace_cycles=1, retirement_grace_cycles=1)
+        if developmental_session is None:
+            lifecycle_result = run_lifecycle_maintenance(
+                runtime, dormancy_grace_cycles=1, retirement_grace_cycles=1
+            )
+        else:
+            lifecycle_result = developmental_session.run(
+                "lifecycle",
+                lambda: run_lifecycle_maintenance(
+                    runtime, dormancy_grace_cycles=1, retirement_grace_cycles=1
+                ),
+                stable_key=f"epoch:{epoch}:lifecycle",
+                status=lambda result: (
+                    DevelopmentalWorkStatus.APPLIED
+                    if any(
+                        int(result.get(key, 0)) > 0
+                        for key in ("dormant", "pending", "retired", "reactivated")
+                    )
+                    else DevelopmentalWorkStatus.NO_CHANGE
+                ),
+            )
         lifecycle_done = time.perf_counter()
         runtime.set_telemetry_gauge("post_sampling_lifecycle_seconds", lifecycle_done - lifecycle_started)
         runtime.set_telemetry_gauge("post_sampling_total_seconds", lifecycle_done - post_sampling_started)
         for key, value in lifecycle_result.items():
             runtime.set_telemetry_gauge(f"lifecycle_{key}", value)
+        developmental_cut_result = None
+        if developmental_session is not None:
+            developmental_cut_result = developmental_session.finish()
+            runtime.persist_developmental_cut(developmental_cut_result)
 
         if runtime.config.enable_snapshots:
             runtime.snapshot()
@@ -771,6 +840,9 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                     "scenario_success_rate": scenario_success,
                     "game_level_metrics": game_level,
                     "transfer_validation": None,
+                    "developmental_cut_manifest_id": (
+                        None if developmental_cut_result is None else developmental_cut_result.manifest_id
+                    ),
                 },
                 performance=performance,
                 metrics=metrics,
