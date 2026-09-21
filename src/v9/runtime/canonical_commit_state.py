@@ -110,13 +110,18 @@ def record_normalized_fast(
         limit = max(2, int(runtime.config.scientific.m1n_facts_per_channel))
         if len(occurrences) < limit:
             occurrences.append(relation)
-        elif identity != (
-            occurrences[-1].uid,
-            occurrences[-1].channel.value,
-            tuple(occurrences[-1].provenance.evidence),
+        elif (
+            bool(getattr(runtime.config.scientific, "concrete_admission_enabled", False))
+            and identity
+            != (
+                occurrences[-1].uid,
+                occurrences[-1].channel.value,
+                tuple(occurrences[-1].provenance.evidence),
+            )
         ):
-            # Keep the retained evidence set bounded while allowing high-value,
-            # later representatives to replace stale concrete examples.
+            # In selective-admission mode, keep the normalized evidence reservoir
+            # bounded while letting newly admitted high-value representatives
+            # replace stale concrete examples.
             del occurrences[0]
             occurrences.append(relation)
     if not was_stable and len(occurrences) >= 2:
