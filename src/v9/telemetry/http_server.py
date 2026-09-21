@@ -60,13 +60,12 @@ h1{{font-size:20px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,mi
 .card{{background:#1d1d1d;padding:12px;border-radius:8px}}.k{{color:#aaa;font-size:12px}}.v{{font-size:20px;margin-top:4px}}
 pre{{background:#1d1d1d;padding:12px;overflow:auto}}
 </style></head>
-<body><h1>Hydra v9.7.6</h1><div id="grid" class="grid"></div><h2>Diagnostics</h2><pre id="diag"></pre>
+<body><h1>Hydra v9.7.6</h1><div id="grid" class="grid"></div>
 <script>
 async function refresh(){{
  const r=await fetch('/api/metrics',{{cache:'no-store'}}); const m=await r.json();
  const p=m.primary_dashboard||{{}}; const g=document.getElementById('grid'); g.innerHTML='';
  for(const [k,v] of Object.entries(p)){{const d=document.createElement('div');d.className='card';d.innerHTML='<div class="k">'+k+'</div><div class="v">'+v+'</div>';g.appendChild(d)}}
- document.getElementById('diag').textContent=JSON.stringify(m.telemetry_diagnostics||{{}},null,2);
 }}
 refresh(); setInterval(refresh,{refresh_ms});
 </script></body></html>""".encode("utf-8")
