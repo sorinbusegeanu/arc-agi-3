@@ -705,6 +705,9 @@ def _retry_after_oom(runtime: Any, *, epoch: int, training_epochs: int, learning
     config = runtime.config.scientific
     if not _is_cuda_oom(exc) or int(oom_retry) >= int(config.hgt_oom_retry_limit):
         raise exc
+    # Do not keep the failed autograd frame (and its CUDA tensors) alive while
+    # the bounded retry constructs a smaller graph.
+    exc.__traceback__ = None
     try:
         import torch
         if torch.cuda.is_available():
@@ -1228,6 +1231,9 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         x_device = {key: value.to(device) for key, value in x_dict.items()}
         edges_device = {key: value.to(device) for key, value in edge_index_dict.items()}
     except RuntimeError as exc:
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return _retry_after_oom(
             runtime,
             epoch=epoch,
@@ -1295,6 +1301,10 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             training_loss = float(loss.detach().cpu().item())
             training_steps += 1
     except RuntimeError as exc:
+        # Forward/backward locals retain the autograd graph until this frame
+        # returns. Drop them before recursively retrying with a smaller graph.
+        loss = logits = values = auxiliary = stream_loss = None
+        batch = ()
         del model, optimizer, x_device, edges_device
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1304,6 +1314,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             training_epochs=training_epochs,
             learning_rate=learning_rate,
             root=root,
+            allow_promotion=allow_promotion,
             budget_scale=_budget_scale,
             oom_retry=_oom_retry,
             exc=exc,

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from v9.hgt import training as hgt_training
 from v9.hgt.epoch_dataset import (
     EpochTransitionDataset,
     action_ranking_pairs,
@@ -28,6 +33,62 @@ def transition(step: int, action: int, valence: int = 0, success: bool = False) 
 
 
 class HGTIterativeTrainingTests(unittest.TestCase):
+    def test_every_oom_retry_preserves_the_promotion_contract(self):
+        source = Path(inspect.getsourcefile(hgt_training) or "").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        training_function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "train_hgt_epoch"
+        )
+        retry_calls = [
+            node
+            for node in ast.walk(training_function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_retry_after_oom"
+        ]
+        self.assertGreaterEqual(len(retry_calls), 2)
+        for call in retry_calls:
+            self.assertIn("allow_promotion", {row.arg for row in call.keywords})
+
+    def test_oom_retry_forwards_false_allow_promotion(self):
+        gauges = {}
+        runtime = SimpleNamespace(
+            config=SimpleNamespace(
+                scientific=SimpleNamespace(hgt_oom_retry_limit=2)
+            ),
+            set_telemetry_gauge=gauges.__setitem__,
+        )
+        expected = object()
+        with patch.object(hgt_training, "train_hgt_epoch", return_value=expected) as retry:
+            result = hgt_training._retry_after_oom(
+                runtime,
+                epoch=3,
+                training_epochs=4,
+                learning_rate=0.01,
+                root="run",
+                allow_promotion=False,
+                budget_scale=1.0,
+                oom_retry=0,
+                exc=RuntimeError("CUDA out of memory"),
+            )
+        self.assertIs(result, expected)
+        retry.assert_called_once_with(
+            runtime,
+            epoch=3,
+            training_epochs=4,
+            learning_rate=0.01,
+            root="run",
+            allow_promotion=False,
+            _budget_scale=0.5,
+            _oom_retry=1,
+        )
+        self.assertEqual(gauges["hgt_oom_retry_count"], 1)
+        self.assertEqual(gauges["hgt_oom_shedding_factor"], 0.5)
+
     def test_epoch_dataset_captures_every_transition(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "epoch.jsonl"
