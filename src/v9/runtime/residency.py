@@ -900,7 +900,16 @@ def _install_runtime_contract(runtime_cls: type) -> None:
         # rather than deferring capacity maintenance to an epoch/flush boundary.
         if manager is not None:
             inserts = int(self.graph.low_level_nodes_inserted_total)
-            if inserts - int(manager.last_insert_check) >= int(manager.scientific.resident_compaction_check_interval):
+            m0_resident, m1g_resident = manager.counts()
+            interval_due = (
+                inserts - int(manager.last_insert_check)
+                >= int(manager.scientific.resident_compaction_check_interval)
+            )
+            capacity_exceeded = (
+                m0_resident > int(manager.scientific.resident_m0_limit)
+                or m1g_resident > int(manager.scientific.resident_m1_grounded_limit)
+            )
+            if interval_due or capacity_exceeded:
                 manager.maybe_compact()
         # Add boundary outcome evidence to the deferred M0 payload so retention
         # scoring can preserve rare successes/failures and truncation boundaries.
