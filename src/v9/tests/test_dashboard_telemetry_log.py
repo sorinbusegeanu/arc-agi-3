@@ -5,6 +5,8 @@ import time
 from types import SimpleNamespace
 from urllib.request import urlopen
 
+from v9 import ContinuousMemoryRuntime
+from v9.runtime.config import RuntimeConfig
 from v9.telemetry.http_server import MetricsHTTPServer
 
 
@@ -94,3 +96,19 @@ def test_dashboard_html_hides_diagnostics_block(tmp_path) -> None:
         assert "<h2>Diagnostics</h2>" not in html
     finally:
         server.close()
+
+
+def test_runtime_dashboard_does_not_call_full_metrics(tmp_path, monkeypatch) -> None:
+    runtime = ContinuousMemoryRuntime(
+        RuntimeConfig(tmp_path / "runtime", enable_snapshots=False, restore=False)
+    )
+    try:
+        def fail_full_metrics():
+            raise AssertionError("dashboard polling called full metrics")
+
+        monkeypatch.setattr(runtime, "metrics", fail_full_metrics)
+        snapshot = runtime.dashboard_metrics()
+        assert "primary_dashboard" in snapshot
+        assert len(snapshot["primary_dashboard"]) <= 24
+    finally:
+        runtime.close()
