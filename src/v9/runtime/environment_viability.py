@@ -578,14 +578,6 @@ def install_environment_viability(runtime_cls: type, pipeline_cls: type) -> None
     def metrics(self: Any) -> dict[str, Any]:
         result = dict(original_metrics(self))
         result.update(self._environment_viability.metrics())
-        primary = result.get("primary_dashboard")
-        if isinstance(primary, dict):
-            primary.update({
-                "viability_anomalies": result.get("viability_anomalies", 0),
-                "viability_low_evidence_environments": result.get("viability_low_evidence_environments", 0),
-                "viability_mean_action_coverage": result.get("viability_mean_action_coverage", 0.0),
-                "viability_mean_effective_exploration_rate": result.get("viability_mean_effective_exploration_rate", 0.0),
-            })
         return result
 
     def pipeline_dispatch(self: Any, transition: Any) -> None:
