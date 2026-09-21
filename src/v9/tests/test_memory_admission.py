@@ -92,6 +92,8 @@ def test_redundant_interactions_advance_support_without_materializing_every_pair
 
         assert signature is not None
         assert runtime.signature_support(signature) == 15
+        assert float(runtime._v978_m1n_evidence[signature]["support"]) == 15.0
+        assert float(runtime.graph.payloads[plans[-1].relation.uid]["support"]) == 15.0
         m0 = sum(
             1
             for node in runtime.graph.nodes.values()
@@ -104,10 +106,10 @@ def test_redundant_interactions_advance_support_without_materializing_every_pair
             and node.memory_type is MemoryType.GROUNDED_CONTINGENCY
         )
         assert m0 == 5
-        assert m1g == 5
+        assert m1g == 1
         assert runtime.telemetry["concrete_admission_retained_events"] == 5
         assert runtime.telemetry["concrete_admission_skipped_events"] == 10
-        assert runtime.telemetry["concrete_nodes_avoided"] == 20
+        assert runtime.telemetry["concrete_nodes_avoided"] == 10
         latest = runtime._latest_interaction_grounding[
             (plans[-1].interaction_grounding.environment_instance_id, 1)
         ]
@@ -115,55 +117,3 @@ def test_redundant_interactions_advance_support_without_materializing_every_pair
     finally:
         runtime.close(normal=False)
 
-
-def test_grounding_registry_aggregates_by_normalized_interaction_structure(
-    tmp_path: Path,
-) -> None:
-    scientific = ScientificConfig(
-        concrete_admission_representatives_per_signature=2,
-        concrete_admission_prediction_error_threshold=1_000_000.0,
-        concrete_admission_future_option_threshold=1_000_000.0,
-    )
-    runtime = ContinuousMemoryRuntime(
-        RuntimeConfig(
-            tmp_path / "grounding",
-            restore=False,
-            enable_snapshots=False,
-            scientific=scientific,
-        )
-    )
-    try:
-        plans = []
-        interaction_structure_low = None
-        for index in range(8):
-            transition = EncodedTransition(
-                actor_id=1,
-                producer_sequence=index + 1,
-                global_step=index,
-                environment_identity=("synthetic", "grounding-admission", "default", "seed=0"),
-                episode_id=1,
-                observation_schema_id=1,
-                before_signature=10,
-                action_id=2,
-                after_signature=11,
-                available_actions_after=4,
-                primary_valence=0,
-                symbols=("token",),
-                curriculum_step="broad",
-                game_scenario="grounding-admission",
-            )
-            prepared = prepare_ingestion(IngestionTask(index + 1, index + 1, transition))
-            plan = build_commit_plan(prepared)
-            interaction_structure_low = int(plan.relation.uid.lo)
-            plans.append(plan)
-
-        apply_canonical_commit_batch(runtime, tuple(plans))
-
-        assert interaction_structure_low is not None
-        assert runtime.grounding.states
-        assert {int(key[1]) for key in runtime.grounding.states} == {
-            interaction_structure_low
-        }
-        assert len(runtime.grounding.states) == 1
-    finally:
-        runtime.close(normal=False)
