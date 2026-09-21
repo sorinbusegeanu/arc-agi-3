@@ -258,10 +258,10 @@ class V978ContinuousMemoryRuntime(FinalContinuousMemoryRuntime):
         return state
 
     def metrics(self) -> dict[str, Any]:
-        # This is the outermost runtime metrics implementation. Holding the
-        # runtime lock here gives every normal superclass extension one coherent
-        # cut without relying on an import-time method replacement.
-        with self._lock:
+        # This is the outermost runtime metrics implementation. Canonical
+        # publication runs independently from the runtime lock, so full metrics
+        # must also hold the graph publication lock while traversing graph state.
+        with self._lock, self.graph._publication_lock:
             self._patch_m1n_evidence()
             result = dict(super().metrics())
             grounding_states = self.grounding.states.copy()
