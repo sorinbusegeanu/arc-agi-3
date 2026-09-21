@@ -885,6 +885,12 @@ def _install_runtime_contract(runtime_cls: type) -> None:
         if manager is not None and manager.sample_memory().state is MemoryGovernorState.HARD_PRESSURE_DRAIN:
             manager.maybe_compact(force=True)
         result = original_apply_batch(self, prepared_rows)
+        # Honor the configured compaction interval during continuous ingestion,
+        # rather than deferring capacity maintenance to an epoch/flush boundary.
+        if manager is not None:
+            inserts = int(self.graph.low_level_nodes_inserted_total)
+            if inserts - int(manager.last_insert_check) >= int(manager.scientific.resident_compaction_check_interval):
+                manager.maybe_compact()
         # Add boundary outcome evidence to the deferred M0 payload so retention
         # scoring can preserve rare successes/failures and truncation boundaries.
         for prepared in prepared_rows:
