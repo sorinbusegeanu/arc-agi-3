@@ -58,6 +58,7 @@ def record_normalized_fast(
     *,
     materialized_row: Any | None = None,
     retain_occurrence: bool = True,
+    batch_materialized_uids: set[Any] | None = None,
 ) -> int:
     ensure_fast_state(runtime)
     normalize = getattr(runtime, "normalize_m1n_family", None)
@@ -132,12 +133,15 @@ def record_normalized_fast(
     already_materialized = (
         relation.uid in runtime.graph.nodes
         or relation.uid in runtime._deferred_base_nodes
+        or relation.uid in (batch_materialized_uids or ())
         or any(row[0].uid == relation.uid for row in deferred_rows)
     )
     if retain_occurrence and not already_materialized:
         deferred_rows.append(
             initial_write.runtime_row() if materialized_row is None else materialized_row
         )
+        if batch_materialized_uids is not None:
+            batch_materialized_uids.add(relation.uid)
         already_materialized = True
     if support > 1 and already_materialized:
         runtime._m1n_dirty.add(signature)
