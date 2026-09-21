@@ -130,8 +130,13 @@ class ScientificConfig:
     hgt_target_inference_latency_ms: float = 50.0
 
     # v9.7.9 bounded resident-memory contract.
-    resident_m0_limit: int = 250_000
-    resident_m1_grounded_limit: int = 250_000
+    concrete_admission_enabled: bool = True
+    concrete_admission_representatives_per_signature: int = 4
+    concrete_admission_prediction_error_threshold: float = 0.50
+    concrete_admission_future_option_threshold: float = 1.0
+    concrete_admission_support_milestones: bool = True
+    resident_m0_limit: int = 50_000
+    resident_m1_grounded_limit: int = 50_000
     resident_low_level_target_ratio: float = 0.85
     resident_compaction_check_interval: int = 25_000
     resident_m0_representative_floor: int = 8
@@ -180,6 +185,7 @@ class ScientificConfig:
             self.hgt_max_semantic_facts_per_memory, self.hgt_oom_retry_limit,
             self.hgt_training_microbatch, self.hgt_gradient_accumulation,
             self.hgt_examples_per_train_trigger,
+            self.concrete_admission_representatives_per_signature,
             self.resident_m0_limit, self.resident_m1_grounded_limit,
             self.resident_compaction_check_interval,
             self.resident_m0_representative_floor, self.resident_m1_grounded_representative_floor,
@@ -198,6 +204,11 @@ class ScientificConfig:
             raise ValueError("max_symbol_facts_per_window cannot exceed symbol_budget_per_window")
         if min(self.allocation_unsolved_weight, self.allocation_optimizing_weight, self.allocation_stable_weight) <= 0:
             raise ValueError("allocation weights must be positive")
+        if min(
+            float(self.concrete_admission_prediction_error_threshold),
+            float(self.concrete_admission_future_option_threshold),
+        ) < 0.0:
+            raise ValueError("concrete admission thresholds must be non-negative")
         if not 0.0 < float(self.resident_low_level_target_ratio) < 1.0:
             raise ValueError("resident low-level target ratio must be in (0, 1)")
         if self.resident_m0_limit <= self.resident_m0_representative_floor:
@@ -319,6 +330,11 @@ class RuntimeConfig:
 _V979_ADDITIVE_FIELDS = {
     "scientific_visibility_mode",
     "learned_developmental_feedback",
+    "concrete_admission_enabled",
+    "concrete_admission_representatives_per_signature",
+    "concrete_admission_prediction_error_threshold",
+    "concrete_admission_future_option_threshold",
+    "concrete_admission_support_milestones",
     "resident_m0_limit",
     "resident_m1_grounded_limit",
     "resident_low_level_target_ratio",
