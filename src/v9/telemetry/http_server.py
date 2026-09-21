@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 
 DASHBOARD_REFRESH_SECONDS = 30.0
+FULL_TELEMETRY_LOG_INTERVAL = 120
 
 
 class MetricsHTTPServer:
@@ -35,6 +36,7 @@ class MetricsHTTPServer:
         self.log_path = None if log_path is None else Path(log_path)
         self._stop_logging = Event()
         self._log_thread: Thread | None = None
+        self._log_sequence = 0
 
         class Handler(BaseHTTPRequestHandler):
             def _write(self, status: int, content_type: str, payload: bytes) -> None:
@@ -97,6 +99,37 @@ refresh(); setInterval(refresh,{refresh_ms});
         self.port = int(port)
         self._thread = Thread(target=self._server.serve_forever, name="v9-metrics-http", daemon=True)
 
+    @staticmethod
+    def _compact_log_snapshot(raw: dict[str, Any], *, full: bool) -> dict[str, Any]:
+        if full:
+            return dict(raw)
+        result: dict[str, Any] = {}
+        primary = raw.get("primary_dashboard")
+        if isinstance(primary, dict):
+            result["primary_dashboard"] = dict(primary)
+        diagnostic = raw.get("telemetry_diagnostics")
+        if isinstance(diagnostic, dict):
+            result["telemetry_diagnostics"] = {
+                str(key): value
+                for key, value in diagnostic.items()
+                if value is None or isinstance(value, (str, int, float, bool))
+            }
+        for key, value in raw.items():
+            if key in {"primary_dashboard", "telemetry_diagnostics"}:
+                continue
+            if value is None or isinstance(value, (str, int, float, bool)):
+                result[str(key)] = value
+        return result
+
+    def _rotate_existing_log(self) -> None:
+        if self.log_path is None or not self.log_path.exists() or self.log_path.stat().st_size <= 0:
+            return
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        archived = self.log_path.with_name(
+            f"{self.log_path.stem}.{stamp}{self.log_path.suffix}"
+        )
+        self.log_path.replace(archived)
+
     def _log_dashboard_metrics(self) -> None:
         if self.log_path is None:
             return
@@ -105,14 +138,15 @@ refresh(); setInterval(refresh,{refresh_ms});
             while not self._stop_logging.is_set():
                 timestamp = datetime.now(timezone.utc).isoformat()
                 try:
+                    self._log_sequence += 1
+                    full = self._log_sequence % FULL_TELEMETRY_LOG_INTERVAL == 0
+                    raw = self._dashboard_provider()
                     snapshot = {
                         "timestamp_utc": timestamp,
-                        **self._dashboard_provider(),
+                        "telemetry_log_full": full,
+                        **self._compact_log_snapshot(raw, full=full),
                     }
                 except Exception as exc:
-                    # A telemetry read must never terminate the long-lived
-                    # logger. Preserve an auditable failure row and retry at the
-                    # next fixed refresh interval.
                     snapshot = {
                         "timestamp_utc": timestamp,
                         "dashboard_metrics_error": {
@@ -125,6 +159,9 @@ refresh(); setInterval(refresh,{refresh_ms});
                     break
 
     def start(self) -> None:
+        if self.log_path is not None:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._rotate_existing_log()
         self._thread.start()
         if self.log_path is not None:
             self._log_thread = Thread(target=self._log_dashboard_metrics, name="v9-dashboard-telemetry-log", daemon=True)

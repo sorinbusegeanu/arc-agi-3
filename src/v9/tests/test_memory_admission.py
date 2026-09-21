@@ -22,9 +22,22 @@ def test_admission_keeps_bootstrap_boundaries_surprise_and_sparse_milestones() -
     assert should_retain_concrete(scientific, prior_support=3).retain
     assert not should_retain_concrete(scientific, prior_support=4).retain
     assert should_retain_concrete(scientific, prior_support=7).reason == "support_milestone"
-    assert should_retain_concrete(
+    novel_context = should_retain_concrete(
         scientific, prior_support=20, novel_context=True
-    ).reason == "novel_context"
+    )
+    assert not novel_context.retain
+    assert novel_context.reason == "novel_context_redundant"
+    assert should_retain_concrete(
+        scientific, prior_support=31, novel_context=True
+    ).reason == "novel_context_milestone"
+    novel_dependent = should_retain_concrete(
+        scientific, prior_support=20, force_novel=True
+    )
+    assert not novel_dependent.retain
+    assert novel_dependent.reason == "novel_dependent_redundant"
+    assert should_retain_concrete(
+        scientific, prior_support=31, force_novel=True
+    ).reason == "novel_dependent_milestone"
 
     class Boundary:
         task_success = True

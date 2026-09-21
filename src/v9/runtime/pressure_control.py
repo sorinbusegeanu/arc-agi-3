@@ -104,6 +104,10 @@ def install_pressure_control(runtime_cls: type, graph_cls: type, resident_manage
         snapshot = manager.sample_memory()
         manager._last_snapshot = snapshot
         self.graph._memory_pressure_state = snapshot.state
+        if snapshot.state in {MemoryGovernorState.COMPACTING, MemoryGovernorState.HARD_PRESSURE_DRAIN}:
+            manager.request_compaction(
+                force=snapshot.state is MemoryGovernorState.HARD_PRESSURE_DRAIN
+            )
         return pressure_budget(snapshot.state)
 
     def pump_ingest_tasks(self: Any) -> bool:
@@ -111,7 +115,8 @@ def install_pressure_control(runtime_cls: type, graph_cls: type, resident_manage
         if policy.producer_paused:
             manager = getattr(self.runtime, "_resident_memory", None)
             if manager is not None:
-                manager.maybe_compact(force=True)
+                manager.request_compaction(force=True)
+                manager.service_prepared_compaction(max_batches=1)
             return False
         return original_pipeline_pump_ingest(self)
 

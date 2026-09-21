@@ -27,11 +27,6 @@ def should_retain_concrete(
     if not bool(getattr(scientific, "concrete_admission_enabled", True)):
         return ConcreteAdmissionDecision(True, "disabled")
 
-    if force_novel:
-        return ConcreteAdmissionDecision(True, "novel_dependent_relation")
-    if novel_context:
-        return ConcreteAdmissionDecision(True, "novel_context")
-
     representatives = max(
         1, int(getattr(scientific, "concrete_admission_representatives_per_signature", 4))
     )
@@ -61,11 +56,20 @@ def should_retain_concrete(
             return ConcreteAdmissionDecision(True, "future_option_change")
 
     next_support = support + 1
-    if bool(getattr(scientific, "concrete_admission_support_milestones", True)) and _power_of_two(
-        next_support
-    ):
+    milestone = bool(
+        getattr(scientific, "concrete_admission_support_milestones", True)
+    ) and _power_of_two(next_support)
+    if milestone and force_novel:
+        return ConcreteAdmissionDecision(True, "novel_dependent_milestone")
+    if milestone and novel_context:
+        return ConcreteAdmissionDecision(True, "novel_context_milestone")
+    if milestone:
         return ConcreteAdmissionDecision(True, "support_milestone")
 
+    if force_novel:
+        return ConcreteAdmissionDecision(False, "novel_dependent_redundant")
+    if novel_context:
+        return ConcreteAdmissionDecision(False, "novel_context_redundant")
     return ConcreteAdmissionDecision(False, "redundant_support")
 
 

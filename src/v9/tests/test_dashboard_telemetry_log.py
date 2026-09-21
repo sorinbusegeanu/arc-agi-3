@@ -117,3 +117,43 @@ def test_runtime_dashboard_does_not_call_full_metrics(tmp_path, monkeypatch) -> 
 
 def test_default_dashboard_and_jsonl_refresh_is_30_seconds() -> None:
     assert DASHBOARD_REFRESH_SECONDS == 30.0
+
+
+def test_dashboard_log_drops_nested_diagnostics_between_full_samples(tmp_path) -> None:
+    provider = _MetricsProvider(tmp_path)
+    original = provider.dashboard_metrics
+
+    def nested_metrics():
+        snapshot = original()
+        snapshot["telemetry_diagnostics"]["large_map"] = {"a": list(range(100))}
+        snapshot["large_top_level"] = {"b": list(range(100))}
+        return snapshot
+
+    provider.dashboard_metrics = nested_metrics
+    server = MetricsHTTPServer(provider.metrics, host="127.0.0.1", port=0, refresh_seconds=0.1)
+    log_path = tmp_path / "telemetry" / "dashboard_metrics.jsonl"
+    server.start()
+    deadline = time.monotonic() + 2.0
+    while (not log_path.exists() or not log_path.stat().st_size) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    server.close()
+    row = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    assert row["telemetry_log_full"] is False
+    assert "large_map" not in row["telemetry_diagnostics"]
+    assert "large_top_level" not in row
+
+
+def test_dashboard_log_rotates_existing_run_file(tmp_path) -> None:
+    provider = _MetricsProvider(tmp_path)
+    log_path = tmp_path / "telemetry" / "dashboard_metrics.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text('{"old": true}\n', encoding="utf-8")
+    server = MetricsHTTPServer(provider.metrics, host="127.0.0.1", port=0, refresh_seconds=0.1)
+    server.start()
+    deadline = time.monotonic() + 2.0
+    while (not log_path.exists() or not log_path.stat().st_size) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    server.close()
+    archives = list(log_path.parent.glob("dashboard_metrics.*.jsonl"))
+    assert archives
+    assert any('"old": true' in path.read_text(encoding="utf-8") for path in archives)
