@@ -548,6 +548,26 @@ class MemoryPipelineService:
             self.inflight.discard(lease.identity.signature)
         return retried
 
+    def derivation_drain_progress_token(self) -> tuple[int, ...]:
+        lease_pending, lease_inflight, lease_completed = self.derivation_leases.counts
+        queue_depths = self.memory.queue_depths() if hasattr(self.memory, "queue_depths") else {}
+        return (
+            int(lease_pending),
+            int(lease_inflight),
+            int(lease_completed),
+            int(len(self.pending_derivation)),
+            int(len(self._derivation_lease_by_task)),
+            int(len(self.derive_results)),
+            int(self.derived),
+            int(self.derivation_retries),
+            int(queue_depths.get("derivation_queue_depth", -1)),
+            int(queue_depths.get("derivation_result_queue_depth", -1)),
+        )
+
+    def derivation_workers_alive(self) -> bool:
+        processes = tuple(getattr(self.memory, "derivation_processes", ()) or ())
+        return bool(processes) and any(process.is_alive() for process in processes)
+
     def pump_derivation_tasks(self) -> bool:
         progressed = self._expire_derivation_leases()
         if not self.pending_derivation:
@@ -1236,6 +1256,7 @@ def run_parallel_memory_jobs(
         memory.join_ingest()
 
         last_progress_at = time.monotonic()
+        last_progress_token = pipeline.derivation_drain_progress_token()
         while (
             pipeline.pending_derivation
             or pipeline.inflight
@@ -1245,24 +1266,45 @@ def run_parallel_memory_jobs(
             progressed = pipeline.service()
             if progressed:
                 last_progress_at = time.monotonic()
+                last_progress_token = pipeline.derivation_drain_progress_token()
                 continue
             if pipeline.block_for_result():
                 last_progress_at = time.monotonic()
+                last_progress_token = pipeline.derivation_drain_progress_token()
                 continue
 
-            # After ingestion is fully drained no new support can arrive. A timed
-            # out derivation lease can therefore be retried immediately instead of
-            # turning a transient worker loss/slow task into an epoch-fatal stall.
+            progress_token = pipeline.derivation_drain_progress_token()
+            if progress_token != last_progress_token:
+                last_progress_token = progress_token
+                last_progress_at = time.monotonic()
+                continue
+
             if time.monotonic() - last_progress_at >= _PIPELINE_DRAIN_STALL_SECONDS:
                 retried = False
                 for task_id in tuple(sorted(pipeline._derivation_lease_by_task)):
                     retried = pipeline._retry_derivation_task(int(task_id)) or retried
                 if retried:
                     last_progress_at = time.monotonic()
+                    last_progress_token = pipeline.derivation_drain_progress_token()
                     continue
+
+                # Pending identities are valid work, not a stall. They have no
+                # lease yet, so the old retry-only check falsely treated a
+                # saturated derivation queue as fatal (for example pending=143,
+                # inflight=0). Keep draining while workers are alive.
+                lease_pending, lease_inflight, _ = pipeline.derivation_leases.counts
+                if (
+                    int(lease_pending) > 0
+                    and int(lease_inflight) == 0
+                    and pipeline.derivation_workers_alive()
+                ):
+                    last_progress_at = time.monotonic()
+                    last_progress_token = pipeline.derivation_drain_progress_token()
+                    continue
+
                 diagnostics = pipeline.diagnostics()
                 raise RuntimeError(
-                    "derivation drain stalled with no retryable leases: "
+                    "derivation drain stalled with no live progress path: "
                     f"{diagnostics}"
                 )
         memory.signal_derivation_stop()
