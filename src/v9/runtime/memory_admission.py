@@ -21,6 +21,7 @@ def should_retain_concrete(
     prior_support: int,
     context: Any | None = None,
     isf_static: tuple[float, float, float, float, float] | None = None,
+    novel_context: bool = False,
     force_novel: bool = False,
 ) -> ConcreteAdmissionDecision:
     if not bool(getattr(scientific, "concrete_admission_enabled", True)):
@@ -28,6 +29,8 @@ def should_retain_concrete(
 
     if force_novel:
         return ConcreteAdmissionDecision(True, "novel_dependent_relation")
+    if novel_context:
+        return ConcreteAdmissionDecision(True, "novel_context")
 
     representatives = max(
         1, int(getattr(scientific, "concrete_admission_representatives_per_signature", 4))
