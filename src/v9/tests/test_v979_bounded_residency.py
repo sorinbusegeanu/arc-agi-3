@@ -148,3 +148,39 @@ def test_memory_governor_transitions_on_rss_pressure() -> None:
         assert governor.sample().state is MemoryGovernorState.HARD_PRESSURE_DRAIN
     with patch("v9.runtime.memory_governor._proc_status_bytes", return_value=0):
         assert governor.sample().state is MemoryGovernorState.NORMAL
+
+
+def test_residency_scoring_uses_stable_training_reservoir_snapshot(tmp_path: Path, monkeypatch) -> None:
+    runtime = ContinuousMemoryRuntime(
+        RuntimeConfig(tmp_path / "run-reservoir-snapshot", enable_snapshots=False, restore=False)
+    )
+    graph = runtime.graph
+    original_reservoir = graph._training_m0_reservoir
+    try:
+        m0 = CanonicalNode.build(MemoryLevel.M0, MemoryType.EPISODE, (7001,), 1)
+        _publish_node(
+            graph,
+            m0,
+            {
+                "action_id": 1,
+                "context_signature": 10,
+                "environment_instance_id": 7,
+                "episode_id": 1,
+            },
+        )
+        stable = graph.training_m0_reservoir_snapshot()
+
+        class ExplodingReservoir:
+            def __iter__(self):
+                raise RuntimeError("live training reservoir iterated")
+
+        graph._training_m0_reservoir = ExplodingReservoir()
+        monkeypatch.setattr(graph, "training_m0_reservoir_snapshot", lambda: stable)
+
+        scored = runtime._resident_memory._score_candidates(
+            [(m0.uid, m0, graph.payloads[m0.uid], m0.uid)]
+        )
+        assert scored
+    finally:
+        graph._training_m0_reservoir = original_reservoir
+        runtime.close()
