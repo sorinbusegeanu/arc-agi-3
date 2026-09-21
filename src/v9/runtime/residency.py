@@ -20,6 +20,10 @@ from .publication import CanonicalGraph, edge_ref, node_ref
 from .read_view import ReadView, _cognitively_visible
 
 
+_COMPACTION_DELETE_BATCH_LIMIT = 4_096
+_COMPACTION_SCAN_BATCH_LIMIT = 32_768
+
+
 def _is_deletable_low_level(node: Any) -> bool:
     return (
         node.level is MemoryLevel.M0 and node.memory_type is MemoryType.EPISODE
@@ -105,6 +109,7 @@ def _install_graph_contract() -> None:
     def graph_init(self: CanonicalGraph, *args: Any, **kwargs: Any) -> None:
         original_init(self, *args, **kwargs)
         self.low_level_nodes_inserted_total = 0
+        self.low_level_nodes_reused_total = 0
         self.low_level_nodes_deleted_total = 0
         self.low_level_edges_deleted_total = 0
         self.low_level_delete_batches_total = 0
@@ -113,15 +118,20 @@ def _install_graph_contract() -> None:
 
     def publish_locked(self: CanonicalGraph, proposal: Any):
         candidates: list[tuple[MemoryUid, MemoryLevel, MemoryType]] = []
+        reused = 0
         duplicate = proposal.proposal_uid in self.applied_proposals
         if not duplicate:
             for write in proposal.writes:
                 node = getattr(write, "node", None)
-                if node is None or node.uid in self.nodes or not _is_deletable_low_level(node):
+                if node is None or not _is_deletable_low_level(node):
+                    continue
+                if node.uid in self.nodes:
+                    reused += 1
                     continue
                 candidates.append((node.uid, node.level, node.memory_type))
         result = original_publish_locked(self, proposal)
-        if result.outcome is MutationOutcome.ACCEPTED and candidates:
+        if result.outcome is MutationOutcome.ACCEPTED:
+            self.low_level_nodes_reused_total += int(reused)
             for uid, level, memory_type in candidates:
                 node = self.nodes.get(uid)
                 if node is None or node.level is not level or node.memory_type is not memory_type:
@@ -366,6 +376,7 @@ def _install_graph_contract() -> None:
         # only aggregate deletion accounting rather than UID tombstones.
         state["retired_tombstones"] = []
         state["low_level_nodes_inserted_total"] = int(self.low_level_nodes_inserted_total)
+        state["low_level_nodes_reused_total"] = int(self.low_level_nodes_reused_total)
         state["low_level_nodes_deleted_total"] = int(self.low_level_nodes_deleted_total)
         state["low_level_edges_deleted_total"] = int(self.low_level_edges_deleted_total)
         state["low_level_delete_batches_total"] = int(self.low_level_delete_batches_total)
@@ -375,6 +386,7 @@ def _install_graph_contract() -> None:
     def from_state_dict(cls, state: dict[str, object]) -> CanonicalGraph:
         result = original_from_state_dict(state)
         result.low_level_nodes_inserted_total = int(state.get("low_level_nodes_inserted_total", 0))
+        result.low_level_nodes_reused_total = int(state.get("low_level_nodes_reused_total", 0))
         result.low_level_nodes_deleted_total = int(state.get("low_level_nodes_deleted_total", 0))
         result.low_level_edges_deleted_total = int(state.get("low_level_edges_deleted_total", 0))
         result.low_level_delete_batches_total = int(state.get("low_level_delete_batches_total", 0))
@@ -448,63 +460,70 @@ class ResidentMemoryManager:
         node = graph.nodes.get(uid)
         if node is None or not _is_deletable_low_level(node):
             return None
-        direct_sources = tuple(graph._provenance_sources_by_target.get(uid, ()))
+
+        # Follow the consolidation ancestry instead of stopping at the nearest
+        # M1N. M2+ families may cover many otherwise-singleton M1N rows and are
+        # therefore the correct replacement scope for redundant concrete
+        # evidence.
         candidates: set[MemoryUid] = set()
-        if node.level is MemoryLevel.M1:
-            for source_uid in direct_sources:
-                source = graph.nodes.get(source_uid)
-                if source is None:
-                    continue
-                if source.memory_type is MemoryType.NORMALIZED_RELATION or source.level > MemoryLevel.M1:
-                    candidates.add(source_uid)
-        else:
-            for source_uid in direct_sources:
-                source = graph.nodes.get(source_uid)
-                if source is None:
-                    continue
-                if source.memory_type is MemoryType.NORMALIZED_RELATION or source.level > MemoryLevel.M1:
-                    candidates.add(source_uid)
-                    continue
-                for second_uid in graph._provenance_sources_by_target.get(source_uid, ()):
-                    second = graph.nodes.get(second_uid)
-                    if second is not None and (
-                        second.memory_type is MemoryType.NORMALIZED_RELATION or second.level > MemoryLevel.M1
-                    ):
-                        candidates.add(second_uid)
+        visited = {uid}
+        frontier = deque([uid])
+        for _ in range(6):
+            next_frontier: deque[MemoryUid] = deque()
+            while frontier:
+                current = frontier.popleft()
+                for source_uid in graph._provenance_sources_by_target.get(current, ()):
+                    if source_uid in visited:
+                        continue
+                    visited.add(source_uid)
+                    source = graph.nodes.get(source_uid)
+                    if source is None:
+                        continue
+                    if source.memory_type is MemoryType.NORMALIZED_RELATION or source.level > MemoryLevel.M1:
+                        candidates.add(source_uid)
+                    next_frontier.append(source_uid)
+            if not next_frontier:
+                break
+            frontier = next_frontier
         if not candidates:
             return None
-        return min(
+        return max(
             candidates,
             key=lambda candidate_uid: (
-                0 if graph.nodes[candidate_uid].memory_type is MemoryType.NORMALIZED_RELATION else 1,
                 int(graph.nodes[candidate_uid].level),
+                int(graph.nodes[candidate_uid].memory_type is not MemoryType.NORMALIZED_RELATION),
                 candidate_uid,
             ),
         )
 
-    def _group_size(self, replacement_uid: MemoryUid, level: MemoryLevel) -> int:
+    def _group_size(self, replacement_uid: MemoryUid, level: MemoryLevel, *, limit: int = 8_192) -> int:
         graph = self.runtime.graph
-        children = tuple(graph._provenance_targets_by_source.get(replacement_uid, ()))
-        if level is MemoryLevel.M1:
-            return sum(
-                1
-                for uid in children
-                if (node := graph.nodes.get(uid)) is not None
-                and node.level is MemoryLevel.M1
-                and node.memory_type is MemoryType.GROUNDED_CONTINGENCY
-            )
+        maximum = max(1, int(limit))
         count = 0
-        for child_uid in children:
-            child = graph.nodes.get(child_uid)
-            if child is None:
-                continue
-            if child.level is MemoryLevel.M0 and child.memory_type is MemoryType.EPISODE:
-                count += 1
-                continue
-            for grandchild_uid in graph._provenance_targets_by_source.get(child_uid, ()):
-                grandchild = graph.nodes.get(grandchild_uid)
-                if grandchild is not None and grandchild.level is MemoryLevel.M0 and grandchild.memory_type is MemoryType.EPISODE:
+        visited = {replacement_uid}
+        frontier = deque([replacement_uid])
+        while frontier and count < maximum:
+            current = frontier.popleft()
+            for child_uid in graph._provenance_targets_by_source.get(current, ()):
+                if child_uid in visited:
+                    continue
+                visited.add(child_uid)
+                child = graph.nodes.get(child_uid)
+                if child is None:
+                    continue
+                matches = (
+                    child.level is MemoryLevel.M0
+                    and child.memory_type is MemoryType.EPISODE
+                    if level is MemoryLevel.M0
+                    else child.level is MemoryLevel.M1
+                    and child.memory_type is MemoryType.GROUNDED_CONTINGENCY
+                )
+                if matches:
                     count += 1
+                    if count >= maximum:
+                        break
+                else:
+                    frontier.append(child_uid)
         return count
 
     def _score_candidates(self, rows: list[tuple[MemoryUid, Any, dict[str, Any], MemoryUid]]) -> list[tuple[float, int, MemoryUid, MemoryUid]]:
@@ -577,26 +596,51 @@ class ResidentMemoryManager:
             rows.append((uid, graph.nodes[uid], graph.payloads.get(uid, {}), replacement_uid))
         return rows
 
+    def _effective_group_floor(self, level: MemoryLevel, group_size: int) -> int:
+        size = max(0, int(group_size))
+        if size <= 1:
+            return size
+        m0, m1g = self.counts()
+        target_m0, target_m1g = self.targets()
+        current = m0 if level is MemoryLevel.M0 else m1g
+        target = target_m0 if level is MemoryLevel.M0 else target_m1g
+        configured = (
+            int(self.scientific.resident_m0_representative_floor)
+            if level is MemoryLevel.M0
+            else int(self.scientific.resident_m1_grounded_representative_floor)
+        )
+        if current <= target:
+            return min(configured, size)
+        # Capacity pressure must be able to shrink recurrent evidence groups.
+        # Scale the representative set with the level-wide target while always
+        # retaining at least one concrete witness for a non-singleton group.
+        target_fraction = min(1.0, max(0.0, float(target) / max(1.0, float(current))))
+        capacity_floor = max(1, int(math.floor(size * target_fraction)))
+        return min(configured, capacity_floor, size - 1)
+
     def _plans_for_level(self, level: MemoryLevel, required: int, scan_budget: int) -> list[tuple[MemoryUid, MemoryUid, str]]:
         if required <= 0:
             return []
         rows = self._candidate_rows(level, scan_budget)
         scored = self._score_candidates(rows)
-        floor = (
-            int(self.scientific.resident_m0_representative_floor)
-            if level is MemoryLevel.M0
-            else int(self.scientific.resident_m1_grounded_representative_floor)
-        )
         planned_by_group: dict[MemoryUid, int] = {}
+        group_floors: dict[MemoryUid, int] = {}
         group_sizes: dict[MemoryUid, int] = {}
         plans: list[tuple[MemoryUid, MemoryUid, str]] = []
         for _score, _created, uid, replacement_uid in scored:
             if len(plans) >= required:
                 break
             if replacement_uid not in group_sizes:
-                group_sizes[replacement_uid] = self._group_size(replacement_uid, level)
+                group_sizes[replacement_uid] = self._group_size(
+                    replacement_uid,
+                    level,
+                    limit=max(64, int(required) + 16),
+                )
+                group_floors[replacement_uid] = self._effective_group_floor(
+                    level, group_sizes[replacement_uid]
+                )
             already = planned_by_group.get(replacement_uid, 0)
-            if group_sizes[replacement_uid] - already <= floor:
+            if group_sizes[replacement_uid] - already <= group_floors[replacement_uid]:
                 continue
             plans.append((uid, replacement_uid, "resident_capacity_compaction"))
             planned_by_group[replacement_uid] = already + 1
@@ -610,8 +654,14 @@ class ResidentMemoryManager:
         excess_m1g = max(0, m1g - target_m1g)
         if not force and excess_m0 + excess_m1g <= 0:
             return 0
-        maximum_delete = int(self.scientific.resident_max_delete_batch)
-        maximum_scan = int(self.scientific.resident_max_scan_batch)
+        maximum_delete = min(
+            int(self.scientific.resident_max_delete_batch),
+            _COMPACTION_DELETE_BATCH_LIMIT,
+        )
+        maximum_scan = min(
+            int(self.scientific.resident_max_scan_batch),
+            _COMPACTION_SCAN_BATCH_LIMIT,
+        )
         budget_m0 = min(excess_m0, maximum_delete)
         budget_m1 = min(excess_m1g, max(0, maximum_delete - budget_m0))
         if budget_m1 == 0 and excess_m1g > 0 and budget_m0 < maximum_delete:
@@ -651,9 +701,10 @@ class ResidentMemoryManager:
             return 0
         self.last_insert_check = inserts
         total = 0
-        passes = 1
-        if hard_limit or snapshot.state is MemoryGovernorState.HARD_PRESSURE_DRAIN or force:
-            passes = 8
+        # Keep each coordinator visit bounded. HARD_PRESSURE_DRAIN will call
+        # compaction again on the next service iteration while producers remain
+        # paused, instead of monopolizing the canonical path for a huge batch.
+        passes = 2 if snapshot.state is MemoryGovernorState.HARD_PRESSURE_DRAIN else 1
         for _ in range(passes):
             deleted = self.compact_once(force=True)
             total += deleted
@@ -710,6 +761,10 @@ class ResidentMemoryManager:
                 "resident_M1_grounded_target": target_m1g,
                 "compaction_backlog": self.backlog(),
                 "low_level_nodes_inserted": int(graph.low_level_nodes_inserted_total),
+                "low_level_nodes_reused": int(graph.low_level_nodes_reused_total),
+                "low_level_dedup_rate": float(graph.low_level_nodes_reused_total) / max(
+                    1, int(graph.low_level_nodes_reused_total) + int(graph.low_level_nodes_inserted_total)
+                ),
                 "low_level_nodes_deleted": int(graph.low_level_nodes_deleted_total),
                 "low_level_edges_deleted": int(graph.low_level_edges_deleted_total),
                 "low_level_delete_batches": int(graph.low_level_delete_batches_total),
@@ -734,6 +789,10 @@ class ResidentMemoryManager:
             "resident_M1_grounded_limit": int(self.scientific.resident_m1_grounded_limit),
             "compaction_backlog": self.backlog(),
             "low_level_nodes_inserted": int(self.runtime.graph.low_level_nodes_inserted_total),
+            "low_level_nodes_reused": int(self.runtime.graph.low_level_nodes_reused_total),
+            "low_level_dedup_rate": float(self.runtime.graph.low_level_nodes_reused_total) / max(
+                1, int(self.runtime.graph.low_level_nodes_reused_total) + int(self.runtime.graph.low_level_nodes_inserted_total)
+            ),
             "low_level_nodes_deleted": int(self.runtime.graph.low_level_nodes_deleted_total),
             "low_level_edges_deleted": int(self.runtime.graph.low_level_edges_deleted_total),
             "compaction_cycles": int(self.compaction_cycles),
@@ -837,6 +896,21 @@ def _install_runtime_contract(runtime_cls: type) -> None:
         if manager is not None and manager.sample_memory().state is MemoryGovernorState.HARD_PRESSURE_DRAIN:
             manager.maybe_compact(force=True)
         result = original_apply_batch(self, prepared_rows)
+        # Honor the configured compaction interval during continuous ingestion,
+        # rather than deferring capacity maintenance to an epoch/flush boundary.
+        if manager is not None:
+            inserts = int(self.graph.low_level_nodes_inserted_total)
+            m0_resident, m1g_resident = manager.counts()
+            interval_due = (
+                inserts - int(manager.last_insert_check)
+                >= int(manager.scientific.resident_compaction_check_interval)
+            )
+            capacity_exceeded = (
+                m0_resident > int(manager.scientific.resident_m0_limit)
+                or m1g_resident > int(manager.scientific.resident_m1_grounded_limit)
+            )
+            if interval_due or capacity_exceeded:
+                manager.maybe_compact()
         # Add boundary outcome evidence to the deferred M0 payload so retention
         # scoring can preserve rare successes/failures and truncation boundaries.
         for prepared in prepared_rows:
@@ -868,16 +942,6 @@ def _install_runtime_contract(runtime_cls: type) -> None:
         manager = getattr(self, "_resident_memory", None)
         if manager is not None:
             result.update(manager.metrics())
-            primary = result.get("primary_dashboard")
-            if isinstance(primary, dict):
-                primary.update({
-                    "M0_resident": result["M0_resident"],
-                    "M1_grounded_resident": result["M1_grounded_resident"],
-                    "compaction_backlog": result["compaction_backlog"],
-                    "process_rss_bytes": result["process_rss_bytes"],
-                    "process_swap_bytes": result["process_swap_bytes"],
-                    "memory_governor_state": result["memory_governor_state"],
-                })
         return result
 
     def full_metrics(self: Any) -> dict[str, Any]:

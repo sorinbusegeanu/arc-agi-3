@@ -184,3 +184,78 @@ def test_residency_scoring_uses_stable_training_reservoir_snapshot(tmp_path: Pat
     finally:
         graph._training_m0_reservoir = original_reservoir
         runtime.close()
+
+
+def test_capacity_pressure_relaxes_representative_floor(tmp_path: Path) -> None:
+    scientific = ScientificConfig(
+        resident_m0_limit=250_000,
+        resident_m1_grounded_limit=250_000,
+        resident_low_level_target_ratio=0.85,
+        resident_m0_representative_floor=8,
+        resident_m1_grounded_representative_floor=2,
+    )
+    runtime = ContinuousMemoryRuntime(
+        RuntimeConfig(tmp_path / "pressure-floor", enable_snapshots=False, restore=False, scientific=scientific)
+    )
+    try:
+        manager = runtime._resident_memory
+        with patch.object(manager, "counts", return_value=(270_000, 260_000)), patch.object(
+            manager, "targets", return_value=(212_500, 212_500)
+        ):
+            assert manager._effective_group_floor(MemoryLevel.M0, 8) == 6
+            assert manager._effective_group_floor(MemoryLevel.M1, 2) == 1
+            assert manager._effective_group_floor(MemoryLevel.M0, 1) == 1
+    finally:
+        runtime.close(normal=False)
+
+
+def test_replacement_walk_reaches_higher_consolidation_family(tmp_path: Path) -> None:
+    runtime = ContinuousMemoryRuntime(
+        RuntimeConfig(tmp_path / "replacement-walk", enable_snapshots=False, restore=False)
+    )
+    try:
+        graph = runtime.graph
+        m0 = CanonicalNode.build(MemoryLevel.M0, MemoryType.EPISODE, (9001,), 1)
+        m1g = CanonicalNode.build(MemoryLevel.M1, MemoryType.GROUNDED_CONTINGENCY, (9002,), 2)
+        m1n = CanonicalNode.build(MemoryLevel.M1, MemoryType.NORMALIZED_RELATION, (9003,), 3)
+        m2 = CanonicalNode.build(MemoryLevel.M2, MemoryType.FAMILY, (9004,), 4)
+        _publish_node(graph, m0, {"action_id": 1, "context_signature": 7})
+        _publish_node(graph, m1g, {"parents": [[m0.uid.hi, m0.uid.lo]]}, watermark=2)
+        _publish_node(graph, m1n, {"parents": [[m1g.uid.hi, m1g.uid.lo]]}, watermark=3)
+        _publish_node(graph, m2, {"parents": [[m1n.uid.hi, m1n.uid.lo]]}, watermark=4)
+        runtime._resident_memory._recount_graph()
+
+        assert runtime._resident_memory._replacement_for(m0.uid) == m2.uid
+        assert runtime._resident_memory._replacement_for(m1g.uid) == m2.uid
+        assert runtime._resident_memory._group_size(m2.uid, MemoryLevel.M0) == 1
+        assert runtime._resident_memory._group_size(m2.uid, MemoryLevel.M1) == 1
+    finally:
+        runtime.close(normal=False)
+
+
+def test_compaction_work_per_pass_is_bounded(tmp_path: Path) -> None:
+    runtime = ContinuousMemoryRuntime(
+        RuntimeConfig(tmp_path / "bounded-pass", enable_snapshots=False, restore=False)
+    )
+    try:
+        manager = runtime._resident_memory
+        with patch.object(manager, "counts", return_value=(300_000, 300_000)), patch.object(
+            manager, "targets", return_value=(212_500, 212_500)
+        ), patch.object(manager, "_plans_for_level", return_value=[]) as plans:
+            assert manager.compact_once(force=True) == 0
+        assert plans.call_count >= 1
+        for call in plans.call_args_list:
+            _level, required, scan_budget = call.args
+            assert required <= 4_096
+            assert scan_budget <= 32_768
+    finally:
+        runtime.close(normal=False)
+
+
+def test_low_level_reuse_is_reported_as_deduplication() -> None:
+    graph = CanonicalGraph(2)
+    m0 = CanonicalNode.build(MemoryLevel.M0, MemoryType.EPISODE, (9901,), 1)
+    _publish_node(graph, m0, {"action_id": 1, "context_signature": 1}, watermark=1)
+    _publish_node(graph, m0, {"action_id": 1, "context_signature": 1}, watermark=2)
+    assert graph.low_level_nodes_inserted_total == 1
+    assert graph.low_level_nodes_reused_total == 1

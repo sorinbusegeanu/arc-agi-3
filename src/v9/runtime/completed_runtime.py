@@ -454,4 +454,7 @@ class CompletedContinuousMemoryRuntime(_PublicContinuousMemoryRuntime):
         return result
 
     def dashboard_metrics(self) -> dict[str, Any]:
-        return self.metrics()
+        # Dashboard polling must stay on the optimized O(1) live/cached path.
+        # Full symbolic metrics are retained in metrics()/full_metrics() for
+        # exact epoch/reporting cuts.
+        return super().dashboard_metrics()

@@ -100,6 +100,7 @@ class ContinuousMemoryRuntime(BaseContinuousMemoryRuntime):
                 diagnostic.get("environment_trajectory_efficiency", 0.0)
             )
             result["prediction_error"] = self._prediction_error_sum / max(1, self._prediction_error_count)
+            result.setdefault("m7_strategy_success_rate", 0.0)
             result["persistent_memory_growth_ratio"] = total_memories / max(1, self.telemetry["events"])
             retired = int(diagnostic.get("hydra_nodes_retired", 0))
             replaced = int(diagnostic.get("hydra_nodes_replaced_by_abstractions", 0))

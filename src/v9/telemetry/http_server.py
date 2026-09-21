@@ -8,7 +8,7 @@ from threading import Event, Thread
 from typing import Any, Callable
 
 
-DASHBOARD_REFRESH_SECONDS = 2.0
+DASHBOARD_REFRESH_SECONDS = 30.0
 
 
 class MetricsHTTPServer:
