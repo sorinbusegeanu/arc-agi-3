@@ -775,6 +775,23 @@ class ResidentMemoryManager:
                 "process_uss_bytes": int(snapshot.uss_bytes),
                 "process_swap_bytes": int(snapshot.swap_bytes),
                 "memory_governor_state": snapshot.state.value,
+                "concrete_admission_retained_events": int(
+                    self.runtime.telemetry.get("concrete_admission_retained_events", 0)
+                ),
+                "concrete_admission_skipped_events": int(
+                    self.runtime.telemetry.get("concrete_admission_skipped_events", 0)
+                ),
+                "concrete_nodes_avoided": int(
+                    self.runtime.telemetry.get("concrete_nodes_avoided", 0)
+                ),
+                "concrete_admission_retention_rate": float(
+                    self.runtime.telemetry.get("concrete_admission_retained_events", 0)
+                )
+                / max(
+                    1,
+                    int(self.runtime.telemetry.get("concrete_admission_retained_events", 0))
+                    + int(self.runtime.telemetry.get("concrete_admission_skipped_events", 0)),
+                ),
             })
             gauges.update(self.governor.state_dict())
 
@@ -802,6 +819,23 @@ class ResidentMemoryManager:
             "process_uss_bytes": int(snapshot.uss_bytes),
             "process_swap_bytes": int(snapshot.swap_bytes),
             "memory_governor_state": snapshot.state.value,
+            "concrete_admission_retained_events": int(
+                self.runtime.telemetry.get("concrete_admission_retained_events", 0)
+            ),
+            "concrete_admission_skipped_events": int(
+                self.runtime.telemetry.get("concrete_admission_skipped_events", 0)
+            ),
+            "concrete_nodes_avoided": int(
+                self.runtime.telemetry.get("concrete_nodes_avoided", 0)
+            ),
+            "concrete_admission_retention_rate": float(
+                self.runtime.telemetry.get("concrete_admission_retained_events", 0)
+            )
+            / max(
+                1,
+                int(self.runtime.telemetry.get("concrete_admission_retained_events", 0))
+                + int(self.runtime.telemetry.get("concrete_admission_skipped_events", 0)),
+            ),
         }
 
 

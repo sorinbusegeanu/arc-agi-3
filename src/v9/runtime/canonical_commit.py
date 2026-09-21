@@ -21,6 +21,7 @@ from .canonical_transaction import (
     CanonicalWorkEstimate,
     _estimate_bytes,
 )
+from .memory_admission import should_retain_concrete
 from .memory_pipeline import CommitPlan, DerivationTask, _m1n_write
 
 
@@ -254,6 +255,24 @@ def _append_dirty_normalized(runtime: Any, relation: Any, rows: list[Any]) -> in
     return signature
 
 
+def _relation_evidence_available(runtime: Any, relation: Any, deferred_rows: list[Any]) -> bool:
+    available_here = {row[0].uid for row in deferred_rows}
+    refs = tuple(relation.provenance.parents) + tuple(relation.provenance.evidence)
+    return all(
+        uid in runtime.graph.nodes
+        or uid in runtime._deferred_base_nodes
+        or uid in available_here
+        for uid in refs
+    )
+
+
+def _relation_context_is_novel(runtime: Any, relation: Any) -> bool:
+    signature = int(relation.structural_signature)
+    context = int(getattr(relation, "context_signature", 0) or 0)
+    rows = runtime._m1n_occurrences.get(signature, ())
+    return not any(int(getattr(row, "context_signature", 0) or 0) == context for row in rows)
+
+
 def apply_canonical_commit_batch(
     runtime: Any,
     rows: Iterable[CommitPlan],
@@ -304,6 +323,12 @@ def apply_canonical_commit_batch(
         last_family = ""
         last_scenario = ""
         isf_rows: list[tuple[ISFComponents, int, int, Any, Any, int]] = []
+        concrete_retained_delta = 0
+        concrete_skipped_delta = 0
+        concrete_nodes_avoided_delta = 0
+        admission_reason_counts: dict[str, int] = {}
+        admitted_concrete_uids: set[Any] = set()
+        batch_materialized_normalized_uids: set[Any] = set()
         max_cross_modal = int(runtime.config.scientific.max_cross_modal_facts_per_macro_event)
         logical_graph_generation = int(runtime.graph.generation)
         publication_generation_delta = getattr(runtime, "_deferred_publication_generation_delta", None)
@@ -314,9 +339,23 @@ def apply_canonical_commit_batch(
             cross_modal_used = 0
             event = plan.event
             previous_interaction = None
+            interaction_retained = False
+
+            novel_derived = any(
+                int(runtime.signature_support(int(row.relation.structural_signature))) == 0
+                for row in plan.derived_relations
+            )
+            novel_aligned = any(
+                symbol.aligned_relation is not None
+                and int(runtime.signature_support(int(symbol.aligned_relation.structural_signature))) == 0
+                for symbol in plan.symbols
+            )
+
             if plan.interaction_grounding is not None:
                 g = plan.interaction_grounding
-                previous_interaction = runtime._latest_interaction_grounding.get((int(g.environment_instance_id), int(g.episode_id)))
+                previous_interaction = runtime._latest_interaction_grounding.get(
+                    (int(g.environment_instance_id), int(g.episode_id))
+                )
 
             if event is not None:
                 environment_id = int(event.identity.environment_instance_id)
@@ -338,17 +377,60 @@ def apply_canonical_commit_batch(
                 modality_deltas[modality] = modality_deltas.get(modality, 0) + 1
                 formation_environments.add(environment_id)
                 stage_before = runtime.stage_tracker.stage
-                plan_deferred_rows.extend(materialized_rows[id(write)] for write in plan.base_writes)
 
-                if plan.interaction_grounding is not None:
-                    grounding = plan.interaction_grounding
-                    runtime._latest_interaction_grounding[(grounding.environment_instance_id, grounding.episode_id)] = grounding
                 if plan.relation is None or plan.normalized_write is None:
                     raise RuntimeError("interaction commit plan is incomplete")
+                prior_support = int(
+                    runtime.signature_support(int(plan.relation.structural_signature))
+                )
+                interaction_decision = should_retain_concrete(
+                    runtime.config.scientific,
+                    prior_support=prior_support,
+                    context=plan.context,
+                    isf_static=plan.isf_static,
+                    novel_context=_relation_context_is_novel(runtime, plan.relation),
+                    force_novel=bool(novel_derived or novel_aligned),
+                )
+                interaction_retained = bool(interaction_decision.retain)
+                admission_reason_counts[interaction_decision.reason] = (
+                    admission_reason_counts.get(interaction_decision.reason, 0) + 1
+                )
+                if plan.interaction_grounding is not None:
+                    # Working-state continuity follows every observed interaction.
+                    # Persistent concrete retention is a separate decision.
+                    grounding = plan.interaction_grounding
+                    runtime._latest_interaction_grounding[
+                        (grounding.environment_instance_id, grounding.episode_id)
+                    ] = grounding
 
-                prior_support = int(runtime.signature_support(int(plan.relation.structural_signature)))
-                signature = record_normalized_fast(runtime, plan.relation, plan.normalized_write, plan_deferred_rows, materialized_row=materialized_rows[id(plan.normalized_write)])
-                dirty_signature = _append_dirty_normalized(runtime, plan.relation, plan_deferred_rows)
+                if interaction_retained:
+                    plan_deferred_rows.extend(
+                        materialized_rows[id(write)] for write in plan.base_writes
+                    )
+                    admitted_concrete_uids.update(write.node.uid for write in plan.base_writes)
+                    concrete_retained_delta += 1
+                else:
+                    concrete_skipped_delta += 1
+                    concrete_nodes_avoided_delta += sum(
+                        1
+                        for write in plan.base_writes
+                        if write.node.uid not in runtime.graph.nodes
+                        and write.node.uid not in runtime._deferred_base_nodes
+                        and write.node.uid not in admitted_concrete_uids
+                    )
+
+                signature = record_normalized_fast(
+                    runtime,
+                    plan.relation,
+                    plan.normalized_write,
+                    plan_deferred_rows,
+                    materialized_row=materialized_rows[id(plan.normalized_write)],
+                    retain_occurrence=interaction_retained,
+                    batch_materialized_uids=batch_materialized_normalized_uids,
+                )
+                dirty_signature = _append_dirty_normalized(
+                    runtime, plan.relation, plan_deferred_rows
+                )
                 if dirty_signature is not None:
                     deferred_dirty_signatures.add(dirty_signature)
                 signatures.append(signature)
@@ -357,49 +439,162 @@ def apply_canonical_commit_batch(
 
                 if plan.isf_static is not None:
                     pvi, osi, explicit_pe, tp, ep = plan.isf_static
-                    evidence_confidence = float(runtime.__dict__.get("_environment_evidence_confidence", {}).get(environment_id, 1.0))
+                    evidence_confidence = float(
+                        runtime.__dict__.get("_environment_evidence_confidence", {}).get(
+                            environment_id, 1.0
+                        )
+                    )
                     if float(pvi) <= 0.0:
                         explicit_pe *= evidence_confidence
                         tp *= evidence_confidence
                         ep *= evidence_confidence
                     recurrence = int(runtime.signature_support(signature))
                     recurrence_pe = 1.0 / max(1.0, float(prior_support + 1))
-                    pe = abs(float(explicit_pe)) if float(explicit_pe) != 0.0 else recurrence_pe
-                    isf_rows.append((ISFComponents(pvi, osi, pe, 1.0 / max(1, recurrence), tp, ep), int(runtime._watermark), int(event.identity.causal_watermark), stage_before, next_stage, logical_graph_generation))
+                    pe = (
+                        abs(float(explicit_pe))
+                        if float(explicit_pe) != 0.0
+                        else recurrence_pe
+                    )
+                    isf_rows.append(
+                        (
+                            ISFComponents(
+                                pvi,
+                                osi,
+                                pe,
+                                1.0 / max(1, recurrence),
+                                tp,
+                                ep,
+                            ),
+                            int(runtime._watermark),
+                            int(event.identity.causal_watermark),
+                            stage_before,
+                            next_stage,
+                            logical_graph_generation,
+                        )
+                    )
                     runtime._prediction_error_sum += abs(float(pe))
                     runtime._prediction_error_count += 1
 
             symbol_occurrences_delta += len(plan.symbol_occurrences)
-            unique_symbols.update(int(row.symbol_id.value) for row in plan.symbol_occurrences)
+            unique_symbols.update(
+                int(row.symbol_id.value) for row in plan.symbol_occurrences
+            )
             index_occurrences = getattr(runtime, "_index_symbol_occurrences", None)
             if callable(index_occurrences):
                 index_occurrences(plan.symbol_occurrences)
             if plan.symbol_codec_state:
-                codec = DeterministicSymbolCodec.from_state_dict(dict(plan.symbol_codec_state))
+                codec = DeterministicSymbolCodec.from_state_dict(
+                    dict(plan.symbol_codec_state)
+                )
                 if codec.vocabulary_id.value not in runtime.symbol_codecs:
                     runtime.symbol_codecs[codec.vocabulary_id.value] = codec
 
             for symbol in plan.symbols:
                 symbol_event = symbol.event
-                runtime._watermark = max(runtime._watermark, int(symbol_event.identity.causal_watermark))
+                runtime._watermark = max(
+                    runtime._watermark, int(symbol_event.identity.causal_watermark)
+                )
                 timeline_events_delta += 1
                 telemetry_events_delta += 1
                 modality = int(symbol_event.identity.modality_id.value)
                 modality_deltas[modality] = modality_deltas.get(modality, 0) + 1
-                formation_environments.add(int(symbol_event.identity.environment_instance_id))
-                plan_deferred_rows.extend(materialized_rows[id(write)] for write in symbol.base_writes)
+                formation_environments.add(
+                    int(symbol_event.identity.environment_instance_id)
+                )
 
-                signature = record_normalized_fast(runtime, symbol.relation, symbol.normalized_write, plan_deferred_rows, materialized_row=materialized_rows[id(symbol.normalized_write)])
-                dirty_signature = _append_dirty_normalized(runtime, symbol.relation, plan_deferred_rows)
+                symbol_prior_support = int(
+                    runtime.signature_support(int(symbol.relation.structural_signature))
+                )
+                aligned_prior_support = (
+                    0
+                    if symbol.aligned_relation is None
+                    else int(
+                        runtime.signature_support(
+                            int(symbol.aligned_relation.structural_signature)
+                        )
+                    )
+                )
+                symbol_decision = should_retain_concrete(
+                    runtime.config.scientific,
+                    prior_support=symbol_prior_support,
+                    context=plan.context,
+                    isf_static=plan.isf_static,
+                    novel_context=_relation_context_is_novel(runtime, symbol.relation),
+                    force_novel=bool(
+                        novel_derived
+                        or (
+                            symbol.aligned_relation is not None
+                            and aligned_prior_support == 0
+                        )
+                    ),
+                )
+                symbol_retained = bool(symbol_decision.retain)
+                admission_reason_counts[symbol_decision.reason] = (
+                    admission_reason_counts.get(symbol_decision.reason, 0) + 1
+                )
+                if symbol_retained:
+                    plan_deferred_rows.extend(
+                        materialized_rows[id(write)] for write in symbol.base_writes
+                    )
+                    admitted_concrete_uids.update(write.node.uid for write in symbol.base_writes)
+                    concrete_retained_delta += 1
+                else:
+                    concrete_skipped_delta += 1
+                    concrete_nodes_avoided_delta += sum(
+                        1
+                        for write in symbol.base_writes
+                        if write.node.uid not in runtime.graph.nodes
+                        and write.node.uid not in runtime._deferred_base_nodes
+                        and write.node.uid not in admitted_concrete_uids
+                    )
+
+                signature = record_normalized_fast(
+                    runtime,
+                    symbol.relation,
+                    symbol.normalized_write,
+                    plan_deferred_rows,
+                    materialized_row=materialized_rows[id(symbol.normalized_write)],
+                    retain_occurrence=symbol_retained,
+                    batch_materialized_uids=batch_materialized_normalized_uids,
+                )
+                dirty_signature = _append_dirty_normalized(
+                    runtime, symbol.relation, plan_deferred_rows
+                )
                 if dirty_signature is not None:
                     deferred_dirty_signatures.add(dirty_signature)
                 signatures.append(signature)
                 touched_signatures.add(signature)
-                if symbol.aligned_relation is not None and cross_modal_used < max_cross_modal:
+
+                if (
+                    symbol.aligned_relation is not None
+                    and cross_modal_used < max_cross_modal
+                ):
                     if symbol.aligned_normalized_write is None:
                         raise RuntimeError("aligned symbol commit plan is incomplete")
-                    aligned_signature = record_normalized_fast(runtime, symbol.aligned_relation, symbol.aligned_normalized_write, plan_deferred_rows, materialized_row=materialized_rows[id(symbol.aligned_normalized_write)])
-                    dirty_signature = _append_dirty_normalized(runtime, symbol.aligned_relation, plan_deferred_rows)
+                    aligned_retain = bool(
+                        not runtime.config.scientific.concrete_admission_enabled
+                        or (
+                            symbol_retained
+                            and interaction_retained
+                            and _relation_evidence_available(
+                                runtime, symbol.aligned_relation, plan_deferred_rows
+                            )
+                        )
+                    )
+                    aligned_signature = record_normalized_fast(
+                        runtime,
+                        symbol.aligned_relation,
+                        symbol.aligned_normalized_write,
+                        plan_deferred_rows,
+                        materialized_row=materialized_rows[
+                            id(symbol.aligned_normalized_write)
+                        ],
+                        retain_occurrence=aligned_retain,
+                        batch_materialized_uids=batch_materialized_normalized_uids,
+                    )
+                    dirty_signature = _append_dirty_normalized(
+                        runtime, symbol.aligned_relation, plan_deferred_rows
+                    )
                     if dirty_signature is not None:
                         deferred_dirty_signatures.add(dirty_signature)
                     signatures.append(aligned_signature)
@@ -408,12 +603,19 @@ def apply_canonical_commit_batch(
                     if plan.interaction_grounding is not None:
                         g = plan.interaction_grounding
                         symbol_structure_uid = symbol.relation.uid
-                        grounding_key = (int(symbol_structure_uid.lo), int(g.uid.lo), int(g.environment_instance_id), 0, 0)
+                        interaction_structure_uid = int(plan.relation.uid.lo)
+                        grounding_key = (
+                            int(symbol_structure_uid.lo),
+                            interaction_structure_uid,
+                            int(g.environment_instance_id),
+                            0,
+                            0,
+                        )
                         before_grounding = runtime.grounding.states.get(grounding_key)
                         after_grounding = runtime.grounding.observe(
                             GroundingEvidence(
                                 int(symbol_structure_uid.lo),
-                                int(g.uid.lo),
+                                interaction_structure_uid,
                                 int(g.environment_instance_id),
                                 0,
                                 0,
@@ -422,7 +624,11 @@ def apply_canonical_commit_batch(
                                 cross_modal_association=True,
                             )
                         )
-                        if before_grounding is None or int(after_grounding.maturity) > int(before_grounding.maturity):
+                        if (
+                            before_grounding is None
+                            or int(after_grounding.maturity)
+                            > int(before_grounding.maturity)
+                        ):
                             runtime.telemetry["grounding_promotions"] += 1
                 advance_stage_fast(runtime)
 
@@ -431,8 +637,24 @@ def apply_canonical_commit_batch(
                     if cross_modal_used >= max_cross_modal:
                         continue
                     cross_modal_used += 1
-                signature = record_normalized_fast(runtime, derived.relation, derived.write, plan_deferred_rows, materialized_row=materialized_rows[id(derived.write)])
-                dirty_signature = _append_dirty_normalized(runtime, derived.relation, plan_deferred_rows)
+                retain_derived_occurrence = bool(
+                    not runtime.config.scientific.concrete_admission_enabled
+                    or _relation_evidence_available(
+                        runtime, derived.relation, plan_deferred_rows
+                    )
+                )
+                signature = record_normalized_fast(
+                    runtime,
+                    derived.relation,
+                    derived.write,
+                    plan_deferred_rows,
+                    materialized_row=materialized_rows[id(derived.write)],
+                    retain_occurrence=retain_derived_occurrence,
+                    batch_materialized_uids=batch_materialized_normalized_uids,
+                )
+                dirty_signature = _append_dirty_normalized(
+                    runtime, derived.relation, plan_deferred_rows
+                )
                 if dirty_signature is not None:
                     deferred_dirty_signatures.add(dirty_signature)
                 signatures.append(signature)
@@ -442,11 +664,40 @@ def apply_canonical_commit_batch(
                 for symbol in plan.symbols:
                     if cross_modal_used >= max_cross_modal:
                         break
-                    proxy = SimpleNamespace(m1g=symbol.grounding, base_writes=symbol.base_writes, occurrence=symbol.occurrence)
-                    control = shuffled_alignment_control(proxy, previous_interaction, causal_watermark=int(runtime._watermark), occurrence=symbol.occurrence)
-                    write = _m1n_write(control.relation, watermark=int(runtime._watermark), occurrence=symbol.occurrence, payload_extra=control.payload())
-                    signature = record_normalized_fast(runtime, control.relation, write, plan_deferred_rows)
-                    dirty_signature = _append_dirty_normalized(runtime, control.relation, plan_deferred_rows)
+                    proxy = SimpleNamespace(
+                        m1g=symbol.grounding,
+                        base_writes=symbol.base_writes,
+                        occurrence=symbol.occurrence,
+                    )
+                    control = shuffled_alignment_control(
+                        proxy,
+                        previous_interaction,
+                        causal_watermark=int(runtime._watermark),
+                        occurrence=symbol.occurrence,
+                    )
+                    write = _m1n_write(
+                        control.relation,
+                        watermark=int(runtime._watermark),
+                        occurrence=symbol.occurrence,
+                        payload_extra=control.payload(),
+                    )
+                    retain_control_occurrence = bool(
+                        not runtime.config.scientific.concrete_admission_enabled
+                        or _relation_evidence_available(
+                            runtime, control.relation, plan_deferred_rows
+                        )
+                    )
+                    signature = record_normalized_fast(
+                        runtime,
+                        control.relation,
+                        write,
+                        plan_deferred_rows,
+                        retain_occurrence=retain_control_occurrence,
+                        batch_materialized_uids=batch_materialized_normalized_uids,
+                    )
+                    dirty_signature = _append_dirty_normalized(
+                        runtime, control.relation, plan_deferred_rows
+                    )
                     if dirty_signature is not None:
                         deferred_dirty_signatures.add(dirty_signature)
                     signatures.append(signature)
@@ -480,6 +731,29 @@ def apply_canonical_commit_batch(
         runtime.timeline.actions_committed += timeline_actions_delta
         runtime.timeline.last_ordering_key = last_ordering_key
         runtime.telemetry["events"] += telemetry_events_delta
+        runtime.telemetry["concrete_admission_retained_events"] = int(
+            runtime.telemetry.get("concrete_admission_retained_events", 0)
+        ) + int(concrete_retained_delta)
+        runtime.telemetry["concrete_admission_skipped_events"] = int(
+            runtime.telemetry.get("concrete_admission_skipped_events", 0)
+        ) + int(concrete_skipped_delta)
+        runtime.telemetry["concrete_nodes_avoided"] = int(
+            runtime.telemetry.get("concrete_nodes_avoided", 0)
+        ) + int(concrete_nodes_avoided_delta)
+        for reason, count in admission_reason_counts.items():
+            key = f"concrete_admission_reason_{reason}"
+            runtime.telemetry[key] = int(runtime.telemetry.get(key, 0)) + int(count)
+        concrete_total = int(runtime.telemetry["concrete_admission_retained_events"]) + int(
+            runtime.telemetry["concrete_admission_skipped_events"]
+        )
+        runtime.set_telemetry_gauge(
+            "concrete_admission_retention_rate",
+            float(runtime.telemetry["concrete_admission_retained_events"])
+            / max(1, concrete_total),
+        )
+        runtime.set_telemetry_gauge(
+            "concrete_nodes_avoided", int(runtime.telemetry["concrete_nodes_avoided"])
+        )
         runtime.telemetry["symbol_occurrences"] = int(runtime.telemetry.get("symbol_occurrences", 0)) + symbol_occurrences_delta
         runtime.set_telemetry_gauge("symbol_occurrences_ingested", runtime.telemetry["symbol_occurrences"])
         runtime.set_telemetry_gauge("unique_symbols_batch", len(unique_symbols))
