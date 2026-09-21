@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
+from v9.runtime.config import ScientificConfig
 from v9.runtime.canonical_commit import apply_canonical_commit_batch
 from v9.runtime.memory_pipeline import IngestionTask, build_commit_plan, prepare_ingestion
 from v9.runtime.multiprocess import EncodedTransition
@@ -36,11 +37,22 @@ def _rows(count: int = 320):
 
 def test_fast_canonical_commit_matches_reference_batch(tmp_path: Path) -> None:
     rows = _rows()
+    scientific = ScientificConfig(concrete_admission_enabled=False)
     reference = ContinuousMemoryRuntime(
-        RuntimeConfig.from_path(tmp_path / "reference", restore=False, enable_snapshots=False)
+        RuntimeConfig(
+            tmp_path / "reference",
+            restore=False,
+            enable_snapshots=False,
+            scientific=scientific,
+        )
     )
     fast = ContinuousMemoryRuntime(
-        RuntimeConfig.from_path(tmp_path / "fast", restore=False, enable_snapshots=False)
+        RuntimeConfig(
+            tmp_path / "fast",
+            restore=False,
+            enable_snapshots=False,
+            scientific=scientific,
+        )
     )
 
     expected_signatures = reference.apply_prepared_ingestion_batch(rows)
