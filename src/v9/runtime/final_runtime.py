@@ -518,4 +518,6 @@ class FinalContinuousMemoryRuntime(CompletedContinuousMemoryRuntime):
         return result
 
     def dashboard_metrics(self) -> dict[str, Any]:
-        return self.metrics()
+        # Preserve the lightweight dashboard path from optimized_runtime.
+        # Exact grounding/provenance scans remain available through metrics().
+        return super().dashboard_metrics()
