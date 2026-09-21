@@ -78,3 +78,73 @@ def test_unrelated_completed_derivation_does_not_wait_for_straggler() -> None:
         assert retried.task_id != first.task_id
     finally:
         service.shutdown_parallel_pipeline()
+
+
+def test_pending_derivation_is_a_live_drain_path_when_workers_are_alive() -> None:
+    class Process:
+        def is_alive(self) -> bool:
+            return True
+
+    class Runtime:
+        watermark = 0
+        config = SimpleNamespace(canonical_transaction_max_input_bytes=1024)
+
+    memory = SimpleNamespace(
+        ingest_workers=1,
+        derivation_queue=queue.Queue(maxsize=1),
+        derivation_result_queue=queue.Queue(),
+        derivation_processes=[Process()],
+        queue_depths=lambda: {
+            "derivation_queue_depth": 1,
+            "derivation_result_queue_depth": 0,
+        },
+    )
+    service = MemoryPipelineService(Runtime(), memory, ingest_queue_capacity=8)
+    try:
+        # Saturate the worker queue so leased work cannot be dispatched yet.
+        memory.derivation_queue.put(object())
+        for signature in (101, 102):
+            service._consider_candidate(DerivationTask(0, signature, (), 2, (), 1))
+
+        assert not service.pump_derivation_tasks()
+        pending, inflight, _ = service.derivation_leases.counts
+        assert pending == 0
+        assert inflight == 2
+        assert service.pending_derivation
+        assert service.derivation_workers_alive()
+        token = service.derivation_drain_progress_token()
+        assert token[3] == 2
+    finally:
+        service.shutdown_parallel_pipeline()
+
+
+def test_unleased_pending_derivation_is_not_retryable_but_remains_valid_work() -> None:
+    class Process:
+        def is_alive(self) -> bool:
+            return True
+
+    class Runtime:
+        watermark = 0
+        config = SimpleNamespace(canonical_transaction_max_input_bytes=1024)
+
+    memory = SimpleNamespace(
+        ingest_workers=1,
+        derivation_queue=queue.Queue(),
+        derivation_result_queue=queue.Queue(),
+        derivation_processes=[Process()],
+        queue_depths=lambda: {
+            "derivation_queue_depth": 0,
+            "derivation_result_queue_depth": 0,
+        },
+    )
+    service = MemoryPipelineService(Runtime(), memory, ingest_queue_capacity=8)
+    try:
+        identity = DerivationTaskIdentity(201, 2, 1)
+        service._derivation_candidates[identity] = DerivationTask(0, 201, (), 2, (), 1)
+        assert service.derivation_leases.enqueue(identity)
+        assert service.derivation_leases.counts[:2] == (1, 0)
+        assert service._derivation_lease_by_task == {}
+        assert service.derivation_workers_alive()
+        assert service.derivation_drain_progress_token()[0] == 1
+    finally:
+        service.shutdown_parallel_pipeline()
