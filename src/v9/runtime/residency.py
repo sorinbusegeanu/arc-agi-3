@@ -868,16 +868,6 @@ def _install_runtime_contract(runtime_cls: type) -> None:
         manager = getattr(self, "_resident_memory", None)
         if manager is not None:
             result.update(manager.metrics())
-            primary = result.get("primary_dashboard")
-            if isinstance(primary, dict):
-                primary.update({
-                    "M0_resident": result["M0_resident"],
-                    "M1_grounded_resident": result["M1_grounded_resident"],
-                    "compaction_backlog": result["compaction_backlog"],
-                    "process_rss_bytes": result["process_rss_bytes"],
-                    "process_swap_bytes": result["process_swap_bytes"],
-                    "memory_governor_state": result["memory_governor_state"],
-                })
         return result
 
     def full_metrics(self: Any) -> dict[str, Any]:
