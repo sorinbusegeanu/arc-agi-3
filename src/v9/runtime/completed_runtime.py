@@ -213,26 +213,30 @@ class CompletedContinuousMemoryRuntime(_PublicContinuousMemoryRuntime):
         previous = self._previous_interactions(prepared_rows)
         base_results = super().apply_prepared_ingestion_batch(prepared_rows)
         completed: list[tuple[int, ...]] = []
-        family_ids: set[int] = set()
         with self._lock:
             for prepared, base in zip(prepared_rows, base_results):
+                row_family_ids: set[int] = set()
                 self._persist_prepared_occurrences(prepared)
                 for relation in (getattr(prepared, "m1n", None),):
                     if relation is not None:
                         self._register_family_relation(relation)
-                        family_ids.add(int(relation.family_signature or relation.structural_signature))
+                        row_family_ids.add(int(relation.family_signature or relation.structural_signature))
                 for symbol in prepared.symbols:
                     self._register_family_relation(symbol.m1n)
-                    family_ids.add(int(symbol.m1n.family_signature or symbol.m1n.structural_signature))
+                    row_family_ids.add(int(symbol.m1n.family_signature or symbol.m1n.structural_signature))
                     if symbol.aligned_m1n is not None:
                         self._register_family_relation(symbol.aligned_m1n)
-                        family_ids.add(int(symbol.aligned_m1n.family_signature or symbol.aligned_m1n.structural_signature))
+                        row_family_ids.add(int(symbol.aligned_m1n.family_signature or symbol.aligned_m1n.structural_signature))
                 m1g = getattr(prepared, "m1g", None)
                 key = None if m1g is None else (int(m1g.environment_instance_id), int(m1g.episode_id))
-                extra, extra_families = self._derive_prepared_symbolic_relations(prepared, None if key is None else previous.get(key))
-                family_ids.update(extra_families)
+                extra, extra_families = self._derive_prepared_symbolic_relations(
+                    prepared, None if key is None else previous.get(key)
+                )
+                row_family_ids.update(extra_families)
+                # Preserve the same developmental publication boundaries as the
+                # ordered single-event path without delegating ingestion per row.
+                self._develop_shared_families(row_family_ids)
                 completed.append(tuple(base) + tuple(extra))
-            self._develop_shared_families(family_ids)
         return tuple(completed)
 
     def apply_prepared_ingestion(self, prepared: Any) -> tuple[int, ...]:
