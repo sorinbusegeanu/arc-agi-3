@@ -47,7 +47,22 @@ class MetricsHTTPServer:
 
             def do_GET(self) -> None:
                 if self.path in {"/api/metrics", "/metrics"}:
-                    raw = json.dumps(provider(), sort_keys=True, default=str).encode("utf-8")
+                    try:
+                        snapshot = provider()
+                    except Exception as exc:
+                        raw = json.dumps(
+                            {
+                                "dashboard_metrics_error": {
+                                    "type": type(exc).__name__,
+                                    "message": str(exc),
+                                }
+                            },
+                            sort_keys=True,
+                            default=str,
+                        ).encode("utf-8")
+                        self._write(503, "application/json; charset=utf-8", raw)
+                        return
+                    raw = json.dumps(snapshot, sort_keys=True, default=str).encode("utf-8")
                     self._write(200, "application/json; charset=utf-8", raw)
                     return
                 if self.path in {"/", "/dashboard"}:

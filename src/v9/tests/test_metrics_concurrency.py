@@ -57,3 +57,26 @@ def test_dashboard_metrics_tolerate_retirement_between_payload_and_node_removal(
         runtime.close(normal=False)
 
     assert result["m7_strategy_success_rate"] == 0.0
+
+
+class _PublicationLockGuardedDict(dict):
+    def __init__(self, rows, lock) -> None:
+        super().__init__(rows)
+        self._lock = lock
+
+    def items(self):
+        assert self._lock._is_owned(), "metrics traversed canonical graph without publication lock"
+        return super().items()
+
+
+def test_full_metrics_hold_canonical_publication_lock(tmp_path) -> None:
+    runtime = ContinuousMemoryRuntime(
+        RuntimeConfig.from_path(tmp_path, restore=False, enable_snapshots=False)
+    )
+    runtime.graph.nodes = _PublicationLockGuardedDict(
+        runtime.graph.nodes, runtime.graph._publication_lock
+    )
+    try:
+        assert isinstance(runtime.metrics(), dict)
+    finally:
+        runtime.close(normal=False)
