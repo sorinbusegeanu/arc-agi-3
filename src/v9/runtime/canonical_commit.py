@@ -331,7 +331,6 @@ def apply_canonical_commit_batch(
             event = plan.event
             previous_interaction = None
             interaction_retained = False
-            retained_symbol_ids: set[int] = set()
 
             novel_derived = any(
                 int(runtime.signature_support(int(row.relation.structural_signature))) == 0
@@ -512,7 +511,6 @@ def apply_canonical_commit_batch(
                     admission_reason_counts.get(symbol_decision.reason, 0) + 1
                 )
                 if symbol_retained:
-                    retained_symbol_ids.add(id(symbol))
                     plan_deferred_rows.extend(
                         materialized_rows[id(write)] for write in symbol.base_writes
                     )
@@ -690,6 +688,29 @@ def apply_canonical_commit_batch(
         runtime.timeline.actions_committed += timeline_actions_delta
         runtime.timeline.last_ordering_key = last_ordering_key
         runtime.telemetry["events"] += telemetry_events_delta
+        runtime.telemetry["concrete_admission_retained_events"] = int(
+            runtime.telemetry.get("concrete_admission_retained_events", 0)
+        ) + int(concrete_retained_delta)
+        runtime.telemetry["concrete_admission_skipped_events"] = int(
+            runtime.telemetry.get("concrete_admission_skipped_events", 0)
+        ) + int(concrete_skipped_delta)
+        runtime.telemetry["concrete_nodes_avoided"] = int(
+            runtime.telemetry.get("concrete_nodes_avoided", 0)
+        ) + int(concrete_nodes_avoided_delta)
+        for reason, count in admission_reason_counts.items():
+            key = f"concrete_admission_reason_{reason}"
+            runtime.telemetry[key] = int(runtime.telemetry.get(key, 0)) + int(count)
+        concrete_total = int(runtime.telemetry["concrete_admission_retained_events"]) + int(
+            runtime.telemetry["concrete_admission_skipped_events"]
+        )
+        runtime.set_telemetry_gauge(
+            "concrete_admission_retention_rate",
+            float(runtime.telemetry["concrete_admission_retained_events"])
+            / max(1, concrete_total),
+        )
+        runtime.set_telemetry_gauge(
+            "concrete_nodes_avoided", int(runtime.telemetry["concrete_nodes_avoided"])
+        )
         runtime.telemetry["symbol_occurrences"] = int(runtime.telemetry.get("symbol_occurrences", 0)) + symbol_occurrences_delta
         runtime.set_telemetry_gauge("symbol_occurrences_ingested", runtime.telemetry["symbol_occurrences"])
         runtime.set_telemetry_gauge("unique_symbols_batch", len(unique_symbols))
