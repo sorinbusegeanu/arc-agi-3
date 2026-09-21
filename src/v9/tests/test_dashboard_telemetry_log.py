@@ -7,7 +7,7 @@ from urllib.request import urlopen
 
 from v9 import ContinuousMemoryRuntime
 from v9.runtime.config import RuntimeConfig
-from v9.telemetry.http_server import MetricsHTTPServer
+from v9.telemetry.http_server import DASHBOARD_REFRESH_SECONDS, MetricsHTTPServer
 
 
 class _MetricsProvider:
@@ -113,3 +113,7 @@ def test_runtime_dashboard_does_not_call_full_metrics(tmp_path, monkeypatch) -> 
     finally:
         monkeypatch.undo()
         runtime.close()
+
+
+def test_default_dashboard_and_jsonl_refresh_is_30_seconds() -> None:
+    assert DASHBOARD_REFRESH_SECONDS == 30.0
