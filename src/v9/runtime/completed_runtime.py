@@ -423,8 +423,15 @@ class CompletedContinuousMemoryRuntime(_PublicContinuousMemoryRuntime):
         windows: set[tuple[int, int, int]] = set()
         unique_symbols: set[tuple[int, int]] = set()
         phase_counts: dict[str, int] = {}
-        for uid, node in self.graph.nodes.items():
-            payload = self.graph.payloads.get(uid, {})
+        # Canonical publication can mutate graph.nodes/payloads independently
+        # of the runtime lock. Take one immutable graph cut before traversing
+        # the full metrics surface.
+        with self.graph._publication_lock:
+            graph_rows = tuple(
+                (uid, node, dict(self.graph.payloads.get(uid, {})))
+                for uid, node in self.graph.nodes.items()
+            )
+        for uid, node, payload in graph_rows:
             identity = payload.get("symbol_identity")
             if node.level is MemoryLevel.M0 and identity is not None:
                 symbol_nodes.append(uid)
