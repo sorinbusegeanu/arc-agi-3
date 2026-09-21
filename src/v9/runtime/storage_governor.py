@@ -83,6 +83,50 @@ class StorageGovernor:
         self._objects: dict[str, StorageObject] = {}
         self._lock = RLock()
 
+    @staticmethod
+    def _classify(relative: Path) -> DurableStorageClass:
+        parts = relative.parts
+        suffix = relative.suffix.lower()
+        if relative == Path("canonical/commit.wal") or relative.name.startswith("commit.wal"):
+            return DurableStorageClass.WAL
+        if parts[:2] == ("canonical", "chunks"):
+            return DurableStorageClass.CANONICAL_CHUNK
+        if "snapshots" in parts or relative.name.startswith("snapshot-"):
+            return DurableStorageClass.SNAPSHOT
+        if parts[:2] == ("hgt", "training_evidence"):
+            return DurableStorageClass.TRAINING_EVIDENCE
+        if "optimizer" in relative.name.lower():
+            return DurableStorageClass.OPTIMIZER_CHECKPOINT
+        if suffix in {".pt", ".pth", ".safetensors"}:
+            return DurableStorageClass.MODEL_CHECKPOINT
+        if parts and parts[0] == "indexes":
+            return DurableStorageClass.SIGNATURE_INDEX
+        if "cut" in relative.name.lower() or "view" in relative.name.lower():
+            return DurableStorageClass.POLICY_VIEW_MANIFEST
+        return DurableStorageClass.EVALUATION_ARTIFACT
+
+    def reconcile_filesystem(self) -> None:
+        """Rebuild bounded accounting from durable files after restart or writes."""
+        with self._lock:
+            rows: dict[str, StorageObject] = {}
+            for path in sorted(self.root.rglob("*")):
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(self.root)
+                object_id = str(relative)
+                previous = self._objects.get(object_id)
+                rows[object_id] = StorageObject(
+                    object_id,
+                    self._classify(relative),
+                    path,
+                    int(path.stat().st_size),
+                    frozenset() if previous is None else previous.references,
+                    False if previous is None else previous.reclaimable,
+                )
+                if len(rows) > self.max_objects:
+                    raise OverflowError("durable storage object-count ceiling exceeded")
+            self._objects = rows
+
     def register(self, row: StorageObject) -> None:
         path = row.path.resolve()
         if path != self.root and self.root not in path.parents:

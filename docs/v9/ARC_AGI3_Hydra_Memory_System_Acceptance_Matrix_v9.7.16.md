@@ -2,11 +2,10 @@
 
 This is the authoritative migration-status index for acceptance criteria 1-128 in section 31 of the v9.7.16 design. A unit test proves coverage of every criterion number. An \`implemented\` row identifies focused evidence; \`pending\` is intentionally non-accepting and must not be interpreted as complete.
 
-Current cutover state (2026-09-20): the historical baseline is 295 passed in
-368.85 seconds. The last complete expanded-suite gate before the subsequent
-transport, snapshot-crash, and matched-view changes was 390 passed with two
-warnings in 559.15 seconds; those later changes currently have focused evidence
-only. `ScientificConfig.design_version` remains `9.7.9`. Canonical WAL and
+Current cutover state (2026-09-21): the complete expanded v9 suite passes 454
+tests with two warnings after the WAL-evidence, deterministic-training, storage,
+restart-identity, dashboard-concurrency, and matched derivation-cut integrations.
+`ScientificConfig.design_version` remains `9.7.9`. Canonical WAL and
 immutable-root integration are available only behind the explicit
 `RuntimeConfig.enable_canonical_durability` migration gate; the gate remains
 off by default because its fixed-benchmark RAM and throughput requirements have
@@ -102,44 +101,44 @@ criterion implemented.
 | 85 | pending | Phase implementation and acceptance evidence pending |
 | 86 | pending | Phase implementation and acceptance evidence pending |
 | 87 | pending | Phase implementation and acceptance evidence pending |
-| 88 | pending | Phase implementation and acceptance evidence pending |
-| 89 | pending | Phase implementation and acceptance evidence pending |
-| 90 | pending | Phase implementation and acceptance evidence pending |
-| 91 | pending | Phase implementation and acceptance evidence pending |
-| 92 | pending | Phase implementation and acceptance evidence pending |
-| 93 | pending | Phase implementation and acceptance evidence pending |
+| 88 | implemented | src/v9/tests/test_developmental_cut.py; src/v9/tests/test_developmental_cut_operator_coverage.py; src/v9/tests/test_developmental_cut_schedule_independence.py; src/v9/tests/test_parallel_developmental_cut.py |
+| 89 | implemented | src/v9/tests/test_training_cut.py; src/v9/tests/test_hgt_iterative_training.py |
+| 90 | implemented | src/v9/tests/test_training_cut_replay_determinism.py |
+| 91 | implemented | src/v9/tests/test_training_cut_optimizer_count.py; src/v9/tests/test_hgt_iterative_training.py |
+| 92 | implemented | src/v9/tests/test_training_evidence_records.py; src/v9/tests/test_live_canonical_durability.py |
+| 93 | implemented | src/v9/tests/test_training_evidence_restart.py; src/v9/tests/test_training_evidence_segments.py |
 | 94 | implemented | src/v9/tests/test_scientific_identity_determinism.py |
 | 95 | implemented | src/v9/tests/test_scientific_identity_determinism.py |
-| 96 | pending | Phase implementation and acceptance evidence pending |
-| 97 | pending | Phase implementation and acceptance evidence pending |
+| 96 | implemented | src/v9/tests/test_storage_governor.py; src/v9/tests/test_snapshot_handle_consistency.py |
+| 97 | implemented | src/v9/tests/test_storage_governor.py; src/v9/tests/test_hgt_iterative_training.py |
 | 98 | pending | Phase implementation and acceptance evidence pending |
 | 99 | pending | Phase implementation and acceptance evidence pending |
 | 100 | pending | Phase implementation and acceptance evidence pending |
 | 101 | pending | Phase implementation and acceptance evidence pending |
 | 102 | pending | Phase implementation and acceptance evidence pending |
-| 103 | pending | Phase implementation and acceptance evidence pending |
-| 104 | pending | Phase implementation and acceptance evidence pending |
-| 105 | pending | Phase implementation and acceptance evidence pending |
-| 106 | pending | Phase implementation and acceptance evidence pending |
-| 107 | pending | Phase implementation and acceptance evidence pending |
+| 103 | implemented | src/v9/tests/test_h16_grounding_conditions.py; src/v9/tests/test_h16_bidirectional_transfer.py |
+| 104 | implemented | src/v9/tests/test_h16_c3_alignment_destroyed.py; src/v9/tests/test_h16_c3_no_metadata_leak.py |
+| 105 | implemented | src/v9/tests/test_h16_bidirectional_transfer.py |
+| 106 | implemented | src/v9/tests/test_scientific_modes.py; src/v9/tests/test_h17_async_development.py |
+| 107 | implemented | src/v9/tests/test_h17_async_development.py |
 | 108 | pending | Phase implementation and acceptance evidence pending |
 | 109 | pending | Phase implementation and acceptance evidence pending |
-| 110 | pending | Phase implementation and acceptance evidence pending |
-| 111 | pending | Phase implementation and acceptance evidence pending |
-| 112 | pending | Phase implementation and acceptance evidence pending |
-| 113 | pending | Phase implementation and acceptance evidence pending |
-| 114 | pending | Phase implementation and acceptance evidence pending |
-| 115 | pending | Phase implementation and acceptance evidence pending |
+| 110 | implemented | src/v9/tests/test_trial_manifest.py; src/v9/tests/test_h19_unused_horizon_discard.py |
+| 111 | implemented | src/v9/tests/test_h19_no_adaptive_budget_confounds.py; src/v9/tests/test_h19_unused_horizon_discard.py |
+| 112 | pending | Model-only control is declared but lacks integrated execution evidence |
+| 113 | implemented | src/v9/tests/test_developmental_milestone_ledger.py; src/v9/tests/test_training_evidence_records.py |
+| 114 | implemented | src/v9/tests/test_prediction_registry.py |
+| 115 | implemented | src/v9/tests/test_prediction_registry.py |
 | 116 | pending | Phase implementation and acceptance evidence pending |
 | 117 | pending | Phase implementation and acceptance evidence pending |
 | 118 | pending | Phase implementation and acceptance evidence pending |
-| 119 | pending | Phase implementation and acceptance evidence pending |
-| 120 | pending | Phase implementation and acceptance evidence pending |
-| 121 | pending | Phase implementation and acceptance evidence pending |
-| 122 | pending | Phase implementation and acceptance evidence pending |
-| 123 | pending | Phase implementation and acceptance evidence pending |
-| 124 | pending | Phase implementation and acceptance evidence pending |
-| 125 | pending | Phase implementation and acceptance evidence pending |
-| 126 | pending | Phase implementation and acceptance evidence pending |
-| 127 | pending | Phase implementation and acceptance evidence pending |
-| 128 | pending | Phase implementation and acceptance evidence pending |
+| 119 | implemented | src/v9/tests/test_h17_async_development.py; src/v9/tests/test_scientific_modes.py |
+| 120 | implemented | src/v9/tests/test_training_evidence_records.py; src/v9/tests/test_hgt_iterative_training.py |
+| 121 | implemented | src/v9/tests/test_canonical_store.py; src/v9/tests/test_canonical_handle_atomicity.py; src/v9/tests/test_snapshot_handle_consistency.py |
+| 122 | implemented | src/v9/tests/test_canonical_continuation_fragments.py; src/v9/tests/test_canonical_fragment_visibility.py |
+| 123 | pending | H18 transform is unit-tested but is not yet enforced at every adapter boundary |
+| 124 | pending | H18 anti-leak transforms are unit-tested but are not yet enforced at every adapter boundary |
+| 125 | implemented | src/v9/tests/test_trial_manifest.py; src/v9/tests/test_h19_unused_horizon_discard.py |
+| 126 | implemented | src/v9/tests/test_h16_c3_alignment_destroyed.py; src/v9/tests/test_h16_c3_no_metadata_leak.py |
+| 127 | implemented | src/v9/tests/test_prediction_registry.py |
+| 128 | implemented | src/v9/tests/test_training_cut_kernel_fallback.py; src/v9/tests/test_hgt_iterative_training.py |

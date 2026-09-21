@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +42,10 @@ from v9.mutation.read_sets import ReadDependency, ReadSet
 from v9.research.evidence import EvidenceLedger
 from v9.research.hypotheses import untested_assessment
 from v9.research.reports import write_report
+from v9.research.prediction_registry import (
+    DevelopmentalMilestoneLedger,
+    ResearchPredictionRegistry,
+)
 from v9.telemetry import (
     ConsolidationSample,
     HGTInferenceSample,
@@ -70,6 +75,13 @@ from .read_view import ReadView
 from .rings import MultimodalTimeline
 from .signature_index import PersistentDirtySignatureWindow, SignatureIndexStore
 from .snapshot_backend import SnapshotResult, assert_native_root, latest_snapshot, load_snapshot, load_snapshot_direct, load_graph_shard, decode_graph_shard, write_snapshot
+from .storage_governor import DurableStorageClass, StorageGovernor
+from .training_evidence import (
+    TrainingEvidenceKind,
+    TrainingEvidenceManifest,
+    TrainingEvidenceMaterializer,
+    TrainingEvidenceRecord,
+)
 
 
 class ContinuousMemoryRuntime:
@@ -82,6 +94,23 @@ class ContinuousMemoryRuntime:
             raise ValueError("v9.5 does not rewrite an existing identity history; choose a fresh --root")
         assert_native_root(self.root)
         write_scientific_config_manifest(self.root, config.scientific)
+        self.storage_governor = StorageGovernor(
+            self.root,
+            class_ceilings={
+                kind: int(config.durable_storage_class_ceiling_bytes)
+                for kind in DurableStorageClass
+            },
+            aggregate_ceiling=int(config.durable_storage_aggregate_ceiling_bytes),
+            soft_fraction=float(config.durable_storage_soft_fraction),
+            minimum_free_bytes=int(config.durable_storage_minimum_free_bytes),
+            minimum_free_fraction=float(config.durable_storage_minimum_free_fraction),
+            max_objects=int(config.durable_storage_max_objects),
+        )
+        self.storage_governor.reconcile_filesystem()
+        self.research_predictions = ResearchPredictionRegistry()
+        self.developmental_milestones = DevelopmentalMilestoneLedger(
+            self.root / "research" / "developmental_milestones.jsonl"
+        )
         self.partitions = PartitionMap(config.shards)
         self.graph = CanonicalGraph(config.shards, node_capacity_per_partition=config.node_capacity_per_shard, edge_capacity_per_partition=config.edge_capacity_per_shard, applied_proposal_capacity=config.action_capacity_per_shard * config.shards)
         scientific = config.scientific
@@ -89,6 +118,7 @@ class ContinuousMemoryRuntime:
         self.developmental_mutation_gate = DevelopmentalMutationGate(
             scientific.scientific_visibility_mode
         )
+        self._deferred_derivation_results: dict[int, Any] = {}
         self._active_developmental_cut_session: DevelopmentalCutSession | None = None
         self.timeline = MultimodalTimeline(capacity=scientific.passive_event_queue_depth, symbol_budget=scientific.symbol_budget_per_window, symbol_payload_bytes=scientific.symbol_payload_bytes)
         self.environments = EnvironmentRegistry()
@@ -228,9 +258,23 @@ class ContinuousMemoryRuntime:
                 ),
             )
         if complete:
-            store = CanonicalStore.from_snapshot(
-                complete[-1], expected_scientific_identity=identity
-            )
+            try:
+                store = CanonicalStore.from_snapshot(
+                    complete[-1], expected_scientific_identity=identity
+                )
+            except ValueError as exc:
+                from .scientific_modes import ScientificVisibilityMode
+
+                if (
+                    self.config.scientific.scientific_visibility_mode
+                    is ScientificVisibilityMode.MATCHED_REASONING
+                    or "identity mismatch" not in str(exc)
+                ):
+                    raise
+                store = CanonicalStore.from_snapshot(
+                    complete[-1],
+                    expected_scientific_identity=self._legacy_canonical_scientific_identity(),
+                )
             store.enable_disk_backing(self.root / "canonical" / "chunks", resident_chunk_limit=0)
         recovery = self.canonical_wal.recover(truncate=True)
         if store.current_handle.canonical_applied_lsn > recovery.wal_durable_lsn:
@@ -238,7 +282,14 @@ class ContinuousMemoryRuntime:
         for frame in recovery.frames:
             if frame.wal_lsn <= store.current_handle.canonical_applied_lsn:
                 continue
-            if frame.scientific_identity != identity:
+            accepted_identities = (identity,)
+            from .scientific_modes import ScientificVisibilityMode
+            if (
+                self.config.scientific.scientific_visibility_mode
+                is ScientificVisibilityMode.ASYNC_DEVELOPMENT
+            ):
+                accepted_identities += (self._legacy_canonical_scientific_identity(),)
+            if frame.scientific_identity not in accepted_identities:
                 raise RuntimeError("canonical WAL contains a different scientific identity")
             overlay = store.begin_overlay(
                 frame.wal_lsn,
@@ -268,12 +319,40 @@ class ContinuousMemoryRuntime:
         self.canonical_wal.register_durable_consumer(
             "hgt_training_evidence", self._hgt_checkpoint_lsn
         )
-        self._hgt_checkpoint_lsn = self.canonical_wal.durable_consumer_checkpoint(
+        consumer_checkpoint = self.canonical_wal.durable_consumer_checkpoint(
             "hgt_training_evidence"
         )
+        self.training_evidence = TrainingEvidenceMaterializer(
+            self.root / "hgt" / "training_evidence"
+        )
+        manifested_checkpoint = self.training_evidence.manifest.hgt_checkpoint_lsn
+        if manifested_checkpoint > recovery.wal_durable_lsn:
+            raise RuntimeError("training-evidence manifest is ahead of durable WAL")
+        if consumer_checkpoint > manifested_checkpoint:
+            raise RuntimeError("HGT WAL consumer is ahead of its training-evidence manifest")
+        if manifested_checkpoint > consumer_checkpoint:
+            self.canonical_wal.update_durable_consumer(
+                "hgt_training_evidence", manifested_checkpoint
+            )
+        self._hgt_checkpoint_lsn = manifested_checkpoint
         self.graph.configure_durable_commit(self._commit_canonical_graph_update)
 
     def _canonical_scientific_identity(self) -> dict[str, str]:
+        identity = {
+            "scientific_config_id": self.config.scientific.config_id.value,
+            "design_version": self.config.scientific.design_version,
+            "visibility_mode": self.config.scientific.scientific_visibility_mode.value,
+            "learned_developmental_feedback": self.config.scientific.learned_developmental_feedback.value,
+        }
+        if self.config.experiment_manifest is not None:
+            from v9.research.experiment_manifest import ExperimentManifest
+
+            identity["experiment_manifest_id"] = ExperimentManifest.load(
+                self.config.experiment_manifest
+            ).manifest_id.value
+        return identity
+
+    def _legacy_canonical_scientific_identity(self) -> dict[str, str]:
         return {
             "scientific_config_id": self.config.scientific.config_id.value,
             "design_version": self.config.scientific.design_version,
@@ -298,8 +377,104 @@ class ContinuousMemoryRuntime:
         if not hasattr(self, "canonical_wal"):
             raise RuntimeError("canonical durability migration gate is not enabled")
         selected = int(checkpoint_lsn)
+        if hasattr(self, "training_evidence") and selected > self.training_evidence.manifest.hgt_checkpoint_lsn:
+            start_lsn = self.training_evidence.manifest.hgt_checkpoint_lsn + 1
+            frames = tuple(
+                frame
+                for frame in self.canonical_wal.recover(truncate=True).frames
+                if start_lsn <= frame.wal_lsn <= selected
+            )
+            if tuple(frame.wal_lsn for frame in frames) != tuple(range(start_lsn, selected + 1)):
+                raise RuntimeError("retained WAL does not cover the requested HGT checkpoint")
+            records = tuple(
+                TrainingEvidenceRecord.from_dict(raw)
+                for frame in frames
+                for raw in frame.training_evidence_records
+            )
+            self.training_evidence.materialize(
+                start_lsn=start_lsn,
+                end_lsn=selected,
+                records=records,
+                wal_durable_lsn=self.canonical_wal.wal_durable_lsn,
+            )
         self.canonical_wal.update_durable_consumer("hgt_training_evidence", selected)
         self._hgt_checkpoint_lsn = selected
+
+    def materialize_training_evidence(self) -> TrainingEvidenceManifest | None:
+        """Atomically materialize the next contiguous durable WAL evidence cut."""
+        if not hasattr(self, "training_evidence"):
+            return None
+        start_lsn = self.training_evidence.manifest.hgt_checkpoint_lsn + 1
+        end_lsn = self.canonical_wal.wal_durable_lsn
+        if start_lsn > end_lsn:
+            return self.training_evidence.manifest
+        frames = tuple(
+            frame
+            for frame in self.canonical_wal.recover(truncate=True).frames
+            if start_lsn <= frame.wal_lsn <= end_lsn
+        )
+        if tuple(frame.wal_lsn for frame in frames) != tuple(range(start_lsn, end_lsn + 1)):
+            raise RuntimeError("retained WAL does not cover the next training-evidence cut")
+        records = tuple(
+            TrainingEvidenceRecord.from_dict(raw)
+            for frame in frames
+            for raw in frame.training_evidence_records
+        )
+        manifest = self.training_evidence.materialize(
+            start_lsn=start_lsn,
+            end_lsn=end_lsn,
+            records=records,
+            wal_durable_lsn=end_lsn,
+        )
+        self.canonical_wal.update_durable_consumer(
+            "hgt_training_evidence", manifest.hgt_checkpoint_lsn
+        )
+        self._hgt_checkpoint_lsn = manifest.hgt_checkpoint_lsn
+        self.set_telemetry_gauge(
+            "training_evidence_manifest_checksum", manifest.checksum
+        )
+        self.set_telemetry_gauge("training_evidence_records", len(records))
+        self._record_developmental_milestones(records)
+        return manifest
+
+    def _record_developmental_milestones(
+        self, records: tuple[TrainingEvidenceRecord, ...]
+    ) -> None:
+        kind_by_level_type = {
+            (1, int(MemoryType.GROUNDED_CONTINGENCY)): "contingency",
+            (1, int(MemoryType.NORMALIZED_RELATION)): "carrier",
+            (2, int(MemoryType.FAMILY)): "family",
+            (3, int(MemoryType.ROLE)): "role",
+            (4, int(MemoryType.CONCEPT)): "concept_candidate",
+            (5, int(MemoryType.CONSEQUENCE)): "m5_consequence",
+            (6, int(MemoryType.OUTCOME)): "m6_outcome",
+            (7, int(MemoryType.STRATEGY)): "m7_strategy",
+        }
+        for record in records:
+            level = record.label_payload.get("memory_level")
+            memory_type = record.label_payload.get("memory_type")
+            milestone = kind_by_level_type.get(
+                (int(level), int(memory_type))
+            ) if level is not None and memory_type is not None else None
+            labels = dict(record.label_payload.get("labels", {}))
+            candidates = [] if milestone is None else [milestone]
+            if (
+                record.kind is TrainingEvidenceKind.INTERACTION
+                and abs(float(record.label_payload.get("future_option_delta", 0.0))) > 0.0
+            ):
+                candidates.append("future_option_motif")
+            if milestone == "concept_candidate" and bool(labels.get("validated")):
+                candidates.append("validated_concept")
+            if milestone == "m7_strategy":
+                candidates.append("planning_replanning_effectiveness")
+            for selected in candidates:
+                self.developmental_milestones.record_first(
+                    kind=selected,
+                    scientific_evidence_id=record.evidence_id.value,
+                    canonical_generation=int(self.canonical_state_handle.generation),
+                    canonical_lsn=int(record.source_wal_lsn),
+                    evidence_artifact=str(self.training_evidence.manifest_path),
+                )
 
     def reclaim_canonical_wal(self) -> int:
         if not hasattr(self, "canonical_wal"):
@@ -326,6 +501,155 @@ class ContinuousMemoryRuntime:
             "authority": edge.authority.value,
             "object_version": int(edge.object_version),
         }
+
+    def _training_records_for_canonical_update(
+        self,
+        *,
+        target_lsn: int,
+        proposal: MutationProposal,
+        node_updates: dict[MemoryUid, tuple[CanonicalNode, dict[str, Any]]],
+        node_deletes: dict[MemoryUid, CanonicalNode],
+    ) -> tuple[TrainingEvidenceRecord, ...]:
+        records: list[TrainingEvidenceRecord] = []
+
+        def append(
+            kind: TrainingEvidenceKind,
+            uid: MemoryUid,
+            node: CanonicalNode,
+            payload: dict[str, Any],
+            *,
+            interaction: bool = False,
+        ) -> None:
+            provenance: dict[str, object] = {
+                "scientific_config_id": self.config.scientific.config_id.value,
+                "memory_uid": uid.hex(),
+                "proposal_uid": int(proposal.proposal_uid),
+                "label_kind": kind.value,
+            }
+            if interaction:
+                provenance.update(
+                    {
+                        "producer_id": int(payload.get("actor_id", 0)),
+                        "producer_sequence": int(payload["producer_sequence"]),
+                        "sampling_branch": str(payload.get("sampling_branch", "")),
+                    }
+                )
+                label_payload = {
+                    key: payload[key]
+                    for key in (
+                        "environment_identity",
+                        "game_scenario",
+                        "actor_id",
+                        "producer_sequence",
+                        "sampling_branch",
+                        "episode_id",
+                        "global_step",
+                        "before_signature",
+                        "after_signature",
+                        "action_id",
+                        "primary_valence",
+                        "future_option_delta",
+                        "task_success",
+                        "task_failure",
+                        "task_truncated",
+                        "level_index",
+                        "levels_completed",
+                    )
+                    if key in payload
+                }
+            else:
+                canonical_payload = canonical_value(payload)
+                label_keys = (
+                    "relation",
+                    "observable_relation",
+                    "channel",
+                    "structural_signature",
+                    "relational_signature",
+                    "consequence_signature",
+                    "invariant_descriptor",
+                    "descriptor",
+                    "class_signature",
+                    "support",
+                    "contradiction",
+                    "compression_benefit",
+                    "explanatory_reach",
+                    "validated",
+                    "mature",
+                    "equivalence_trials",
+                    "equivalence_successes",
+                    "reliability_trials",
+                    "reliability_successes",
+                    "primary_valence_sum",
+                    "realized_cost_sum",
+                    "retired",
+                )
+                label_payload = {
+                    "memory_level": int(node.level),
+                    "memory_type": int(node.memory_type),
+                    "labels": {
+                        key: canonical_payload[key]
+                        for key in label_keys
+                        if key in canonical_payload
+                    },
+                    "payload_checksum": hashlib.sha256(
+                        json.dumps(
+                            canonical_payload,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                }
+            records.append(
+                TrainingEvidenceRecord.create(
+                    kind=kind,
+                    source_wal_lsn=target_lsn,
+                    scientific_provenance=provenance,
+                    schema_versions={
+                        "training_evidence": 1,
+                        "canonical_graph": int(self.graph.SCHEMA_VERSION),
+                    },
+                    label_payload=label_payload,
+                )
+            )
+
+        for uid, (node, payload) in sorted(node_updates.items()):
+            if (
+                node.level is MemoryLevel.M0
+                and "producer_sequence" in payload
+                and payload.get("symbol_identity") is None
+            ):
+                append(TrainingEvidenceKind.INTERACTION, uid, node, payload, interaction=True)
+            elif node.level is MemoryLevel.M1:
+                kind = (
+                    TrainingEvidenceKind.GROUNDING
+                    if node.memory_type is MemoryType.GROUNDED_CONTINGENCY
+                    else TrainingEvidenceKind.DERIVATION
+                )
+                append(kind, uid, node, payload)
+                if bool(payload.get("heldout_transfer")):
+                    append(TrainingEvidenceKind.INVARIANCE, uid, node, payload)
+            elif node.level in {MemoryLevel.M2, MemoryLevel.M3}:
+                append(TrainingEvidenceKind.MEMORY_FORMATION, uid, node, payload)
+                append(TrainingEvidenceKind.DERIVATION, uid, node, payload)
+            elif node.level is MemoryLevel.M4:
+                append(TrainingEvidenceKind.INVARIANCE, uid, node, payload)
+                if bool(payload.get("validated")):
+                    append(TrainingEvidenceKind.TRANSFER, uid, node, payload)
+            elif node.level is MemoryLevel.M5:
+                append(TrainingEvidenceKind.TRANSITION_CONSEQUENCE, uid, node, payload)
+            elif node.level is MemoryLevel.M6:
+                append(TrainingEvidenceKind.DELAYED_OUTCOME, uid, node, payload)
+            elif node.level is MemoryLevel.M7:
+                append(TrainingEvidenceKind.STRATEGY_RANKING, uid, node, payload)
+                append(TrainingEvidenceKind.REASONING_TRACE, uid, node, payload)
+        for uid, node in sorted(node_deletes.items()):
+            append(
+                TrainingEvidenceKind.CONSOLIDATION,
+                uid,
+                node,
+                {"retired": True},
+            )
+        return tuple(records)
 
     def _commit_canonical_graph_update(
         self,
@@ -376,6 +700,12 @@ class ContinuousMemoryRuntime:
                 put(CanonicalCollection.GRAPH, store_key, value)
                 if edge.relation is RelationType.PROVENANCE:
                     put(CanonicalCollection.PROVENANCE_INDEX, store_key, value)
+        training_records = self._training_records_for_canonical_update(
+            target_lsn=target_lsn,
+            proposal=proposal,
+            node_updates=node_updates,
+            node_deletes=node_deletes,
+        )
         try:
             self.canonical_wal.commit_overlay(
                 self.canonical_store,
@@ -383,6 +713,9 @@ class ContinuousMemoryRuntime:
                 transaction_id=f"proposal-{int(proposal.proposal_uid):016x}",
                 frame_payload={
                     "mutations": tuple(mutations),
+                    "training_evidence_records": tuple(
+                        record.as_dict() for record in training_records
+                    ),
                     "scientific_identity": self._canonical_scientific_identity(),
                     "work_metadata": {
                         "rows": len(node_updates) + len(edge_updates),
@@ -503,6 +836,32 @@ class ContinuousMemoryRuntime:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return
+        from .scientific_modes import ScientificVisibilityMode
+
+        manifest_identity = {
+            key: str(manifest[key])
+            for key in (
+                "scientific_config_id",
+                "visibility_mode",
+                "learned_developmental_feedback",
+                "experiment_manifest_id",
+            )
+            if manifest.get(key) is not None
+        }
+        if manifest_identity:
+            expected_hgt_identity = {
+                key: value
+                for key, value in self._canonical_scientific_identity().items()
+                if key != "design_version"
+            }
+            if manifest_identity != expected_hgt_identity:
+                raise RuntimeError("HGT checkpoint scientific identity mismatch")
+        elif getattr(
+            getattr(getattr(self, "config", None), "scientific", None),
+            "scientific_visibility_mode",
+            ScientificVisibilityMode.ASYNC_DEVELOPMENT,
+        ) is ScientificVisibilityMode.MATCHED_REASONING:
+            raise RuntimeError("matched HGT checkpoint has no scientific identity")
         pending = manifest.get("candidate_status") == "TESTING_PENDING_BEHAVIOR" and manifest.get("candidate_model_version")
         version = manifest.get("candidate_model_version") if pending else (manifest.get("last_accepted_model_version") or manifest.get("current_model_version"))
         checkpoint_rel = (
@@ -870,6 +1229,10 @@ class ContinuousMemoryRuntime:
     def start(self) -> None:
         if self._closed:
             raise RuntimeError("runtime is closed")
+        self.storage_governor.reconcile_filesystem()
+        storage_status = self.storage_governor.status()
+        if not storage_status.actor_admission_allowed:
+            raise RuntimeError("durable storage hard pressure prevents actor admission")
         self._started = True
 
     def reserve_producer_sequence(self, producer_id: int, proposed_sequence: int) -> int:
@@ -1471,6 +1834,7 @@ class ContinuousMemoryRuntime:
                 )
 
     def flush_deferred_memory_updates(self) -> None:
+        self.flush_deferred_derivation_results()
         # Freeze a complete developmental cut, do pure CPU work outside the runtime
         # lock, and publish only if the authoritative cut is still current.
         for _attempt in range(3):
@@ -1848,8 +2212,53 @@ class ContinuousMemoryRuntime:
                 )
 
     def apply_derivation_results_batch(self, results) -> None:
-        for result in tuple(results):
+        rows = tuple(results)
+        from .scientific_modes import ScientificVisibilityMode
+
+        if (
+            self.config.scientific.scientific_visibility_mode
+            is ScientificVisibilityMode.MATCHED_REASONING
+            and not self.developmental_mutation_gate.cut_active
+        ):
+            ceiling = int(self.config.scientific.proposal_queue_depth)
+            for result in rows:
+                signature = int(result.structural_signature)
+                if (
+                    signature not in self._deferred_derivation_results
+                    and len(self._deferred_derivation_results) >= ceiling
+                ):
+                    raise OverflowError(
+                        "matched developmental derivation proposal ceiling exceeded"
+                    )
+                self._deferred_derivation_results[signature] = result
+            self.set_telemetry_gauge(
+                "deferred_developmental_derivations",
+                len(self._deferred_derivation_results),
+            )
+            return
+        for result in rows:
             self.apply_derivation_result(result)
+
+    def flush_deferred_derivation_results(self) -> int:
+        if not self._deferred_derivation_results:
+            return 0
+        self.developmental_mutation_gate.assert_publication_allowed()
+        rows = tuple(
+            self._deferred_derivation_results[signature]
+            for signature in sorted(self._deferred_derivation_results)
+        )
+        self._deferred_derivation_results.clear()
+        try:
+            for result in rows:
+                self.apply_derivation_result(result)
+        except BaseException:
+            for result in rows:
+                self._deferred_derivation_results.setdefault(
+                    int(result.structural_signature), result
+                )
+            raise
+        self.set_telemetry_gauge("deferred_developmental_derivations", 0)
+        return len(rows)
 
     def _derive_tasks_parallel(self, tasks):
         from v9.runtime.memory_pipeline import derive_memory
@@ -2131,6 +2540,9 @@ class ContinuousMemoryRuntime:
             self._restore(captured)
 
     def snapshot(self) -> SnapshotResult:
+        self.storage_governor.reconcile_filesystem()
+        if not self.storage_governor.status().checkpoint_creation_allowed:
+            raise RuntimeError("durable storage pressure prevents snapshot creation")
         with self._lock:
             self.wait_quiescent()
             self.flush_deferred_memory_updates()
@@ -2144,6 +2556,7 @@ class ContinuousMemoryRuntime:
         try:
             result = write_snapshot(self.root, fixed_cut, snapshot_id=snapshot_id, watermark=watermark, graph_generation=generation, scientific_config_id=self.config.scientific.config_id.value)
             self.write_canonical_snapshot(snapshot_id)
+            self.storage_governor.reconcile_filesystem()
             return result
         except BaseException:
             with self._lock:
@@ -2437,10 +2850,16 @@ class ContinuousMemoryRuntime:
         )
         validated_transfers = sum(row.successes for row in self.transfer_trust.records.values())
         prediction_observations = self.telemetry["symbol_conditioned_prediction_observations"]
+        # Canonical retirement removes node and payload entries separately while
+        # holding the graph publication lock. Dashboard metrics use the runtime
+        # lock, so under free-threaded Python they may observe that bounded
+        # intermediate state. An orphan payload is never actor-visible and must
+        # simply be absent from this metrics cut rather than killing telemetry.
         strategy_payloads = [
             payload
-            for uid, payload in self.graph.payloads.items()
-            if self.graph.nodes[uid].level is MemoryLevel.M7
+            for uid, payload in tuple(self.graph.payloads.items())
+            if (node := self.graph.nodes.get(uid)) is not None
+            and node.level is MemoryLevel.M7
         ]
         strategy_trials = sum(int(row.get("reliability_trials", 0)) for row in strategy_payloads)
         strategy_successes = sum(int(row.get("reliability_successes", 0)) for row in strategy_payloads)
@@ -2451,6 +2870,7 @@ class ContinuousMemoryRuntime:
         preference_outcomes = [o for o in self._m6.values() if o.preference_trials > 0]
         validated_m4 = sum(bool(row.validated) for row in self._m4.values())
         diagnostic = self.unified_telemetry.diagnostic_metrics()
+        storage_status = self.storage_governor.status()
         retired = int(diagnostic.get("hydra_nodes_retired", 0))
         replaced = int(diagnostic.get("hydra_nodes_replaced_by_abstractions", 0))
         total_memories = sum(counts.values())
@@ -2508,6 +2928,12 @@ class ContinuousMemoryRuntime:
             "persistent_consolidated_bytes": persistent_bytes,
             "persistent_memory_growth_ratio": total_memories / max(1, self.telemetry["events"]),
             "compression_ratio": compression_ratio,
+            "durable_storage_state": storage_status.state.value,
+            "durable_storage_bytes": storage_status.aggregate_bytes,
+            "durable_storage_ceiling_bytes": storage_status.aggregate_ceiling,
+            "durable_storage_bytes_by_class": dict(storage_status.bytes_by_class),
+            "filesystem_free_bytes": storage_status.filesystem_free_bytes,
+            "filesystem_free_fraction": storage_status.filesystem_free_fraction,
             "m4_validated": validated_m4,
             "m7_strategy_success_rate": strategy_successes / max(1, strategy_trials),
             "success_rate": float(diagnostic.get("behavioral_success_rate", 0.0)),
@@ -2553,6 +2979,12 @@ class ContinuousMemoryRuntime:
                 "metrics": self.metrics(),
                 "hypotheses": self.scientific_statuses(),
                 "hypothesis_assessments": assessments,
+                "research_prediction_registry": [
+                    asdict(row) for row in self.research_predictions.definitions
+                ],
+                "developmental_milestones": [
+                    asdict(row) for row in self.developmental_milestones.records
+                ],
                 "scientific_config": self.config.scientific.as_dict(),
             },
         )

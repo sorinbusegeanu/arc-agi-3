@@ -6,15 +6,21 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from .epoch_dataset import transition_training_rows, action_ranking_pairs
+from .epoch_dataset import (
+    action_ranking_pairs,
+    transition_training_rows,
+    transition_training_rows_from_records,
+)
 from .grounding_objectives import GROUNDING_OBJECTIVES
 from typing import Any
 
 from v9.memory.model import MemoryLevel
 from v9.memory.relations import RelationType
 from v9.telemetry import HGTTrainingSample, ModelEvolutionSample, read_gpu_snapshot
+from v9.runtime.scientific_modes import ScientificVisibilityMode
+from .training_cut import TrainingCut, TrainingDeterminismMode
 
 # Authoritative on-disk tensor/objective schema. Checkpoint compatibility must
 # not depend on which runtime installer happened to be imported first.
@@ -967,11 +973,20 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         examples = int(getattr(getattr(runtime, "graph", None), "memory_count", lambda: 0)())
         return HGTTrainingResult(epoch, "SKIPPED_DEPENDENCY", runtime.unified_telemetry.model_version, None, 0.0, 0.0, examples, 0, None)
     config = runtime.config.scientific
+    matched_reasoning = (
+        config.scientific_visibility_mode is ScientificVisibilityMode.MATCHED_REASONING
+    )
+    deterministic_seed = int(config.random_seeds[0]) + int(epoch) * 1_000_003
+    if matched_reasoning:
+        torch.manual_seed(deterministic_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(deterministic_seed)
+        torch.use_deterministic_algorithms(True)
     memory_node_budget = max(64, int(config.hgt_max_subgraph_nodes * float(_budget_scale)))
     canonical_edge_budget = max(256, int(config.hgt_max_subgraph_edges * float(_budget_scale)))
     total_node_budget = max(memory_node_budget, int(config.hgt_max_total_nodes * float(_budget_scale)))
     total_edge_budget = max(canonical_edge_budget, int(config.hgt_max_total_edges * float(_budget_scale)))
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not matched_reasoning:
         torch.cuda.empty_cache()
         free_bytes, total_bytes = torch.cuda.mem_get_info()
         # The previous run peaked around half of a 16 GB card. Expand the
@@ -994,8 +1009,40 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             total_node_budget = max(memory_node_budget, int(total_node_budget * pressure))
             total_edge_budget = max(canonical_edge_budget, int(total_edge_budget * pressure))
             runtime.set_telemetry_gauge("hgt_vram_preflight_shedding_factor", float(pressure))
-    epoch_dataset_path = getattr(runtime, "_hgt_training_dataset_path", None)
-    epoch_transition_rows = transition_training_rows(epoch_dataset_path) if epoch_dataset_path and Path(epoch_dataset_path).exists() else []
+    evidence_materializer = getattr(runtime, "training_evidence", None)
+    evidence_branch = str(getattr(runtime, "_hgt_training_evidence_branch", ""))
+    selected_evidence_records = ()
+    if evidence_materializer is not None and evidence_branch:
+        selected_evidence_records = tuple(
+            sorted(
+                (
+                    record
+                    for record in evidence_materializer.records()
+                    if record.kind.value == "interaction"
+                    and str(record.label_payload.get("sampling_branch", "")) == evidence_branch
+                ),
+                key=lambda record: (
+                    str(record.label_payload.get("game_scenario", "")),
+                    int(record.label_payload.get("actor_id", 0)),
+                    int(record.label_payload.get("episode_id", 0)),
+                    int(record.label_payload.get("global_step", 0)),
+                    int(record.label_payload.get("producer_sequence", 0)),
+                    record.evidence_id.value,
+                ),
+            )
+        )
+        epoch_transition_rows = transition_training_rows_from_records(
+            (dict(record.label_payload) for record in selected_evidence_records),
+            max_rows=int(config.hgt_transition_chunk_rows),
+            active_episode_limit=int(config.hgt_active_episode_limit),
+        )
+        runtime.set_telemetry_gauge("hgt_training_evidence_authority", "canonical_wal")
+    else:
+        # Explicit legacy migration path for v9.7.8/v9.7.9 roots that predate
+        # WAL-embedded TrainingEvidenceRecords.
+        epoch_dataset_path = getattr(runtime, "_hgt_training_dataset_path", None)
+        epoch_transition_rows = transition_training_rows(epoch_dataset_path) if epoch_dataset_path and Path(epoch_dataset_path).exists() else []
+        runtime.set_telemetry_gauge("hgt_training_evidence_authority", "legacy_epoch_jsonl")
     epoch_ranking_pairs = action_ranking_pairs(epoch_transition_rows) if epoch_transition_rows else []
     transition_train_rows = list(epoch_transition_rows)
     runtime.set_telemetry_gauge("hgt_training_dataset_transitions", len(epoch_transition_rows))
@@ -1074,22 +1121,23 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     training_examples = _masked_count(train_masks, action_masks)
     if training_examples <= 0:
         return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, None, 0.0, 0.0, action_examples, 0, None)
-    dynamic_training_steps = max(
+    dynamic_training_steps = int(training_epochs) if matched_reasoning else max(
         int(training_epochs),
         min(64, max(1, int(math.ceil(training_examples / 2048.0)))),
     )
+    stream_batch_size = max(64, min(2048, int(getattr(config, "hgt_epoch_batch_size", 512))))
     if epoch_transition_rows:
-        stream_batch_size = max(64, min(2048, int(getattr(config, "hgt_epoch_batch_size", 512))))
         full_dataset_steps = math.ceil(len(epoch_transition_rows) / stream_batch_size)
-        dynamic_training_steps = max(int(dynamic_training_steps), int(full_dataset_steps))
+        if not matched_reasoning:
+            dynamic_training_steps = max(int(dynamic_training_steps), int(full_dataset_steps))
         runtime.set_telemetry_gauge("hgt_training_batches", int(full_dataset_steps))
         runtime.set_telemetry_gauge("hgt_training_coverage_planned", 1.0)
     runtime.set_telemetry_gauge("hgt_dynamic_training_steps", int(dynamic_training_steps))
     runtime.set_telemetry_gauge("hgt_training_examples_current", int(training_examples))
     runtime.set_telemetry_gauge("hgt_examples_per_training_step_target", 2048)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
+    device = torch.device("cpu" if matched_reasoning else ("cuda" if torch.cuda.is_available() else "cpu"))
+    if torch.cuda.is_available() and not matched_reasoning:
         torch.cuda.reset_peak_memory_stats()
     model_dir = Path(root) / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -1103,6 +1151,45 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     parent_checkpoint = manifest.get("current_checkpoint") if parent_version else None
     if parent_version and not parent_checkpoint:
         parent_checkpoint = f"models/{parent_version}.pt"
+    if matched_reasoning:
+        from v9.research.experiment_manifest import ExperimentManifest
+
+        experiment = ExperimentManifest.load(runtime.config.experiment_manifest)
+        evidence_checksum = (
+            evidence_materializer.manifest.checksum
+            if evidence_materializer is not None
+            else "0" * 64
+        )
+        training_cut = TrainingCut(
+            evidence_checksum,
+            tuple(record.evidence_id.value for record in selected_evidence_records),
+            (("model", deterministic_seed), ("replay", deterministic_seed + 1)),
+            (("learning_rate", format(float(learning_rate), ".17g")),),
+            int(dynamic_training_steps),
+            int(stream_batch_size),
+            1,
+            1,
+            int(MODEL_SCHEMA_VERSION),
+            TrainingDeterminismMode.DETERMINISTIC_CPU,
+            str(parent_version or "untrained"),
+            experiment.manifest_id.value,
+        )
+        cut_directory = Path(root) / "hgt" / "training_cuts"
+        cut_directory.mkdir(parents=True, exist_ok=True)
+        cut_path = cut_directory / f"cut-{training_cut.checksum}.json"
+        cut_payload = {
+            key: (value.value if hasattr(value, "value") else value)
+            for key, value in asdict(training_cut).items()
+        }
+        temporary_cut = cut_path.with_suffix(".tmp")
+        with temporary_cut.open("w", encoding="utf-8") as handle:
+            json.dump(cut_payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_cut, cut_path)
+        runtime.set_telemetry_gauge("training_cut_checksum", training_cut.checksum)
+        runtime.__dict__["_active_training_cut"] = training_cut
     checkpoint_state = None
     parent_architecture = None
 
@@ -1168,10 +1255,13 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     last_grad_norm = 0.0
     model.train()
     try:
-        stream_batch_size = max(64, min(2048, int(getattr(config, "hgt_epoch_batch_size", 512))))
         transition_batches = [transition_train_rows[i:i + stream_batch_size] for i in range(0, len(transition_train_rows), stream_batch_size)]
         ranking_correct = ranking_total = transitions_trained = 0
-        loop_count = max(1, max(int(dynamic_training_steps), len(transition_batches)))
+        loop_count = (
+            max(1, int(dynamic_training_steps))
+            if matched_reasoning
+            else max(1, max(int(dynamic_training_steps), len(transition_batches)))
+        )
         for step_index in range(loop_count):
             optimizer.zero_grad(set_to_none=True)
             logits, values, auxiliary = model(x_device, edges_device)
@@ -1225,6 +1315,19 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     runtime.set_telemetry_gauge("hgt_action_ranking_training_pairs", int(locals().get("ranking_total", 0)))
     if training_steps <= 0:
         return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, parent_version, 0.0, 0.0, action_examples, 0, parent_checkpoint)
+    if matched_reasoning and training_steps != int(training_cut.optimizer_step_count):
+        runtime.set_telemetry_gauge("training_cut_failure", "INCOMPLETE_OPTIMIZER_WORK")
+        return HGTTrainingResult(
+            epoch,
+            "FAILED_TRAINING_CUT_INCOMPLETE",
+            runtime.unified_telemetry.model_version,
+            parent_version,
+            training_loss,
+            0.0,
+            action_examples,
+            training_steps,
+            parent_checkpoint,
+        )
 
     runtime.set_telemetry_gauge("hgt_transition_training_examples", len(transition_train_rows))
     model.eval()
@@ -1279,6 +1382,22 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     # Its scientific evaluation is the next epoch's matched HGT-ON/OFF sampling.
     promote = True
     status = "TESTING_PENDING_BEHAVIOR"
+    storage_governor = getattr(runtime, "storage_governor", None)
+    if storage_governor is not None:
+        storage_governor.reconcile_filesystem()
+        if not storage_governor.status().checkpoint_creation_allowed:
+            runtime.set_telemetry_gauge("hgt_promotion_result", "STORAGE_PRESSURE_DEFERRED")
+            return HGTTrainingResult(
+                epoch,
+                "STORAGE_PRESSURE_DEFERRED",
+                runtime.unified_telemetry.model_version,
+                parent_version,
+                training_loss,
+                0.0,
+                action_examples,
+                training_steps,
+                parent_checkpoint,
+            )
     if promote:
         temporary_checkpoint = checkpoint_path.with_suffix(".pt.tmp")
         torch.save(
@@ -1295,18 +1414,26 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
                 "training_accuracy": train_accuracy,
                 "loss_by_head": dict(training_loss_by_head),
                 "objective_weights": list(config.hgt_loss_weights),
-            "objective_names": list(OBJECTIVE_NAMES),
-            "symbol_node_type": "SYMBOL",
-            "symbol_schema_version": 2,
                 "objective_names": list(OBJECTIVE_NAMES),
                 "symbol_node_type": "SYMBOL",
                 "symbol_schema_version": 2,
                 "dynamic_loss_weighting": bool(config.hgt_dynamic_loss_weighting),
                 "action_scores": action_scores,
                 "context_action_scores": context_action_scores,
+                "training_cut_checksum": (
+                    training_cut.checksum if matched_reasoning else None
+                ),
+                "scientific_config_id": config.config_id.value,
+                "visibility_mode": config.scientific_visibility_mode.value,
+                "learned_developmental_feedback": config.learned_developmental_feedback.value,
+                "experiment_manifest_id": (
+                    experiment.manifest_id.value if matched_reasoning else None
+                ),
             },
             temporary_checkpoint,
         )
+        with temporary_checkpoint.open("rb") as checkpoint_handle:
+            os.fsync(checkpoint_handle.fileno())
         os.replace(temporary_checkpoint, checkpoint_path)
         _write_architecture_sidecar(
             checkpoint_path,
@@ -1343,10 +1470,21 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             "training_examples": training_examples,
             "action_scores": action_scores,
             "context_action_scores": context_action_scores,
+            "training_cut_checksum": (
+                training_cut.checksum if matched_reasoning else None
+            ),
+            "scientific_config_id": config.config_id.value,
+            "visibility_mode": config.scientific_visibility_mode.value,
+            "learned_developmental_feedback": config.learned_developmental_feedback.value,
+            "experiment_manifest_id": (
+                experiment.manifest_id.value if matched_reasoning else None
+            ),
         }
         temporary_manifest = manifest_path.with_suffix(".json.tmp")
         temporary_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary_manifest, manifest_path)
+        if storage_governor is not None:
+            storage_governor.reconcile_filesystem()
         model_version = candidate_version
         runtime.set_hgt_action_scores(action_scores, context_action_scores=context_action_scores)
     else:

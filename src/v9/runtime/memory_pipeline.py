@@ -436,6 +436,12 @@ class TransitionCommitContext:
     semantic_options: tuple[tuple[int, int, int, int, float], ...]
     semantic_after: tuple[tuple[int, int, int, int, float], ...]
     semantic_delta: tuple[tuple[int, int, int, int, float], ...]
+    actor_id: int
+    producer_sequence: int
+    global_step: int
+    environment_identity: tuple[str, str, str, str]
+    game_scenario: str
+    sampling_branch: str
 
 
 def _commit_context(transition: Any) -> TransitionCommitContext:
@@ -455,6 +461,12 @@ def _commit_context(transition: Any) -> TransitionCommitContext:
         tuple(transition.semantic_options),
         tuple(transition.semantic_after),
         tuple(transition.semantic_delta),
+        int(transition.actor_id),
+        int(transition.producer_sequence),
+        int(transition.global_step),
+        tuple(str(value) for value in transition.environment_identity),
+        str(transition.game_scenario),
+        str(getattr(transition, "sampling_branch", "")),
     )
 
 
@@ -513,6 +525,14 @@ def _semantic_payload(context: TransitionCommitContext | None, scope: str) -> di
                 "task_truncated": bool(context.task_truncated),
                 "level_index": int(context.level_index),
                 "levels_completed": int(context.levels_completed),
+                "actor_id": int(context.actor_id),
+                "producer_sequence": int(context.producer_sequence),
+                "global_step": int(context.global_step),
+                "environment_identity": list(context.environment_identity),
+                "game_scenario": str(context.game_scenario),
+                "sampling_branch": str(context.sampling_branch),
+                "before_signature": int(context.before_signature),
+                "after_signature": int(context.after_signature),
             }
         )
     if scope in {"m0", "m1n"}:

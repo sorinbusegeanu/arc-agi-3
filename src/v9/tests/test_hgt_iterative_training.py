@@ -4,7 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from v9.hgt.epoch_dataset import EpochTransitionDataset, action_ranking_pairs, iter_epoch_transitions, transition_training_rows
+from v9.hgt.epoch_dataset import (
+    EpochTransitionDataset,
+    action_ranking_pairs,
+    iter_epoch_transitions,
+    transition_training_rows,
+    transition_training_rows_from_records,
+)
 from v9.hgt.matched_evaluation import matched_jobs, select_matched_branch
 from v9.runtime.multiprocess import EncodedTransition
 from v9.runtime.runtime import ContinuousMemoryRuntime
@@ -42,6 +48,43 @@ class HGTIterativeTrainingTests(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             self.assertGreater(rows[1]["target_return"], rows[0]["target_return"])
             self.assertEqual(len(action_ranking_pairs(rows)), 1)
+
+    def test_wal_records_reconstruct_the_same_bounded_training_rows(self):
+        raw = [
+            {
+                "environment_identity": ["synthetic", "test", "1", "test"],
+                "game_scenario": "test",
+                "actor_id": 1,
+                "episode_id": 1,
+                "global_step": 0,
+                "before_signature": 7,
+                "after_signature": 8,
+                "action_id": 0,
+                "primary_valence": -1,
+                "task_success": False,
+                "task_failure": False,
+                "task_truncated": False,
+            },
+            {
+                "environment_identity": ["synthetic", "test", "1", "test"],
+                "game_scenario": "test",
+                "actor_id": 1,
+                "episode_id": 1,
+                "global_step": 1,
+                "before_signature": 8,
+                "after_signature": 9,
+                "action_id": 1,
+                "primary_valence": 1,
+                "task_success": True,
+                "task_failure": False,
+                "task_truncated": False,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "epoch.jsonl"
+            path.write_text("".join(__import__("json").dumps(row) + "\n" for row in raw))
+            legacy = transition_training_rows(path)
+        self.assertEqual(transition_training_rows_from_records(iter(raw)), legacy)
 
     def test_matched_jobs_preserve_seeds_and_budgets(self):
         jobs = [(1, object(), 500, 123), (2, object(), 700, 456)]

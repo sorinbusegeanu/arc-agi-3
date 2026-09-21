@@ -27,4 +27,13 @@ def test_migration_status_keeps_v979_active_until_final_cutover() -> None:
     assert status.active_design_version == "9.7.9"
     capabilities = dict(status.capabilities)
     assert capabilities["scientific_identity_and_modes"]
+    assert capabilities["immutable_canonical_store"]
+    assert capabilities["canonical_wal"]
+    assert capabilities["developmental_cut"]
+    assert capabilities["wal_backed_training_evidence"]
+    assert capabilities["deterministic_training_cut"]
+    assert capabilities["durable_storage_governance"]
+    assert capabilities["dual_mode_restart"]
+    assert not capabilities["h18_structural_prior_transform"]
+    assert not capabilities["crash_reproducibility_soak"]
     assert not capabilities["legacy_cleanup_and_cutover"]

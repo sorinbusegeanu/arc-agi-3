@@ -10,6 +10,7 @@ from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
 from v9.runtime.publication import CanonicalGraph
 from v9.runtime.canonical_store import canonical_value
 from v9.runtime.canonical_commit import apply_canonical_commit_batch
+from v9.runtime.training_evidence import TrainingEvidenceRecord
 from v9.benchmarks.ingestion_drain import _plans
 
 
@@ -131,6 +132,52 @@ def test_ingestion_tail_keeps_compatibility_graph_equal_to_immutable_root(tmp_pa
     for uid, payload in runtime.graph.payloads.items():
         key = f"node:{uid.hi:016x}{uid.lo:016x}"
         assert canonical_value(payloads[key]) == canonical_value(payload)
+
+
+def test_interaction_commit_embeds_reconstructable_training_evidence_in_wal(tmp_path: Path) -> None:
+    runtime = ContinuousMemoryRuntime(
+        RuntimeConfig.from_path(
+            tmp_path,
+            restore=False,
+            enable_snapshots=False,
+            enable_canonical_durability=True,
+        )
+    )
+    apply_canonical_commit_batch(runtime, _plans(2))
+
+    frames = runtime.canonical_wal.recover().frames
+    records = tuple(
+        TrainingEvidenceRecord.from_dict(raw)
+        for frame in frames
+        for raw in frame.training_evidence_records
+        if raw["kind"] == "interaction"
+    )
+    assert len(records) == 2
+    assert tuple(row.source_wal_lsn for row in records) == tuple(
+        frame.wal_lsn
+        for frame in frames
+        for raw in frame.training_evidence_records
+        if raw["kind"] == "interaction"
+    )
+    assert [row.label_payload["global_step"] for row in records] == [0, 1]
+    assert [row.label_payload["producer_sequence"] for row in records] == [1, 2]
+
+    manifest = runtime.materialize_training_evidence()
+    assert manifest is not None
+    assert manifest.hgt_checkpoint_lsn == runtime.persistence_frontiers.wal_durable_lsn
+    assert runtime.persistence_frontiers.hgt_checkpoint_lsn == manifest.hgt_checkpoint_lsn
+    materialized_interactions = tuple(
+        row
+        for row in runtime.training_evidence.records()
+        if row.kind.value == "interaction"
+    )
+    assert tuple(sorted(materialized_interactions, key=lambda row: row.evidence_id)) == tuple(
+        sorted(records, key=lambda row: row.evidence_id)
+    )
+    assert {row.kind for row in runtime.developmental_milestones.records} >= {
+        "contingency",
+        "carrier",
+    }
 
 
 def test_resident_deletion_is_durable_before_visibility(tmp_path: Path) -> None:

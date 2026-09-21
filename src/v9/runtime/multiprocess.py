@@ -73,6 +73,7 @@ class EncodedTransition:
     strategy_target_outcome_lo: int | None = None
     strategy_replanned: bool = False
     replanning_baseline_cost: float | None = None
+    sampling_branch: str = ""
 
     @property
     def done(self) -> bool:
@@ -321,7 +322,7 @@ def _put_counted_stage_batch(
         counters[int(counter_index)] = int(counters[int(counter_index)]) + len(envelope.transitions)
 
 
-def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, initial_policy: ActorPolicySnapshot, policy_updates: Any, epsilon: float, stagnation: float = 0.0, policy_refresh_steps: int = 32, policy_refresh_ms: float = 100.0, policy_refresh_enabled: bool = True, stage_queue: Any, result_queue: Any, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, production_counters: Any = None, counter_index: int = 0, epoch_inference_view_id: str = "", transport_pool: TransportSlabPool | None = None) -> None:
+def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, initial_policy: ActorPolicySnapshot, policy_updates: Any, epsilon: float, stagnation: float = 0.0, policy_refresh_steps: int = 32, policy_refresh_ms: float = 100.0, policy_refresh_enabled: bool = True, stage_queue: Any, result_queue: Any, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, production_counters: Any = None, counter_index: int = 0, epoch_inference_view_id: str = "", transport_pool: TransportSlabPool | None = None, evidence_branch: str = "") -> None:
     game_id = str(getattr(spec, "display_name", getattr(spec, "game_id", "unknown")))
     adapter = None
     completion_sent = False
@@ -562,6 +563,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     strategy_target_outcome_lo=None if active_strategy_outcome is None else int(active_strategy_outcome.lo),
                     strategy_replanned=active_replanned,
                     replanning_baseline_cost=active_replanning_baseline_cost if executed_strategy_uid is not None else None,
+                    sampling_branch=str(evidence_branch),
                 )
                 pending_transitions.append(transition)
                 if len(pending_transitions) >= 64:
@@ -846,7 +848,7 @@ class ProcessTopology:
             process.start()
             self.stage_processes.append(process)
 
-    def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, initial_policy: ActorPolicySnapshot, epsilon: float, stagnation: float = 0.0, policy_refresh_steps: int = 64, policy_refresh_ms: float = 250.0, policy_refresh_enabled: bool = True, epoch_inference_view_id: str = "") -> None:
+    def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, initial_policy: ActorPolicySnapshot, epsilon: float, stagnation: float = 0.0, policy_refresh_steps: int = 64, policy_refresh_ms: float = 250.0, policy_refresh_enabled: bool = True, epoch_inference_view_id: str = "", evidence_branch: str = "") -> None:
         if adapter_factory_path == "v9.cli:make_adapter":
             adapter_factory_path = "v9.environments.passive_capture:make_adapter"
         process = self.actor_ctx.Process(
@@ -873,6 +875,7 @@ class ProcessTopology:
                 "counter_index": int(index),
                 "epoch_inference_view_id": str(epoch_inference_view_id),
                 "transport_pool": self.transport_pool,
+                "evidence_branch": str(evidence_branch),
             },
             name=f"v9-actor-{actor_id}",
         )

@@ -429,7 +429,13 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
 
     def run_sampling_jobs(jobs: list[tuple[int, Any, int, int]], *, epoch: int, dataset: Any, common_kwargs: dict[str, Any]):
         if scientific_mode is not ScientificVisibilityMode.MATCHED_REASONING:
-            return run_parallel_memory_jobs(runtime, jobs, hgt_dataset=dataset, **common_kwargs)
+            return run_parallel_memory_jobs(
+                runtime,
+                jobs,
+                hgt_dataset=dataset,
+                evidence_branch=f"epoch-{int(epoch)}:{dataset.branch}",
+                **common_kwargs,
+            )
         view = runtime.create_epoch_inference_view(sampling_epoch_id=epoch)
         try:
             runtime.set_telemetry_gauge("epoch_inference_view_id", view.identity.checksum)
@@ -442,6 +448,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                 jobs,
                 hgt_dataset=dataset,
                 bound_epoch_view=view,
+                evidence_branch=f"epoch-{int(epoch)}:{dataset.branch}",
                 **common_kwargs,
             )
         finally:
@@ -546,6 +553,9 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         runtime.set_telemetry_gauge("hgt_sampled_training_transitions", sampled_training_transitions)
         runtime.set_telemetry_gauge("hgt_training_dataset_path", str(selected_dataset_path))
         runtime.__dict__["_hgt_training_dataset_path"] = str(selected_dataset_path)
+        runtime.__dict__["_hgt_training_evidence_branch"] = (
+            f"epoch-{int(epoch)}:{Path(selected_dataset_path).stem}"
+        )
         actor_results.extend(process_results)
         post_sampling_started = time.perf_counter()
         runtime.wait_quiescent(args.drain_timeout)
@@ -680,6 +690,10 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         runtime.set_telemetry_gauge("replay_processed_epoch", int(replay_result.processed))
         runtime.set_telemetry_gauge("replay_new_memories_epoch", int(replay_result.new_memories))
         runtime.set_telemetry_gauge("replay_revisions_epoch", int(replay_result.revisions))
+
+        materialize_training_evidence = getattr(runtime, "materialize_training_evidence", None)
+        if callable(materialize_training_evidence):
+            materialize_training_evidence()
 
         training_started = time.perf_counter()
         training = train_hgt_epoch(

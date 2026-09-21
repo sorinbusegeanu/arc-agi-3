@@ -81,12 +81,6 @@ _install_runtime_integrity_followup(_runtime_integrity_module, MemoryPipelineSer
 from v9.runtime.inline_lowlevel_publication import install_inline_lowlevel_publication as _install_inline_lowlevel_publication
 _install_inline_lowlevel_publication(ContinuousMemoryRuntime)
 
-# Metrics layers compose several mutable runtime registries. Keep each complete
-# dashboard/metrics read on one authoritative runtime cut so publication cannot
-# resize graph dictionaries during telemetry traversal.
-from v9.runtime.metrics_concurrency import install_metrics_concurrency as _install_metrics_concurrency
-_install_metrics_concurrency(ContinuousMemoryRuntime)
-
 # Canonical commit remains strictly ordered, but it runs independently from the
 # coordinator's queue-draining loop so actor publication and worker preparation
 # continue while the authoritative graph mutation is in progress.

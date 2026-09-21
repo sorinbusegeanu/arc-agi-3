@@ -258,23 +258,27 @@ class V978ContinuousMemoryRuntime(FinalContinuousMemoryRuntime):
         return state
 
     def metrics(self) -> dict[str, Any]:
-        self._patch_m1n_evidence()
-        result = dict(super().metrics())
-        grounding_states = self.grounding.states.copy()
-        states = tuple(grounding_states.values())
-        for maturity in range(6):
-            result[f"grounding_G{maturity}_count"] = sum(int(int(state.maturity) == maturity) for state in states)
-        result["grounding_active_count"] = sum(int(state.behavior_eligible) for state in states)
-        result["symbol_to_interaction_prediction_gain"] = float(self._symbol_prediction_delta_sum)
-        result["interaction_to_symbol_generalization_gain"] = float(self._interaction_to_symbol_prediction_delta_sum)
-        result["heldout_transfer_successes"] = sum(int(int(state.maturity) >= 3 and state.behavior_eligible and bool(state.validation_trial_ids)) for state in states)
-        provenance = dict(result.get("symbol_grounding_provenance", {}))
-        provenance.update(
-            {
-                "environment_ids": sorted({int(key[2]) for key in grounding_states}),
-                "context_scope_ids": sorted({int(key[3]) for key in grounding_states}),
-                "lineage_ids": sorted({int(key[4]) for key in grounding_states}),
-            }
-        )
-        result["symbol_grounding_provenance"] = provenance
-        return result
+        # This is the outermost runtime metrics implementation. Holding the
+        # runtime lock here gives every normal superclass extension one coherent
+        # cut without relying on an import-time method replacement.
+        with self._lock:
+            self._patch_m1n_evidence()
+            result = dict(super().metrics())
+            grounding_states = self.grounding.states.copy()
+            states = tuple(grounding_states.values())
+            for maturity in range(6):
+                result[f"grounding_G{maturity}_count"] = sum(int(int(state.maturity) == maturity) for state in states)
+            result["grounding_active_count"] = sum(int(state.behavior_eligible) for state in states)
+            result["symbol_to_interaction_prediction_gain"] = float(self._symbol_prediction_delta_sum)
+            result["interaction_to_symbol_generalization_gain"] = float(self._interaction_to_symbol_prediction_delta_sum)
+            result["heldout_transfer_successes"] = sum(int(int(state.maturity) >= 3 and state.behavior_eligible and bool(state.validation_trial_ids)) for state in states)
+            provenance = dict(result.get("symbol_grounding_provenance", {}))
+            provenance.update(
+                {
+                    "environment_ids": sorted({int(key[2]) for key in grounding_states}),
+                    "context_scope_ids": sorted({int(key[3]) for key in grounding_states}),
+                    "lineage_ids": sorted({int(key[4]) for key in grounding_states}),
+                }
+            )
+            result["symbol_grounding_provenance"] = provenance
+            return result

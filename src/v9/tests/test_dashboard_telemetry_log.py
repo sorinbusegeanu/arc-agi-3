@@ -21,6 +21,18 @@ class _MetricsProvider:
         }
 
 
+class _InitiallyFailingMetricsProvider(_MetricsProvider):
+    def __init__(self, root) -> None:
+        super().__init__(root)
+        self.calls = 0
+
+    def dashboard_metrics(self):
+        self.calls += 1
+        if self.calls == 1:
+            raise KeyError("transient-retirement-cut")
+        return super().dashboard_metrics()
+
+
 def test_dashboard_metrics_are_logged_from_same_provider(tmp_path) -> None:
     provider = _MetricsProvider(tmp_path)
     server = MetricsHTTPServer(provider.metrics, host="127.0.0.1", port=0, refresh_seconds=0.1)
@@ -37,3 +49,32 @@ def test_dashboard_metrics_are_logged_from_same_provider(tmp_path) -> None:
     assert latest["primary_dashboard"] == provider.dashboard_metrics()["primary_dashboard"]
     assert latest["telemetry_diagnostics"] == provider.dashboard_metrics()["telemetry_diagnostics"]
     assert latest["timestamp_utc"]
+
+
+def test_dashboard_logger_records_provider_failure_and_keeps_polling(tmp_path) -> None:
+    provider = _InitiallyFailingMetricsProvider(tmp_path)
+    server = MetricsHTTPServer(
+        provider.metrics,
+        host="127.0.0.1",
+        port=0,
+        refresh_seconds=0.1,
+    )
+    log_path = tmp_path / "telemetry" / "dashboard_metrics.jsonl"
+    server.start()
+    deadline = time.monotonic() + 2.0
+    rows = []
+    while time.monotonic() < deadline:
+        if log_path.exists():
+            rows = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line
+            ]
+            if len(rows) >= 2:
+                break
+        time.sleep(0.01)
+    server.close()
+
+    assert rows[0]["dashboard_metrics_error"]["type"] == "KeyError"
+    assert rows[-1]["primary_dashboard"]["M0_count"] == 12
+    assert provider.calls >= 2

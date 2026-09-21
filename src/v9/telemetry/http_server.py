@@ -89,10 +89,23 @@ refresh(); setInterval(refresh,{refresh_ms});
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("a", encoding="utf-8", buffering=1) as handle:
             while not self._stop_logging.is_set():
-                snapshot = {
-                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    **self._dashboard_provider(),
-                }
+                timestamp = datetime.now(timezone.utc).isoformat()
+                try:
+                    snapshot = {
+                        "timestamp_utc": timestamp,
+                        **self._dashboard_provider(),
+                    }
+                except Exception as exc:
+                    # A telemetry read must never terminate the long-lived
+                    # logger. Preserve an auditable failure row and retry at the
+                    # next fixed refresh interval.
+                    snapshot = {
+                        "timestamp_utc": timestamp,
+                        "dashboard_metrics_error": {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    }
                 handle.write(json.dumps(snapshot, sort_keys=True, default=str) + "\n")
                 if self._stop_logging.wait(self.refresh_seconds):
                     break

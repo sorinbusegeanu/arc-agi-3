@@ -480,6 +480,23 @@ class MemoryPipelineService:
         return True
 
     def _consider_candidate(self, candidate: Any) -> None:
+        from .scientific_modes import ScientificVisibilityMode
+
+        if (
+            getattr(
+                getattr(self.runtime.config, "scientific", None),
+                "scientific_visibility_mode",
+                ScientificVisibilityMode.ASYNC_DEVELOPMENT,
+            )
+            is ScientificVisibilityMode.MATCHED_REASONING
+        ):
+            # Matched epochs derive from the selected branch's immutable
+            # post-sampling cut.  Dispatching these candidates now would let
+            # worker completion timing publish M2-M4 during sampling.
+            self.runtime.set_telemetry_gauge(
+                "matched_derivation_candidates_deferred_to_cut", 1
+            )
+            return
         signature = int(candidate.structural_signature)
         support = int(candidate.support)
         previous = int(self.last_support.get(signature, 0))
@@ -792,6 +809,7 @@ def run_parallel_memory_jobs(
     allow_policy_refresh: bool = True,
     bound_epoch_view: Any | None = None,
     hgt_dataset: Any | None = None,
+    evidence_branch: str = "",
 ) -> list[ProcessActorResult]:
     original_job_count = len(jobs)
     jobs = expand_jobs_for_actor_limit(jobs, actor_limit)
@@ -891,6 +909,7 @@ def run_parallel_memory_jobs(
             policy_refresh_ms=float(actor_view_refresh_ms),
             policy_refresh_enabled=bool(allow_policy_refresh),
             epoch_inference_view_id=bound_epoch_view_id,
+            evidence_branch=str(evidence_branch),
         )
         process = topology.actor_processes[-1]
         if process.pid is None:

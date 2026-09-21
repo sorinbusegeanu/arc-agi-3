@@ -63,7 +63,6 @@ class TrainingEvidenceRecord:
         selected = kind if isinstance(kind, TrainingEvidenceKind) else TrainingEvidenceKind(str(kind))
         identity_payload = {
             "kind": selected.value,
-            "source_wal_lsn": int(source_wal_lsn),
             "scientific_provenance": sorted((str(key), str(value)) for key, value in scientific_provenance.items()),
             "schema_versions": sorted((str(key), int(value)) for key, value in schema_versions.items()),
             "label_payload": label_payload,
@@ -72,6 +71,7 @@ class TrainingEvidenceRecord:
         record_payload = {
             **identity_payload,
             "evidence_id": evidence_id.value,
+            "source_wal_lsn": int(source_wal_lsn),
             "quality_millionths": int(quality_millionths),
             "weight_millionths": int(weight_millionths),
         }

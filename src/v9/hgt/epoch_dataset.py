@@ -19,6 +19,7 @@ class EpochTransitionDataset:
 
     def __init__(self, path: str | Path, *, epoch: int, branch: str, model_version: str | None) -> None:
         self.path = Path(path)
+        self.branch = str(branch)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.meta_path = self.path.with_suffix(".meta.json")
         self.count = 0
@@ -124,6 +125,20 @@ def iter_episode_training_rows(
     discount: float = 0.97,
 ) -> Iterator[dict[str, Any]]:
     """Stream returns while retaining only bounded active episode buffers."""
+    yield from iter_episode_training_rows_from_records(
+        iter_epoch_transitions(path),
+        active_episode_limit=active_episode_limit,
+        discount=discount,
+    )
+
+
+def iter_episode_training_rows_from_records(
+    records: Iterable[dict[str, Any]],
+    *,
+    active_episode_limit: int | None = None,
+    discount: float = 0.97,
+) -> Iterator[dict[str, Any]]:
+    """Build bounded episode returns from any durable transition record stream."""
     limit = max(1, int(active_episode_limit or DEFAULT_ACTIVE_EPISODE_LIMIT))
     active: OrderedDict[tuple[str, int, int], list[dict[str, Any]]] = OrderedDict()
     current_by_actor: dict[tuple[str, int], tuple[str, int, int]] = {}
@@ -137,7 +152,7 @@ def iter_episode_training_rows(
             current_by_actor.pop(actor_key, None)
         return _episode_rows(raw_rows, discount=discount)
 
-    for row in iter_epoch_transitions(path):
+    for row in records:
         key = _episode_key(row)
         actor_key = (key[0], key[1])
         previous = current_by_actor.get(actor_key)
@@ -187,10 +202,26 @@ def transition_training_rows(
     active_episode_limit: int | None = None,
 ) -> list[dict[str, Any]]:
     """Return a deterministic bounded sample without materializing the raw epoch."""
+    return transition_training_rows_from_records(
+        iter_epoch_transitions(path),
+        max_rows=max_rows,
+        active_episode_limit=active_episode_limit,
+    )
+
+
+def transition_training_rows_from_records(
+    records: Iterable[dict[str, Any]],
+    *,
+    max_rows: int | None = None,
+    active_episode_limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Return the same deterministic sample from WAL-backed evidence records."""
     maximum = max(1, int(max_rows or DEFAULT_TRANSITION_SAMPLE_ROWS))
     heap: list[tuple[int, int, dict[str, Any]]] = []
     serial = 0
-    for row in iter_episode_training_rows(path, active_episode_limit=active_episode_limit):
+    for row in iter_episode_training_rows_from_records(
+        records, active_episode_limit=active_episode_limit
+    ):
         priority = _sample_priority(row)
         item = (-priority, -serial, row)
         if len(heap) < maximum:

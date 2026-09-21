@@ -285,6 +285,12 @@ class RuntimeConfig:
     canonical_continuation_max_bytes: int = 16 * 1024 * 1024
     canonical_transaction_max_writes: int = 65_536
     canonical_transaction_max_work_units: int = 1_000_000
+    durable_storage_class_ceiling_bytes: int = 256 * 1024 * 1024 * 1024
+    durable_storage_aggregate_ceiling_bytes: int = 512 * 1024 * 1024 * 1024
+    durable_storage_soft_fraction: float = 0.85
+    durable_storage_minimum_free_bytes: int = 2 * 1024 * 1024 * 1024
+    durable_storage_minimum_free_fraction: float = 0.01
+    durable_storage_max_objects: int = 1_000_000
     multiprocessing_start_method: str | None = None
     scientific: ScientificConfig = ScientificConfig()
 
@@ -293,10 +299,14 @@ class RuntimeConfig:
         return cls(Path(root), **kwargs)
 
     def __post_init__(self) -> None:
-        if min(self.shards, self.stage_workers, self.stage_ring_capacity, self.shard_ring_capacity, self.node_capacity_per_shard, self.edge_capacity_per_shard, self.action_capacity_per_shard, self.shard_batch_size, self.canonical_transaction_max_rows, self.canonical_transaction_max_input_bytes, self.canonical_transaction_max_mutation_bytes, self.canonical_continuation_max_bytes, self.canonical_transaction_max_writes, self.canonical_transaction_max_work_units) <= 0:
+        if min(self.shards, self.stage_workers, self.stage_ring_capacity, self.shard_ring_capacity, self.node_capacity_per_shard, self.edge_capacity_per_shard, self.action_capacity_per_shard, self.shard_batch_size, self.canonical_transaction_max_rows, self.canonical_transaction_max_input_bytes, self.canonical_transaction_max_mutation_bytes, self.canonical_continuation_max_bytes, self.canonical_transaction_max_writes, self.canonical_transaction_max_work_units, self.durable_storage_class_ceiling_bytes, self.durable_storage_aggregate_ceiling_bytes, self.durable_storage_max_objects) <= 0:
             raise ValueError("runtime counts and capacities must be positive")
         if min(self.snapshot_interval_seconds, self.peer_interval_seconds) <= 0:
             raise ValueError("runtime intervals must be positive")
+        if not 0 < self.durable_storage_soft_fraction < 1:
+            raise ValueError("durable storage soft fraction must be in (0, 1)")
+        if self.durable_storage_minimum_free_bytes < 0 or not 0 <= self.durable_storage_minimum_free_fraction < 1:
+            raise ValueError("invalid durable filesystem pressure thresholds")
         if self.scientific.scientific_visibility_mode is ScientificVisibilityMode.MATCHED_REASONING and self.experiment_manifest is None:
             raise ValueError("MATCHED_REASONING requires an immutable ExperimentManifest")
         if (

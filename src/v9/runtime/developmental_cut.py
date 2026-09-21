@@ -214,6 +214,10 @@ class DevelopmentalMutationGate:
         if _ACTIVE_CUT.get() is None:
             raise RuntimeError("MATCHED_REASONING developmental mutation is outside DevelopmentalCut")
 
+    @property
+    def cut_active(self) -> bool:
+        return _ACTIVE_CUT.get() is not None
+
 
 class DevelopmentalCutSession:
     """One pinned matched-mode cut spanning explicitly composed runtime work.

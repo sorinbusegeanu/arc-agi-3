@@ -54,7 +54,23 @@ def _materialize_commit_rows(plans: tuple[CommitPlan, ...]) -> dict[int, Any]:
     return materialized_rows
 
 
-def _mutation_work(row: Any) -> tuple[int, int, int]:
+def _training_evidence_record_count(node: Any, payload: dict[str, Any]) -> int:
+    if node.level is MemoryLevel.M0:
+        return int("producer_sequence" in payload and payload.get("symbol_identity") is None)
+    if node.level is MemoryLevel.M1:
+        return 1 + int(bool(payload.get("heldout_transfer")))
+    if node.level in {MemoryLevel.M2, MemoryLevel.M3}:
+        return 2
+    if node.level is MemoryLevel.M4:
+        return 1 + int(bool(payload.get("validated")))
+    if node.level in {MemoryLevel.M5, MemoryLevel.M6}:
+        return 1
+    if node.level is MemoryLevel.M7:
+        return 2
+    return 0
+
+
+def _mutation_work(row: Any, *, reserve_training_evidence: bool = False) -> tuple[int, int, int]:
     node, payload, evidence = row
     node_bytes = _estimate_bytes(
         (int(node.uid.hi), int(node.uid.lo)),
@@ -63,6 +79,13 @@ def _mutation_work(row: Any) -> tuple[int, int, int]:
     mutation_bytes = node_bytes
     write_count = 3
     maximum_primitive_bytes = node_bytes
+    if reserve_training_evidence:
+        # Records contain compact fixed-schema labels plus checksums. Reserve a
+        # conservative encoded ceiling so WAL evidence can never push an
+        # otherwise admitted canonical transaction over its byte budget.
+        evidence_bytes = 4096 * _training_evidence_record_count(node, payload)
+        mutation_bytes += evidence_bytes
+        maximum_primitive_bytes = max(maximum_primitive_bytes, evidence_bytes)
     parents = {
         (int(parent[0]), int(parent[1]))
         for parent in payload.get("parents", ())
@@ -95,12 +118,15 @@ def _estimate_materialized_commit(
     materialized_rows: dict[int, Any],
     *,
     input_bytes: int,
+    reserve_training_evidence: bool = False,
 ) -> tuple[CanonicalWorkEstimate, int]:
     mutation_bytes = 0
     write_count = 0
     maximum_primitive_bytes = 0
     for row in materialized_rows.values():
-        row_bytes, row_writes, primitive_bytes = _mutation_work(row)
+        row_bytes, row_writes, primitive_bytes = _mutation_work(
+            row, reserve_training_evidence=reserve_training_evidence
+        )
         mutation_bytes += row_bytes
         write_count += row_writes
         maximum_primitive_bytes = max(maximum_primitive_bytes, primitive_bytes)
@@ -162,7 +188,9 @@ def canonical_commit_prefix_length(
                 continue
             row = write.runtime_row()
             materialized_rows[key] = row
-            row_bytes, row_writes, primitive_bytes = _mutation_work(row)
+            row_bytes, row_writes, primitive_bytes = _mutation_work(
+                row, reserve_training_evidence=hasattr(runtime, "canonical_wal")
+            )
             mutation_bytes += row_bytes
             write_count += row_writes
             maximum_primitive_bytes = max(maximum_primitive_bytes, primitive_bytes)
@@ -240,7 +268,10 @@ def apply_canonical_commit_batch(
     # runtime lock. Only state-dependent mutation remains in the critical section.
     materialized_rows = _materialize_commit_rows(plans)
     estimate, maximum_primitive_bytes = _estimate_materialized_commit(
-        plans, materialized_rows, input_bytes=int(input_bytes)
+        plans,
+        materialized_rows,
+        input_bytes=int(input_bytes),
+        reserve_training_evidence=hasattr(runtime, "canonical_wal"),
     )
     budget = _work_budget(runtime)
     status = budget.status(estimate)

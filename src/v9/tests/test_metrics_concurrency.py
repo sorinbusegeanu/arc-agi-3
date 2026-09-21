@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from v9 import ContinuousMemoryRuntime, RuntimeConfig
+from v9.memory.identity import MemoryUid
 
 
 class _LockGuardedDict(dict):
@@ -37,3 +38,22 @@ def test_composed_metrics_hold_runtime_lock_across_all_layers(tmp_path) -> None:
 
     assert isinstance(runtime.metrics(), dict)
     assert isinstance(runtime.dashboard_metrics(), dict)
+
+
+def test_dashboard_metrics_tolerate_retirement_between_payload_and_node_removal(tmp_path) -> None:
+    runtime = ContinuousMemoryRuntime(
+        RuntimeConfig.from_path(tmp_path, restore=False, enable_snapshots=False)
+    )
+    orphan = MemoryUid(6512798212089775223, 13334826863637042881)
+    runtime.graph.payloads[orphan] = {
+        "reliability_trials": 1,
+        "reliability_successes": 1,
+    }
+
+    try:
+        result = runtime.dashboard_metrics()
+    finally:
+        runtime.graph.payloads.pop(orphan, None)
+        runtime.close(normal=False)
+
+    assert result["m7_strategy_success_rate"] == 0.0
