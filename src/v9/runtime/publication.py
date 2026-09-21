@@ -259,6 +259,11 @@ class CanonicalGraph:
                     results.append(self._publish_locked(proposal))
         return tuple(results)
 
+    def training_m0_reservoir_snapshot(self) -> tuple[MemoryUid, ...]:
+        """Return a stable training-reservoir cut for lock-free consumers."""
+        with self._publication_lock:
+            return tuple(self._training_m0_reservoir)
+
     def pressure_ratio(self) -> float:
         with self._publication_lock:
             ratios: list[float] = []
