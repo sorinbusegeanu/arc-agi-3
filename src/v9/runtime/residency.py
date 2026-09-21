@@ -510,7 +510,7 @@ class ResidentMemoryManager:
     def _score_candidates(self, rows: list[tuple[MemoryUid, Any, dict[str, Any], MemoryUid]]) -> list[tuple[float, int, MemoryUid, MemoryUid]]:
         context_counts: dict[tuple[int, int], int] = {}
         structure_counts: dict[tuple[int, ...], int] = {}
-        training_m0 = set(self.runtime.graph._training_m0_reservoir)
+        training_m0 = set(self.runtime.graph.training_m0_reservoir_snapshot())
         for _uid, node, payload, _replacement in rows:
             context = int(payload.get("context_signature", payload.get("grounded_context_signature", 0)) or 0)
             action = int(payload.get("action_id", payload.get("executable_action_token", 0)) or 0)
