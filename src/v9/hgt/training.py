@@ -992,17 +992,11 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     if torch.cuda.is_available() and not matched_reasoning:
         torch.cuda.empty_cache()
         free_bytes, total_bytes = torch.cuda.mem_get_info()
-        # The previous run peaked around half of a 16 GB card. Expand the
-        # bounded graph on cards with ample headroom and let the existing OOM
-        # retry/shedding path back off if the realized graph is denser.
-        target_used_bytes = int(total_bytes * 0.78)
-        baseline_used_bytes = max(1, int(total_bytes - free_bytes))
-        capacity_scale = min(2.0, max(1.0, target_used_bytes / baseline_used_bytes))
-        memory_node_budget = max(64, int(memory_node_budget * capacity_scale))
-        canonical_edge_budget = max(256, int(canonical_edge_budget * capacity_scale))
-        total_node_budget = max(memory_node_budget, int(total_node_budget * capacity_scale))
-        total_edge_budget = max(canonical_edge_budget, int(total_edge_budget * capacity_scale))
-        runtime.set_telemetry_gauge("hgt_vram_capacity_scale", float(capacity_scale))
+        # Keep the configured graph budgets authoritative. Free VRAM is only a
+        # pressure signal for shedding; it must never enlarge a graph because
+        # forward/backward activation memory is not represented by mem_get_info().
+        capacity_scale = 1.0
+        runtime.set_telemetry_gauge("hgt_vram_capacity_scale", capacity_scale)
         runtime.set_telemetry_gauge("hgt_vram_free_before_training_bytes", int(free_bytes))
         runtime.set_telemetry_gauge("hgt_vram_total_bytes", int(total_bytes))
         if int(free_bytes) < int(config.hgt_min_free_vram_bytes):
