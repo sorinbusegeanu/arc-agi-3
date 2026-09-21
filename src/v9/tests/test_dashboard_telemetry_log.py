@@ -111,4 +111,5 @@ def test_runtime_dashboard_does_not_call_full_metrics(tmp_path, monkeypatch) -> 
         assert "primary_dashboard" in snapshot
         assert len(snapshot["primary_dashboard"]) <= 24
     finally:
+        monkeypatch.undo()
         runtime.close()
