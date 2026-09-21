@@ -266,6 +266,13 @@ def _relation_evidence_available(runtime: Any, relation: Any, deferred_rows: lis
     )
 
 
+def _relation_context_is_novel(runtime: Any, relation: Any) -> bool:
+    signature = int(relation.structural_signature)
+    context = int(getattr(relation, "context_signature", 0) or 0)
+    rows = runtime._m1n_occurrences.get(signature, ())
+    return not any(int(getattr(row, "context_signature", 0) or 0) == context for row in rows)
+
+
 def apply_canonical_commit_batch(
     runtime: Any,
     rows: Iterable[CommitPlan],
@@ -379,22 +386,26 @@ def apply_canonical_commit_batch(
                     prior_support=prior_support,
                     context=plan.context,
                     isf_static=plan.isf_static,
+                    novel_context=_relation_context_is_novel(runtime, plan.relation),
                     force_novel=bool(novel_derived or novel_aligned),
                 )
                 interaction_retained = bool(interaction_decision.retain)
                 admission_reason_counts[interaction_decision.reason] = (
                     admission_reason_counts.get(interaction_decision.reason, 0) + 1
                 )
+                if plan.interaction_grounding is not None:
+                    # Working-state continuity follows every observed interaction.
+                    # Persistent concrete retention is a separate decision.
+                    grounding = plan.interaction_grounding
+                    runtime._latest_interaction_grounding[
+                        (grounding.environment_instance_id, grounding.episode_id)
+                    ] = grounding
+
                 if interaction_retained:
                     plan_deferred_rows.extend(
                         materialized_rows[id(write)] for write in plan.base_writes
                     )
                     concrete_retained_delta += 1
-                    if plan.interaction_grounding is not None:
-                        grounding = plan.interaction_grounding
-                        runtime._latest_interaction_grounding[
-                            (grounding.environment_instance_id, grounding.episode_id)
-                        ] = grounding
                 else:
                     concrete_skipped_delta += 1
                     concrete_nodes_avoided_delta += len(plan.base_writes)
@@ -498,6 +509,7 @@ def apply_canonical_commit_batch(
                     prior_support=symbol_prior_support,
                     context=plan.context,
                     isf_static=plan.isf_static,
+                    novel_context=_relation_context_is_novel(runtime, symbol.relation),
                     force_novel=bool(
                         novel_derived
                         or (
@@ -569,9 +581,10 @@ def apply_canonical_commit_batch(
                     if plan.interaction_grounding is not None:
                         g = plan.interaction_grounding
                         symbol_structure_uid = symbol.relation.uid
+                        interaction_structure_uid = int(plan.relation.uid.lo)
                         grounding_key = (
                             int(symbol_structure_uid.lo),
-                            int(g.uid.lo),
+                            interaction_structure_uid,
                             int(g.environment_instance_id),
                             0,
                             0,
@@ -580,7 +593,7 @@ def apply_canonical_commit_batch(
                         after_grounding = runtime.grounding.observe(
                             GroundingEvidence(
                                 int(symbol_structure_uid.lo),
-                                int(g.uid.lo),
+                                interaction_structure_uid,
                                 int(g.environment_instance_id),
                                 0,
                                 0,
