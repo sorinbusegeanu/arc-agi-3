@@ -21,6 +21,7 @@ from .canonical_transaction import (
     CanonicalWorkEstimate,
     _estimate_bytes,
 )
+from .memory_admission import should_retain_concrete
 from .memory_pipeline import CommitPlan, DerivationTask, _m1n_write
 
 
@@ -252,6 +253,17 @@ def _append_dirty_normalized(runtime: Any, relation: Any, rows: list[Any]) -> in
         )
     )
     return signature
+
+
+def _relation_evidence_available(runtime: Any, relation: Any, deferred_rows: list[Any]) -> bool:
+    available_here = {row[0].uid for row in deferred_rows}
+    refs = tuple(relation.provenance.parents) + tuple(relation.provenance.evidence)
+    return all(
+        uid in runtime.graph.nodes
+        or uid in runtime._deferred_base_nodes
+        or uid in available_here
+        for uid in refs
+    )
 
 
 def apply_canonical_commit_batch(
