@@ -1,5 +1,6 @@
 from pathlib import Path
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
+from v9.runtime.config import ScientificConfig
 from v9.runtime.memory_pipeline import IngestionTask, prepare_ingestion
 from v9.runtime.multiprocess import EncodedTransition
 from v9.runtime.parallel_memory_coordinator import _adaptive_canonical_batch_size
@@ -27,8 +28,23 @@ def _stage_semantics(runtime):
 
 def test_true_batch_matches_ordered_single_event_state(tmp_path: Path, monkeypatch) -> None:
     rows = _prepared()
-    single = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path / "single", restore=False, enable_snapshots=False))
-    batched = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path / "batched", restore=False, enable_snapshots=False))
+    scientific = ScientificConfig(concrete_admission_enabled=False)
+    single = ContinuousMemoryRuntime(
+        RuntimeConfig.from_path(
+            tmp_path / "single",
+            restore=False,
+            enable_snapshots=False,
+            scientific=scientific,
+        )
+    )
+    batched = ContinuousMemoryRuntime(
+        RuntimeConfig.from_path(
+            tmp_path / "batched",
+            restore=False,
+            enable_snapshots=False,
+            scientific=scientific,
+        )
+    )
     for row in rows:
         single.apply_prepared_ingestion(row)
     def no_single_event_fallback(_row):
