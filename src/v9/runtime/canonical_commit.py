@@ -327,6 +327,7 @@ def apply_canonical_commit_batch(
         concrete_skipped_delta = 0
         concrete_nodes_avoided_delta = 0
         admission_reason_counts: dict[str, int] = {}
+        admitted_concrete_uids: set[Any] = set()
         max_cross_modal = int(runtime.config.scientific.max_cross_modal_facts_per_macro_event)
         logical_graph_generation = int(runtime.graph.generation)
         publication_generation_delta = getattr(runtime, "_deferred_publication_generation_delta", None)
@@ -405,10 +406,17 @@ def apply_canonical_commit_batch(
                     plan_deferred_rows.extend(
                         materialized_rows[id(write)] for write in plan.base_writes
                     )
+                    admitted_concrete_uids.update(write.node.uid for write in plan.base_writes)
                     concrete_retained_delta += 1
                 else:
                     concrete_skipped_delta += 1
-                    concrete_nodes_avoided_delta += len(plan.base_writes)
+                    concrete_nodes_avoided_delta += sum(
+                        1
+                        for write in plan.base_writes
+                        if write.node.uid not in runtime.graph.nodes
+                        and write.node.uid not in runtime._deferred_base_nodes
+                        and write.node.uid not in admitted_concrete_uids
+                    )
 
                 signature = record_normalized_fast(
                     runtime,
@@ -526,10 +534,17 @@ def apply_canonical_commit_batch(
                     plan_deferred_rows.extend(
                         materialized_rows[id(write)] for write in symbol.base_writes
                     )
+                    admitted_concrete_uids.update(write.node.uid for write in symbol.base_writes)
                     concrete_retained_delta += 1
                 else:
                     concrete_skipped_delta += 1
-                    concrete_nodes_avoided_delta += len(symbol.base_writes)
+                    concrete_nodes_avoided_delta += sum(
+                        1
+                        for write in symbol.base_writes
+                        if write.node.uid not in runtime.graph.nodes
+                        and write.node.uid not in runtime._deferred_base_nodes
+                        and write.node.uid not in admitted_concrete_uids
+                    )
 
                 signature = record_normalized_fast(
                     runtime,
