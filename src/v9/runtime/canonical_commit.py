@@ -328,6 +328,7 @@ def apply_canonical_commit_batch(
         concrete_nodes_avoided_delta = 0
         admission_reason_counts: dict[str, int] = {}
         admitted_concrete_uids: set[Any] = set()
+        batch_materialized_normalized_uids: set[Any] = set()
         max_cross_modal = int(runtime.config.scientific.max_cross_modal_facts_per_macro_event)
         logical_graph_generation = int(runtime.graph.generation)
         publication_generation_delta = getattr(runtime, "_deferred_publication_generation_delta", None)
@@ -425,6 +426,7 @@ def apply_canonical_commit_batch(
                     plan_deferred_rows,
                     materialized_row=materialized_rows[id(plan.normalized_write)],
                     retain_occurrence=interaction_retained,
+                    batch_materialized_uids=batch_materialized_normalized_uids,
                 )
                 dirty_signature = _append_dirty_normalized(
                     runtime, plan.relation, plan_deferred_rows
@@ -553,6 +555,7 @@ def apply_canonical_commit_batch(
                     plan_deferred_rows,
                     materialized_row=materialized_rows[id(symbol.normalized_write)],
                     retain_occurrence=symbol_retained,
+                    batch_materialized_uids=batch_materialized_normalized_uids,
                 )
                 dirty_signature = _append_dirty_normalized(
                     runtime, symbol.relation, plan_deferred_rows
@@ -587,6 +590,7 @@ def apply_canonical_commit_batch(
                             id(symbol.aligned_normalized_write)
                         ],
                         retain_occurrence=aligned_retain,
+                        batch_materialized_uids=batch_materialized_normalized_uids,
                     )
                     dirty_signature = _append_dirty_normalized(
                         runtime, symbol.aligned_relation, plan_deferred_rows
@@ -646,6 +650,7 @@ def apply_canonical_commit_batch(
                     plan_deferred_rows,
                     materialized_row=materialized_rows[id(derived.write)],
                     retain_occurrence=retain_derived_occurrence,
+                    batch_materialized_uids=batch_materialized_normalized_uids,
                 )
                 dirty_signature = _append_dirty_normalized(
                     runtime, derived.relation, plan_deferred_rows
@@ -688,6 +693,7 @@ def apply_canonical_commit_batch(
                         write,
                         plan_deferred_rows,
                         retain_occurrence=retain_control_occurrence,
+                        batch_materialized_uids=batch_materialized_normalized_uids,
                     )
                     dirty_signature = _append_dirty_normalized(
                         runtime, control.relation, plan_deferred_rows
