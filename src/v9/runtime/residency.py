@@ -460,63 +460,70 @@ class ResidentMemoryManager:
         node = graph.nodes.get(uid)
         if node is None or not _is_deletable_low_level(node):
             return None
-        direct_sources = tuple(graph._provenance_sources_by_target.get(uid, ()))
+
+        # Follow the consolidation ancestry instead of stopping at the nearest
+        # M1N. M2+ families may cover many otherwise-singleton M1N rows and are
+        # therefore the correct replacement scope for redundant concrete
+        # evidence.
         candidates: set[MemoryUid] = set()
-        if node.level is MemoryLevel.M1:
-            for source_uid in direct_sources:
-                source = graph.nodes.get(source_uid)
-                if source is None:
-                    continue
-                if source.memory_type is MemoryType.NORMALIZED_RELATION or source.level > MemoryLevel.M1:
-                    candidates.add(source_uid)
-        else:
-            for source_uid in direct_sources:
-                source = graph.nodes.get(source_uid)
-                if source is None:
-                    continue
-                if source.memory_type is MemoryType.NORMALIZED_RELATION or source.level > MemoryLevel.M1:
-                    candidates.add(source_uid)
-                    continue
-                for second_uid in graph._provenance_sources_by_target.get(source_uid, ()):
-                    second = graph.nodes.get(second_uid)
-                    if second is not None and (
-                        second.memory_type is MemoryType.NORMALIZED_RELATION or second.level > MemoryLevel.M1
-                    ):
-                        candidates.add(second_uid)
+        visited = {uid}
+        frontier = deque([uid])
+        for _ in range(6):
+            next_frontier: deque[MemoryUid] = deque()
+            while frontier:
+                current = frontier.popleft()
+                for source_uid in graph._provenance_sources_by_target.get(current, ()):
+                    if source_uid in visited:
+                        continue
+                    visited.add(source_uid)
+                    source = graph.nodes.get(source_uid)
+                    if source is None:
+                        continue
+                    if source.memory_type is MemoryType.NORMALIZED_RELATION or source.level > MemoryLevel.M1:
+                        candidates.add(source_uid)
+                    next_frontier.append(source_uid)
+            if not next_frontier:
+                break
+            frontier = next_frontier
         if not candidates:
             return None
-        return min(
+        return max(
             candidates,
             key=lambda candidate_uid: (
-                0 if graph.nodes[candidate_uid].memory_type is MemoryType.NORMALIZED_RELATION else 1,
                 int(graph.nodes[candidate_uid].level),
+                int(graph.nodes[candidate_uid].memory_type is not MemoryType.NORMALIZED_RELATION),
                 candidate_uid,
             ),
         )
 
-    def _group_size(self, replacement_uid: MemoryUid, level: MemoryLevel) -> int:
+    def _group_size(self, replacement_uid: MemoryUid, level: MemoryLevel, *, limit: int = 8_192) -> int:
         graph = self.runtime.graph
-        children = tuple(graph._provenance_targets_by_source.get(replacement_uid, ()))
-        if level is MemoryLevel.M1:
-            return sum(
-                1
-                for uid in children
-                if (node := graph.nodes.get(uid)) is not None
-                and node.level is MemoryLevel.M1
-                and node.memory_type is MemoryType.GROUNDED_CONTINGENCY
-            )
+        maximum = max(1, int(limit))
         count = 0
-        for child_uid in children:
-            child = graph.nodes.get(child_uid)
-            if child is None:
-                continue
-            if child.level is MemoryLevel.M0 and child.memory_type is MemoryType.EPISODE:
-                count += 1
-                continue
-            for grandchild_uid in graph._provenance_targets_by_source.get(child_uid, ()):
-                grandchild = graph.nodes.get(grandchild_uid)
-                if grandchild is not None and grandchild.level is MemoryLevel.M0 and grandchild.memory_type is MemoryType.EPISODE:
+        visited = {replacement_uid}
+        frontier = deque([replacement_uid])
+        while frontier and count < maximum:
+            current = frontier.popleft()
+            for child_uid in graph._provenance_targets_by_source.get(current, ()):
+                if child_uid in visited:
+                    continue
+                visited.add(child_uid)
+                child = graph.nodes.get(child_uid)
+                if child is None:
+                    continue
+                matches = (
+                    child.level is MemoryLevel.M0
+                    and child.memory_type is MemoryType.EPISODE
+                    if level is MemoryLevel.M0
+                    else child.level is MemoryLevel.M1
+                    and child.memory_type is MemoryType.GROUNDED_CONTINGENCY
+                )
+                if matches:
                     count += 1
+                    if count >= maximum:
+                        break
+                else:
+                    frontier.append(child_uid)
         return count
 
     def _score_candidates(self, rows: list[tuple[MemoryUid, Any, dict[str, Any], MemoryUid]]) -> list[tuple[float, int, MemoryUid, MemoryUid]]:
@@ -624,7 +631,11 @@ class ResidentMemoryManager:
             if len(plans) >= required:
                 break
             if replacement_uid not in group_sizes:
-                group_sizes[replacement_uid] = self._group_size(replacement_uid, level)
+                group_sizes[replacement_uid] = self._group_size(
+                    replacement_uid,
+                    level,
+                    limit=max(64, int(required) + 16),
+                )
                 group_floors[replacement_uid] = self._effective_group_floor(
                     level, group_sizes[replacement_uid]
                 )
