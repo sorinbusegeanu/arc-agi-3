@@ -50,7 +50,15 @@ def advance_stage_fast(runtime: Any) -> Any:
     return next_stage
 
 
-def record_normalized_fast(runtime: Any, relation: Any, initial_write: CanonicalWrite, deferred_rows: list[Any], *, materialized_row: Any | None = None) -> int:
+def record_normalized_fast(
+    runtime: Any,
+    relation: Any,
+    initial_write: CanonicalWrite,
+    deferred_rows: list[Any],
+    *,
+    materialized_row: Any | None = None,
+    retain_occurrence: bool = True,
+) -> int:
     ensure_fast_state(runtime)
     normalize = getattr(runtime, "normalize_m1n_family", None)
     if callable(normalize):
@@ -64,7 +72,10 @@ def record_normalized_fast(runtime: Any, relation: Any, initial_write: Canonical
     family = int(getattr(relation, "family_signature", 0) or signature)
     family_rows = runtime._m1n_family_occurrences.setdefault(family, [])
     identity = (relation.uid, relation.channel.value, tuple(relation.provenance.evidence))
-    if all((existing.uid, existing.channel.value, tuple(existing.provenance.evidence)) != identity for existing in family_rows):
+    if retain_occurrence and all(
+        (existing.uid, existing.channel.value, tuple(existing.provenance.evidence)) != identity
+        for existing in family_rows
+    ):
         family_rows.append(relation)
         family_limit = max(4, int(runtime.config.scientific.m1n_facts_per_channel) * 4)
         if len(family_rows) > family_limit:
@@ -95,15 +106,35 @@ def record_normalized_fast(runtime: Any, relation: Any, initial_write: Canonical
         runtime._actor_action_supports[scoped] = runtime._actor_action_supports.get(scoped, 0.0) + 1.0
         runtime._actor_policy_generation += 1
 
-    if len(occurrences) < max(2, runtime.config.scientific.m1n_facts_per_channel):
-        occurrences.append(relation)
+    if retain_occurrence:
+        limit = max(2, int(runtime.config.scientific.m1n_facts_per_channel))
+        if len(occurrences) < limit:
+            occurrences.append(relation)
+        elif identity != (
+            occurrences[-1].uid,
+            occurrences[-1].channel.value,
+            tuple(occurrences[-1].provenance.evidence),
+        ):
+            # Keep the retained evidence set bounded while allowing high-value,
+            # later representatives to replace stale concrete examples.
+            del occurrences[0]
+            occurrences.append(relation)
     if not was_stable and len(occurrences) >= 2:
         runtime._fast_stable_contingencies += 1
 
     runtime._replay_pool[relation.uid] = float(support)
-    if support == 1:
-        deferred_rows.append(initial_write.runtime_row() if materialized_row is None else materialized_row)
-    else:
+
+    already_materialized = (
+        relation.uid in runtime.graph.nodes
+        or relation.uid in runtime._deferred_base_nodes
+        or any(row[0].uid == relation.uid for row in deferred_rows)
+    )
+    if retain_occurrence and not already_materialized:
+        deferred_rows.append(
+            initial_write.runtime_row() if materialized_row is None else materialized_row
+        )
+        already_materialized = True
+    if support > 1 and already_materialized:
         runtime._m1n_dirty.add(signature)
     return signature
 
