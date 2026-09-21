@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from types import SimpleNamespace
+from urllib.request import urlopen
 
 from v9.telemetry.http_server import MetricsHTTPServer
 
@@ -78,3 +79,18 @@ def test_dashboard_logger_records_provider_failure_and_keeps_polling(tmp_path) -
     assert rows[0]["dashboard_metrics_error"]["type"] == "KeyError"
     assert rows[-1]["primary_dashboard"]["M0_count"] == 12
     assert provider.calls >= 2
+
+
+def test_dashboard_html_hides_diagnostics_block(tmp_path) -> None:
+    provider = _MetricsProvider(tmp_path)
+    server = MetricsHTTPServer(provider.metrics, host="127.0.0.1", port=0, refresh_seconds=0.1)
+    server.start()
+    try:
+        port = int(server._server.server_address[1])
+        with urlopen(f"http://127.0.0.1:{port}/dashboard", timeout=2.0) as response:
+            html = response.read().decode("utf-8")
+        assert 'id="grid"' in html
+        assert 'id="diag"' not in html
+        assert "<h2>Diagnostics</h2>" not in html
+    finally:
+        server.close()
