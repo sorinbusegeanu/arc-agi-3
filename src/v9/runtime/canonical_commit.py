@@ -569,10 +569,13 @@ def apply_canonical_commit_batch(
                     if symbol.aligned_normalized_write is None:
                         raise RuntimeError("aligned symbol commit plan is incomplete")
                     aligned_retain = bool(
-                        symbol_retained
-                        and interaction_retained
-                        and _relation_evidence_available(
-                            runtime, symbol.aligned_relation, plan_deferred_rows
+                        not runtime.config.scientific.concrete_admission_enabled
+                        or (
+                            symbol_retained
+                            and interaction_retained
+                            and _relation_evidence_available(
+                                runtime, symbol.aligned_relation, plan_deferred_rows
+                            )
                         )
                     )
                     aligned_signature = record_normalized_fast(
@@ -630,8 +633,11 @@ def apply_canonical_commit_batch(
                     if cross_modal_used >= max_cross_modal:
                         continue
                     cross_modal_used += 1
-                retain_derived_occurrence = _relation_evidence_available(
-                    runtime, derived.relation, plan_deferred_rows
+                retain_derived_occurrence = bool(
+                    not runtime.config.scientific.concrete_admission_enabled
+                    or _relation_evidence_available(
+                        runtime, derived.relation, plan_deferred_rows
+                    )
                 )
                 signature = record_normalized_fast(
                     runtime,
@@ -670,8 +676,11 @@ def apply_canonical_commit_batch(
                         occurrence=symbol.occurrence,
                         payload_extra=control.payload(),
                     )
-                    retain_control_occurrence = _relation_evidence_available(
-                        runtime, control.relation, plan_deferred_rows
+                    retain_control_occurrence = bool(
+                        not runtime.config.scientific.concrete_admission_enabled
+                        or _relation_evidence_available(
+                            runtime, control.relation, plan_deferred_rows
+                        )
                     )
                     signature = record_normalized_fast(
                         runtime,
