@@ -10,6 +10,8 @@ from v9.telemetry import (
     ModelEvolutionSample,
     OptimizationSample,
 )
+from v9.telemetry.dashboard import PRIMARY_KEYS
+
 
 
 def test_unified_telemetry_covers_all_v976_categories_and_persists(tmp_path) -> None:
@@ -120,21 +122,22 @@ def test_unified_telemetry_covers_all_v976_categories_and_persists(tmp_path) -> 
     dashboard = metrics["primary_dashboard"]
     diagnostics = metrics["telemetry_diagnostics"]
 
-    assert dashboard["reasoning_cycles"] == 3.0
-    assert dashboard["final_vs_initial_candidate_improvement"] == 1.0
-    assert dashboard["HGT_consequence_error"] == 0.2
-    assert dashboard["HGT_strategy_ranking_accuracy"] == 1.0
-    assert dashboard["HGT_candidate_refinement_success"] == 1.0
-    assert dashboard["HGT_training_loss"] == 0.5
-    assert dashboard["HGT_validation_loss"] == 0.6
-    assert dashboard["historical_retention"] == 0.93
-    assert dashboard["current_curriculum_gain"] == 0.08
-    assert dashboard["cross_family_validation_gain"] == 0.04
+    assert tuple(dashboard) == PRIMARY_KEYS
+    assert len(dashboard) == 24
     assert dashboard["ModelVersion"] == "hgt-2"
     assert dashboard["GPU_memory_GB"] == round(4_000_000_000 / (1024.0 ** 3), 2)
-    assert "inference_latency" not in dashboard
-    assert "training_step_latency" not in dashboard
 
+    assert diagnostics["reasoning_cycles"] == 3.0
+    assert diagnostics["initial_candidate_score"] == 1.0
+    assert diagnostics["best_candidate_score"] == 2.0
+    assert diagnostics["hgt_consequence_error"] == 0.2
+    assert diagnostics["hgt_strategy_ranking_accuracy"] == 1.0
+    assert diagnostics["hgt_candidate_refinement_success"] == 1.0
+    assert diagnostics["hgt_training_loss"] == 0.5
+    assert diagnostics["hgt_validation_loss"] == 0.6
+    assert diagnostics["historical_retention"] == 0.93
+    assert diagnostics["current_curriculum_gain"] == 0.08
+    assert diagnostics["cross_family_validation_gain"] == 0.04
     assert diagnostics["reasoning_stop_reasons"]["AMBIGUITY_RESOLVED"] == 1
     assert diagnostics["replay_compression_ratio"] == 0.75
     assert diagnostics["mean_relative_efficiency_gain"] == 0.4

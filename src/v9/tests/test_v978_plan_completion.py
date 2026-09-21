@@ -65,7 +65,7 @@ def test_h16_report_publishes_matched_controls_and_causal_effect() -> None:
     assert "h16_heldout_causal_effect" in runtime.gauges
 
 
-def test_primary_dashboard_contains_grounding_and_h16_metrics() -> None:
+def test_primary_dashboard_omits_detailed_grounding_and_h16_metrics() -> None:
     runtime_metrics = {
         "memory_levels": {},
         "grounding_G3_count": 2,
@@ -82,7 +82,7 @@ def test_primary_dashboard_contains_grounding_and_h16_metrics() -> None:
         "h16_heldout_causal_effect": 0.3,
     }
     dashboard = build_primary_dashboard(runtime_metrics, diagnostic)
-    assert dashboard["grounding_G3_count"] == 2
-    assert dashboard["grounding_mean_confidence"] == 0.8
-    assert dashboard["H16_C2_score"] == 0.6
-    assert dashboard["H16_heldout_causal_effect"] == 0.3
+    assert "grounding_G3_count" not in dashboard
+    assert "grounding_mean_confidence" not in dashboard
+    assert "H16_C2_score" not in dashboard
+    assert "H16_heldout_causal_effect" not in dashboard
