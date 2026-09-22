@@ -1161,7 +1161,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         int(training_epochs),
         min(64, max(1, int(math.ceil(training_examples / 2048.0)))),
     )
-    stream_batch_size = max(64, min(2048, int(getattr(config, "hgt_epoch_batch_size", 512))))
+    stream_batch_size = max(1, min(2048, int(config.hgt_epoch_batch_size)))
     if epoch_transition_rows:
         full_dataset_steps = math.ceil(len(epoch_transition_rows) / stream_batch_size)
         if not matched_reasoning:
