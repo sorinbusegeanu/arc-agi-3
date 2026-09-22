@@ -8,6 +8,8 @@ import v9.cli as cli
 from v9.environments.contract import BoundaryEvent, BoundaryScope
 from v9.environments.schemas import ActionSchema, EnvironmentIdentity, ObservationSchema
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig
+from v9.runtime.developmental_cut import DevelopmentalWorkStatus
+from v9.runtime.epoch_runner import _run_epoch_transfer_validation
 from v9.runtime.transfer_validation import (
     TransferValidationStats,
     _balance_transfer_candidates,
@@ -274,3 +276,63 @@ def test_transfer_validation_cli_restores_validates_persists_and_exits(tmp_path:
         "passed": 1,
         "validated_concepts": 1,
     }
+
+
+
+def test_epoch_runner_automatically_executes_transfer_validation(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+    expected = TransferValidationStats(8, 8, 4, 1, None)
+
+    def validate(runtime, specs, args, *, epoch, adapter_factory):
+        calls["validation"] = (runtime, specs, args, epoch, adapter_factory)
+        return expected
+
+    monkeypatch.setattr("v9.runtime.epoch_runner.run_transfer_validation_interval", validate)
+    runtime = object()
+    specs = (object(),)
+    args = SimpleNamespace()
+    adapter_factory = object()
+
+    result = _run_epoch_transfer_validation(
+        runtime,
+        specs,
+        args,
+        epoch=3,
+        adapter_factory=adapter_factory,
+        developmental_session=None,
+    )
+
+    assert result == expected
+    assert calls["validation"] == (runtime, specs, args, 3, adapter_factory)
+
+
+def test_epoch_transfer_validation_runs_inside_matched_developmental_cut(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+    expected = TransferValidationStats(4, 4, 2, 1, None)
+
+    def validate(runtime, specs, args, *, epoch, adapter_factory):
+        calls["validation"] = (runtime, specs, args, epoch, adapter_factory)
+        return expected
+
+    class Session:
+        def run(self, operator, operation, *, stable_key, status):
+            calls["operator"] = operator
+            calls["stable_key"] = stable_key
+            value = operation()
+            calls["status"] = status(value)
+            return value
+
+    monkeypatch.setattr("v9.runtime.epoch_runner.run_transfer_validation_interval", validate)
+    result = _run_epoch_transfer_validation(
+        object(),
+        (object(),),
+        SimpleNamespace(),
+        epoch=5,
+        adapter_factory=object(),
+        developmental_session=Session(),
+    )
+
+    assert result == expected
+    assert calls["operator"] == "transfer_validation"
+    assert calls["stable_key"] == "epoch:5:transfer-validation"
+    assert calls["status"] is DevelopmentalWorkStatus.APPLIED
