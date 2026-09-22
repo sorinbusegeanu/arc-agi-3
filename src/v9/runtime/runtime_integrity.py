@@ -175,6 +175,9 @@ def _write_streaming_snapshot(runtime: Any, chunked_snapshot: Any) -> Any:
     temporary: Path | None = None
     snapshot_id = 0
     try:
+        canonical_backed = hasattr(runtime, "canonical_store") and hasattr(
+            runtime, "canonical_wal"
+        )
         with runtime._lock, runtime.graph._publication_lock:
             runtime._snapshot_id += 1
             runtime.telemetry["snapshot_writes"] += 1
@@ -186,8 +189,6 @@ def _write_streaming_snapshot(runtime: Any, chunked_snapshot: Any) -> Any:
             if temporary.exists():
                 shutil.rmtree(temporary, ignore_errors=True)
             temporary.mkdir(parents=True)
-            capture_dir = temporary / ".capture"
-            capture_dir.mkdir()
 
             state, graph_header = _runtime_state_without_materialized_graph(runtime)
             state.pop("graph", None)
@@ -196,17 +197,53 @@ def _write_streaming_snapshot(runtime: Any, chunked_snapshot: Any) -> Any:
             _dump_pickle_file(runtime_state_path, state)
             _dump_pickle_file(graph_header_path, graph_header)
             del state, graph_header
-            captures = tuple(
-                chunked_snapshot.capture_graph_shard(
-                    runtime.graph, partition, capture_dir
+
+            captures = ()
+            capture_dir: Path | None = None
+            canonical_cut = None
+            if canonical_backed:
+                handle = runtime.canonical_store.current_handle
+                canonical_cut = {
+                    "canonical_handle_checksum": str(handle.checksum),
+                    "snapshot_applied_lsn": int(handle.canonical_applied_lsn),
+                    "scientific_identity": dict(
+                        runtime._canonical_scientific_identity()
+                    ),
+                }
+            else:
+                capture_dir = temporary / ".capture"
+                capture_dir.mkdir()
+                captures = tuple(
+                    chunked_snapshot.capture_graph_shard(
+                        runtime.graph, partition, capture_dir
+                    )
+                    for partition in range(int(runtime.graph.partition_count))
                 )
-                for partition in range(int(runtime.graph.partition_count))
-            )
 
         capture_done = time.perf_counter()
         runtime.set_telemetry_gauge(
             "snapshot_capture_seconds", capture_done - started
         )
+
+        canonical_reference = None
+        if canonical_cut is not None:
+            canonical_path = runtime.write_canonical_snapshot(snapshot_id)
+            if canonical_path is None:
+                raise RuntimeError("canonical-backed snapshot has no canonical path")
+            handle = runtime.canonical_store.current_handle
+            if (
+                str(handle.checksum)
+                != canonical_cut["canonical_handle_checksum"]
+                or int(handle.canonical_applied_lsn)
+                != int(canonical_cut["snapshot_applied_lsn"])
+            ):
+                raise RuntimeError(
+                    "canonical state advanced during quiescent snapshot capture"
+                )
+            canonical_reference = {
+                **canonical_cut,
+                "path": str(Path(canonical_path).relative_to(root)),
+            }
 
         runtime_chunks, runtime_bytes, runtime_sha = chunked_snapshot.write_file_chunks(
             root, runtime_state_path
@@ -220,7 +257,8 @@ def _write_streaming_snapshot(runtime: Any, chunked_snapshot: Any) -> Any:
         ]
         runtime_state_path.unlink(missing_ok=True)
         graph_header_path.unlink(missing_ok=True)
-        shutil.rmtree(capture_dir, ignore_errors=True)
+        if capture_dir is not None:
+            shutil.rmtree(capture_dir, ignore_errors=True)
 
         manifest = {
             "schema": chunked_snapshot.NATIVE_SCHEMA,
@@ -237,6 +275,8 @@ def _write_streaming_snapshot(runtime: Any, chunked_snapshot: Any) -> Any:
             "graph_header_bytes": int(header_bytes),
             "graph_header_sha256": str(header_sha),
             "graph_header_chunks": header_chunks,
+            "graph_source": "canonical" if canonical_reference is not None else "native_shards",
+            "canonical_graph_snapshot": canonical_reference,
             "graph_shards": graph_shards,
             "symbol_graph_schema_version": int(SYMBOL_GRAPH_SCHEMA_VERSION),
             "symbol_grounding_design_version": "9.7.9",
@@ -255,6 +295,12 @@ def _write_streaming_snapshot(runtime: Any, chunked_snapshot: Any) -> Any:
         )
         runtime.set_telemetry_gauge(
             "snapshot_total_seconds", time.perf_counter() - started
+        )
+        runtime.set_telemetry_gauge(
+            "snapshot_graph_shards_written", len(graph_shards)
+        )
+        runtime.set_telemetry_gauge(
+            "snapshot_uses_canonical_graph", int(canonical_reference is not None)
         )
         return chunked_snapshot.SnapshotResult(
             target, snapshot_id, watermark, generation
@@ -812,9 +858,7 @@ def install_runtime_integrity(
             self._restore(captured)
 
     def snapshot(self: Any):
-        result = _write_streaming_snapshot(self, chunked_snapshot)
-        self.write_canonical_snapshot(self._snapshot_id)
-        return result
+        return _write_streaming_snapshot(self, chunked_snapshot)
 
     runtime_cls._restore = restore
     runtime_cls.apply_environment_evidence_confidence = apply_environment_evidence_confidence
