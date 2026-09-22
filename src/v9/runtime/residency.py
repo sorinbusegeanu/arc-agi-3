@@ -869,9 +869,22 @@ class ResidentMemoryManager:
             if len(plans) >= required:
                 break
             if replacement_uid not in group_sizes:
-                group_sizes[replacement_uid] = max(
-                    1, int(observed_group_sizes.get((replacement_uid, level), 1))
+                observed = max(
+                    0, int(observed_group_sizes.get((replacement_uid, level), 0))
                 )
+                # Incremental accounting can be incomplete after restore, bulk
+                # publication, or a missed feed. Verify small/unknown groups by
+                # bounded provenance traversal; this never scans the whole level.
+                if observed <= 1:
+                    observed = max(
+                        observed,
+                        self._group_size(
+                            replacement_uid,
+                            level,
+                            limit=max(64, min(int(scan_budget), int(required) + 16)),
+                        ),
+                    )
+                group_sizes[replacement_uid] = max(1, observed)
                 group_floors[replacement_uid] = self._effective_group_floor(
                     level, group_sizes[replacement_uid]
                 )
