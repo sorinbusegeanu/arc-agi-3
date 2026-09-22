@@ -25,6 +25,10 @@ from .training_cut import TrainingCut, TrainingDeterminismMode
 # Authoritative on-disk tensor/objective schema. Checkpoint compatibility must
 # not depend on which runtime installer happened to be imported first.
 MODEL_SCHEMA_VERSION = 8
+POLICY_VALIDATION_FRACTION = 0.20
+POLICY_RANKING_LOSS_WEIGHT = 1.0
+POLICY_MIN_VALIDATION_RANKING_ACCURACY = 0.50
+POLICY_MAX_SCORE = 0.05
 MEMORY_NODE_TYPES = (
     "M0_EPISODE",
     "M1_GROUNDED_CONTINGENCY",
@@ -710,12 +714,13 @@ def _bounded_advantage_scores(scores: dict[int, float], scale: float) -> dict[in
 def _policy_score_scale(config: Any, *, validation_accuracy: float, validation_pairs: int) -> float:
     if validation_pairs <= 0:
         return 0.0
-    threshold = float(config.hgt_min_validation_ranking_accuracy)
+    del config
+    threshold = POLICY_MIN_VALIDATION_RANKING_ACCURACY
     accuracy = float(validation_accuracy)
     if accuracy <= threshold:
         return 0.0
     quality = (accuracy - threshold) / max(1e-9, 1.0 - threshold)
-    return float(config.hgt_max_policy_score) * max(0.0, min(1.0, quality))
+    return POLICY_MAX_SCORE * max(0.0, min(1.0, quality))
 
 
 def _masked_count(masks: dict[str, Any], action_masks: dict[str, Any]) -> int:
@@ -1265,7 +1270,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         action_meta,
         action_masks,
         torch,
-        validation_fraction=float(config.hgt_validation_fraction),
+        validation_fraction=POLICY_VALIDATION_FRACTION,
     )
     training_examples = _masked_count(train_masks, action_masks)
     validation_examples = _masked_count(validation_masks, action_masks)
@@ -1283,7 +1288,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
 
     training_ranking_pairs, validation_ranking_pairs = _split_ranking_pairs(
         epoch_ranking_pairs,
-        validation_fraction=float(config.hgt_validation_fraction),
+        validation_fraction=POLICY_VALIDATION_FRACTION,
     )
     stream_batch_size = max(1, min(2048, int(config.hgt_epoch_batch_size)))
     ranking_batches = [
@@ -1462,7 +1467,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
                 torch,
             )
             if ranking_loss is not None:
-                weighted_ranking = float(config.hgt_ranking_loss_weight) * ranking_loss
+                weighted_ranking = POLICY_RANKING_LOSS_WEIGHT * ranking_loss
                 loss = weighted_ranking if loss is None else loss + weighted_ranking
                 ranking_correct += int(step_correct)
                 ranking_total += int(step_total)
@@ -1557,7 +1562,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
 
     total_train_loss_t = base_train_loss_t
     if train_ranking_loss_t is not None:
-        weighted = float(config.hgt_ranking_loss_weight) * train_ranking_loss_t
+        weighted = POLICY_RANKING_LOSS_WEIGHT * train_ranking_loss_t
         total_train_loss_t = weighted if total_train_loss_t is None else total_train_loss_t + weighted
     validation_terms = [
         value for value in (validation_policy_loss_t, validation_ranking_loss_t)
