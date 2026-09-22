@@ -632,6 +632,8 @@ class CanonicalStore:
         path: str | Path,
         *,
         expected_scientific_identity: Mapping[str, str] | None = None,
+        chunk_directory: str | Path | None = None,
+        resident_chunk_limit: int | None = None,
     ) -> "CanonicalStore":
         target = cls._restorable_snapshot_path(path)
         if not (target / "COMPLETE").is_file():
@@ -661,7 +663,11 @@ class CanonicalStore:
                     raise ValueError("canonical snapshot chunk count mismatch")
                 if not isinstance(handle, CanonicalStateHandle) or handle.checksum != manifest["canonical_handle_checksum"]:
                     raise ValueError("canonical snapshot handle mismatch")
-                store = cls(schema_versions=dict(handle.schema_versions))
+                store = cls(
+                    schema_versions=dict(handle.schema_versions),
+                    chunk_directory=chunk_directory,
+                    resident_chunk_limit=resident_chunk_limit,
+                )
                 with store._lock:
                     store._chunks = OrderedDict()
                     store._chunk_references = {}
@@ -680,7 +686,11 @@ class CanonicalStore:
             handle = state["handle"]
             if not isinstance(handle, CanonicalStateHandle) or handle.checksum != manifest["canonical_handle_checksum"]:
                 raise ValueError("canonical snapshot handle mismatch")
-            store = cls(schema_versions=dict(handle.schema_versions))
+            store = cls(
+                    schema_versions=dict(handle.schema_versions),
+                    chunk_directory=chunk_directory,
+                    resident_chunk_limit=resident_chunk_limit,
+                )
             with store._lock:
                 store._chunks = OrderedDict()
                 store._chunk_references = {}
