@@ -640,7 +640,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                 "hgt_baseline_model_version", baseline_model
             )
             runtime.set_telemetry_gauge(
-                "hgt_behavioral_gain", float(0.0 if decision is None else (0.0 if decision is None else decision.gain))
+                "hgt_behavioral_gain", float(0.0 if decision is None else decision.gain)
             )
             runtime.set_telemetry_gauge(
                 "hgt_evaluation_branch", decision.selected_branch
@@ -734,7 +734,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         if baseline_success is None:
             baseline_success = behavioral_success
         runtime.set_telemetry_gauge("behavioral_success_rate", behavioral_success)
-        runtime.set_telemetry_gauge("behavioral_success_gain", 0.0 if is_bootstrap else float(0.0 if decision is None else (0.0 if decision is None else decision.gain)))
+        runtime.set_telemetry_gauge("behavioral_success_gain", 0.0 if is_bootstrap else float(0.0 if decision is None else decision.gain))
         runtime.set_telemetry_gauge("successful_scenarios", sum(rate > 0.0 for rate in scenario_success.values()))
         game_level = _game_level_metrics(process_results)
         previous_game_results = dict(game_level["by_game"])
@@ -1012,7 +1012,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                 training={
                     **asdict(training),
                     "behavioral_success_rate": behavioral_success,
-                    "behavioral_success_gain": 0.0 if is_bootstrap else float(0.0 if decision is None else (0.0 if decision is None else decision.gain)),
+                    "behavioral_success_gain": 0.0 if is_bootstrap else float(0.0 if decision is None else decision.gain),
                     "scenario_success_rate": scenario_success,
                     "game_level_metrics": game_level,
                     "transfer_validation": asdict(transfer),
