@@ -52,9 +52,7 @@ def _validated_snapshot_config_id(path: Path, expected_config_id: str) -> str:
     if migration_path.exists():
         migration = json.loads(migration_path.read_text(encoding="utf-8"))
         if (
-            str(migration.get("source_design_version", "")) == "9.7.8"
-            and str(migration.get("target_design_version", "")) == "9.7.9"
-            and str(migration.get("source_scientific_config_id", "")) == actual
+            str(migration.get("source_scientific_config_id", "")) == actual
             and str(migration.get("target_scientific_config_id", "")) == expected_config_id
         ):
             return actual

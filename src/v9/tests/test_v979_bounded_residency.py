@@ -259,3 +259,76 @@ def test_low_level_reuse_is_reported_as_deduplication() -> None:
     _publish_node(graph, m0, {"action_id": 1, "context_signature": 1}, watermark=2)
     assert graph.low_level_nodes_inserted_total == 1
     assert graph.low_level_nodes_reused_total == 1
+
+
+def test_candidate_selection_uses_incremental_queue_without_level_rescan(tmp_path: Path) -> None:
+    runtime = ContinuousMemoryRuntime(
+        RuntimeConfig(tmp_path / "incremental-candidates", enable_snapshots=False, restore=False)
+    )
+    try:
+        graph = runtime.graph
+        m0 = CanonicalNode.build(MemoryLevel.M0, MemoryType.EPISODE, (12001,), 1)
+        m1g = CanonicalNode.build(MemoryLevel.M1, MemoryType.GROUNDED_CONTINGENCY, (12002,), 2)
+        m1n = CanonicalNode.build(MemoryLevel.M1, MemoryType.NORMALIZED_RELATION, (12003,), 3)
+        _publish_node(graph, m0, {"action_id": 1, "context_signature": 3})
+        _publish_node(graph, m1g, {"parents": [[m0.uid.hi, m0.uid.lo]]}, watermark=2)
+        _publish_node(graph, m1n, {"parents": [[m1g.uid.hi, m1g.uid.lo]]}, watermark=3)
+
+        class ExplodingPopulation:
+            def __iter__(self):
+                raise AssertionError("level population was rescanned")
+
+        original = graph._uids_by_level[MemoryLevel.M0]
+        graph._uids_by_level[MemoryLevel.M0] = ExplodingPopulation()
+        try:
+            rows = runtime._resident_memory._candidate_rows(MemoryLevel.M0, 16)
+        finally:
+            graph._uids_by_level[MemoryLevel.M0] = original
+        assert any(uid == m0.uid for uid, *_ in rows)
+    finally:
+        runtime.close(normal=False)
+
+
+def test_flush_schedules_compaction_without_synchronous_planning(tmp_path: Path, monkeypatch) -> None:
+    runtime = ContinuousMemoryRuntime(
+        RuntimeConfig(tmp_path / "async-compaction", enable_snapshots=False, restore=False)
+    )
+    try:
+        manager = runtime._resident_memory
+        calls: list[bool] = []
+
+        def fail_sync(*, force: bool = False):
+            raise AssertionError("synchronous compaction entered the runtime flush path")
+
+        monkeypatch.setattr(manager, "maybe_compact", fail_sync)
+        monkeypatch.setattr(
+            manager,
+            "request_compaction",
+            lambda *, force=False: calls.append(bool(force)) or True,
+        )
+        monkeypatch.setattr(manager, "service_prepared_compaction", lambda *, max_batches=1: 0)
+        runtime.flush_deferred_memory_updates()
+        assert calls
+    finally:
+        runtime.close(normal=False)
+
+
+def test_low_level_cleanup_does_not_scan_all_lifecycle_or_m1n_entries(tmp_path: Path) -> None:
+    runtime = ContinuousMemoryRuntime(
+        RuntimeConfig(tmp_path / "targeted-cleanup", enable_snapshots=False, restore=False)
+    )
+    try:
+        uid = MemoryUid(123, 456)
+        runtime.lifecycle.observe(
+            uid, support_delta=1, relevant_opportunity=True, watermark=1
+        )
+
+        class NoItemsDict(dict):
+            def items(self):
+                raise AssertionError("full M1N occurrence scan entered deletion cleanup")
+
+        runtime._m1n_occurrences = NoItemsDict(runtime._m1n_occurrences)
+        runtime.on_low_level_deleted((uid,), affected_signatures=())
+        assert uid not in runtime.lifecycle.records
+    finally:
+        runtime.close(normal=False)

@@ -68,11 +68,20 @@ def should_retain_concrete(
         )
 
     next_support = support + 1
-    if bool(getattr(scientific, "concrete_admission_support_milestones", True)) and _power_of_two(
-        next_support
-    ):
+    milestone = bool(
+        getattr(scientific, "concrete_admission_support_milestones", True)
+    ) and _power_of_two(next_support)
+    if milestone and force_novel:
+        return ConcreteAdmissionDecision(True, "novel_dependent_milestone")
+    if milestone and novel_context:
+        return ConcreteAdmissionDecision(True, "novel_context_milestone")
+    if milestone:
         return ConcreteAdmissionDecision(True, "support_milestone")
 
+    if force_novel:
+        return ConcreteAdmissionDecision(False, "novel_dependent_redundant")
+    if novel_context:
+        return ConcreteAdmissionDecision(False, "novel_context_redundant")
     return ConcreteAdmissionDecision(False, "redundant_support")
 
 

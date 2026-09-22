@@ -175,6 +175,9 @@ def _publish_chunk(runtime: Any, rows: tuple[tuple[Any, dict[str, Any], tuple[An
                         graph._resident_m0_count = int(getattr(graph, "_resident_m0_count", 0)) + 1
                     else:
                         graph._resident_m1_grounded_count = int(getattr(graph, "_resident_m1_grounded_count", 0)) + 1
+                    candidate_feed = getattr(graph, "_low_level_candidate_feed", None)
+                    if candidate_feed is not None:
+                        candidate_feed.append((uid, node.level))
                     inserted_low_level += 1
                 new_nodes.append(node)
             graph.nodes[uid] = node
