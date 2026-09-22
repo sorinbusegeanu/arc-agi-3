@@ -326,6 +326,7 @@ def apply_canonical_commit_batch(
         concrete_retained_delta = 0
         concrete_skipped_delta = 0
         concrete_nodes_avoided_delta = 0
+        skipped_interaction_training_payloads: list[dict[str, Any]] = []
         admission_reason_counts: dict[str, int] = {}
         admitted_concrete_uids: set[Any] = set()
         batch_materialized_normalized_uids: set[Any] = set()
@@ -412,6 +413,10 @@ def apply_canonical_commit_batch(
                         and write.node.uid not in runtime._deferred_base_nodes
                         and write.node.uid not in admitted_concrete_uids
                     )
+                    if plan.base_writes:
+                        skipped_interaction_training_payloads.append(
+                            dict(materialized_rows[id(plan.base_writes[0])][1])
+                        )
 
                 signature = record_normalized_fast(
                     runtime,
@@ -699,6 +704,12 @@ def apply_canonical_commit_batch(
                 deferred_groups.append(deferred_group)
                 if callable(publication_generation_delta):
                     logical_graph_generation += int(publication_generation_delta(deferred_group))
+
+        commit_skipped_evidence = getattr(
+            runtime, "_commit_skipped_interaction_training_evidence", None
+        )
+        if skipped_interaction_training_payloads and callable(commit_skipped_evidence):
+            commit_skipped_evidence(tuple(skipped_interaction_training_payloads))
 
         if deferred_groups:
             defer_groups = getattr(runtime, "_defer_base_groups", None)
