@@ -386,13 +386,19 @@ class CanonicalStore:
                         return value
         return default
 
-    def collection(self, handle: CanonicalStateHandle, collection: CanonicalCollection | str) -> Mapping[Hashable, object]:
+    def iter_collection(
+        self,
+        handle: CanonicalStateHandle,
+        collection: CanonicalCollection | str,
+    ) -> Iterator[tuple[Hashable, object]]:
+        """Iterate immutable collection rows one persisted chunk at a time."""
         selected = collection if isinstance(collection, CanonicalCollection) else CanonicalCollection(str(collection))
-        with self._lock:
-            result: dict[Hashable, object] = {}
-            for chunk_id in handle.roots(selected):
-                result.update(self.chunk(chunk_id).entries)
-            return MappingProxyType(result)
+        for chunk_id in handle.roots(selected):
+            chunk = self.chunk(chunk_id)
+            yield from chunk.entries
+
+    def collection(self, handle: CanonicalStateHandle, collection: CanonicalCollection | str) -> Mapping[Hashable, object]:
+        return MappingProxyType(dict(self.iter_collection(handle, collection)))
 
     def _make_chunks(
         self,
@@ -541,8 +547,6 @@ class CanonicalStore:
             shutil.rmtree(temporary)
         temporary.mkdir(parents=True)
         with self.pin() as handle:
-            with self._lock:
-                chunks = tuple(self.chunk(chunk_id) for chunk_id in handle.all_chunk_ids)
             state_path = temporary / "canonical-state.pkl"
             state_hasher = hashlib.sha256()
 
@@ -554,12 +558,16 @@ class CanonicalStore:
                     state_hasher.update(payload)
                     return self.stream.write(payload)
 
+                def flush(self) -> None:
+                    self.stream.flush()
+
             with state_path.open("wb") as output:
-                pickle.dump(
-                    {"handle": handle, "chunks": chunks},
-                    _HashingWriter(output),
-                    protocol=5,
-                )
+                writer = _HashingWriter(output)
+                pickler = pickle.Pickler(writer, protocol=5)
+                pickler.dump(handle)
+                pickler.dump(len(handle.all_chunk_ids))
+                for chunk_id in handle.all_chunk_ids:
+                    pickler.dump(self.chunk(chunk_id))
                 output.flush()
                 os.fsync(output.fileno())
             state_checksum = state_hasher.hexdigest()
@@ -570,6 +578,8 @@ class CanonicalStore:
                 "canonical_handle_checksum": handle.checksum,
                 "canonical_generation": handle.generation,
                 "state_checksum": state_checksum,
+                "state_format": "pickle-stream-v2",
+                "chunk_count": len(handle.all_chunk_ids),
                 "scientific_identity": dict(sorted((scientific_identity or {}).items())),
             }
             manifest_path = temporary / "manifest.json"
@@ -630,12 +640,32 @@ class CanonicalStore:
         expected = dict(sorted((expected_scientific_identity or {}).items()))
         if expected_scientific_identity is not None and manifest.get("scientific_identity") != expected:
             raise ValueError("canonical snapshot scientific identity mismatch")
-        state_payload = (target / "canonical-state.pkl").read_bytes()
-        if hashlib.sha256(state_payload).hexdigest() != manifest["state_checksum"]:
+        state_path = target / "canonical-state.pkl"
+        hasher = hashlib.sha256()
+        with state_path.open("rb") as source:
+            while True:
+                block = source.read(1024 * 1024)
+                if not block:
+                    break
+                hasher.update(block)
+        if hasher.hexdigest() != manifest["state_checksum"]:
             raise ValueError("canonical snapshot state checksum mismatch")
-        state = pickle.loads(state_payload)
-        handle = state["handle"]
-        chunks = tuple(state["chunks"])
+
+        state_format = str(manifest.get("state_format", "pickle-bundle-v1"))
+        if state_format == "pickle-stream-v2":
+            with state_path.open("rb") as source:
+                unpickler = pickle.Unpickler(source)
+                handle = unpickler.load()
+                chunk_count = int(unpickler.load())
+                chunks = tuple(unpickler.load() for _ in range(chunk_count))
+            if chunk_count != int(manifest.get("chunk_count", chunk_count)):
+                raise ValueError("canonical snapshot chunk count mismatch")
+        else:
+            state_payload = state_path.read_bytes()
+            state = pickle.loads(state_payload)
+            handle = state["handle"]
+            chunks = tuple(state["chunks"])
+
         if not isinstance(handle, CanonicalStateHandle) or handle.checksum != manifest["canonical_handle_checksum"]:
             raise ValueError("canonical snapshot handle mismatch")
         store = cls(schema_versions=dict(handle.schema_versions))
