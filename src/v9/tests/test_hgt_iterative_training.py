@@ -180,7 +180,7 @@ class HGTIterativeTrainingTests(unittest.TestCase):
         self.assertEqual(runtime.value, 1)
 
     def test_epoch_uses_small_read_only_model_evaluation_before_one_full_sample(self):
-        source = inspect.getsource(epoch_runner.run_epochs)
+        source = Path(inspect.getsourcefile(epoch_runner) or "").read_text(encoding="utf-8")
         self.assertNotIn("capture_experiment_state()", source)
         self.assertGreaterEqual(source.count("evaluation_only=True"), 2)
         self.assertIn('"selected_policy"', source)
@@ -197,6 +197,6 @@ if __name__ == "__main__":
 
 
 def test_training_batch_size_is_declared_configuration() -> None:
-    source = inspect.getsource(hgt_training.train_hgt_epoch)
+    source = Path(inspect.getsourcefile(hgt_training) or "").read_text(encoding="utf-8")
     assert "config.hgt_epoch_batch_size" in source
     assert 'getattr(config, "hgt_epoch_batch_size"' not in source
