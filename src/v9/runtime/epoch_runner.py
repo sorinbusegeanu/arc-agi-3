@@ -15,6 +15,7 @@ from .developmental_cut import DevelopmentalWorkStatus
 from .lifecycle import run_lifecycle_maintenance
 from .parallel_memory_coordinator import run_parallel_memory_jobs
 from .scientific_modes import ScientificVisibilityMode, coerce_visibility_mode
+from .transfer_validation import TransferValidationStats, run_transfer_validation_interval
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,10 +413,41 @@ def _load_viability_history(root: str | Path) -> dict[str, dict[str, Any]]:
     return latest
 
 
+def _run_epoch_transfer_validation(
+    runtime: Any,
+    specs: tuple[Any, ...],
+    args: Any,
+    *,
+    epoch: int,
+    adapter_factory: Any,
+    developmental_session: Any | None,
+) -> TransferValidationStats:
+    def validate() -> TransferValidationStats:
+        return run_transfer_validation_interval(
+            runtime,
+            specs,
+            args,
+            epoch=epoch,
+            adapter_factory=adapter_factory,
+        )
+
+    if developmental_session is None:
+        return validate()
+    return developmental_session.run(
+        "transfer_validation",
+        validate,
+        stable_key=f"epoch:{epoch}:transfer-validation",
+        status=lambda result: (
+            DevelopmentalWorkStatus.APPLIED
+            if int(result.attempted) > 0
+            or int(result.completed) > 0
+            or int(result.validated_concepts) > 0
+            else DevelopmentalWorkStatus.NO_CHANGE
+        ),
+    )
+
+
 def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_factory: Any | None = None):
-    # Retained for caller compatibility; environment construction belongs to
-    # the sampling coordinator, while transfer validation is a separate CLI run.
-    del adapter_factory
     actor_results = []
     epoch_results = []
     baseline_success: float | None = None
@@ -423,6 +455,11 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
     previous_viability_profiles: dict[str, dict[str, Any]] = _load_viability_history(args.root)
     previous_game_cost: dict[str, float] = {}
     previous_scenario_success: dict[str, float] = {}
+    transfer_attempted = transfer_completed = transfer_passed = transfer_validated = 0
+    if adapter_factory is None:
+        # Imported lazily to avoid the cli -> epoch_runner module cycle.
+        from v9.cli import make_adapter as adapter_factory
+
     scientific_mode = coerce_visibility_mode(
         getattr(args, "scientific_mode", ScientificVisibilityMode.ASYNC_DEVELOPMENT)
     )
@@ -642,6 +679,32 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             json.dumps(game_level["current_run_best_level_by_game"], sort_keys=True),
         )
 
+        # M4 -> M5 is a causal gate. Automatic epoch validation is required for
+        # higher memory to progress during continuous-run; the standalone
+        # --transfer-validation command remains available for validation-only runs.
+        transfer_started = time.perf_counter()
+        transfer = _run_epoch_transfer_validation(
+            runtime,
+            specs,
+            args,
+            epoch=epoch,
+            adapter_factory=adapter_factory,
+            developmental_session=developmental_session,
+        )
+        transfer_done = time.perf_counter()
+        runtime.set_telemetry_gauge(
+            "post_sampling_transfer_seconds", transfer_done - transfer_started
+        )
+        transfer_attempted += int(transfer.attempted)
+        transfer_completed += int(transfer.completed)
+        transfer_passed += int(transfer.passed)
+        transfer_validated += int(transfer.validated_concepts)
+        runtime.set_telemetry_gauge("transfer_experiments_attempted", transfer_attempted)
+        runtime.set_telemetry_gauge("transfer_experiments_completed", transfer_completed)
+        runtime.set_telemetry_gauge("transfer_experiments_passed", transfer_passed)
+        runtime.set_telemetry_gauge("transfer_concepts_validated", transfer_validated)
+        runtime.set_telemetry_gauge("transfer_experiment_blocker", transfer.blocker or "")
+
         requested_training_steps = int(args.hgt_training_epochs)
         effective_training_steps = (
             requested_training_steps
@@ -853,7 +916,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                     "behavioral_success_gain": 0.0 if is_bootstrap else float(decision.gain),
                     "scenario_success_rate": scenario_success,
                     "game_level_metrics": game_level,
-                    "transfer_validation": None,
+                    "transfer_validation": asdict(transfer),
                     "developmental_cut_manifest_id": (
                         None if developmental_cut_result is None else developmental_cut_result.manifest_id
                     ),
