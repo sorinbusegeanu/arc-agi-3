@@ -138,7 +138,7 @@ class ScientificConfig:
     resident_m0_limit: int = 50_000
     resident_m1_grounded_limit: int = 50_000
     resident_low_level_target_ratio: float = 0.85
-    resident_compaction_check_interval: int = 25_000
+    resident_compaction_check_interval: int = 4_096
     resident_m0_representative_floor: int = 8
     resident_m1_grounded_representative_floor: int = 2
     resident_max_delete_batch: int = 262_144
