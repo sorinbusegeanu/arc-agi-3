@@ -207,3 +207,18 @@ def test_viability_epoch_path_uses_runtime_environment_identity(tmp_path) -> Non
     epoch_rows = [row for row in rows if "game" in row]
     assert epoch_rows
     assert all("evidence_confidence" in row for row in epoch_rows)
+
+
+
+def test_hgt_evaluation_and_batch_size_cli_are_authoritative(tmp_path) -> None:
+    args = build_parser().parse_args([
+        "continuous-run",
+        "--root", str(tmp_path / "hgt-config"),
+        "--games", "step1",
+        "--hgt-eval-steps-per-game", "37",
+        "--hgt-training-batch-size", "768",
+        "--no-dashboard",
+    ])
+    config = _runtime_config(args)
+    assert config.scientific.hgt_evaluation_steps_per_game == 37
+    assert config.scientific.hgt_epoch_batch_size == 768
