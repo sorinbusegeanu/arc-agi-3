@@ -91,13 +91,23 @@ def _terminal(row: dict[str, Any]) -> bool:
 
 
 def _episode_rows(raw_rows: list[dict[str, Any]], *, discount: float = 0.97) -> list[dict[str, Any]]:
-    running = 0.0
-    result: list[dict[str, Any]] = []
-    for row in reversed(raw_rows):
+    immediate_rows: list[tuple[dict[str, Any], float]] = []
+    previous_levels = 0
+    for row in raw_rows:
+        levels_completed = int(row.get("levels_completed", 0))
+        level_gain = max(0, levels_completed - previous_levels)
+        previous_levels = max(previous_levels, levels_completed)
         immediate = float(int(row.get("primary_valence", 0)))
         immediate += 1.0 if bool(row.get("task_success", False)) else 0.0
         immediate -= 1.0 if bool(row.get("task_failure", False)) else 0.0
         immediate -= 0.10 if bool(row.get("task_truncated", False)) else 0.0
+        if level_gain:
+            immediate += min(1.0, 0.5 * float(level_gain))
+        immediate_rows.append((row, max(-1.0, min(1.0, immediate))))
+
+    running = 0.0
+    result: list[dict[str, Any]] = []
+    for row, immediate in reversed(immediate_rows):
         running = max(-1.0, min(1.0, immediate + float(discount) * running))
         result.append({
             "environment_identity": tuple(row.get("environment_identity") or ()),
@@ -113,6 +123,8 @@ def _episode_rows(raw_rows: list[dict[str, Any]], *, discount: float = 0.97) -> 
             "task_success": bool(row.get("task_success", False)),
             "task_failure": bool(row.get("task_failure", False)),
             "task_truncated": bool(row.get("task_truncated", False)),
+            "level_index": int(row.get("level_index", 0)),
+            "levels_completed": int(row.get("levels_completed", 0)),
         })
     result.reverse()
     return result
