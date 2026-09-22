@@ -561,15 +561,36 @@ class CanonicalStore:
                 def flush(self) -> None:
                     self.stream.flush()
 
+            external_chunks = self.chunk_directory is not None
             with state_path.open("wb") as output:
                 writer = _HashingWriter(output)
                 pickler = pickle.Pickler(writer, protocol=5)
                 pickler.dump(handle)
-                pickler.dump(len(handle.all_chunk_ids))
-                for chunk_id in handle.all_chunk_ids:
-                    pickler.dump(self.chunk(chunk_id))
+                if not external_chunks:
+                    pickler.dump(len(handle.all_chunk_ids))
+                    for chunk_id in handle.all_chunk_ids:
+                        pickler.dump(self.chunk(chunk_id))
                 output.flush()
                 os.fsync(output.fileno())
+
+            chunk_directory_ref = None
+            if external_chunks:
+                assert self.chunk_directory is not None
+                self.chunk_directory.mkdir(parents=True, exist_ok=True)
+                for chunk_id in handle.all_chunk_ids:
+                    chunk_path = self.chunk_directory / f"{chunk_id.value}.pkl"
+                    if not chunk_path.is_file():
+                        chunk = self.chunk(chunk_id)
+                        temporary_chunk = chunk_path.with_suffix(".tmp")
+                        with temporary_chunk.open("wb") as output:
+                            pickle.dump(chunk, output, protocol=5)
+                            output.flush()
+                            os.fsync(output.fileno())
+                        os.replace(temporary_chunk, chunk_path)
+                chunk_directory_ref = os.path.relpath(
+                    self.chunk_directory, target.parent.parent
+                )
+
             state_checksum = state_hasher.hexdigest()
             if crash_hook:
                 crash_hook("state_fsynced")
@@ -578,8 +599,11 @@ class CanonicalStore:
                 "canonical_handle_checksum": handle.checksum,
                 "canonical_generation": handle.generation,
                 "state_checksum": state_checksum,
-                "state_format": "pickle-stream-v2",
+                "state_format": (
+                    "external-chunks-v3" if external_chunks else "pickle-stream-v2"
+                ),
                 "chunk_count": len(handle.all_chunk_ids),
+                "chunk_directory": chunk_directory_ref,
                 "scientific_identity": dict(sorted((scientific_identity or {}).items())),
             }
             manifest_path = temporary / "manifest.json"
@@ -654,7 +678,36 @@ class CanonicalStore:
             raise ValueError("canonical snapshot state checksum mismatch")
 
         state_format = str(manifest.get("state_format", "pickle-bundle-v1"))
-        if state_format == "pickle-stream-v2":
+        if state_format == "external-chunks-v3":
+            with state_path.open("rb") as source:
+                handle = pickle.Unpickler(source).load()
+            if not isinstance(handle, CanonicalStateHandle) or handle.checksum != manifest["canonical_handle_checksum"]:
+                raise ValueError("canonical snapshot handle mismatch")
+            selected_chunk_directory = (
+                Path(chunk_directory)
+                if chunk_directory is not None
+                else target.parent.parent / str(manifest.get("chunk_directory", "chunks"))
+            )
+            store = cls(
+                schema_versions=dict(handle.schema_versions),
+                chunk_directory=selected_chunk_directory,
+                resident_chunk_limit=resident_chunk_limit,
+            )
+            with store._lock:
+                store._chunks = OrderedDict()
+                store._chunk_references = {
+                    chunk_id: 0 for chunk_id in handle.all_chunk_ids
+                }
+            missing = [
+                chunk_id.value
+                for chunk_id in handle.all_chunk_ids
+                if not (selected_chunk_directory / f"{chunk_id.value}.pkl").is_file()
+            ]
+            if missing:
+                raise ValueError(
+                    f"canonical snapshot references missing chunks: {missing[:3]}"
+                )
+        elif state_format == "pickle-stream-v2":
             with state_path.open("rb") as source:
                 unpickler = pickle.Unpickler(source)
                 handle = unpickler.load()
