@@ -1768,8 +1768,8 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         gpu_memory_bytes=int(gpu.memory_used_bytes),
         gpu_utilization=float(gpu.utilization_percent),
         historical_retention=0.0,
-        current_curriculum_gain=max(0.0, train_accuracy - (1.0 / 3.0)),
-        cross_family_validation_gain=0.0,
+        current_curriculum_gain=max(0.0, train_accuracy - 0.5),
+        cross_family_validation_gain=max(0.0, validation_accuracy - 0.5),
         loss_by_head=dict(training_loss_by_head),
     )
     runtime.record_hgt_training(sample)
@@ -1779,7 +1779,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             model_version=model_version,
             parent_model_version=parent_version,
             training_examples_since_parent=training_examples,
-            current_stage_delta=max(0.0, train_accuracy - (1.0 / 3.0)),
+            current_stage_delta=max(0.0, train_accuracy - 0.5),
             historical_retention_delta=0.0,
             cross_family_transfer_delta=0.0,
             reasoning_improvement_delta=float(train_accuracy),
@@ -1793,7 +1793,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         model_version=model_version,
         parent_model_version=parent_version,
         training_loss=training_loss,
-        validation_loss=0.0,
+        validation_loss=float(validation_loss),
         examples=action_examples,
         training_steps=training_steps,
         checkpoint=checkpoint_rel if promote else parent_checkpoint,
