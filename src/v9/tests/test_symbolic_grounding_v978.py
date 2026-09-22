@@ -57,7 +57,7 @@ def test_hgt_uses_canonical_symbol_not_legacy_tuple_authority() -> None:
     from v9.hgt.training import SEMANTIC_NODE_TYPES
     assert "SYMBOL" in SEMANTIC_NODE_TYPES
     assert "TEXT" not in SEMANTIC_NODE_TYPES
-    assert HGT_V978_MODEL_SCHEMA_VERSION == 7
+    assert HGT_V978_MODEL_SCHEMA_VERSION == 8
     payload = {"symbol_identity": [1, 2, 3, 0], "semantic_before": [[7, 99, 1, 2, 1.0], [5, 1, 2, 3, 1.0]]}
     filtered = _without_legacy_symbol_tuples(payload)
     assert "symbol_identity" not in filtered
