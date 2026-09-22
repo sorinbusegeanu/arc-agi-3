@@ -278,6 +278,7 @@ def iter_action_ranking_pairs(
                 grouped.pop(key, None)
 
     emitted = 0
+    games_with_context_pair: set[str] = set()
     for context in sorted(grouped):
         actions = grouped[context]
         means = {
@@ -295,6 +296,7 @@ def iter_action_ranking_pairs(
         best_row["ranking_scope"] = "context"
         worst_row["ranking_scope"] = "context"
         yield best_row, worst_row
+        games_with_context_pair.add(str(context[0]))
         emitted += 1
         if emitted >= max(1, int(max_pairs)):
             return
@@ -303,6 +305,8 @@ def iter_action_ranking_pairs(
     # back from context scores to environment/game action scores, so train and
     # validate the same fallback ranking when exact-context pairs are sparse.
     for game in sorted(by_game):
+        if game in games_with_context_pair:
+            continue
         actions = by_game[game]
         means = {
             action: total / count
