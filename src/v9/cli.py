@@ -220,6 +220,10 @@ def _runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     scientific = ScientificConfig()
     overrides = {name: value for name, value in vars(args).items() if name.startswith("allocation_") and value is not None}
     overrides["random_seeds"] = (int(getattr(args, "seed", 0)),)
+    if hasattr(args, "hgt_eval_steps_per_game"):
+        overrides["hgt_evaluation_steps_per_game"] = int(args.hgt_eval_steps_per_game)
+    if hasattr(args, "hgt_training_batch_size"):
+        overrides["hgt_epoch_batch_size"] = int(args.hgt_training_batch_size)
     overrides["scientific_visibility_mode"] = getattr(
         args, "scientific_mode", ScientificVisibilityMode.ASYNC_DEVELOPMENT.value
     )
@@ -435,7 +439,7 @@ def run_continuous(args: argparse.Namespace) -> int:
     args.validation_mode = effective_validation_mode
     if args.transfer_validation:
         return _run_transfer_validation(args, specs)
-    if args.actors <= 0 or args.steps_per_game <= 0 or args.min_episode_opportunities <= 0 or args.epochs <= 0 or args.hgt_training_epochs <= 0 or args.hgt_learning_rate <= 0 or args.graph_check <= 0 or args.wait < 0 or args.progress_interval_seconds <= 0 or not 0 <= args.epsilon <= 1:
+    if args.actors <= 0 or args.steps_per_game <= 0 or args.min_episode_opportunities <= 0 or args.epochs <= 0 or args.hgt_training_epochs <= 0 or args.hgt_learning_rate <= 0 or args.hgt_eval_steps_per_game <= 0 or args.hgt_training_batch_size <= 0 or args.graph_check <= 0 or args.wait < 0 or args.progress_interval_seconds <= 0 or not 0 <= args.epsilon <= 1:
         raise ValueError("actors, steps-per-game, graph-check and progress interval must be positive; wait and epsilon must be valid")
     if min(args.ingest_workers, args.derivation_workers, args.ingest_queue_capacity, args.derivation_queue_capacity, args.publication_queue_capacity, args.actor_view_refresh_steps) <= 0 or args.actor_view_refresh_ms <= 0:
         raise ValueError("memory worker counts, queue capacities and actor policy refresh controls must be positive")
@@ -547,6 +551,8 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--epochs", type=int, default=1)
     continuous.add_argument("--hgt-training-epochs", type=int, default=1)
     continuous.add_argument("--hgt-learning-rate", type=float, default=0.0003)
+    continuous.add_argument("--hgt-eval-steps-per-game", type=int, default=50)
+    continuous.add_argument("--hgt-training-batch-size", type=int, default=512)
     continuous.add_argument("--actors", type=int, default=8)
     continuous.add_argument("--actor-view-refresh-steps", type=int, default=64)
     continuous.add_argument("--actor-view-refresh-ms", type=float, default=250.0)
