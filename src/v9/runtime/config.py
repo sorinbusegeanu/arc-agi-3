@@ -127,10 +127,6 @@ class ScientificConfig:
     hgt_gradient_accumulation: int = 8
     hgt_epoch_batch_size: int = 512
     hgt_evaluation_steps_per_game: int = 50
-    hgt_validation_fraction: float = 0.20
-    hgt_ranking_loss_weight: float = 1.0
-    hgt_min_validation_ranking_accuracy: float = 0.50
-    hgt_max_policy_score: float = 0.05
     hgt_examples_per_train_trigger: int = 5000
     hgt_training_duty_cycle: float = 0.50
     hgt_target_inference_latency_ms: float = 50.0
@@ -257,14 +253,6 @@ class ScientificConfig:
             raise ValueError("HGT total edge budget cannot be smaller than canonical-edge budget")
         if self.hgt_min_free_vram_bytes < 0:
             raise ValueError("HGT free VRAM reserve must be non-negative")
-        if not 0.0 < float(self.hgt_validation_fraction) < 0.5:
-            raise ValueError("HGT validation fraction must be in (0, 0.5)")
-        if float(self.hgt_ranking_loss_weight) <= 0.0:
-            raise ValueError("HGT ranking loss weight must be positive")
-        if not 0.0 <= float(self.hgt_min_validation_ranking_accuracy) <= 1.0:
-            raise ValueError("HGT minimum validation ranking accuracy must be in [0, 1]")
-        if not 0.0 < float(self.hgt_max_policy_score) <= 0.25:
-            raise ValueError("HGT maximum policy score must be in (0, 0.25]")
         if len(self.hgt_loss_weights) != 9 or any(float(value) <= 0.0 for value in self.hgt_loss_weights):
             raise ValueError("HGT requires nine positive base objective weights; grounding objectives use the default auxiliary weight")
 
