@@ -72,18 +72,7 @@ def test_legacy_game_selectors_remain_supported() -> None:
     assert len(mix) == 5
 
 
-def test_step1_continuous_run_executes_curriculum(tmp_path, monkeypatch) -> None:
-    from v9.runtime import epoch_runner
-
-    def unexpected_transfer_validation(*_args, **_kwargs):
-        raise AssertionError("normal continuous-run invoked transfer validation")
-
-    monkeypatch.setattr(
-        epoch_runner,
-        "run_transfer_validation_interval",
-        unexpected_transfer_validation,
-        raising=False,
-    )
+def test_step1_continuous_run_executes_curriculum(tmp_path) -> None:
     root = tmp_path / "step1"
     args = build_parser().parse_args([
         "continuous-run",
@@ -103,6 +92,9 @@ def test_step1_continuous_run_executes_curriculum(tmp_path, monkeypatch) -> None
     assert len(summary["games"]) == 12
     assert len(summary["actors"]) == 12
     assert summary["automatic_transfer_experiments"]["mode"] == "learning_only"
+    assert summary["automatic_transfer_experiments"]["attempted"] == 0
+    assert summary["automatic_transfer_experiments"]["blocker"] == "automatic transfer validation disabled"
+    assert summary["epochs"][0]["training"]["transfer_validation"]["blocker"] == "automatic transfer validation disabled"
     counts = summary["metrics"]["telemetry_diagnostics"]["curriculum_counts"]
     assert sum(counts.values()) == 1200
     assert all(key.startswith("step1|synthetic|") for key in counts)
