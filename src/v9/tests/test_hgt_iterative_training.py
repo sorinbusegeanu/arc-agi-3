@@ -19,6 +19,7 @@ from v9.hgt.epoch_dataset import (
 from v9.hgt.matched_evaluation import matched_jobs, select_matched_branch
 from v9.runtime.multiprocess import EncodedTransition
 from v9.runtime.runtime import ContinuousMemoryRuntime
+from v9.runtime import epoch_runner
 
 
 def transition(step: int, action: int, valence: int = 0, success: bool = False) -> EncodedTransition:
@@ -177,6 +178,11 @@ class HGTIterativeTrainingTests(unittest.TestCase):
         runtime.value = 9
         runtime.restore_experiment_state(base)
         self.assertEqual(runtime.value, 1)
+
+    def test_matched_epoch_avoids_redundant_off_state_snapshot(self):
+        source = inspect.getsource(epoch_runner.run_epochs)
+        self.assertEqual(source.count("capture_experiment_state()"), 2)
+        self.assertNotIn("off_state = runtime.capture_experiment_state()", source)
 
     def test_branch_selection_uses_macro_success_then_progress(self):
         self.assertEqual(select_matched_branch(.30, .20).selected_branch, "hgt_on")
