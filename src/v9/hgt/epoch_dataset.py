@@ -254,30 +254,74 @@ def iter_action_ranking_pairs(
     max_pairs: int = DEFAULT_ACTION_RANKING_PAIRS,
 ) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
     grouped: dict[tuple[str, int], dict[int, tuple[float, int, dict[str, Any]]]] = {}
+    by_game: dict[str, dict[int, tuple[float, int, dict[str, Any]]]] = {}
     context_limit = max(1024, int(max_pairs) * 4)
     for row in rows:
-        context = str(row["game_scenario"]), int(row["context_signature"])
+        game = str(row["game_scenario"])
+        context = game, int(row["context_signature"])
         action = int(row["action_id"])
         actions = grouped.setdefault(context, {})
         total, count, example = actions.get(action, (0.0, 0, row))
         actions[action] = total + float(row["target_return"]), count + 1, example
+
+        game_actions = by_game.setdefault(game, {})
+        game_total, game_count, game_example = game_actions.get(
+            action, (0.0, 0, row)
+        )
+        game_actions[action] = (
+            game_total + float(row["target_return"]),
+            game_count + 1,
+            game_example,
+        )
         if len(grouped) > context_limit:
             for key in sorted(grouped, reverse=True)[: len(grouped) - context_limit]:
                 grouped.pop(key, None)
+
     emitted = 0
     for context in sorted(grouped):
         actions = grouped[context]
-        means = {action: total / count for action, (total, count, _example) in actions.items()}
+        means = {
+            action: total / count
+            for action, (total, count, _example) in actions.items()
+        }
         if len(means) < 2:
             continue
         ordered = sorted(means, key=lambda action: (-means[action], action))
         best, worst = ordered[0], ordered[-1]
         if means[best] <= means[worst]:
             continue
-        yield actions[best][2], actions[worst][2]
+        best_row = dict(actions[best][2])
+        worst_row = dict(actions[worst][2])
+        best_row["ranking_scope"] = "context"
+        worst_row["ranking_scope"] = "context"
+        yield best_row, worst_row
         emitted += 1
         if emitted >= max(1, int(max_pairs)):
-            break
+            return
+
+    # Opaque state signatures are often unique. The actor policy itself falls
+    # back from context scores to environment/game action scores, so train and
+    # validate the same fallback ranking when exact-context pairs are sparse.
+    for game in sorted(by_game):
+        actions = by_game[game]
+        means = {
+            action: total / count
+            for action, (total, count, _example) in actions.items()
+        }
+        if len(means) < 2:
+            continue
+        ordered = sorted(means, key=lambda action: (-means[action], action))
+        best, worst = ordered[0], ordered[-1]
+        if means[best] <= means[worst]:
+            continue
+        best_row = dict(actions[best][2])
+        worst_row = dict(actions[worst][2])
+        best_row["ranking_scope"] = "game"
+        worst_row["ranking_scope"] = "game"
+        yield best_row, worst_row
+        emitted += 1
+        if emitted >= max(1, int(max_pairs)):
+            return
 
 
 def action_ranking_pairs(rows: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
