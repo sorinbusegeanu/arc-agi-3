@@ -20,7 +20,14 @@ class _MetricsProvider:
     def dashboard_metrics(self):
         return {
             "primary_dashboard": {"behavioral_success_rate": 0.25, "M0_count": 12},
-            "telemetry_diagnostics": {"sampling_rate": 123.0, "sampling_backlog": 4},
+            "telemetry_diagnostics": {
+                "sampling_rate": 123.0,
+                "sampling_backlog": 4,
+                "very_large_debug_blob": "x" * 20_000,
+            },
+            "M0_resident": 11,
+            "compaction_backlog": 3,
+            "process_rss_bytes": 456,
         }
 
 
@@ -50,8 +57,13 @@ def test_dashboard_metrics_are_logged_from_same_provider(tmp_path) -> None:
     assert rows
     latest = rows[-1]
     assert latest["primary_dashboard"] == provider.dashboard_metrics()["primary_dashboard"]
-    assert latest["telemetry_diagnostics"] == provider.dashboard_metrics()["telemetry_diagnostics"]
+    assert latest["M0_resident"] == 11
+    assert latest["compaction_backlog"] == 3
+    assert latest["process_rss_bytes"] == 456
+    assert "telemetry_diagnostics" not in latest
+    assert "very_large_debug_blob" not in json.dumps(latest)
     assert latest["timestamp_utc"]
+    assert len(json.dumps(latest)) < 2_000
 
 
 def test_dashboard_logger_records_provider_failure_and_keeps_polling(tmp_path) -> None:
@@ -117,3 +129,28 @@ def test_runtime_dashboard_does_not_call_full_metrics(tmp_path, monkeypatch) -> 
 
 def test_default_dashboard_and_jsonl_refresh_is_30_seconds() -> None:
     assert DASHBOARD_REFRESH_SECONDS == 30.0
+
+
+def test_dashboard_log_is_per_run_not_append_forever(tmp_path) -> None:
+    provider = _MetricsProvider(tmp_path)
+    log_path = tmp_path / "telemetry" / "dashboard_metrics.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text('{"stale": true}\n' * 50, encoding="utf-8")
+
+    server = MetricsHTTPServer(
+        provider.metrics,
+        host="127.0.0.1",
+        port=0,
+        refresh_seconds=0.1,
+    )
+    server.start()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if log_path.exists() and "primary_dashboard" in log_path.read_text(encoding="utf-8"):
+            break
+        time.sleep(0.01)
+    server.close()
+
+    text = log_path.read_text(encoding="utf-8")
+    assert '"stale"' not in text
+    assert '"primary_dashboard"' in text

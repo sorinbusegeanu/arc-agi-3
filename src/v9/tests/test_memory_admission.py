@@ -18,13 +18,35 @@ def test_admission_keeps_bootstrap_boundaries_surprise_and_sparse_milestones() -
         concrete_admission_future_option_threshold=1.0,
     )
 
-    assert should_retain_concrete(scientific, prior_support=0).retain
-    assert should_retain_concrete(scientific, prior_support=3).retain
-    assert not should_retain_concrete(scientific, prior_support=4).retain
-    assert should_retain_concrete(scientific, prior_support=7).reason == "support_milestone"
+    first = should_retain_concrete(
+        scientific,
+        prior_support=0,
+        retained_representatives=0,
+        novel_context=True,
+    )
+    assert not first.retain
+    assert first.reason == "unconfirmed_novelty"
     assert should_retain_concrete(
-        scientific, prior_support=20, novel_context=True
-    ).reason == "novel_context"
+        scientific,
+        prior_support=1,
+        retained_representatives=0,
+        novel_context=True,
+    ).reason == "recurrent_novel_context"
+    assert should_retain_concrete(
+        scientific,
+        prior_support=3,
+        retained_representatives=2,
+    ).retain
+    assert not should_retain_concrete(
+        scientific,
+        prior_support=4,
+        retained_representatives=4,
+    ).retain
+    assert should_retain_concrete(
+        scientific,
+        prior_support=7,
+        retained_representatives=4,
+    ).reason == "support_milestone"
 
     class Boundary:
         task_success = True
@@ -109,7 +131,9 @@ def test_redundant_interactions_advance_support_without_materializing_every_pair
         assert m1g == 1
         assert runtime.telemetry["concrete_admission_retained_events"] == 5
         assert runtime.telemetry["concrete_admission_skipped_events"] == 10
-        assert runtime.telemetry["concrete_nodes_avoided"] == 10
+        # First observation avoids both its unique M0 and not-yet-materialized
+        # canonical M1G; later skipped observations avoid only their unique M0.
+        assert runtime.telemetry["concrete_nodes_avoided"] == 11
         latest = runtime._latest_interaction_grounding[
             (plans[-1].interaction_grounding.environment_instance_id, 1)
         ]
@@ -117,3 +141,26 @@ def test_redundant_interactions_advance_support_without_materializing_every_pair
     finally:
         runtime.close(normal=False)
 
+
+
+def test_prepare_ingestion_uses_true_future_option_delta() -> None:
+    transition = EncodedTransition(
+        actor_id=1,
+        producer_sequence=1,
+        global_step=0,
+        environment_identity=("synthetic", "options", "default", "seed=0"),
+        episode_id=1,
+        observation_schema_id=1,
+        before_signature=10,
+        action_id=2,
+        after_signature=11,
+        available_actions_after=8,
+        primary_valence=0,
+        symbols=(),
+        curriculum_step="broad",
+        game_scenario="options",
+        future_option_delta=-2.0,
+    )
+    prepared = prepare_ingestion(IngestionTask(1, 1, transition))
+    assert prepared.event is not None
+    assert prepared.event.experience.future_option_delta == -2.0

@@ -295,7 +295,7 @@ def prepare_ingestion(task: IngestionTask) -> PreparedIngestion:
             int(transition.after_signature),
             _semantic_signature(transition.semantic_delta, (int(transition.observation_schema_id), int(transition.before_signature != transition.after_signature)), person=b"v9-family"),
             _semantic_signature(transition.semantic_before, (int(transition.observation_schema_id), int(transition.before_signature)), person=b"v9-carrier"),
-            float(transition.available_actions_after),
+            float(getattr(transition, "future_option_delta", 0.0)),
             max(int(transition.before_signature != transition.after_signature), len(transition.semantic_delta)),
             int(transition.primary_valence),
             stable_u64(environment, int(transition.episode_id), person=b"v9-trajectory"),
