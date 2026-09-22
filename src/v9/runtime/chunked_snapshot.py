@@ -365,19 +365,26 @@ def _load_v4(path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     shard_specs = sorted(list(manifest.get("graph_shards", [])), key=lambda row: int(row["partition"]))
+    canonical_reference = manifest.get("canonical_graph_snapshot")
     expected_partitions = int(graph.get("partition_count", 0))
-    if len(shard_specs) != expected_partitions:
-        raise RuntimeError("snapshot graph shard count mismatch")
-    for expected_partition, spec in enumerate(shard_specs):
-        if int(spec["partition"]) != expected_partition:
-            raise RuntimeError("snapshot graph shard sequence mismatch")
-        shard_bytes = _checked_chunks(root, list(spec.get("chunks", [])), str(spec.get("sha256", "")), f"graph shard {expected_partition}")
-        shard_nodes, shard_edges = _decode_graph_shard(shard_bytes, expected_partition=expected_partition)
-        nodes.extend(shard_nodes)
-        edges.extend(shard_edges)
-    graph["nodes"] = nodes
-    graph["edges"] = edges
-    state["graph"] = graph
+    if canonical_reference is not None:
+        if shard_specs:
+            raise RuntimeError("canonical-backed snapshot also contains graph shards")
+        state["graph"] = graph
+        state["_canonical_graph_snapshot"] = dict(canonical_reference)
+    else:
+        if len(shard_specs) != expected_partitions:
+            raise RuntimeError("snapshot graph shard count mismatch")
+        for expected_partition, spec in enumerate(shard_specs):
+            if int(spec["partition"]) != expected_partition:
+                raise RuntimeError("snapshot graph shard sequence mismatch")
+            shard_bytes = _checked_chunks(root, list(spec.get("chunks", [])), str(spec.get("sha256", "")), f"graph shard {expected_partition}")
+            shard_nodes, shard_edges = _decode_graph_shard(shard_bytes, expected_partition=expected_partition)
+            nodes.extend(shard_nodes)
+            edges.extend(shard_edges)
+        graph["nodes"] = nodes
+        graph["edges"] = edges
+        state["graph"] = graph
     return {
         "schema": NATIVE_SCHEMA,
         "snapshot_version": SNAPSHOT_VERSION,
@@ -405,8 +412,16 @@ def load_snapshot_parts(path: Path, *, expected_config_id: str) -> tuple[dict[st
     state = dict(pickle.loads(runtime_bytes))
     graph_header = dict(pickle.loads(graph_header_bytes))
     shard_specs = sorted(list(manifest.get("graph_shards", [])), key=lambda row: int(row["partition"]))
+    canonical_reference = manifest.get("canonical_graph_snapshot")
     expected_partitions = int(graph_header.get("partition_count", 0))
-    if expected_partitions <= 0 or len(shard_specs) != expected_partitions:
+    if expected_partitions <= 0:
+        raise RuntimeError("snapshot graph header has invalid partition count")
+    if canonical_reference is not None:
+        if shard_specs:
+            raise RuntimeError("canonical-backed snapshot also contains graph shards")
+        state["_canonical_graph_snapshot"] = dict(canonical_reference)
+        return state, graph_header, []
+    if len(shard_specs) != expected_partitions:
         raise RuntimeError("snapshot graph shard count mismatch")
     shards = []
     for expected_partition, spec in enumerate(shard_specs):
