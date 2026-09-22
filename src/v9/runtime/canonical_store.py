@@ -657,28 +657,42 @@ class CanonicalStore:
                 unpickler = pickle.Unpickler(source)
                 handle = unpickler.load()
                 chunk_count = int(unpickler.load())
-                chunks = tuple(unpickler.load() for _ in range(chunk_count))
-            if chunk_count != int(manifest.get("chunk_count", chunk_count)):
-                raise ValueError("canonical snapshot chunk count mismatch")
+                if chunk_count != int(manifest.get("chunk_count", chunk_count)):
+                    raise ValueError("canonical snapshot chunk count mismatch")
+                if not isinstance(handle, CanonicalStateHandle) or handle.checksum != manifest["canonical_handle_checksum"]:
+                    raise ValueError("canonical snapshot handle mismatch")
+                store = cls(schema_versions=dict(handle.schema_versions))
+                with store._lock:
+                    store._chunks = OrderedDict()
+                    store._chunk_references = {}
+                for _ in range(chunk_count):
+                    chunk = unpickler.load()
+                    if not isinstance(chunk, CanonicalChunk):
+                        raise ValueError("canonical snapshot contains an invalid chunk")
+                    payload = _encoded({"collection": chunk.collection.value, "schema_version": chunk.schema_version, "entries": chunk.entries})
+                    if hashlib.sha256(payload).hexdigest() != chunk.chunk_id.value:
+                        raise ValueError("canonical snapshot chunk checksum mismatch")
+                    with store._lock:
+                        store._store_chunk(chunk)
         else:
             state_payload = state_path.read_bytes()
             state = pickle.loads(state_payload)
             handle = state["handle"]
-            chunks = tuple(state["chunks"])
+            if not isinstance(handle, CanonicalStateHandle) or handle.checksum != manifest["canonical_handle_checksum"]:
+                raise ValueError("canonical snapshot handle mismatch")
+            store = cls(schema_versions=dict(handle.schema_versions))
+            with store._lock:
+                store._chunks = OrderedDict()
+                store._chunk_references = {}
+                for chunk in tuple(state["chunks"]):
+                    if not isinstance(chunk, CanonicalChunk):
+                        raise ValueError("canonical snapshot contains an invalid chunk")
+                    payload = _encoded({"collection": chunk.collection.value, "schema_version": chunk.schema_version, "entries": chunk.entries})
+                    if hashlib.sha256(payload).hexdigest() != chunk.chunk_id.value:
+                        raise ValueError("canonical snapshot chunk checksum mismatch")
+                    store._store_chunk(chunk)
 
-        if not isinstance(handle, CanonicalStateHandle) or handle.checksum != manifest["canonical_handle_checksum"]:
-            raise ValueError("canonical snapshot handle mismatch")
-        store = cls(schema_versions=dict(handle.schema_versions))
         with store._lock:
-            store._chunks = OrderedDict()
-            store._chunk_references = {}
-            for chunk in chunks:
-                if not isinstance(chunk, CanonicalChunk):
-                    raise ValueError("canonical snapshot contains an invalid chunk")
-                payload = _encoded({"collection": chunk.collection.value, "schema_version": chunk.schema_version, "entries": chunk.entries})
-                if hashlib.sha256(payload).hexdigest() != chunk.chunk_id.value:
-                    raise ValueError("canonical snapshot chunk checksum mismatch")
-                store._store_chunk(chunk)
             if set(handle.all_chunk_ids) != set(store._chunk_references):
                 raise ValueError("canonical snapshot root/chunk reachability mismatch")
             store._current = handle
