@@ -1261,21 +1261,48 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
                     "hgt_unregistered_environment_count",
                     sum(1 for family in environment_families.values() if family == "unregistered"),
                 )
-    train_masks = {key: mask.clone() for key, mask in action_masks.items()}
+    train_masks, validation_masks = _split_policy_masks(
+        action_meta,
+        action_masks,
+        torch,
+        validation_fraction=float(config.hgt_validation_fraction),
+    )
     training_examples = _masked_count(train_masks, action_masks)
+    validation_examples = _masked_count(validation_masks, action_masks)
+    if training_examples <= 0:
+        # Tiny cuts still train, but cannot claim held-out validation.
+        train_masks = {key: mask.clone() for key, mask in action_masks.items()}
+        validation_masks = {
+            key: torch.zeros_like(mask, dtype=torch.bool)
+            for key, mask in action_masks.items()
+        }
+        training_examples = _masked_count(train_masks, action_masks)
+        validation_examples = 0
     if training_examples <= 0:
         return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, None, 0.0, 0.0, action_examples, 0, None)
+
+    training_ranking_pairs, validation_ranking_pairs = _split_ranking_pairs(
+        epoch_ranking_pairs,
+        validation_fraction=float(config.hgt_validation_fraction),
+    )
+    stream_batch_size = max(1, min(2048, int(config.hgt_epoch_batch_size)))
+    ranking_batches = [
+        training_ranking_pairs[index:index + stream_batch_size]
+        for index in range(0, len(training_ranking_pairs), stream_batch_size)
+    ]
     dynamic_training_steps = int(training_epochs) if matched_reasoning else max(
         int(training_epochs),
         min(64, max(1, int(math.ceil(training_examples / 2048.0)))),
+        len(ranking_batches),
     )
-    stream_batch_size = max(1, min(2048, int(config.hgt_epoch_batch_size)))
-    if epoch_transition_rows:
-        full_dataset_steps = math.ceil(len(epoch_transition_rows) / stream_batch_size)
-        if not matched_reasoning:
-            dynamic_training_steps = max(int(dynamic_training_steps), int(full_dataset_steps))
-        runtime.set_telemetry_gauge("hgt_training_batches", int(full_dataset_steps))
-        runtime.set_telemetry_gauge("hgt_training_coverage_planned", 1.0)
+    runtime.set_telemetry_gauge("hgt_training_batches", max(1, len(ranking_batches)))
+    runtime.set_telemetry_gauge(
+        "hgt_training_coverage_planned",
+        float(training_examples) / max(1, action_examples),
+    )
+    runtime.set_telemetry_gauge("hgt_validation_examples", int(validation_examples))
+    runtime.set_telemetry_gauge("hgt_training_ranking_pairs", len(training_ranking_pairs))
+    runtime.set_telemetry_gauge("hgt_validation_ranking_pairs", len(validation_ranking_pairs))
     runtime.set_telemetry_gauge("hgt_dynamic_training_steps", int(dynamic_training_steps))
     runtime.set_telemetry_gauge("hgt_training_examples_current", int(training_examples))
     runtime.set_telemetry_gauge("hgt_examples_per_training_step_target", 2048)
@@ -1402,17 +1429,12 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     last_grad_norm = 0.0
     model.train()
     try:
-        transition_batches = [transition_train_rows[i:i + stream_batch_size] for i in range(0, len(transition_train_rows), stream_batch_size)]
-        ranking_correct = ranking_total = transitions_trained = 0
-        loop_count = (
-            max(1, int(dynamic_training_steps))
-            if matched_reasoning
-            else max(1, max(int(dynamic_training_steps), len(transition_batches)))
-        )
+        ranking_correct = ranking_total = ranking_pairs_trained = 0
+        loop_count = max(1, int(dynamic_training_steps))
         for step_index in range(loop_count):
             optimizer.zero_grad(set_to_none=True)
             logits, values, auxiliary = model(x_device, edges_device)
-            loss, _, _ = _loss(
+            loss, consequence_accuracy, _ = _loss(
                 logits,
                 values,
                 auxiliary,
@@ -1427,13 +1449,24 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
                 log_vars=model.objective_log_vars,
                 dynamic_weighting=bool(config.hgt_dynamic_loss_weighting),
             )
-            batch = transition_batches[step_index] if step_index < len(transition_batches) else []
-            stream_loss, stream_correct, stream_total = _transition_batch_loss(model, batch, torch, device)
-            if stream_loss is not None:
-                loss = stream_loss if loss is None else loss + stream_loss
-                transitions_trained += len(batch)
-                ranking_correct += int(stream_correct)
-                ranking_total += int(stream_total)
+            ranking_batch = (
+                ranking_batches[step_index % len(ranking_batches)]
+                if ranking_batches
+                else ()
+            )
+            ranking_loss, step_correct, step_total = _explicit_action_ranking_loss(
+                values,
+                action_meta,
+                train_masks,
+                ranking_batch,
+                torch,
+            )
+            if ranking_loss is not None:
+                weighted_ranking = float(config.hgt_ranking_loss_weight) * ranking_loss
+                loss = weighted_ranking if loss is None else loss + weighted_ranking
+                ranking_correct += int(step_correct)
+                ranking_total += int(step_total)
+                ranking_pairs_trained += int(step_total)
             if loss is None:
                 break
             loss.backward()
@@ -1442,10 +1475,8 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             training_loss = float(loss.detach().cpu().item())
             training_steps += 1
     except RuntimeError as exc:
-        # Forward/backward locals retain the autograd graph until this frame
-        # returns. Drop them before recursively retrying with a smaller graph.
-        loss = logits = values = auxiliary = stream_loss = None
-        batch = ()
+        loss = logits = values = auxiliary = ranking_loss = None
+        ranking_batch = ()
         del model, optimizer, x_device, edges_device
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1460,11 +1491,11 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             oom_retry=_oom_retry,
             exc=exc,
         )
-    runtime.set_telemetry_gauge("hgt_transitions_trained", int(locals().get("transitions_trained", 0)))
-    coverage = float(locals().get("transitions_trained", 0)) / max(1, len(transition_train_rows)) if transition_train_rows else 0.0
+    coverage = float(training_examples) / max(1, action_examples)
+    train_ranking_accuracy = float(ranking_correct) / max(1, ranking_total)
     runtime.set_telemetry_gauge("hgt_training_coverage", coverage)
-    runtime.set_telemetry_gauge("hgt_action_ranking_accuracy", float(locals().get("ranking_correct", 0)) / max(1, locals().get("ranking_total", 0)))
-    runtime.set_telemetry_gauge("hgt_action_ranking_training_pairs", int(locals().get("ranking_total", 0)))
+    runtime.set_telemetry_gauge("hgt_action_ranking_accuracy", train_ranking_accuracy)
+    runtime.set_telemetry_gauge("hgt_action_ranking_training_pairs", int(ranking_pairs_trained))
     if training_steps <= 0:
         return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, parent_version, 0.0, 0.0, action_examples, 0, parent_checkpoint)
     if matched_reasoning and training_steps != int(training_cut.optimizer_step_count):
@@ -1481,12 +1512,12 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             parent_checkpoint,
         )
 
-    runtime.set_telemetry_gauge("hgt_transition_training_examples", len(transition_train_rows))
+    runtime.set_telemetry_gauge("hgt_transition_training_examples", len(epoch_transition_rows))
     model.eval()
     inference_started = time.perf_counter()
     with torch.no_grad():
         logits, values, auxiliary = model(x_device, edges_device)
-        train_loss_t, train_accuracy, training_loss_by_head = _loss(
+        base_train_loss_t, consequence_accuracy, training_loss_by_head = _loss(
             logits,
             values,
             auxiliary,
@@ -1501,8 +1532,58 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             log_vars=model.objective_log_vars,
             dynamic_weighting=bool(config.hgt_dynamic_loss_weighting),
         )
+        train_ranking_loss_t, train_rank_correct, train_rank_total = _explicit_action_ranking_loss(
+            values,
+            action_meta,
+            train_masks,
+            training_ranking_pairs,
+            torch,
+        )
+        validation_policy_loss_t = _policy_validation_loss(
+            logits,
+            values,
+            y_dict,
+            action_targets,
+            validation_masks,
+            torch,
+        )
+        validation_ranking_loss_t, validation_rank_correct, validation_rank_total = _explicit_action_ranking_loss(
+            values,
+            action_meta,
+            validation_masks,
+            validation_ranking_pairs,
+            torch,
+        )
+
+    total_train_loss_t = base_train_loss_t
+    if train_ranking_loss_t is not None:
+        weighted = float(config.hgt_ranking_loss_weight) * train_ranking_loss_t
+        total_train_loss_t = weighted if total_train_loss_t is None else total_train_loss_t + weighted
+    validation_terms = [
+        value for value in (validation_policy_loss_t, validation_ranking_loss_t)
+        if value is not None
+    ]
+    validation_loss = (
+        float(torch.stack(validation_terms).mean().cpu().item())
+        if validation_terms
+        else 0.0
+    )
+    validation_accuracy = (
+        float(validation_rank_correct) / max(1, int(validation_rank_total))
+        if validation_rank_total
+        else 0.0
+    )
+    train_accuracy = (
+        float(train_rank_correct) / max(1, int(train_rank_total))
+        if train_rank_total
+        else float(consequence_accuracy)
+    )
+    runtime.set_telemetry_gauge("hgt_validation_loss", validation_loss)
+    runtime.set_telemetry_gauge("hgt_validation_ranking_accuracy", validation_accuracy)
+    runtime.set_telemetry_gauge("hgt_validation_ranking_pairs_used", int(validation_rank_total))
+    runtime.set_telemetry_gauge("hgt_consequence_accuracy", float(consequence_accuracy))
     inference_latency_ms = 1000.0 * (time.perf_counter() - inference_started)
-    training_loss = float(train_loss_t.cpu().item()) if train_loss_t is not None else training_loss
+    training_loss = float(total_train_loss_t.cpu().item()) if total_train_loss_t is not None else training_loss
     elapsed = max(1e-9, time.perf_counter() - start)
     version_index = int(manifest.get("version_index", 0)) + 1
     candidate_version = f"hgt-{version_index:06d}"
@@ -1515,21 +1596,42 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         for index, row in enumerate(rows):
             if row is None:
                 continue
-            environment_id, context_signature, action_id, _, _ = row
+            environment_id, context_signature, action_id, _, _, _game = row
             score = float(predicted[index].item())
             action_score_sums.setdefault(environment_id, {}).setdefault(action_id, []).append(score)
             context_score_sums.setdefault(environment_id, {}).setdefault(context_signature, {}).setdefault(action_id, []).append(score)
-    action_scores = {
+    raw_action_scores = {
         environment_id: {action_id: sum(scores) / len(scores) for action_id, scores in actions.items() if scores}
         for environment_id, actions in action_score_sums.items()
     }
-    context_action_scores = {
+    raw_context_action_scores = {
         environment_id: {
             context: {action_id: sum(scores) / len(scores) for action_id, scores in actions.items() if scores}
             for context, actions in contexts.items()
         }
         for environment_id, contexts in context_score_sums.items()
     }
+    policy_score_scale = _policy_score_scale(
+        config,
+        validation_accuracy=validation_accuracy,
+        validation_pairs=int(validation_rank_total),
+    )
+    action_scores = {
+        environment_id: _bounded_advantage_scores(scores, policy_score_scale)
+        for environment_id, scores in raw_action_scores.items()
+    }
+    context_action_scores = {
+        environment_id: {
+            context: _bounded_advantage_scores(scores, policy_score_scale)
+            for context, scores in contexts.items()
+        }
+        for environment_id, contexts in raw_context_action_scores.items()
+    }
+    runtime.set_telemetry_gauge("hgt_policy_score_scale", float(policy_score_scale))
+    runtime.set_telemetry_gauge(
+        "hgt_policy_gate_open",
+        int(policy_score_scale > 0.0),
+    )
     # Every newly trained version becomes the candidate used by the next epoch.
     # Its scientific evaluation is the next epoch's matched HGT-ON/OFF sampling.
     promote = True
@@ -1564,6 +1666,9 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
                 "heads": int(config.hgt_heads),
                 "training_loss": training_loss,
                 "training_accuracy": train_accuracy,
+                "validation_loss": validation_loss,
+                "validation_accuracy": validation_accuracy,
+                "policy_score_scale": policy_score_scale,
                 "loss_by_head": dict(training_loss_by_head),
                 "objective_weights": list(config.hgt_loss_weights),
                 "objective_names": list(OBJECTIVE_NAMES),
@@ -1610,6 +1715,9 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
             "parent_model_version": parent_version,
             "training_loss": training_loss,
             "training_accuracy": train_accuracy,
+            "validation_loss": validation_loss,
+            "validation_accuracy": validation_accuracy,
+            "policy_score_scale": policy_score_scale,
             "loss_by_head": dict(training_loss_by_head),
             "objective_weights": list(config.hgt_loss_weights),
             "dynamic_loss_weighting": bool(config.hgt_dynamic_loss_weighting),
@@ -1644,14 +1752,14 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     gpu = read_gpu_snapshot()
     sample = HGTTrainingSample(
         training_loss=training_loss,
-        validation_loss=0.0,
+        validation_loss=float(validation_loss),
         training_step_latency_ms=1000.0 * elapsed / max(1, training_steps),
-        training_examples_seen=int(locals().get("transitions_trained", training_examples)),
+        training_examples_seen=int(training_examples),
         effective_batch_size=int(stream_batch_size),
         gradient_norm=last_grad_norm,
         learning_rate=float(learning_rate),
         training_steps=training_steps,
-        examples_per_second=float(locals().get("transitions_trained", training_examples)) / elapsed,
+        examples_per_second=float(training_examples) / elapsed,
         gpu_memory_bytes=int(gpu.memory_used_bytes),
         gpu_utilization=float(gpu.utilization_percent),
         historical_retention=0.0,
@@ -1684,7 +1792,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         examples=action_examples,
         training_steps=training_steps,
         checkpoint=checkpoint_rel if promote else parent_checkpoint,
-        validation_accuracy=0.0,
+        validation_accuracy=float(validation_accuracy),
         training_accuracy=float(train_accuracy),
         inference_latency_ms=float(inference_latency_ms),
         subgraph_nodes=sum(int(value.shape[0]) for value in x_dict.values()),
