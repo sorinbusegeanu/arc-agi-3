@@ -326,6 +326,7 @@ def apply_canonical_commit_batch(
         concrete_retained_delta = 0
         concrete_skipped_delta = 0
         concrete_nodes_avoided_delta = 0
+        skipped_interaction_training_payloads: list[dict[str, Any]] = []
         admission_reason_counts: dict[str, int] = {}
         admitted_concrete_uids: set[Any] = set()
         batch_materialized_normalized_uids: set[Any] = set()
@@ -340,16 +341,6 @@ def apply_canonical_commit_batch(
             event = plan.event
             previous_interaction = None
             interaction_retained = False
-
-            novel_derived = any(
-                int(runtime.signature_support(int(row.relation.structural_signature))) == 0
-                for row in plan.derived_relations
-            )
-            novel_aligned = any(
-                symbol.aligned_relation is not None
-                and int(runtime.signature_support(int(symbol.aligned_relation.structural_signature))) == 0
-                for symbol in plan.symbols
-            )
 
             if plan.interaction_grounding is not None:
                 g = plan.interaction_grounding
@@ -388,8 +379,12 @@ def apply_canonical_commit_batch(
                     prior_support=prior_support,
                     context=plan.context,
                     isf_static=plan.isf_static,
+                    retained_representatives=len(
+                        runtime._m1n_occurrences.get(
+                            int(plan.relation.structural_signature), ()
+                        )
+                    ),
                     novel_context=_relation_context_is_novel(runtime, plan.relation),
-                    force_novel=bool(novel_derived or novel_aligned),
                 )
                 interaction_retained = bool(interaction_decision.retain)
                 admission_reason_counts[interaction_decision.reason] = (
@@ -418,6 +413,10 @@ def apply_canonical_commit_batch(
                         and write.node.uid not in runtime._deferred_base_nodes
                         and write.node.uid not in admitted_concrete_uids
                     )
+                    if plan.base_writes:
+                        skipped_interaction_training_payloads.append(
+                            dict(materialized_rows[id(plan.base_writes[0])][1])
+                        )
 
                 signature = record_normalized_fast(
                     runtime,
@@ -505,28 +504,17 @@ def apply_canonical_commit_batch(
                 symbol_prior_support = int(
                     runtime.signature_support(int(symbol.relation.structural_signature))
                 )
-                aligned_prior_support = (
-                    0
-                    if symbol.aligned_relation is None
-                    else int(
-                        runtime.signature_support(
-                            int(symbol.aligned_relation.structural_signature)
-                        )
-                    )
-                )
                 symbol_decision = should_retain_concrete(
                     runtime.config.scientific,
                     prior_support=symbol_prior_support,
                     context=plan.context,
                     isf_static=plan.isf_static,
-                    novel_context=_relation_context_is_novel(runtime, symbol.relation),
-                    force_novel=bool(
-                        novel_derived
-                        or (
-                            symbol.aligned_relation is not None
-                            and aligned_prior_support == 0
+                    retained_representatives=len(
+                        runtime._m1n_occurrences.get(
+                            int(symbol.relation.structural_signature), ()
                         )
                     ),
+                    novel_context=_relation_context_is_novel(runtime, symbol.relation),
                 )
                 symbol_retained = bool(symbol_decision.retain)
                 admission_reason_counts[symbol_decision.reason] = (
@@ -716,6 +704,12 @@ def apply_canonical_commit_batch(
                 deferred_groups.append(deferred_group)
                 if callable(publication_generation_delta):
                     logical_graph_generation += int(publication_generation_delta(deferred_group))
+
+        commit_skipped_evidence = getattr(
+            runtime, "_commit_skipped_interaction_training_evidence", None
+        )
+        if skipped_interaction_training_payloads and callable(commit_skipped_evidence):
+            commit_skipped_evidence(tuple(skipped_interaction_training_payloads))
 
         if deferred_groups:
             defer_groups = getattr(runtime, "_defer_base_groups", None)

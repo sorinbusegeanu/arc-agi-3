@@ -651,6 +651,89 @@ class ContinuousMemoryRuntime:
             )
         return tuple(records)
 
+    def _commit_skipped_interaction_training_evidence(
+        self,
+        payloads: Iterable[dict[str, Any]],
+    ) -> None:
+        rows = tuple(dict(payload) for payload in payloads)
+        if not rows or not hasattr(self, "canonical_wal") or not hasattr(self, "canonical_store"):
+            return
+
+        target_lsn = self.canonical_wal.wal_durable_lsn + 1
+        records: list[TrainingEvidenceRecord] = []
+        label_keys = (
+            "environment_identity",
+            "game_scenario",
+            "actor_id",
+            "producer_sequence",
+            "sampling_branch",
+            "episode_id",
+            "global_step",
+            "before_signature",
+            "after_signature",
+            "action_id",
+            "primary_valence",
+            "future_option_delta",
+            "task_success",
+            "task_failure",
+            "task_truncated",
+            "level_index",
+            "levels_completed",
+        )
+        for payload in rows:
+            label_payload = {
+                key: payload[key]
+                for key in label_keys
+                if key in payload
+            }
+            provenance = {
+                "scientific_config_id": self.config.scientific.config_id.value,
+                "producer_id": int(payload.get("actor_id", 0)),
+                "producer_sequence": int(payload.get("producer_sequence", 0)),
+                "sampling_branch": str(payload.get("sampling_branch", "")),
+                "materialization": "selective_admission_skipped",
+            }
+            records.append(
+                TrainingEvidenceRecord.create(
+                    kind=TrainingEvidenceKind.INTERACTION,
+                    source_wal_lsn=target_lsn,
+                    scientific_provenance=provenance,
+                    schema_versions={
+                        "training_evidence": 1,
+                        "canonical_graph": int(self.graph.SCHEMA_VERSION),
+                    },
+                    label_payload=label_payload,
+                )
+            )
+
+        overlay = self.canonical_store.begin_overlay(
+            target_lsn,
+            max_entries=int(self.config.canonical_transaction_max_writes),
+            max_bytes=int(self.config.canonical_transaction_max_mutation_bytes),
+        )
+        try:
+            self.canonical_wal.commit_overlay(
+                self.canonical_store,
+                overlay,
+                transaction_id=f"selective-admission-evidence-{target_lsn:016x}",
+                frame_payload={
+                    "mutations": (),
+                    "training_evidence_records": tuple(
+                        record.as_dict() for record in records
+                    ),
+                    "scientific_identity": self._canonical_scientific_identity(),
+                    "work_metadata": {
+                        "rows": 0,
+                        "writes": 0,
+                        "generation": int(self.graph.generation),
+                    },
+                },
+            )
+        except BaseException:
+            if not overlay.closed:
+                self.canonical_store.abort_overlay(overlay)
+            raise
+
     def _commit_canonical_graph_update(
         self,
         *,

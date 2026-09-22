@@ -245,11 +245,16 @@ def _prepared_transition(sequence: int):
     return prepare_ingestion(IngestionTask(sequence, sequence, transition))
 
 
-def test_parallel_sampling_publishes_raw_graph_inline(tmp_path) -> None:
+def test_parallel_sampling_publishes_admitted_raw_graph_inline(tmp_path) -> None:
     from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
 
     runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False, enable_snapshots=False))
     runtime.apply_prepared_ingestion(_prepared_transition(1))
+
+    # One-off ordinary novelty advances normalized evidence but is not retained
+    # as a concrete episode. Recurrence promotes a representative.
+    assert runtime.metrics()["memory_levels"]["M0"] == 0
+    runtime.apply_prepared_ingestion(_prepared_transition(2))
 
     assert runtime.metrics()["memory_levels"]["M0"] == 1
     assert runtime.graph.memory_count() >= 3

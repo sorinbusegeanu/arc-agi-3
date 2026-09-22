@@ -9,7 +9,41 @@ from typing import Any, Callable
 
 
 DASHBOARD_REFRESH_SECONDS = 30.0
-FULL_TELEMETRY_LOG_INTERVAL = 120
+
+
+_COMPACT_LOG_KEYS = (
+    "watermark",
+    "graph_generation",
+    "memories",
+    "memory_levels",
+    "M0_resident",
+    "M1_grounded_resident",
+    "resident_M0_limit",
+    "resident_M1_grounded_limit",
+    "compaction_backlog",
+    "compaction_cycles",
+    "compaction_seconds",
+    "low_level_nodes_inserted",
+    "low_level_nodes_deleted",
+    "low_level_dedup_rate",
+    "concrete_admission_retained_events",
+    "concrete_admission_skipped_events",
+    "concrete_admission_retention_rate",
+    "concrete_nodes_avoided",
+    "process_rss_bytes",
+    "memory_governor_state",
+)
+
+
+def _compact_log_snapshot(snapshot: dict[str, Any], *, timestamp: str) -> dict[str, Any]:
+    compact: dict[str, Any] = {
+        "timestamp_utc": timestamp,
+        "primary_dashboard": dict(snapshot.get("primary_dashboard", {})),
+    }
+    for key in _COMPACT_LOG_KEYS:
+        if key in snapshot:
+            compact[key] = snapshot[key]
+    return compact
 
 
 class MetricsHTTPServer:
@@ -36,7 +70,6 @@ class MetricsHTTPServer:
         self.log_path = None if log_path is None else Path(log_path)
         self._stop_logging = Event()
         self._log_thread: Thread | None = None
-        self._log_sequence = 0
 
         class Handler(BaseHTTPRequestHandler):
             def _write(self, status: int, content_type: str, payload: bytes) -> None:
@@ -99,54 +132,24 @@ refresh(); setInterval(refresh,{refresh_ms});
         self.port = int(port)
         self._thread = Thread(target=self._server.serve_forever, name="v9-metrics-http", daemon=True)
 
-    @staticmethod
-    def _compact_log_snapshot(raw: dict[str, Any], *, full: bool) -> dict[str, Any]:
-        if full:
-            return dict(raw)
-        result: dict[str, Any] = {}
-        primary = raw.get("primary_dashboard")
-        if isinstance(primary, dict):
-            result["primary_dashboard"] = dict(primary)
-        diagnostic = raw.get("telemetry_diagnostics")
-        if isinstance(diagnostic, dict):
-            result["telemetry_diagnostics"] = {
-                str(key): value
-                for key, value in diagnostic.items()
-                if value is None or isinstance(value, (str, int, float, bool))
-            }
-        for key, value in raw.items():
-            if key in {"primary_dashboard", "telemetry_diagnostics"}:
-                continue
-            if value is None or isinstance(value, (str, int, float, bool)):
-                result[str(key)] = value
-        return result
-
-    def _rotate_existing_log(self) -> None:
-        if self.log_path is None or not self.log_path.exists() or self.log_path.stat().st_size <= 0:
-            return
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        archived = self.log_path.with_name(
-            f"{self.log_path.stem}.{stamp}{self.log_path.suffix}"
-        )
-        self.log_path.replace(archived)
-
     def _log_dashboard_metrics(self) -> None:
         if self.log_path is None:
             return
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.log_path.open("a", encoding="utf-8", buffering=1) as handle:
+        # One process run owns one dashboard log. Reusing --root must not append
+        # previous runs indefinitely.
+        with self.log_path.open("w", encoding="utf-8", buffering=1) as handle:
             while not self._stop_logging.is_set():
                 timestamp = datetime.now(timezone.utc).isoformat()
                 try:
-                    self._log_sequence += 1
-                    full = self._log_sequence % FULL_TELEMETRY_LOG_INTERVAL == 0
-                    raw = self._dashboard_provider()
-                    snapshot = {
-                        "timestamp_utc": timestamp,
-                        "telemetry_log_full": full,
-                        **self._compact_log_snapshot(raw, full=full),
-                    }
+                    snapshot = _compact_log_snapshot(
+                        self._dashboard_provider(),
+                        timestamp=timestamp,
+                    )
                 except Exception as exc:
+                    # A telemetry read must never terminate the long-lived
+                    # logger. Preserve an auditable failure row and retry at the
+                    # next fixed refresh interval.
                     snapshot = {
                         "timestamp_utc": timestamp,
                         "dashboard_metrics_error": {
@@ -159,9 +162,6 @@ refresh(); setInterval(refresh,{refresh_ms});
                     break
 
     def start(self) -> None:
-        if self.log_path is not None:
-            self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._rotate_existing_log()
         self._thread.start()
         if self.log_path is not None:
             self._log_thread = Thread(target=self._log_dashboard_metrics, name="v9-dashboard-telemetry-log", daemon=True)

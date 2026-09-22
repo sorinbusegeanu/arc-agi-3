@@ -54,6 +54,7 @@ class EncodedTransition:
     symbols_only: bool = False
     action_schema_id: int = 0
     available_action_set_signature: int = 0
+    future_option_delta: float = 0.0
     boundary_scope: str = "NONE"
     task_success: bool = False
     task_failure: bool = False
@@ -539,6 +540,7 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
                     after_signature=int(adapter.encode_observation(after)),
                     available_actions_after=len(available_after),
                     available_action_set_signature=_action_set_signature(action_schema_id, available_after),
+                    future_option_delta=float(len(available_after) - len(actions)),
                     primary_valence=int(boundary.primary_valence),
                     boundary_scope=str(boundary.scope.value),
                     task_success=bool(progress.success),

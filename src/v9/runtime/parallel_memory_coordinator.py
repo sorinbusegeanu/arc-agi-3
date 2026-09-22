@@ -665,6 +665,14 @@ class MemoryPipelineService:
         self.last_canonical_ingest_batch = len(plans)
         self.ingested += len(plans)
         self.release_ingest_input_bytes(input_bytes)
+
+        # Continuous canonical ingestion bypasses runtime.apply_prepared_ingestion_batch,
+        # so residency maintenance must be serviced here as well. The manager keeps
+        # each visit bounded and internally enforces the configured insertion interval.
+        resident_manager = getattr(self.runtime, "_resident_memory", None)
+        if resident_manager is not None:
+            resident_manager.maybe_compact()
+
         for candidate in result.derivation_candidates:
             self._consider_candidate(candidate)
         backlog = max(len(self.pending_ingest), len(self.ingest_results), max(0, self.sampled - self.ingested))
