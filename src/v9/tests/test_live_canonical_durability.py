@@ -159,8 +159,14 @@ def test_interaction_commit_embeds_reconstructable_training_evidence_in_wal(tmp_
         for raw in frame.training_evidence_records
         if raw["kind"] == "interaction"
     )
-    assert [row.label_payload["global_step"] for row in records] == [0, 1]
-    assert [row.label_payload["producer_sequence"] for row in records] == [1, 2]
+    ordered_records = sorted(
+        records,
+        key=lambda row: int(row.label_payload["producer_sequence"]),
+    )
+    # Selective admission decouples durable evidence publication order from
+    # concrete graph publication order. Producer sequence remains authoritative.
+    assert [row.label_payload["global_step"] for row in ordered_records] == [0, 1]
+    assert [row.label_payload["producer_sequence"] for row in ordered_records] == [1, 2]
 
     manifest = runtime.materialize_training_evidence()
     assert manifest is not None
