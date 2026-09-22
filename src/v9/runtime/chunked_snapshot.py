@@ -11,7 +11,15 @@ from typing import Any
 
 from v9.memory.identity import MemoryUid
 
-from .snapshot_chunks import CHUNK_BYTES, read_chunks, sha256, write_chunks
+from .snapshot_chunks import (
+    CHUNK_BYTES,
+    iter_file_blocks,
+    read_chunks,
+    sha256,
+    write_chunks,
+    write_file_chunks,
+    write_stream_chunks,
+)
 
 NATIVE_SCHEMA = "arc-agi3-hydra-v9"
 LEGACY_SNAPSHOT_VERSION = 3
@@ -119,6 +127,141 @@ def _encode_graph_shard(partition: int, nodes: list[dict[str, Any]], edges: list
         len(blob),
     )
     return bytes(header + node_records + edge_records + blob)
+
+
+@dataclass(frozen=True, slots=True)
+class GraphShardCapture:
+    partition: int
+    node_count: int
+    edge_count: int
+    blob_bytes: int
+    node_records_path: Path
+    edge_records_path: Path
+    blob_path: Path
+
+
+def capture_graph_shard(graph: Any, partition: int, directory: Path) -> GraphShardCapture:
+    """Capture one graph partition with memory bounded by one node/edge payload."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    partition = int(partition)
+    node_records_path = directory / f"graph-{partition:04d}.nodes"
+    edge_records_path = directory / f"graph-{partition:04d}.edges"
+    blob_path = directory / f"graph-{partition:04d}.blob"
+    node_count = 0
+    edge_count = 0
+
+    with (
+        node_records_path.open("wb") as node_records,
+        edge_records_path.open("wb") as edge_records,
+        blob_path.open("wb") as blob,
+    ):
+        for uid in sorted(graph._node_uids_by_partition[partition]):
+            node = graph.nodes.get(uid)
+            if node is None:
+                continue
+            structural_bytes = pickle.dumps(
+                tuple(int(value) for value in node.structural_key), protocol=5
+            )
+            structural_offset = blob.tell()
+            blob.write(structural_bytes)
+            payload_bytes = pickle.dumps(dict(graph.payloads.get(uid, {})), protocol=5)
+            payload_offset = blob.tell()
+            blob.write(payload_bytes)
+            node_records.write(
+                _NODE_RECORD.pack(
+                    int(uid.hi),
+                    int(uid.lo),
+                    int(node.level),
+                    int(node.memory_type),
+                    int(node.created_watermark),
+                    int(structural_offset),
+                    len(structural_bytes),
+                    int(payload_offset),
+                    len(payload_bytes),
+                )
+            )
+            node_count += 1
+
+        for key in sorted(graph._edge_keys_by_partition[partition]):
+            edge = graph.edges.get(key)
+            if edge is None:
+                continue
+            relation_bytes = edge.relation.value.encode("utf-8")
+            relation_offset = blob.tell()
+            blob.write(relation_bytes)
+            authority_bytes = edge.authority.value.encode("utf-8")
+            authority_offset = blob.tell()
+            blob.write(authority_bytes)
+            evidence_offset = blob.tell()
+            for evidence_uid in edge.evidence_uids:
+                blob.write(_UID_PAIR.pack(int(evidence_uid.hi), int(evidence_uid.lo)))
+            evidence_length = int(blob.tell() - evidence_offset)
+            edge_records.write(
+                _EDGE_RECORD.pack(
+                    int(edge.source.hi),
+                    int(edge.source.lo),
+                    int(edge.target.hi),
+                    int(edge.target.lo),
+                    int(relation_offset),
+                    len(relation_bytes),
+                    int(authority_offset),
+                    len(authority_bytes),
+                    int(evidence_offset),
+                    evidence_length,
+                    int(edge.object_version),
+                )
+            )
+            edge_count += 1
+        blob_bytes = int(blob.tell())
+
+    return GraphShardCapture(
+        partition,
+        node_count,
+        edge_count,
+        blob_bytes,
+        node_records_path,
+        edge_records_path,
+        blob_path,
+    )
+
+
+def _graph_shard_capture_blocks(capture: GraphShardCapture):
+    yield _GRAPH_SHARD_HEADER.pack(
+        _GRAPH_SHARD_MAGIC,
+        _GRAPH_SHARD_VERSION,
+        int(capture.partition),
+        int(capture.node_count),
+        int(capture.edge_count),
+        int(capture.blob_bytes),
+    )
+    yield from iter_file_blocks(capture.node_records_path)
+    yield from iter_file_blocks(capture.edge_records_path)
+    yield from iter_file_blocks(capture.blob_path)
+
+
+def publish_graph_shard_capture(root: Path, capture: GraphShardCapture) -> dict[str, Any]:
+    chunks, total_bytes, digest = write_stream_chunks(
+        Path(root), _graph_shard_capture_blocks(capture)
+    )
+    return {
+        "partition": int(capture.partition),
+        "nodes": int(capture.node_count),
+        "edges": int(capture.edge_count),
+        "bytes": int(total_bytes),
+        "sha256": str(digest),
+        "chunks": chunks,
+    }
+
+
+def write_graph_shard_capture_file(capture: GraphShardCapture, target: Path) -> Path:
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("wb") as output:
+        for block in _graph_shard_capture_blocks(capture):
+            output.write(block)
+        output.flush()
+    return target
 
 
 def _decode_graph_shard(payload: bytes, *, expected_partition: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
