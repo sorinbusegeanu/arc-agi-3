@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -31,7 +32,7 @@ from v9.memory.m6_outcome import M6Outcome
 from v9.memory.m7_strategy import M7Strategy
 from v9.memory.model import CanonicalNode, CognitiveState, ExperienceEvent, MemoryLevel, MemoryType
 from v9.memory.provenance import DerivationProvenance
-from v9.memory.relations import RelationEdge, RelationType
+from v9.memory.relations import EdgeAuthority, RelationEdge, RelationType
 from v9.memory.residency import PayloadStore
 from v9.modalities.contract import InteractionEvent, PassiveSymbolEvent, PassiveWorldEvent, SYMBOL_MODALITY, TimelineEvent, TimelineIdentity, WORLD_MODALITY
 from v9.modalities.symbols import DeterministicSymbolCodec
@@ -202,21 +203,54 @@ class ContinuousMemoryRuntime:
                     self._restore(load_snapshot(path, expected_config_id=scientific.config_id.value))
                 else:
                     runtime_state, graph_header, shard_specs = direct
-                    graph = CanonicalGraph.from_sharded_state(graph_header, ())
-                    from concurrent.futures import ThreadPoolExecutor
-                    workers = max(1, min(len(shard_specs), 4))
-                    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="v9-restore") as pool:
-                        for start in range(0, len(shard_specs), workers):
-                            batch = shard_specs[start:start + workers]
-                            decoded = list(pool.map(
-                                lambda row: decode_graph_shard(
-                                    load_graph_shard(path, row[0], row[1]),
-                                    expected_partition=row[0],
-                                ),
-                                batch,
-                            ))
-                            graph.install_sharded_rows(decoded)
-                            del decoded
+                    canonical_reference = runtime_state.pop(
+                        "_canonical_graph_snapshot", None
+                    )
+                    if canonical_reference is not None:
+                        canonical_path = self.root / str(canonical_reference["path"])
+                        canonical_store = CanonicalStore.from_snapshot(
+                            canonical_path,
+                            expected_scientific_identity=dict(
+                                canonical_reference["scientific_identity"]
+                            ),
+                            chunk_directory=self.root / "canonical" / "chunks",
+                            resident_chunk_limit=0,
+                        )
+                        expected_checksum = str(
+                            canonical_reference["canonical_handle_checksum"]
+                        )
+                        expected_lsn = int(
+                            canonical_reference["snapshot_applied_lsn"]
+                        )
+                        if (
+                            canonical_store.current_handle.checksum
+                            != expected_checksum
+                            or canonical_store.current_handle.canonical_applied_lsn
+                            != expected_lsn
+                        ):
+                            raise RuntimeError(
+                                "canonical graph snapshot reference mismatch"
+                            )
+                        graph = self._graph_from_canonical_store(
+                            canonical_store, graph_header
+                        )
+                        self.__dict__["_restored_canonical_store"] = canonical_store
+                    else:
+                        graph = CanonicalGraph.from_sharded_state(graph_header, ())
+                        from concurrent.futures import ThreadPoolExecutor
+                        workers = max(1, min(len(shard_specs), 4))
+                        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="v9-restore") as pool:
+                            for start in range(0, len(shard_specs), workers):
+                                batch = shard_specs[start:start + workers]
+                                decoded = list(pool.map(
+                                    lambda row: decode_graph_shard(
+                                        load_graph_shard(path, row[0], row[1]),
+                                        expected_partition=row[0],
+                                    ),
+                                    batch,
+                                ))
+                                graph.install_sharded_rows(decoded)
+                                del decoded
                     runtime_state["graph"] = graph_header
                     self._restore({"state": runtime_state}, graph_override=graph)
             self._restore_hgt_checkpoint()
@@ -229,9 +263,113 @@ class ContinuousMemoryRuntime:
         persistent = int(self.signature_index.get(selected).support)
         return max(cached, persistent)
 
+    def _graph_from_canonical_store(
+        self,
+        store: CanonicalStore,
+        graph_header: dict[str, Any],
+    ) -> CanonicalGraph:
+        """Rebuild the RAM compatibility graph from the canonical authority."""
+        graph = CanonicalGraph.from_sharded_state(graph_header, ())
+        handle = store.current_handle
+        node_batch: list[dict[str, Any]] = []
+        edge_batch: list[dict[str, Any]] = []
+        batch_limit = 4096
+
+        def flush_nodes() -> None:
+            if node_batch:
+                graph.install_sharded_rows(((tuple(node_batch), ()),))
+                node_batch.clear()
+
+        def flush_edges() -> None:
+            if edge_batch:
+                graph.install_sharded_rows((((), tuple(edge_batch)),))
+                edge_batch.clear()
+
+        for key, raw_value in store.iter_collection(
+            handle, CanonicalCollection.GRAPH
+        ):
+            key_text = str(key)
+            value = dict(raw_value)
+            if key_text.startswith("node:"):
+                uid = value["uid"]
+                node_batch.append(
+                    {
+                        "hi": int(uid[0]),
+                        "lo": int(uid[1]),
+                        "level": int(value["level"]),
+                        "memory_type": int(value["memory_type"]),
+                        "structural_key": [
+                            int(item) for item in value.get("structural_key", ())
+                        ],
+                        "created_watermark": int(
+                            value.get("created_watermark", 0)
+                        ),
+                        "payload": {},
+                    }
+                )
+                if len(node_batch) >= batch_limit:
+                    flush_nodes()
+            elif key_text.startswith("edge:"):
+                source = value["source"]
+                target = value["target"]
+                edge_batch.append(
+                    {
+                        "source_hi": int(source[0]),
+                        "source_lo": int(source[1]),
+                        "relation": str(value["relation"]),
+                        "target_hi": int(target[0]),
+                        "target_lo": int(target[1]),
+                        "evidence": [
+                            [int(uid[0]), int(uid[1])]
+                            for uid in value.get("evidence", ())
+                        ],
+                        "authority": str(
+                            value.get("authority", EdgeAuthority.ACTIVE.value)
+                        ),
+                        "object_version": int(value.get("object_version", 0)),
+                    }
+                )
+                if len(edge_batch) >= batch_limit:
+                    flush_edges()
+        flush_nodes()
+        flush_edges()
+
+        for key, raw_payload in store.iter_collection(
+            handle, CanonicalCollection.PAYLOAD
+        ):
+            key_text = str(key)
+            if not key_text.startswith("node:"):
+                continue
+            encoded_uid = key_text[5:]
+            if len(encoded_uid) != 32:
+                raise RuntimeError("canonical payload key has invalid memory UID")
+            uid = MemoryUid(
+                int(encoded_uid[:16], 16),
+                int(encoded_uid[16:], 16),
+            )
+            if uid in graph.nodes:
+                graph.payloads[uid] = dict(raw_payload)
+
+        reservoir_limit = graph._training_m0_reservoir.maxlen or 65_536
+        recent = heapq.nlargest(
+            reservoir_limit,
+            (
+                (int(graph.nodes[uid].created_watermark), uid)
+                for uid in graph._uids_by_level[MemoryLevel.M0]
+                if uid in graph.nodes
+                and graph.payloads.get(uid, {}).get("action_id") is not None
+            ),
+        )
+        graph._training_m0_reservoir.clear()
+        for _, uid in sorted(recent):
+            graph._training_m0_reservoir.append(uid)
+        graph._cached_read_view = None
+        return graph
+
     def _initialize_canonical_durability(self) -> None:
         """Compose the WAL and immutable canonical root into graph publication."""
-        store = CanonicalStore(
+        restored_store = self.__dict__.pop("_restored_canonical_store", None)
+        store = restored_store or CanonicalStore(
             schema_versions={"canonical_graph": int(self.graph.SCHEMA_VERSION)},
             max_chunk_entries=min(8192, int(self.config.canonical_transaction_max_writes)),
             max_chunk_bytes=min(64 * 1024 * 1024, int(self.config.canonical_transaction_max_mutation_bytes)),
@@ -257,10 +395,13 @@ class ContinuousMemoryRuntime:
                     not path.name.startswith("."),
                 ),
             )
-        if complete:
+        if complete and restored_store is None:
             try:
                 store = CanonicalStore.from_snapshot(
-                    complete[-1], expected_scientific_identity=identity
+                    complete[-1],
+                    expected_scientific_identity=identity,
+                    chunk_directory=self.root / "canonical" / "chunks",
+                    resident_chunk_limit=0,
                 )
             except ValueError as exc:
                 from .scientific_modes import ScientificVisibilityMode
@@ -274,8 +415,9 @@ class ContinuousMemoryRuntime:
                 store = CanonicalStore.from_snapshot(
                     complete[-1],
                     expected_scientific_identity=self._legacy_canonical_scientific_identity(),
+                    chunk_directory=self.root / "canonical" / "chunks",
+                    resident_chunk_limit=0,
                 )
-            store.enable_disk_backing(self.root / "canonical" / "chunks", resident_chunk_limit=0)
         recovery = self.canonical_wal.recover(truncate=True)
         if store.current_handle.canonical_applied_lsn > recovery.wal_durable_lsn:
             raise RuntimeError("canonical snapshot is ahead of its durable WAL")
@@ -305,8 +447,8 @@ class ContinuousMemoryRuntime:
                     overlay.put(collection, key, mutation.get("value"))
             store.finalize_overlay(overlay)
         self.canonical_store = store
-        self._canonical_snapshot_applied_lsn = (
-            store.current_handle.canonical_applied_lsn if complete else 0
+        self._canonical_snapshot_applied_lsn = int(
+            store.current_handle.canonical_applied_lsn
         )
         self._hgt_checkpoint_lsn = 0
         self.canonical_wal.register_durable_consumer(

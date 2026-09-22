@@ -125,6 +125,8 @@ class ScientificConfig:
     hgt_model_version: str = "untrained"
     hgt_training_microbatch: int = 4
     hgt_gradient_accumulation: int = 8
+    hgt_epoch_batch_size: int = 512
+    hgt_evaluation_steps_per_game: int = 50
     hgt_examples_per_train_trigger: int = 5000
     hgt_training_duty_cycle: float = 0.50
     hgt_target_inference_latency_ms: float = 50.0
@@ -184,6 +186,7 @@ class ScientificConfig:
             self.hgt_max_subgraph_edges, self.hgt_max_total_nodes, self.hgt_max_total_edges,
             self.hgt_max_semantic_facts_per_memory, self.hgt_oom_retry_limit,
             self.hgt_training_microbatch, self.hgt_gradient_accumulation,
+            self.hgt_epoch_batch_size, self.hgt_evaluation_steps_per_game,
             self.hgt_examples_per_train_trigger,
             self.concrete_admission_representatives_per_signature,
             self.resident_m0_limit, self.resident_m1_grounded_limit,
@@ -348,6 +351,8 @@ _V979_ADDITIVE_FIELDS = {
     "memory_swap_high_watermark_bytes",
     "hgt_transition_chunk_rows",
     "hgt_active_episode_limit",
+    "hgt_epoch_batch_size",
+    "hgt_evaluation_steps_per_game",
 }
 
 

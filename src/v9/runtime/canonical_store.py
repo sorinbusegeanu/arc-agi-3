@@ -386,13 +386,19 @@ class CanonicalStore:
                         return value
         return default
 
-    def collection(self, handle: CanonicalStateHandle, collection: CanonicalCollection | str) -> Mapping[Hashable, object]:
+    def iter_collection(
+        self,
+        handle: CanonicalStateHandle,
+        collection: CanonicalCollection | str,
+    ) -> Iterator[tuple[Hashable, object]]:
+        """Iterate immutable collection rows one persisted chunk at a time."""
         selected = collection if isinstance(collection, CanonicalCollection) else CanonicalCollection(str(collection))
-        with self._lock:
-            result: dict[Hashable, object] = {}
-            for chunk_id in handle.roots(selected):
-                result.update(self.chunk(chunk_id).entries)
-            return MappingProxyType(result)
+        for chunk_id in handle.roots(selected):
+            chunk = self.chunk(chunk_id)
+            yield from chunk.entries
+
+    def collection(self, handle: CanonicalStateHandle, collection: CanonicalCollection | str) -> Mapping[Hashable, object]:
+        return MappingProxyType(dict(self.iter_collection(handle, collection)))
 
     def _make_chunks(
         self,
@@ -541,8 +547,6 @@ class CanonicalStore:
             shutil.rmtree(temporary)
         temporary.mkdir(parents=True)
         with self.pin() as handle:
-            with self._lock:
-                chunks = tuple(self.chunk(chunk_id) for chunk_id in handle.all_chunk_ids)
             state_path = temporary / "canonical-state.pkl"
             state_hasher = hashlib.sha256()
 
@@ -554,14 +558,39 @@ class CanonicalStore:
                     state_hasher.update(payload)
                     return self.stream.write(payload)
 
+                def flush(self) -> None:
+                    self.stream.flush()
+
+            external_chunks = self.chunk_directory is not None
             with state_path.open("wb") as output:
-                pickle.dump(
-                    {"handle": handle, "chunks": chunks},
-                    _HashingWriter(output),
-                    protocol=5,
-                )
+                writer = _HashingWriter(output)
+                pickler = pickle.Pickler(writer, protocol=5)
+                pickler.dump(handle)
+                if not external_chunks:
+                    pickler.dump(len(handle.all_chunk_ids))
+                    for chunk_id in handle.all_chunk_ids:
+                        pickler.dump(self.chunk(chunk_id))
                 output.flush()
                 os.fsync(output.fileno())
+
+            chunk_directory_ref = None
+            if external_chunks:
+                assert self.chunk_directory is not None
+                self.chunk_directory.mkdir(parents=True, exist_ok=True)
+                for chunk_id in handle.all_chunk_ids:
+                    chunk_path = self.chunk_directory / f"{chunk_id.value}.pkl"
+                    if not chunk_path.is_file():
+                        chunk = self.chunk(chunk_id)
+                        temporary_chunk = chunk_path.with_suffix(".tmp")
+                        with temporary_chunk.open("wb") as output:
+                            pickle.dump(chunk, output, protocol=5)
+                            output.flush()
+                            os.fsync(output.fileno())
+                        os.replace(temporary_chunk, chunk_path)
+                chunk_directory_ref = os.path.relpath(
+                    self.chunk_directory, target.parent.parent
+                )
+
             state_checksum = state_hasher.hexdigest()
             if crash_hook:
                 crash_hook("state_fsynced")
@@ -570,6 +599,11 @@ class CanonicalStore:
                 "canonical_handle_checksum": handle.checksum,
                 "canonical_generation": handle.generation,
                 "state_checksum": state_checksum,
+                "state_format": (
+                    "external-chunks-v3" if external_chunks else "pickle-stream-v2"
+                ),
+                "chunk_count": len(handle.all_chunk_ids),
+                "chunk_directory": chunk_directory_ref,
                 "scientific_identity": dict(sorted((scientific_identity or {}).items())),
             }
             manifest_path = temporary / "manifest.json"
@@ -622,6 +656,8 @@ class CanonicalStore:
         path: str | Path,
         *,
         expected_scientific_identity: Mapping[str, str] | None = None,
+        chunk_directory: str | Path | None = None,
+        resident_chunk_limit: int | None = None,
     ) -> "CanonicalStore":
         target = cls._restorable_snapshot_path(path)
         if not (target / "COMPLETE").is_file():
@@ -630,25 +666,96 @@ class CanonicalStore:
         expected = dict(sorted((expected_scientific_identity or {}).items()))
         if expected_scientific_identity is not None and manifest.get("scientific_identity") != expected:
             raise ValueError("canonical snapshot scientific identity mismatch")
-        state_payload = (target / "canonical-state.pkl").read_bytes()
-        if hashlib.sha256(state_payload).hexdigest() != manifest["state_checksum"]:
+        state_path = target / "canonical-state.pkl"
+        hasher = hashlib.sha256()
+        with state_path.open("rb") as source:
+            while True:
+                block = source.read(1024 * 1024)
+                if not block:
+                    break
+                hasher.update(block)
+        if hasher.hexdigest() != manifest["state_checksum"]:
             raise ValueError("canonical snapshot state checksum mismatch")
-        state = pickle.loads(state_payload)
-        handle = state["handle"]
-        chunks = tuple(state["chunks"])
-        if not isinstance(handle, CanonicalStateHandle) or handle.checksum != manifest["canonical_handle_checksum"]:
-            raise ValueError("canonical snapshot handle mismatch")
-        store = cls(schema_versions=dict(handle.schema_versions))
+
+        state_format = str(manifest.get("state_format", "pickle-bundle-v1"))
+        if state_format == "external-chunks-v3":
+            with state_path.open("rb") as source:
+                handle = pickle.Unpickler(source).load()
+            if not isinstance(handle, CanonicalStateHandle) or handle.checksum != manifest["canonical_handle_checksum"]:
+                raise ValueError("canonical snapshot handle mismatch")
+            selected_chunk_directory = (
+                Path(chunk_directory)
+                if chunk_directory is not None
+                else target.parent.parent / str(manifest.get("chunk_directory", "chunks"))
+            )
+            store = cls(
+                schema_versions=dict(handle.schema_versions),
+                chunk_directory=selected_chunk_directory,
+                resident_chunk_limit=resident_chunk_limit,
+            )
+            with store._lock:
+                store._chunks = OrderedDict()
+                store._chunk_references = {
+                    chunk_id: 0 for chunk_id in handle.all_chunk_ids
+                }
+            missing = [
+                chunk_id.value
+                for chunk_id in handle.all_chunk_ids
+                if not (selected_chunk_directory / f"{chunk_id.value}.pkl").is_file()
+            ]
+            if missing:
+                raise ValueError(
+                    f"canonical snapshot references missing chunks: {missing[:3]}"
+                )
+        elif state_format == "pickle-stream-v2":
+            with state_path.open("rb") as source:
+                unpickler = pickle.Unpickler(source)
+                handle = unpickler.load()
+                chunk_count = int(unpickler.load())
+                if chunk_count != int(manifest.get("chunk_count", chunk_count)):
+                    raise ValueError("canonical snapshot chunk count mismatch")
+                if not isinstance(handle, CanonicalStateHandle) or handle.checksum != manifest["canonical_handle_checksum"]:
+                    raise ValueError("canonical snapshot handle mismatch")
+                store = cls(
+                    schema_versions=dict(handle.schema_versions),
+                    chunk_directory=chunk_directory,
+                    resident_chunk_limit=resident_chunk_limit,
+                )
+                with store._lock:
+                    store._chunks = OrderedDict()
+                    store._chunk_references = {}
+                for _ in range(chunk_count):
+                    chunk = unpickler.load()
+                    if not isinstance(chunk, CanonicalChunk):
+                        raise ValueError("canonical snapshot contains an invalid chunk")
+                    payload = _encoded({"collection": chunk.collection.value, "schema_version": chunk.schema_version, "entries": chunk.entries})
+                    if hashlib.sha256(payload).hexdigest() != chunk.chunk_id.value:
+                        raise ValueError("canonical snapshot chunk checksum mismatch")
+                    with store._lock:
+                        store._store_chunk(chunk)
+        else:
+            state_payload = state_path.read_bytes()
+            state = pickle.loads(state_payload)
+            handle = state["handle"]
+            if not isinstance(handle, CanonicalStateHandle) or handle.checksum != manifest["canonical_handle_checksum"]:
+                raise ValueError("canonical snapshot handle mismatch")
+            store = cls(
+                    schema_versions=dict(handle.schema_versions),
+                    chunk_directory=chunk_directory,
+                    resident_chunk_limit=resident_chunk_limit,
+                )
+            with store._lock:
+                store._chunks = OrderedDict()
+                store._chunk_references = {}
+                for chunk in tuple(state["chunks"]):
+                    if not isinstance(chunk, CanonicalChunk):
+                        raise ValueError("canonical snapshot contains an invalid chunk")
+                    payload = _encoded({"collection": chunk.collection.value, "schema_version": chunk.schema_version, "entries": chunk.entries})
+                    if hashlib.sha256(payload).hexdigest() != chunk.chunk_id.value:
+                        raise ValueError("canonical snapshot chunk checksum mismatch")
+                    store._store_chunk(chunk)
+
         with store._lock:
-            store._chunks = OrderedDict()
-            store._chunk_references = {}
-            for chunk in chunks:
-                if not isinstance(chunk, CanonicalChunk):
-                    raise ValueError("canonical snapshot contains an invalid chunk")
-                payload = _encoded({"collection": chunk.collection.value, "schema_version": chunk.schema_version, "entries": chunk.entries})
-                if hashlib.sha256(payload).hexdigest() != chunk.chunk_id.value:
-                    raise ValueError("canonical snapshot chunk checksum mismatch")
-                store._store_chunk(chunk)
             if set(handle.all_chunk_ids) != set(store._chunk_references):
                 raise ValueError("canonical snapshot root/chunk reachability mismatch")
             store._current = handle

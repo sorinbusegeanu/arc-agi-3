@@ -6,9 +6,9 @@ from pathlib import Path
 import time
 from typing import Any
 
-from v9.hgt import resolve_hgt_behavior_test, rollback_hgt_model, train_hgt_epoch
+from v9.hgt import load_hgt_policy_version, resolve_hgt_behavior_test, train_hgt_epoch
 from v9.hgt.epoch_dataset import EpochTransitionDataset, dataset_path
-from v9.hgt.matched_evaluation import matched_jobs, select_matched_branch
+from v9.hgt.matched_evaluation import select_matched_branch
 from v9.memory.m1_normalized import NormalizedChannel
 from v9.telemetry import HGTInferenceSample, OptimizationSample
 from .developmental_cut import DevelopmentalWorkStatus
@@ -464,14 +464,31 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         getattr(args, "scientific_mode", ScientificVisibilityMode.ASYNC_DEVELOPMENT)
     )
 
-    def run_sampling_jobs(jobs: list[tuple[int, Any, int, int]], *, epoch: int, dataset: Any, common_kwargs: dict[str, Any]):
+    def run_sampling_jobs(
+        jobs: list[tuple[int, Any, int, int]],
+        *,
+        epoch: int,
+        dataset: Any | None,
+        common_kwargs: dict[str, Any],
+        evaluation_only: bool = False,
+        evidence_branch: str | None = None,
+    ):
+        branch = (
+            str(evidence_branch)
+            if evidence_branch is not None
+            else ("" if dataset is None else str(dataset.branch))
+        )
+        selected_kwargs = dict(common_kwargs)
+        if evaluation_only:
+            selected_kwargs["allow_policy_refresh"] = False
         if scientific_mode is not ScientificVisibilityMode.MATCHED_REASONING:
             return run_parallel_memory_jobs(
                 runtime,
                 jobs,
                 hgt_dataset=dataset,
-                evidence_branch=f"epoch-{int(epoch)}:{dataset.branch}",
-                **common_kwargs,
+                evidence_branch=f"epoch-{int(epoch)}:{branch}",
+                evaluation_only=bool(evaluation_only),
+                **selected_kwargs,
             )
         view = runtime.create_epoch_inference_view(sampling_epoch_id=epoch)
         try:
@@ -485,11 +502,13 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                 jobs,
                 hgt_dataset=dataset,
                 bound_epoch_view=view,
-                evidence_branch=f"epoch-{int(epoch)}:{dataset.branch}",
-                **common_kwargs,
+                evidence_branch=f"epoch-{int(epoch)}:{branch}",
+                evaluation_only=bool(evaluation_only),
+                **selected_kwargs,
             )
         finally:
             view.close()
+
 
     for epoch in range(1, int(args.epochs) + 1):
         jobs = build_epoch_jobs(specs, args, epoch=epoch, previous_game_results=previous_game_results)
@@ -501,7 +520,6 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             "sampling_game_budgets",
             json.dumps({str(job[1].display_name): int(job[2]) for job in jobs}, sort_keys=True),
         )
-        print(f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} sampling start actors={len(jobs)}", flush=True)
         active_model = str(runtime.unified_telemetry.model_version or "untrained")
         is_bootstrap = active_model in {"None", "untrained", ""}
         common_kwargs = dict(
@@ -519,72 +537,168 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                 getattr(args, "scientific_mode", ScientificVisibilityMode.ASYNC_DEVELOPMENT)
             ),
         )
-        if is_bootstrap:
-            epoch_dataset = EpochTransitionDataset(dataset_path(args.root, epoch=epoch, branch="bootstrap"), epoch=epoch, branch="bootstrap", model_version=active_model)
-            try:
-                process_results = run_sampling_jobs(jobs, epoch=epoch, dataset=epoch_dataset, common_kwargs=common_kwargs)
-            finally:
-                epoch_dataset.close()
-            selected_dataset_path = epoch_dataset.path
-            runtime.set_telemetry_gauge("hgt_evaluation_branch", "bootstrap")
-        else:
-            on_jobs, off_jobs = matched_jobs(jobs)
-            branch_base_state = runtime.capture_experiment_state()
-            on_dataset = EpochTransitionDataset(dataset_path(args.root, epoch=epoch, branch="hgt_on"), epoch=epoch, branch="hgt_on", model_version=active_model)
-            try:
-                runtime.set_hgt_enabled(True)
-                on_results = run_sampling_jobs(on_jobs, epoch=epoch, dataset=on_dataset, common_kwargs=common_kwargs)
-            finally:
-                on_dataset.close()
-            on_state = runtime.capture_experiment_state()
-            # Restore the exact pre-evaluation Hydra/model state before OFF.
-            runtime.restore_experiment_state(branch_base_state)
+
+        decision = None
+        on_success = off_success = 0.0
+        matched_hgt_accepted = True
+        behavior_resolution = None
+        baseline_model = "untrained"
+
+        if not is_bootstrap:
             manifest_path = Path(args.root) / "models" / "hgt_manifest.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
-            parent_model = manifest.get("parent_model_version")
-            baseline_model = str(parent_model or "random")
-            off_dataset = EpochTransitionDataset(dataset_path(args.root, epoch=epoch, branch="hgt_parent"), epoch=epoch, branch="hgt_parent", model_version=baseline_model)
-            try:
-                if parent_model:
-                    # Evaluate the accepted parent from the exact same captured
-                    # state. rollback_hgt_model restores its action policy.
-                    restored_parent = rollback_hgt_model(runtime, root=args.root)
-                    if str(restored_parent) != str(parent_model):
-                        raise RuntimeError(f"failed to restore HGT parent {parent_model!r} for matched evaluation")
-                    runtime.set_hgt_enabled(True)
-                else:
-                    # The first candidate is compared with the pre-HGT random/
-                    # Hydra control policy.
-                    runtime.set_hgt_enabled(False)
-                off_results = run_sampling_jobs(off_jobs, epoch=epoch, dataset=off_dataset, common_kwargs=common_kwargs)
-            finally:
-                off_dataset.close()
+            parent_model = manifest.get("parent_model_version") or manifest.get("last_accepted_model_version")
+            baseline_model = str(parent_model or "untrained")
+            eval_steps = max(1, int(args.hgt_eval_steps_per_game))
+            evaluation_jobs = [
+                (actor_id, spec, min(int(step_budget), eval_steps), seed)
+                for actor_id, spec, step_budget, seed in jobs
+            ]
+            runtime.set_telemetry_gauge(
+                "hgt_evaluation_step_budget",
+                sum(int(row[2]) for row in evaluation_jobs),
+            )
+            runtime.set_telemetry_gauge(
+                "hgt_evaluation_steps_per_game", eval_steps
+            )
+            print(
+                f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} HGT evaluation "
+                f"candidate={active_model} parent={baseline_model} "
+                f"steps/game={eval_steps}",
+                flush=True,
+            )
+
+            candidate_state = runtime.capture_hgt_policy_state()
+            on_results = run_sampling_jobs(
+                evaluation_jobs,
+                epoch=epoch,
+                dataset=None,
+                common_kwargs=common_kwargs,
+                evaluation_only=True,
+                evidence_branch="hgt_candidate_eval",
+            )
+
+            if parent_model:
+                restored_parent = load_hgt_policy_version(
+                    runtime, root=args.root, model_version=str(parent_model)
+                )
+                if str(restored_parent) != str(parent_model):
+                    raise RuntimeError(
+                        f"failed to load HGT parent {parent_model!r} for evaluation"
+                    )
+            else:
+                runtime.set_hgt_enabled(False)
+
+            off_results = run_sampling_jobs(
+                evaluation_jobs,
+                epoch=epoch,
+                dataset=None,
+                common_kwargs=common_kwargs,
+                evaluation_only=True,
+                evidence_branch="hgt_parent_eval",
+            )
+
+            if parent_model:
+                runtime.set_hgt_action_scores(
+                    candidate_state["scores"],
+                    context_action_scores=candidate_state["context_scores"],
+                )
+                runtime.unified_telemetry.model_version = str(
+                    candidate_state["model_version"]
+                )
+            else:
                 runtime.set_hgt_enabled(True)
-            on_scenario, on_success = _scenario_success(on_results, specs)
-            off_scenario, off_success = _scenario_success(off_results, specs)
+
+            _on_scenario, on_success = _scenario_success(on_results, specs)
+            _off_scenario, off_success = _scenario_success(off_results, specs)
             on_game = _game_level_metrics(on_results)
             off_game = _game_level_metrics(off_results)
             decision = select_matched_branch(
-                on_success, off_success,
-                on_levels=sum(int(r.levels_completed) for r in on_results),
-                off_levels=sum(int(r.levels_completed) for r in off_results),
+                on_success,
+                off_success,
+                on_levels=sum(int(row.levels_completed) for row in on_results),
+                off_levels=sum(int(row.levels_completed) for row in off_results),
                 on_solved_games=int(on_game["current_run_solved_games"]),
                 off_solved_games=int(off_game["current_run_solved_games"]),
             )
-            off_state = runtime.capture_experiment_state()
-            process_results = on_results if decision.selected_branch == "hgt_on" else off_results
-            selected_dataset_path = on_dataset.path if decision.selected_branch == "hgt_on" else off_dataset.path
-            # Continue the scientific runtime from the branch whose behavior won.
-            runtime.restore_experiment_state(on_state if decision.selected_branch == "hgt_on" else off_state)
-            runtime.set_hgt_enabled(True)
-            runtime.set_telemetry_gauge("hgt_on_behavioral_success", float(on_success))
-            runtime.set_telemetry_gauge("hgt_parent_behavioral_success", float(off_success))
-            runtime.set_telemetry_gauge("hgt_baseline_model_version", baseline_model)
-            runtime.set_telemetry_gauge("hgt_behavioral_gain", float(decision.gain))
-            runtime.set_telemetry_gauge("hgt_evaluation_branch", decision.selected_branch)
-            runtime.set_telemetry_gauge("hgt_branch_selection_reason", decision.reason)
-            runtime.set_telemetry_gauge("hgt_on_dataset_transitions", int(on_dataset.count))
-            runtime.set_telemetry_gauge("hgt_parent_dataset_transitions", int(off_dataset.count))
+            matched_hgt_accepted = decision.selected_branch == "hgt_on"
+            behavior_resolution = resolve_hgt_behavior_test(
+                runtime,
+                root=args.root,
+                accepted=matched_hgt_accepted,
+            )
+            selected_model = str(
+                runtime.unified_telemetry.model_version or "untrained"
+            )
+            runtime.set_telemetry_gauge(
+                "hgt_on_behavioral_success", float(on_success)
+            )
+            runtime.set_telemetry_gauge(
+                "hgt_parent_behavioral_success", float(off_success)
+            )
+            runtime.set_telemetry_gauge(
+                "hgt_baseline_model_version", baseline_model
+            )
+            runtime.set_telemetry_gauge(
+                "hgt_behavioral_gain", float(0.0 if decision is None else decision.gain)
+            )
+            runtime.set_telemetry_gauge(
+                "hgt_evaluation_branch", decision.selected_branch
+            )
+            runtime.set_telemetry_gauge(
+                "hgt_branch_selection_reason", decision.reason
+            )
+            runtime.set_telemetry_gauge(
+                "hgt_evaluation_candidate_steps",
+                sum(int(row.steps) for row in on_results),
+            )
+            runtime.set_telemetry_gauge(
+                "hgt_evaluation_parent_steps",
+                sum(int(row.steps) for row in off_results),
+            )
+            verdict = "PROMOTED" if matched_hgt_accepted else "REJECTED"
+            runtime.set_telemetry_gauge("hgt_behavior_test_result", verdict)
+            runtime.set_telemetry_gauge("hgt_promotion_result", verdict)
+            runtime.set_telemetry_gauge(
+                "hgt_resolved_model_version",
+                str(behavior_resolution or selected_model),
+            )
+            print(
+                f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} HGT evaluation "
+                f"status={verdict} selected={selected_model} gain={(0.0 if decision is None else decision.gain):.4f}",
+                flush=True,
+            )
+        else:
+            selected_model = active_model
+            runtime.set_telemetry_gauge("hgt_evaluation_branch", "bootstrap")
+            runtime.set_telemetry_gauge("hgt_evaluation_step_budget", 0)
+
+        sampling_branch = "bootstrap" if is_bootstrap else "selected_policy"
+        epoch_dataset = EpochTransitionDataset(
+            dataset_path(args.root, epoch=epoch, branch=sampling_branch),
+            epoch=epoch,
+            branch=sampling_branch,
+            model_version=selected_model,
+        )
+        print(
+            f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} sampling start "
+            f"actors={len(jobs)} model={selected_model}",
+            flush=True,
+        )
+        try:
+            process_results = run_sampling_jobs(
+                jobs,
+                epoch=epoch,
+                dataset=epoch_dataset,
+                common_kwargs=common_kwargs,
+                evidence_branch=sampling_branch,
+            )
+        finally:
+            epoch_dataset.close()
+        selected_dataset_path = epoch_dataset.path
+        runtime.set_telemetry_gauge(
+            "hgt_selected_sampling_model", selected_model
+        )
         with open(selected_dataset_path, encoding="utf-8") as training_dataset_handle:
             sampled_training_transitions = sum(1 for _ in training_dataset_handle)
         runtime.set_telemetry_gauge("hgt_sampled_training_transitions", sampled_training_transitions)
@@ -620,7 +734,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         if baseline_success is None:
             baseline_success = behavioral_success
         runtime.set_telemetry_gauge("behavioral_success_rate", behavioral_success)
-        runtime.set_telemetry_gauge("behavioral_success_gain", 0.0 if is_bootstrap else float(decision.gain))
+        runtime.set_telemetry_gauge("behavioral_success_gain", 0.0 if is_bootstrap else float(0.0 if decision is None else decision.gain))
         runtime.set_telemetry_gauge("successful_scenarios", sum(rate > 0.0 for rate in scenario_success.values()))
         game_level = _game_level_metrics(process_results)
         previous_game_results = dict(game_level["by_game"])
@@ -716,22 +830,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
         runtime.set_telemetry_gauge("symbol_prediction_samples_epoch", symbol_prediction_samples)
         runtime.set_telemetry_gauge("post_sampling_symbol_prediction_seconds", time.perf_counter() - symbol_prediction_started)
 
-        matched_hgt_accepted = bool(is_bootstrap or decision.selected_branch == "hgt_on")
-        behavior_resolution = resolve_hgt_behavior_test(
-            runtime,
-            root=args.root,
-            accepted=matched_hgt_accepted,
-        ) if not is_bootstrap else None
-        if behavior_resolution is not None:
-            verdict = "PROMOTED" if matched_hgt_accepted else "REJECTED"
-            runtime.set_telemetry_gauge("hgt_behavior_test_result", verdict)
-            runtime.set_telemetry_gauge("hgt_promotion_result", verdict)
-            runtime.set_telemetry_gauge("hgt_resolved_model_version", str(behavior_resolution))
-            print(
-                f"{time.strftime('[%H:%M]')} epoch {epoch}/{args.epochs} HGT behavior-test "
-                f"status={verdict} model={behavior_resolution} matched_gain={decision.gain:.4f}",
-                flush=True,
-            )
+
 
         replay_started = time.perf_counter()
         if developmental_session is None:
@@ -784,7 +883,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                 inference_latency_ms=float(training.inference_latency_ms),
                 relevance_precision=float(training.relevance_precision),
                 correspondence_accuracy=training_accuracy,
-                behavior_delta=float(0.0 if is_bootstrap else decision.gain),
+                behavior_delta=float(0.0 if is_bootstrap else (0.0 if decision is None else decision.gain)),
             )
         )
 
@@ -803,11 +902,11 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
             final_score=float(behavioral_success),
             best_score=max(float(baseline_success or 0.0), float(behavioral_success)),
             changed=bool(changed_scenarios),
-            behavior_improved=bool((0.0 if is_bootstrap else decision.gain) > 0.0),
+            behavior_improved=bool((0.0 if is_bootstrap else (0.0 if decision is None else decision.gain)) > 0.0),
             reasoning_cost=float(max(1, training.training_steps)),
             stop_reason=str(training.status),
             candidate_changes=int(changed_scenarios),
-            prediction_improvement=max(0.0, float(0.0 if is_bootstrap else decision.gain)),
+            prediction_improvement=max(0.0, float(0.0 if is_bootstrap else (0.0 if decision is None else decision.gain))),
             strategy_changes=int(changed_scenarios),
         )
         prior_scenario_success = dict(previous_scenario_success)
@@ -913,7 +1012,7 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                 training={
                     **asdict(training),
                     "behavioral_success_rate": behavioral_success,
-                    "behavioral_success_gain": 0.0 if is_bootstrap else float(decision.gain),
+                    "behavioral_success_gain": 0.0 if is_bootstrap else float(0.0 if decision is None else decision.gain),
                     "scenario_success_rate": scenario_success,
                     "game_level_metrics": game_level,
                     "transfer_validation": asdict(transfer),

@@ -765,6 +765,45 @@ def resolve_hgt_behavior_test(runtime: Any, *, root: str | Path, accepted: bool)
     runtime.set_telemetry_gauge("hgt_behavior_test_result", "REJECTED_BEHAVIOR_GATE")
     return rolled_back
 
+def load_hgt_policy_version(
+    runtime: Any, *, root: str | Path, model_version: str
+) -> str | None:
+    """Load one HGT checkpoint into runtime policy without mutating the model manifest."""
+    selected = str(model_version)
+    checkpoint_path = Path(root) / "models" / f"{selected}.pt"
+    if not checkpoint_path.exists():
+        return None
+    torch, _, _ = _require_torch()
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(checkpoint, dict):
+        return None
+    action_scores = {
+        int(environment): {
+            int(action): float(score) for action, score in actions.items()
+        }
+        for environment, actions in dict(checkpoint.get("action_scores", {})).items()
+    }
+    context_action_scores = {
+        int(environment): {
+            int(context): {
+                int(action): float(score) for action, score in actions.items()
+            }
+            for context, actions in contexts.items()
+        }
+        for environment, contexts in dict(
+            checkpoint.get("context_action_scores", {})
+        ).items()
+    }
+    try:
+        runtime.set_hgt_action_scores(
+            action_scores, context_action_scores=context_action_scores
+        )
+    except TypeError:
+        runtime.set_hgt_action_scores(action_scores)
+    runtime.unified_telemetry.model_version = selected
+    return selected
+
+
 def rollback_hgt_model(runtime: Any, *, root: str | Path) -> str | None:
     """Restore the parent checkpoint after a measured behavioral regression."""
     model_dir = Path(root) / "models"
@@ -1122,7 +1161,7 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         int(training_epochs),
         min(64, max(1, int(math.ceil(training_examples / 2048.0)))),
     )
-    stream_batch_size = max(64, min(2048, int(getattr(config, "hgt_epoch_batch_size", 512))))
+    stream_batch_size = max(1, min(2048, int(config.hgt_epoch_batch_size)))
     if epoch_transition_rows:
         full_dataset_steps = math.ceil(len(epoch_transition_rows) / stream_batch_size)
         if not matched_reasoning:

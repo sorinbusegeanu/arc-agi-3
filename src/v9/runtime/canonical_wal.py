@@ -328,79 +328,106 @@ class CanonicalCommitWAL:
         with self._lock:
             if not self.path.exists():
                 return WALRecoveryResult((), 0, 0, 0, 0)
-            data = self.path.read_bytes()
-            offset = 0
+            file_size = int(self.path.stat().st_size)
             valid_end = 0
             frames: list[CanonicalCommitFrame] = []
             groups = 0
             expected_previous = 0
-            while offset + _HEADER.size <= len(data):
-                group_start = offset
-                try:
-                    magic, version, group_id, previous_lsn, frame_count, payload_bytes, header_checksum = _HEADER.unpack_from(data, offset)
-                    if groups == 0 and group_id == 1:
-                        # A reclaimed WAL begins at the first frame still needed
-                        # by every registered durable consumer. Its header keeps
-                        # the removed prefix's final LSN as the causal anchor.
-                        expected_previous = int(previous_lsn)
-                    if (
-                        magic != _HEADER_MAGIC
-                        or version != _VERSION
-                        or group_id != groups + 1
-                        or previous_lsn != expected_previous
-                    ):
+
+            with self.path.open("rb", buffering=0) as handle:
+                while True:
+                    group_start = int(handle.tell())
+                    encoded_header = handle.read(_HEADER.size)
+                    if not encoded_header:
                         break
-                    core = struct.pack(">8sIQQIQ", magic, version, group_id, previous_lsn, frame_count, payload_bytes)
-                    if (
-                        _checksum(core) != header_checksum
-                        or not 0 < frame_count <= self.max_group_frames
-                        or payload_bytes > self.max_pending_bytes
-                    ):
+                    if len(encoded_header) != _HEADER.size:
                         break
-                    offset += _HEADER.size
-                    group_frames: list[CanonicalCommitFrame] = []
-                    actual_payload = 0
-                    frame_previous = previous_lsn
-                    for _ in range(frame_count):
-                        if offset + _FRAME.size > len(data):
-                            raise ValueError("torn frame header")
-                        frame_magic, lsn, prior, length, checksum = _FRAME.unpack_from(data, offset)
+                    try:
+                        magic, version, group_id, previous_lsn, frame_count, payload_bytes, header_checksum = _HEADER.unpack(encoded_header)
+                        if groups == 0 and group_id == 1:
+                            expected_previous = int(previous_lsn)
                         if (
-                            frame_magic != _FRAME_MAGIC
-                            or prior != frame_previous
-                            or lsn != frame_previous + 1
-                            or length > self.max_pending_bytes
+                            magic != _HEADER_MAGIC
+                            or version != _VERSION
+                            or group_id != groups + 1
+                            or previous_lsn != expected_previous
                         ):
-                            raise ValueError("invalid frame header")
-                        offset += _FRAME.size
-                        if offset + length > len(data):
-                            raise ValueError("torn frame payload")
-                        payload = data[offset : offset + length]
-                        offset += length
-                        group_frames.append(_decode_frame(payload, checksum, lsn, prior))
-                        actual_payload += length
-                        frame_previous = lsn
-                    if actual_payload != payload_bytes or offset + _FOOTER.size > len(data):
-                        raise ValueError("invalid group payload size or torn footer")
-                    footer_magic, footer_group, last_lsn, group_checksum = _FOOTER.unpack_from(data, offset)
-                    if footer_magic != _FOOTER_MAGIC or footer_group != group_id or last_lsn != group_frames[-1].wal_lsn:
-                        raise ValueError("invalid WAL group footer")
-                    if _checksum(data[group_start:offset]) != group_checksum:
-                        raise ValueError("WAL group checksum mismatch")
-                    offset += _FOOTER.size
-                except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
-                    break
-                frames.extend(group_frames)
-                groups += 1
-                expected_previous = group_frames[-1].wal_lsn
-                valid_end = offset
-            truncated = len(data) - valid_end
+                            break
+                        core = struct.pack(
+                            ">8sIQQIQ",
+                            magic,
+                            version,
+                            group_id,
+                            previous_lsn,
+                            frame_count,
+                            payload_bytes,
+                        )
+                        if (
+                            _checksum(core) != header_checksum
+                            or not 0 < frame_count <= self.max_group_frames
+                            or payload_bytes > self.max_pending_bytes
+                        ):
+                            break
+
+                        group_hasher = hashlib.sha256()
+                        group_hasher.update(encoded_header)
+                        group_frames: list[CanonicalCommitFrame] = []
+                        actual_payload = 0
+                        frame_previous = previous_lsn
+
+                        for _ in range(frame_count):
+                            encoded_frame = handle.read(_FRAME.size)
+                            if len(encoded_frame) != _FRAME.size:
+                                raise ValueError("torn frame header")
+                            group_hasher.update(encoded_frame)
+                            frame_magic, lsn, prior, length, checksum = _FRAME.unpack(encoded_frame)
+                            if (
+                                frame_magic != _FRAME_MAGIC
+                                or prior != frame_previous
+                                or lsn != frame_previous + 1
+                                or length > self.max_pending_bytes
+                            ):
+                                raise ValueError("invalid frame header")
+                            payload = handle.read(length)
+                            if len(payload) != length:
+                                raise ValueError("torn frame payload")
+                            group_hasher.update(payload)
+                            group_frames.append(_decode_frame(payload, checksum, lsn, prior))
+                            actual_payload += length
+                            frame_previous = lsn
+
+                        if actual_payload != payload_bytes:
+                            raise ValueError("invalid group payload size")
+                        encoded_footer = handle.read(_FOOTER.size)
+                        if len(encoded_footer) != _FOOTER.size:
+                            raise ValueError("torn footer")
+                        footer_magic, footer_group, last_lsn, group_checksum = _FOOTER.unpack(encoded_footer)
+                        if (
+                            footer_magic != _FOOTER_MAGIC
+                            or footer_group != group_id
+                            or last_lsn != group_frames[-1].wal_lsn
+                            or group_hasher.digest() != group_checksum
+                        ):
+                            raise ValueError("invalid WAL group footer")
+                    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                        break
+
+                    frames.extend(group_frames)
+                    groups += 1
+                    expected_previous = group_frames[-1].wal_lsn
+                    valid_end = int(handle.tell())
+                    if valid_end <= group_start:
+                        raise RuntimeError("WAL recovery made no forward progress")
+
+            truncated = file_size - valid_end
             if truncate and truncated:
                 with self.path.open("r+b") as handle:
                     handle.truncate(valid_end)
                     handle.flush()
                     self._fsync(handle.fileno())
-            return WALRecoveryResult(tuple(frames), groups, expected_previous, valid_end, truncated)
+            return WALRecoveryResult(
+                tuple(frames), groups, expected_previous, valid_end, truncated
+            )
 
     def commit_overlay(
         self,
@@ -526,36 +553,46 @@ class CanonicalCommitWAL:
             if removable == 0:
                 return 0
             retained = frames[removable:]
-            groups: list[tuple[CanonicalCommitFrame, ...]] = []
-            pending: list[CanonicalCommitFrame] = []
-            pending_bytes = 0
-            for frame in retained:
-                payload_bytes = len(_json_bytes(frame.payload()))
-                if pending and (
-                    len(pending) >= self.max_group_frames
-                    or pending_bytes + payload_bytes > self.max_pending_bytes
-                ):
-                    groups.append(tuple(pending))
-                    pending = []
-                    pending_bytes = 0
-                pending.append(frame)
-                pending_bytes += payload_bytes
-            if pending:
-                groups.append(tuple(pending))
-            encoded = b"".join(
-                self._encode_group(group, group_id=index)
-                for index, group in enumerate(groups, start=1)
-            )
+
             temporary_path: Path | None = None
             replaced = False
+            written_groups = 0
             try:
                 with tempfile.NamedTemporaryFile(
-                    mode="wb", dir=self.path.parent, prefix=f".{self.path.name}.reclaim-", delete=False
+                    mode="wb",
+                    dir=self.path.parent,
+                    prefix=f".{self.path.name}.reclaim-",
+                    delete=False,
                 ) as handle:
                     temporary_path = Path(handle.name)
-                    self._write_all(handle, encoded)
+                    pending: list[CanonicalCommitFrame] = []
+                    pending_bytes = 0
+
+                    def flush_group() -> None:
+                        nonlocal pending, pending_bytes, written_groups
+                        if not pending:
+                            return
+                        written_groups += 1
+                        encoded = self._encode_group(
+                            tuple(pending), group_id=written_groups
+                        )
+                        self._write_all(handle, encoded)
+                        pending = []
+                        pending_bytes = 0
+
+                    for frame in retained:
+                        payload_bytes = len(_json_bytes(frame.payload()))
+                        if pending and (
+                            len(pending) >= self.max_group_frames
+                            or pending_bytes + payload_bytes > self.max_pending_bytes
+                        ):
+                            flush_group()
+                        pending.append(frame)
+                        pending_bytes += payload_bytes
+                    flush_group()
                     handle.flush()
                     self._fsync(handle.fileno())
+
                 os.replace(temporary_path, self.path)
                 replaced = True
                 directory_fd = os.open(self.path.parent, os.O_RDONLY)
@@ -564,16 +601,14 @@ class CanonicalCommitWAL:
                 finally:
                     os.close(directory_fd)
             except BaseException:
-                # Once replacement occurred, the directory-entry durability is
-                # indeterminate to this process. Reopen/recovery is required
-                # before another append can safely choose a group identity.
                 if replaced:
                     self._poisoned = True
                 raise
             finally:
                 if temporary_path is not None:
                     temporary_path.unlink(missing_ok=True)
-            self._group_id = len(groups)
+
+            self._group_id = written_groups
             self._durable_lsn = retained[-1].wal_lsn
             return removable
 

@@ -58,3 +58,29 @@ def test_failed_fsync_requires_reopen_before_another_append(tmp_path: Path) -> N
     committed = reopened.append_group(({"transaction_id": "after-recovery"},))
     assert committed[0].previous_lsn == 1
     assert committed[0].wal_lsn == 2
+
+
+
+def test_wal_recovery_and_reclaim_do_not_read_whole_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "streamed.wal"
+    wal = CanonicalCommitWAL(path, max_group_frames=1)
+    for index in range(3):
+        wal.append_group(({"transaction_id": f"tx-{index}"},))
+    wal.register_durable_consumer("snapshot", 0)
+    wal.update_durable_consumer("snapshot", 2)
+
+    original_read_bytes = Path.read_bytes
+
+    def fail_wal_read_bytes(self: Path):
+        if self == path:
+            raise AssertionError("WAL recovery materialized the whole file")
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_wal_read_bytes)
+    recovery = wal.recover()
+    assert tuple(row.wal_lsn for row in recovery.frames) == (1, 2, 3)
+    assert wal.reclaim_prefix() == 2
+    recovery = wal.recover()
+    assert tuple(row.wal_lsn for row in recovery.frames) == (3,)

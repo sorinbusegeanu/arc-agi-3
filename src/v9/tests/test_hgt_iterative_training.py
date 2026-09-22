@@ -19,6 +19,7 @@ from v9.hgt.epoch_dataset import (
 from v9.hgt.matched_evaluation import matched_jobs, select_matched_branch
 from v9.runtime.multiprocess import EncodedTransition
 from v9.runtime.runtime import ContinuousMemoryRuntime
+from v9.runtime import epoch_runner
 
 
 def transition(step: int, action: int, valence: int = 0, success: bool = False) -> EncodedTransition:
@@ -178,6 +179,13 @@ class HGTIterativeTrainingTests(unittest.TestCase):
         runtime.restore_experiment_state(base)
         self.assertEqual(runtime.value, 1)
 
+    def test_epoch_uses_small_read_only_model_evaluation_before_one_full_sample(self):
+        source = Path(inspect.getsourcefile(epoch_runner) or "").read_text(encoding="utf-8")
+        self.assertNotIn("capture_experiment_state()", source)
+        self.assertGreaterEqual(source.count("evaluation_only=True"), 2)
+        self.assertIn('"selected_policy"', source)
+        self.assertIn("hgt_eval_steps_per_game", source)
+
     def test_branch_selection_uses_macro_success_then_progress(self):
         self.assertEqual(select_matched_branch(.30, .20).selected_branch, "hgt_on")
         self.assertEqual(select_matched_branch(.20, .30).selected_branch, "hgt_off")
@@ -186,3 +194,9 @@ class HGTIterativeTrainingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_training_batch_size_is_declared_configuration() -> None:
+    source = Path(inspect.getsourcefile(hgt_training) or "").read_text(encoding="utf-8")
+    assert "config.hgt_epoch_batch_size" in source
+    assert 'getattr(config, "hgt_epoch_batch_size"' not in source

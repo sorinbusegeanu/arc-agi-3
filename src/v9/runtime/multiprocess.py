@@ -323,7 +323,7 @@ def _put_counted_stage_batch(
         counters[int(counter_index)] = int(counters[int(counter_index)]) + len(envelope.transitions)
 
 
-def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, initial_policy: ActorPolicySnapshot, policy_updates: Any, epsilon: float, stagnation: float = 0.0, policy_refresh_steps: int = 32, policy_refresh_ms: float = 100.0, policy_refresh_enabled: bool = True, stage_queue: Any, result_queue: Any, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, production_counters: Any = None, counter_index: int = 0, epoch_inference_view_id: str = "", transport_pool: TransportSlabPool | None = None, evidence_branch: str = "") -> None:
+def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, initial_policy: ActorPolicySnapshot, policy_updates: Any, epsilon: float, stagnation: float = 0.0, policy_refresh_steps: int = 32, policy_refresh_ms: float = 100.0, policy_refresh_enabled: bool = True, stage_queue: Any, result_queue: Any, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, production_counters: Any = None, counter_index: int = 0, epoch_inference_view_id: str = "", transport_pool: TransportSlabPool | None = None, evidence_branch: str = "", publish_transitions: bool = True) -> None:
     game_id = str(getattr(spec, "display_name", getattr(spec, "game_id", "unknown")))
     adapter = None
     completion_sent = False
@@ -331,6 +331,9 @@ def actor_process_main(*, spec: Any, actor_id: int, steps: int, seed: int, env_r
 
     def flush_transitions() -> None:
         if not pending_transitions:
+            return
+        if not publish_transitions:
+            pending_transitions.clear()
             return
         rows = tuple(pending_transitions)
         _put_counted_stage_batch(
@@ -850,7 +853,7 @@ class ProcessTopology:
             process.start()
             self.stage_processes.append(process)
 
-    def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, initial_policy: ActorPolicySnapshot, epsilon: float, stagnation: float = 0.0, policy_refresh_steps: int = 64, policy_refresh_ms: float = 250.0, policy_refresh_enabled: bool = True, epoch_inference_view_id: str = "", evidence_branch: str = "") -> None:
+    def start_actor(self, *, index: int, spec: Any, actor_id: int, steps: int, seed: int, env_root: str | None, adapter_factory_path: str, alfred_backend_factory: str | None, run_nonce: int, initial_policy: ActorPolicySnapshot, epsilon: float, stagnation: float = 0.0, policy_refresh_steps: int = 64, policy_refresh_ms: float = 250.0, policy_refresh_enabled: bool = True, epoch_inference_view_id: str = "", evidence_branch: str = "", publish_transitions: bool = True) -> None:
         if adapter_factory_path == "v9.cli:make_adapter":
             adapter_factory_path = "v9.environments.passive_capture:make_adapter"
         process = self.actor_ctx.Process(
@@ -878,6 +881,7 @@ class ProcessTopology:
                 "epoch_inference_view_id": str(epoch_inference_view_id),
                 "transport_pool": self.transport_pool,
                 "evidence_branch": str(evidence_branch),
+                "publish_transitions": bool(publish_transitions),
             },
             name=f"v9-actor-{actor_id}",
         )

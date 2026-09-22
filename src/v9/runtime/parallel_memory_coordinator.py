@@ -838,6 +838,7 @@ def run_parallel_memory_jobs(
     bound_epoch_view: Any | None = None,
     hgt_dataset: Any | None = None,
     evidence_branch: str = "",
+    evaluation_only: bool = False,
 ) -> list[ProcessActorResult]:
     original_job_count = len(jobs)
     jobs = expand_jobs_for_actor_limit(jobs, actor_limit)
@@ -885,6 +886,8 @@ def run_parallel_memory_jobs(
     next_progress = started_at + max(1.0, float(progress_interval_seconds))
     clean_shutdown = False
     dataset_start_count = int(getattr(hgt_dataset, "count", 0)) if hgt_dataset is not None else 0
+    if evaluation_only and hgt_dataset is not None:
+        raise ValueError("evaluation-only jobs cannot write an HGT training dataset")
     hgt_writer = _AsyncHGTWriter(hgt_dataset) if hgt_dataset is not None else None
     publication_queue_drain_seconds = 0.0
     publication_queue_drain_rows = 0
@@ -938,6 +941,7 @@ def run_parallel_memory_jobs(
             policy_refresh_enabled=bool(allow_policy_refresh),
             epoch_inference_view_id=bound_epoch_view_id,
             evidence_branch=str(evidence_branch),
+            publish_transitions=not bool(evaluation_only),
         )
         process = topology.actor_processes[-1]
         if process.pid is None:
@@ -1190,7 +1194,8 @@ def run_parallel_memory_jobs(
                 time.sleep(0.001)
 
         expected_transitions = sum(int(row.steps) for row in results)
-        wait_for_published_transitions(expected_transitions)
+        if not evaluation_only:
+            wait_for_published_transitions(expected_transitions)
         topology.join_actor_workers()
         topology.signal_stage_stop()
         topology.join_stage_workers()
@@ -1318,11 +1323,16 @@ def run_parallel_memory_jobs(
         memory.signal_derivation_stop()
         memory.join_derivation()
 
-        if pipeline.ingested != expected_transitions:
-            raise RuntimeError(f"ingestion count mismatch at epoch boundary: expected={expected_transitions} ingested={pipeline.ingested}")
-        produced_transitions = int(actor_produced_steps())
+        produced_transitions = (
+            int(expected_transitions) if evaluation_only else int(actor_produced_steps())
+        )
         causally_admitted = int(pipeline.sampled)
-        if not produced_transitions == causally_admitted == int(pipeline.ingested):
+        expected_ingested = 0 if evaluation_only else int(expected_transitions)
+        if pipeline.ingested != expected_ingested:
+            raise RuntimeError(
+                f"ingestion count mismatch at epoch boundary: expected={expected_ingested} ingested={pipeline.ingested}"
+            )
+        if not evaluation_only and not produced_transitions == causally_admitted == int(pipeline.ingested):
             raise RuntimeError(
                 "epoch causal completion mismatch: "
                 f"produced={produced_transitions} causally_admitted={causally_admitted} "
@@ -1354,6 +1364,8 @@ def run_parallel_memory_jobs(
             "coordinator_pending_ingest_batches": 0,
             "coordinator_pending_derivation": 0,
             "canonical_pipeline_version": 3,
+            "evaluation_only": int(bool(evaluation_only)),
+            "evaluation_steps": int(expected_transitions) if evaluation_only else 0,
         }.items():
             runtime.set_telemetry_gauge(key, value)
         progress()
