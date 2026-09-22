@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import pickle
+from types import SimpleNamespace
 
 from v9.memory.identity import MemoryUid
 from v9.memory.model import CanonicalNode, MemoryLevel, MemoryType
@@ -47,7 +49,12 @@ def test_runtime_snapshot_avoids_full_graph_partition_materialization(
 
         monkeypatch.setattr(runtime.graph, "_partition_state", fail_partition_state)
         monkeypatch.setattr(
-            "v9.runtime.runtime_integrity.pickle.dumps", fail_pickle_dumps
+            "v9.runtime.runtime_integrity.pickle",
+            SimpleNamespace(
+                dump=pickle.dump,
+                loads=pickle.loads,
+                dumps=fail_pickle_dumps,
+            ),
         )
 
         result = runtime.snapshot()
