@@ -108,29 +108,44 @@ def _runtime_state_without_materialized_graph(runtime: Any) -> tuple[dict[str, A
     return state, header
 
 
+def _dump_pickle_file(path: Path, value: Any) -> None:
+    with Path(path).open("wb") as stream:
+        pickle.dump(value, stream, protocol=5)
+        stream.flush()
+
+
 def _write_experiment_cut(runtime: Any, target: Path, chunked_snapshot: Any) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.tmp")
     if temporary.exists():
         shutil.rmtree(temporary, ignore_errors=True)
     temporary.mkdir(parents=True)
+    capture_dir = temporary / ".capture"
+    capture_dir.mkdir()
     try:
         with runtime._lock, runtime.graph._publication_lock:
             state, header = _runtime_state_without_materialized_graph(runtime)
-            (temporary / "runtime.pkl").write_bytes(pickle.dumps(state, protocol=5))
-            (temporary / "graph_header.pkl").write_bytes(pickle.dumps(header, protocol=5))
-            for partition in range(int(runtime.graph.partition_count)):
-                nodes, edges = runtime.graph._partition_state(partition)
-                encoded = chunked_snapshot._encode_graph_shard(partition, nodes, edges)
-                (temporary / f"graph-{partition:04d}.bin").write_bytes(encoded)
-                del nodes, edges, encoded
+            _dump_pickle_file(temporary / "runtime.pkl", state)
+            _dump_pickle_file(temporary / "graph_header.pkl", header)
+            del state, header
+            captures = tuple(
+                chunked_snapshot.capture_graph_shard(
+                    runtime.graph, partition, capture_dir
+                )
+                for partition in range(int(runtime.graph.partition_count))
+            )
+        for capture in captures:
+            chunked_snapshot.write_graph_shard_capture_file(
+                capture,
+                temporary / f"graph-{int(capture.partition):04d}.bin",
+            )
+        shutil.rmtree(capture_dir, ignore_errors=True)
         if target.exists():
             shutil.rmtree(target, ignore_errors=True)
         os.replace(temporary, target)
     finally:
         if temporary.exists():
             shutil.rmtree(temporary, ignore_errors=True)
-
 
 def _restore_experiment_cut(runtime: Any, handle: _ExperimentStateHandle, graph_cls: type, chunked_snapshot: Any) -> None:
     path = handle.path
@@ -151,76 +166,109 @@ def _write_streaming_snapshot(runtime: Any, chunked_snapshot: Any) -> Any:
     runtime.wait_quiescent()
     runtime.flush_deferred_memory_updates()
     runtime.evidence.flush()
-    with runtime._lock, runtime.graph._publication_lock:
-        runtime._snapshot_id += 1
-        runtime.telemetry["snapshot_writes"] += 1
-        snapshot_id = int(runtime._snapshot_id)
-        watermark = int(runtime._watermark)
-        generation = int(runtime.graph.generation)
-        state, graph_header = _runtime_state_without_materialized_graph(runtime)
-        state.pop("graph", None)
-        runtime_bytes = pickle.dumps(state, protocol=5)
-        graph_header_bytes = pickle.dumps(graph_header, protocol=5)
 
-        root = Path(runtime.root)
-        snapshots = root / "snapshots"
-        snapshots.mkdir(parents=True, exist_ok=True)
-        graph_shards: list[dict[str, Any]] = []
-        for partition in range(int(runtime.graph.partition_count)):
-            nodes, edges = runtime.graph._partition_state(partition)
-            shard_bytes = chunked_snapshot._encode_graph_shard(partition, nodes, edges)
-            graph_shards.append(
-                {
-                    "partition": partition,
-                    "nodes": len(nodes),
-                    "edges": len(edges),
-                    "bytes": len(shard_bytes),
-                    "sha256": chunked_snapshot.sha256(shard_bytes),
-                    "chunks": chunked_snapshot.write_chunks(root, shard_bytes),
-                }
-            )
-            del nodes, edges, shard_bytes
-
-    target = snapshots / f"snapshot-{snapshot_id:020d}"
-    temporary = snapshots / f".{target.name}.{os.getpid()}.tmp"
-    if temporary.exists():
-        shutil.rmtree(temporary, ignore_errors=True)
-    temporary.mkdir(parents=True)
-    manifest = {
-        "schema": chunked_snapshot.NATIVE_SCHEMA,
-        "snapshot_version": chunked_snapshot.SNAPSHOT_VERSION,
-        "state_format": chunked_snapshot.STATE_FORMAT,
-        "scientific_config_id": runtime.config.scientific.config_id.value,
-        "snapshot_id": snapshot_id,
-        "watermark": watermark,
-        "graph_generation": generation,
-        "chunk_bytes": chunked_snapshot.CHUNK_BYTES,
-        "runtime_state_bytes": len(runtime_bytes),
-        "runtime_state_sha256": chunked_snapshot.sha256(runtime_bytes),
-        "runtime_state_chunks": chunked_snapshot.write_chunks(root, runtime_bytes),
-        "graph_header_bytes": len(graph_header_bytes),
-        "graph_header_sha256": chunked_snapshot.sha256(graph_header_bytes),
-        "graph_header_chunks": chunked_snapshot.write_chunks(root, graph_header_bytes),
-        "graph_shards": graph_shards,
-        "symbol_graph_schema_version": int(SYMBOL_GRAPH_SCHEMA_VERSION),
-        "symbol_grounding_design_version": "9.7.9",
-    }
-    payload_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+    root = Path(runtime.root)
+    snapshots = root / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+    runtime.set_telemetry_gauge("snapshot_in_progress", 1)
+    temporary: Path | None = None
+    snapshot_id = 0
     try:
+        with runtime._lock, runtime.graph._publication_lock:
+            runtime._snapshot_id += 1
+            runtime.telemetry["snapshot_writes"] += 1
+            snapshot_id = int(runtime._snapshot_id)
+            watermark = int(runtime._watermark)
+            generation = int(runtime.graph.generation)
+            target = snapshots / f"snapshot-{snapshot_id:020d}"
+            temporary = snapshots / f".{target.name}.{os.getpid()}.tmp"
+            if temporary.exists():
+                shutil.rmtree(temporary, ignore_errors=True)
+            temporary.mkdir(parents=True)
+            capture_dir = temporary / ".capture"
+            capture_dir.mkdir()
+
+            state, graph_header = _runtime_state_without_materialized_graph(runtime)
+            state.pop("graph", None)
+            runtime_state_path = temporary / "runtime.pkl"
+            graph_header_path = temporary / "graph_header.pkl"
+            _dump_pickle_file(runtime_state_path, state)
+            _dump_pickle_file(graph_header_path, graph_header)
+            del state, graph_header
+            captures = tuple(
+                chunked_snapshot.capture_graph_shard(
+                    runtime.graph, partition, capture_dir
+                )
+                for partition in range(int(runtime.graph.partition_count))
+            )
+
+        capture_done = time.perf_counter()
+        runtime.set_telemetry_gauge(
+            "snapshot_capture_seconds", capture_done - started
+        )
+
+        runtime_chunks, runtime_bytes, runtime_sha = chunked_snapshot.write_file_chunks(
+            root, runtime_state_path
+        )
+        header_chunks, header_bytes, header_sha = chunked_snapshot.write_file_chunks(
+            root, graph_header_path
+        )
+        graph_shards = [
+            chunked_snapshot.publish_graph_shard_capture(root, capture)
+            for capture in captures
+        ]
+        runtime_state_path.unlink(missing_ok=True)
+        graph_header_path.unlink(missing_ok=True)
+        shutil.rmtree(capture_dir, ignore_errors=True)
+
+        manifest = {
+            "schema": chunked_snapshot.NATIVE_SCHEMA,
+            "snapshot_version": chunked_snapshot.SNAPSHOT_VERSION,
+            "state_format": chunked_snapshot.STATE_FORMAT,
+            "scientific_config_id": runtime.config.scientific.config_id.value,
+            "snapshot_id": snapshot_id,
+            "watermark": watermark,
+            "graph_generation": generation,
+            "chunk_bytes": chunked_snapshot.CHUNK_BYTES,
+            "runtime_state_bytes": int(runtime_bytes),
+            "runtime_state_sha256": str(runtime_sha),
+            "runtime_state_chunks": runtime_chunks,
+            "graph_header_bytes": int(header_bytes),
+            "graph_header_sha256": str(header_sha),
+            "graph_header_chunks": header_chunks,
+            "graph_shards": graph_shards,
+            "symbol_graph_schema_version": int(SYMBOL_GRAPH_SCHEMA_VERSION),
+            "symbol_grounding_design_version": "9.7.9",
+        }
+        payload_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
         (temporary / "manifest.json").write_bytes(payload_bytes)
-        (temporary / "COMPLETE").write_text(chunked_snapshot.sha256(payload_bytes) + "\n", encoding="ascii")
+        (temporary / "COMPLETE").write_text(
+            chunked_snapshot.sha256(payload_bytes) + "\n", encoding="ascii"
+        )
         if target.exists():
             shutil.rmtree(target)
         os.replace(temporary, target)
+        temporary = None
+        runtime.set_telemetry_gauge(
+            "snapshot_publish_seconds", time.perf_counter() - capture_done
+        )
+        runtime.set_telemetry_gauge(
+            "snapshot_total_seconds", time.perf_counter() - started
+        )
+        return chunked_snapshot.SnapshotResult(
+            target, snapshot_id, watermark, generation
+        )
     except BaseException:
         with runtime._lock:
-            runtime.telemetry["snapshot_writes"] = max(0, int(runtime.telemetry["snapshot_writes"]) - 1)
+            runtime.telemetry["snapshot_writes"] = max(
+                0, int(runtime.telemetry["snapshot_writes"]) - 1
+            )
         raise
     finally:
-        if temporary.exists():
+        runtime.set_telemetry_gauge("snapshot_in_progress", 0)
+        if temporary is not None and temporary.exists():
             shutil.rmtree(temporary, ignore_errors=True)
-    return chunked_snapshot.SnapshotResult(target, snapshot_id, watermark, generation)
-
 
 def _prune_grounding_registry(registry: GroundingRegistry) -> None:
     if len(registry.states) <= _GROUNDING_STATE_LIMIT:
