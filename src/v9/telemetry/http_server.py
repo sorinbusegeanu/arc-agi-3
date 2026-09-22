@@ -11,6 +11,41 @@ from typing import Any, Callable
 DASHBOARD_REFRESH_SECONDS = 30.0
 
 
+_COMPACT_LOG_KEYS = (
+    "watermark",
+    "graph_generation",
+    "memories",
+    "memory_levels",
+    "M0_resident",
+    "M1_grounded_resident",
+    "resident_M0_limit",
+    "resident_M1_grounded_limit",
+    "compaction_backlog",
+    "compaction_cycles",
+    "compaction_seconds",
+    "low_level_nodes_inserted",
+    "low_level_nodes_deleted",
+    "low_level_dedup_rate",
+    "concrete_admission_retained_events",
+    "concrete_admission_skipped_events",
+    "concrete_admission_retention_rate",
+    "concrete_nodes_avoided",
+    "process_rss_bytes",
+    "memory_governor_state",
+)
+
+
+def _compact_log_snapshot(snapshot: dict[str, Any], *, timestamp: str) -> dict[str, Any]:
+    compact: dict[str, Any] = {
+        "timestamp_utc": timestamp,
+        "primary_dashboard": dict(snapshot.get("primary_dashboard", {})),
+    }
+    for key in _COMPACT_LOG_KEYS:
+        if key in snapshot:
+            compact[key] = snapshot[key]
+    return compact
+
+
 class MetricsHTTPServer:
     def __init__(
         self,
@@ -101,14 +136,16 @@ refresh(); setInterval(refresh,{refresh_ms});
         if self.log_path is None:
             return
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.log_path.open("a", encoding="utf-8", buffering=1) as handle:
+        # One process run owns one dashboard log. Reusing --root must not append
+        # previous runs indefinitely.
+        with self.log_path.open("w", encoding="utf-8", buffering=1) as handle:
             while not self._stop_logging.is_set():
                 timestamp = datetime.now(timezone.utc).isoformat()
                 try:
-                    snapshot = {
-                        "timestamp_utc": timestamp,
-                        **self._dashboard_provider(),
-                    }
+                    snapshot = _compact_log_snapshot(
+                        self._dashboard_provider(),
+                        timestamp=timestamp,
+                    )
                 except Exception as exc:
                     # A telemetry read must never terminate the long-lived
                     # logger. Preserve an auditable failure row and retry at the
