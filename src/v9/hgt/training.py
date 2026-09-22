@@ -24,7 +24,7 @@ from .training_cut import TrainingCut, TrainingDeterminismMode
 
 # Authoritative on-disk tensor/objective schema. Checkpoint compatibility must
 # not depend on which runtime installer happened to be imported first.
-MODEL_SCHEMA_VERSION = 7
+MODEL_SCHEMA_VERSION = 8
 MEMORY_NODE_TYPES = (
     "M0_EPISODE",
     "M1_GROUNDED_CONTINGENCY",
@@ -106,7 +106,19 @@ def _semantic_rows(payload: dict[str, Any]) -> tuple[tuple[int, int, int, int, f
     return tuple(rows)
 
 
+def _predictive_semantic_rows(payload: dict[str, Any]) -> tuple[tuple[int, int, int, int, float], ...]:
+    """Only information available before observing the selected action outcome."""
+    rows: list[tuple[int, int, int, int, float]] = []
+    for key in ("semantic_before", "semantic_action", "semantic_options"):
+        for row in payload.get(key, ()) or ():
+            if isinstance(row, (list, tuple)) and len(row) == 5:
+                rows.append((int(row[0]), int(row[1]), int(row[2]), int(row[3]), float(row[4])))
+    return tuple(rows)
+
+
 def _node_feature(node: Any, payload: dict[str, Any], dim: int, torch: Any):
+    # Outcome fields (valence, success/failure/truncation, levels completed,
+    # semantic_after/effects) are labels. They must not be policy inputs.
     values = [
         float(int(node.level)) / 7.0,
         float(int(node.memory_type)) / 700.0,
@@ -118,16 +130,10 @@ def _node_feature(node: Any, payload: dict[str, Any], dim: int, torch: Any):
         float(bool(payload.get("validated", False))),
         float(payload.get("support", 0)) / 64.0,
         float(len(payload.get("parents", ()))) / 8.0,
-        float(bool(payload.get("task_success", False))),
-        float(bool(payload.get("task_failure", False))),
-        float(bool(payload.get("task_truncated", False))),
-        min(1.0, float(payload.get("level_index", 0)) / 32.0),
-        min(1.0, float(payload.get("levels_completed", 0)) / 32.0),
-        max(-1.0, min(1.0, float(payload.get("primary_valence", 0)))),
     ]
     while len(values) < dim:
         values.append(0.0)
-    for kind, subject, relation, obj, value in _semantic_rows(payload):
+    for kind, subject, relation, obj, value in _predictive_semantic_rows(payload):
         if kind == 7:
             base, width = 40, 8
         elif kind == 8:
@@ -413,7 +419,14 @@ def build_hgt_graph(
             action_masks.append(bool(usable_action))
             if usable_action:
                 env, context, action, episode = int(environment_id), int(context_signature), int(action_id), int(episode_id)
-                rows_meta.append((env, context, action, episode, int(node.created_watermark)))
+                rows_meta.append((
+                    env,
+                    context,
+                    action,
+                    episode,
+                    int(node.created_watermark),
+                    str(payload.get("game_scenario", "")),
+                ))
                 episode_rows.setdefault((env, episode), []).append((
                     node_type, index, int(node.created_watermark), valence,
                     bool(payload.get("task_success", False)),
@@ -579,39 +592,130 @@ def _contextualize_transition_rows(rows: list[dict[str, Any]], read_view: Any) -
     return contextualized
 
 
-def _transition_features(rows: list[dict[str, Any]], torch: Any, *, input_dim: int = 64):
-    features = torch.zeros((len(rows), input_dim), dtype=torch.float32)
-    for index, row in enumerate(rows):
-        for offset, value in enumerate((int(row.get("context_signature", 0)), int(row.get("next_context_signature", 0)), int(row.get("action_id", 0)), int(row.get("global_step", 0)), int(row.get("episode_id", 0)), int(row.get("hydra_context_count", 0)), int(row.get("hydra_context_valence_sum", 0)), *tuple(int(v) for v in row.get("hydra_context_levels", ())[:8]))):
-            digest = hashlib.blake2b(str(value).encode("ascii"), digest_size=8, person=b"v9-hgt-row").digest()
-            features[index, int.from_bytes(digest, "little") % input_dim] += 2.0 if offset == 2 else 1.0
-    return features
+def _context_is_validation(game: str, context: int, validation_fraction: float) -> bool:
+    digest = hashlib.blake2b(
+        f"{game}:{int(context)}".encode("utf-8"),
+        digest_size=8,
+        person=b"v9-hgt-val",
+    ).digest()
+    threshold = int(max(0.0, min(1.0, float(validation_fraction))) * (1 << 64))
+    return int.from_bytes(digest, "big") < threshold
 
 
-def _transition_batch_loss(model: Any, rows: list[dict[str, Any]], torch: Any, device: Any):
-    if not rows or NODE_TYPE not in model.encoders:
+def _split_policy_masks(action_meta, action_masks, torch, *, validation_fraction: float):
+    train_masks = {}
+    validation_masks = {}
+    for node_type, mask in action_masks.items():
+        train = mask.clone()
+        validation = torch.zeros_like(mask, dtype=torch.bool)
+        rows = action_meta.get(node_type, ())
+        for index, row in enumerate(rows):
+            if row is None or not bool(mask[index]):
+                continue
+            _env, context, _action, _episode, _watermark, game = row
+            if _context_is_validation(str(game), int(context), validation_fraction):
+                train[index] = False
+                validation[index] = True
+        train_masks[node_type] = train
+        validation_masks[node_type] = validation
+    return train_masks, validation_masks
+
+
+def _split_ranking_pairs(pairs, *, validation_fraction: float):
+    train = []
+    validation = []
+    for best, worst in pairs:
+        game = str(best.get("game_scenario", ""))
+        context = int(best.get("context_signature", 0))
+        target = validation if _context_is_validation(game, context, validation_fraction) else train
+        target.append((best, worst))
+    return train, validation
+
+
+def _explicit_action_ranking_loss(
+    value_dict,
+    action_meta,
+    policy_masks,
+    pairs,
+    torch,
+):
+    if not pairs:
         return None, 0, 0
-    hidden = model.encoders[NODE_TYPE](_transition_features(rows, torch).to(device)).relu()
-    values = model.value_heads[NODE_TYPE](hidden).squeeze(-1)
-    targets = torch.tensor([float(row["target_return"]) for row in rows], dtype=torch.float32, device=device)
-    regression = torch.nn.functional.smooth_l1_loss(values, targets)
-    groups: dict[tuple[str, int], list[int]] = {}
-    for index, row in enumerate(rows):
-        groups.setdefault((str(row["game_scenario"]), int(row["context_signature"])), []).append(index)
-    ranking_terms = []
+    lookup: dict[tuple[str, int, int], list[Any]] = {}
+    for node_type, rows in action_meta.items():
+        values = value_dict.get(node_type)
+        masks = policy_masks.get(node_type)
+        if values is None or masks is None:
+            continue
+        for index, row in enumerate(rows):
+            if row is None or not bool(masks[index]):
+                continue
+            _env, context, action, _episode, _watermark, game = row
+            lookup.setdefault((str(game), int(context), int(action)), []).append(values[index])
+
+    terms = []
     correct = total = 0
-    for indices in groups.values():
-        if len(indices) < 2:
+    for best, worst in pairs:
+        game = str(best.get("game_scenario", ""))
+        context = int(best.get("context_signature", 0))
+        best_values = lookup.get((game, context, int(best.get("action_id", 0))), ())
+        worst_values = lookup.get((game, context, int(worst.get("action_id", 0))), ())
+        if not best_values or not worst_values:
             continue
-        best = max(indices, key=lambda i: float(rows[i]["target_return"]))
-        worst = min(indices, key=lambda i: float(rows[i]["target_return"]))
-        if float(rows[best]["target_return"]) <= float(rows[worst]["target_return"]):
-            continue
-        ranking_terms.append(torch.nn.functional.softplus(-(values[best] - values[worst])))
-        correct += int(float(values[best].detach().cpu()) > float(values[worst].detach().cpu()))
+        best_score = torch.stack(tuple(best_values)).mean()
+        worst_score = torch.stack(tuple(worst_values)).mean()
+        terms.append(torch.nn.functional.softplus(-(best_score - worst_score)))
+        correct += int(float(best_score.detach().cpu()) > float(worst_score.detach().cpu()))
         total += 1
-    ranking = torch.stack(ranking_terms).mean() if ranking_terms else regression.new_zeros(())
-    return regression + ranking, correct, total
+    if not terms:
+        return None, 0, 0
+    return torch.stack(terms).mean(), correct, total
+
+
+def _policy_validation_loss(
+    logits_dict,
+    value_dict,
+    y_dict,
+    action_targets,
+    validation_masks,
+    torch,
+):
+    terms = []
+    for node_type, mask in validation_masks.items():
+        logits = logits_dict.get(node_type)
+        values = value_dict.get(node_type)
+        if logits is None or values is None or not bool(mask.any()):
+            continue
+        selected = mask.to(logits.device)
+        target_class = y_dict[node_type].to(logits.device)[selected]
+        target_value = action_targets[node_type].to(values.device)[selected]
+        terms.append(torch.nn.functional.cross_entropy(logits[selected], target_class))
+        terms.append(torch.nn.functional.smooth_l1_loss(values[selected], target_value))
+    if not terms:
+        return None
+    return torch.stack(terms).mean()
+
+
+def _bounded_advantage_scores(scores: dict[int, float], scale: float) -> dict[int, float]:
+    if not scores or scale <= 0.0:
+        return {int(action): 0.0 for action in scores}
+    mean = sum(float(value) for value in scores.values()) / len(scores)
+    centered = {int(action): float(value) - mean for action, value in scores.items()}
+    maximum = max((abs(value) for value in centered.values()), default=0.0)
+    if maximum <= 1e-12:
+        return {action: 0.0 for action in centered}
+    return {action: float(scale) * value / maximum for action, value in centered.items()}
+
+
+def _policy_score_scale(config: Any, *, validation_accuracy: float, validation_pairs: int) -> float:
+    if validation_pairs <= 0:
+        return 0.0
+    threshold = float(config.hgt_min_validation_ranking_accuracy)
+    accuracy = float(validation_accuracy)
+    if accuracy <= threshold:
+        return 0.0
+    quality = (accuracy - threshold) / max(1e-9, 1.0 - threshold)
+    return float(config.hgt_max_policy_score) * max(0.0, min(1.0, quality))
 
 
 def _masked_count(masks: dict[str, Any], action_masks: dict[str, Any]) -> int:
@@ -662,7 +766,11 @@ def _loss(
     for objective in AUX_OBJECTIVES:
         losses = []
         for node_type, predictions in auxiliary_dict[objective].items():
-            mask = masks[node_type].to(predictions.device) & task_masks[objective][node_type].to(predictions.device)
+            policy_mask = masks[node_type].to(predictions.device)
+            action_mask = action_masks[node_type].to(predictions.device)
+            mask = task_masks[objective][node_type].to(predictions.device) & (
+                (~action_mask) | policy_mask
+            )
             if not bool(mask.any()):
                 continue
             target = task_targets[objective][node_type].to(predictions.device)[mask]
