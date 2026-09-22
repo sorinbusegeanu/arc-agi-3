@@ -21,23 +21,18 @@ def should_retain_concrete(
     prior_support: int,
     context: Any | None = None,
     isf_static: tuple[float, float, float, float, float] | None = None,
+    retained_representatives: int = 0,
     novel_context: bool = False,
     force_novel: bool = False,
 ) -> ConcreteAdmissionDecision:
     if not bool(getattr(scientific, "concrete_admission_enabled", True)):
         return ConcreteAdmissionDecision(True, "disabled")
 
-    if force_novel:
-        return ConcreteAdmissionDecision(True, "novel_dependent_relation")
-    if novel_context:
-        return ConcreteAdmissionDecision(True, "novel_context")
-
     representatives = max(
         1, int(getattr(scientific, "concrete_admission_representatives_per_signature", 4))
     )
     support = max(0, int(prior_support))
-    if support < representatives:
-        return ConcreteAdmissionDecision(True, "bootstrap_representative")
+    retained = max(0, int(retained_representatives))
 
     if context is not None:
         if (
@@ -59,6 +54,18 @@ def should_retain_concrete(
             getattr(scientific, "concrete_admission_future_option_threshold", 1.0)
         ):
             return ConcreteAdmissionDecision(True, "future_option_change")
+
+    # A one-off structural novelty is not enough to justify permanent concrete
+    # storage. Its normalized support is still counted, and a recurrence can
+    # promote it into the representative reservoir.
+    if support == 0:
+        return ConcreteAdmissionDecision(False, "unconfirmed_novelty")
+
+    if retained < representatives:
+        return ConcreteAdmissionDecision(
+            True,
+            "recurrent_novel_context" if novel_context else "recurrent_representative",
+        )
 
     next_support = support + 1
     if bool(getattr(scientific, "concrete_admission_support_milestones", True)) and _power_of_two(
