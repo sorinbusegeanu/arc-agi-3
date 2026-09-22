@@ -179,10 +179,12 @@ class HGTIterativeTrainingTests(unittest.TestCase):
         runtime.restore_experiment_state(base)
         self.assertEqual(runtime.value, 1)
 
-    def test_matched_epoch_avoids_redundant_off_state_snapshot(self):
+    def test_epoch_uses_small_read_only_model_evaluation_before_one_full_sample(self):
         source = inspect.getsource(epoch_runner.run_epochs)
-        self.assertEqual(source.count("capture_experiment_state()"), 2)
-        self.assertNotIn("off_state = runtime.capture_experiment_state()", source)
+        self.assertNotIn("capture_experiment_state()", source)
+        self.assertGreaterEqual(source.count("evaluation_only=True"), 2)
+        self.assertIn('"selected_policy"', source)
+        self.assertIn("hgt_eval_steps_per_game", source)
 
     def test_branch_selection_uses_macro_success_then_progress(self):
         self.assertEqual(select_matched_branch(.30, .20).selected_branch, "hgt_on")
@@ -192,3 +194,9 @@ class HGTIterativeTrainingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_training_batch_size_is_declared_configuration() -> None:
+    source = inspect.getsource(hgt_training.train_hgt_epoch)
+    assert "config.hgt_epoch_batch_size" in source
+    assert 'getattr(config, "hgt_epoch_batch_size"' not in source
