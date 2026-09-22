@@ -1578,6 +1578,11 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         if train_rank_total
         else float(consequence_accuracy)
     )
+    training_loss_by_head = dict(training_loss_by_head)
+    if train_ranking_loss_t is not None:
+        training_loss_by_head["action_ranking"] = float(
+            train_ranking_loss_t.detach().cpu().item()
+        )
     runtime.set_telemetry_gauge("hgt_validation_loss", validation_loss)
     runtime.set_telemetry_gauge("hgt_validation_ranking_accuracy", validation_accuracy)
     runtime.set_telemetry_gauge("hgt_validation_ranking_pairs_used", int(validation_rank_total))
