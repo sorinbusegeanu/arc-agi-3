@@ -645,7 +645,8 @@ def _explicit_action_ranking_loss(
 ):
     if not pairs:
         return None, 0, 0
-    lookup: dict[tuple[str, int, int], list[Any]] = {}
+    context_lookup: dict[tuple[str, int, int], list[Any]] = {}
+    game_lookup: dict[tuple[str, int], list[Any]] = {}
     for node_type, rows in action_meta.items():
         values = value_dict.get(node_type)
         masks = policy_masks.get(node_type)
@@ -655,15 +656,31 @@ def _explicit_action_ranking_loss(
             if row is None or not bool(masks[index]):
                 continue
             _env, context, action, _episode, _watermark, game = row
-            lookup.setdefault((str(game), int(context), int(action)), []).append(values[index])
+            context_lookup.setdefault(
+                (str(game), int(context), int(action)), []
+            ).append(values[index])
+            game_lookup.setdefault((str(game), int(action)), []).append(values[index])
 
     terms = []
     correct = total = 0
     for best, worst in pairs:
         game = str(best.get("game_scenario", ""))
         context = int(best.get("context_signature", 0))
-        best_values = lookup.get((game, context, int(best.get("action_id", 0))), ())
-        worst_values = lookup.get((game, context, int(worst.get("action_id", 0))), ())
+        scope = str(best.get("ranking_scope", "context"))
+        if scope == "game":
+            best_values = game_lookup.get(
+                (game, int(best.get("action_id", 0))), ()
+            )
+            worst_values = game_lookup.get(
+                (game, int(worst.get("action_id", 0))), ()
+            )
+        else:
+            best_values = context_lookup.get(
+                (game, context, int(best.get("action_id", 0))), ()
+            )
+            worst_values = context_lookup.get(
+                (game, context, int(worst.get("action_id", 0))), ()
+            )
         if not best_values or not worst_values:
             continue
         best_score = torch.stack(tuple(best_values)).mean()
@@ -1192,7 +1209,31 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
         epoch_dataset_path = getattr(runtime, "_hgt_training_dataset_path", None)
         epoch_transition_rows = transition_training_rows(epoch_dataset_path) if epoch_dataset_path and Path(epoch_dataset_path).exists() else []
         runtime.set_telemetry_gauge("hgt_training_evidence_authority", "legacy_epoch_jsonl")
-    epoch_ranking_pairs = action_ranking_pairs(epoch_transition_rows) if epoch_transition_rows else []
+    training_transition_rows = [
+        row for row in epoch_transition_rows
+        if not _context_is_validation(
+            str(row.get("game_scenario", "")),
+            int(row.get("context_signature", 0)),
+            POLICY_VALIDATION_FRACTION,
+        )
+    ]
+    validation_transition_rows = [
+        row for row in epoch_transition_rows
+        if _context_is_validation(
+            str(row.get("game_scenario", "")),
+            int(row.get("context_signature", 0)),
+            POLICY_VALIDATION_FRACTION,
+        )
+    ]
+    training_ranking_pairs = (
+        action_ranking_pairs(training_transition_rows)
+        if training_transition_rows else []
+    )
+    validation_ranking_pairs = (
+        action_ranking_pairs(validation_transition_rows)
+        if validation_transition_rows else []
+    )
+    epoch_ranking_pairs = training_ranking_pairs + validation_ranking_pairs
     transition_train_rows = list(epoch_transition_rows)
     runtime.set_telemetry_gauge("hgt_training_dataset_transitions", len(epoch_transition_rows))
     runtime.set_telemetry_gauge("hgt_action_ranking_pairs", len(epoch_ranking_pairs))
@@ -1286,10 +1327,6 @@ def train_hgt_epoch(runtime: Any, *, epoch: int, training_epochs: int, learning_
     if training_examples <= 0:
         return HGTTrainingResult(epoch, "SKIPPED_NO_TRAINING_EVIDENCE", runtime.unified_telemetry.model_version, None, 0.0, 0.0, action_examples, 0, None)
 
-    training_ranking_pairs, validation_ranking_pairs = _split_ranking_pairs(
-        epoch_ranking_pairs,
-        validation_fraction=POLICY_VALIDATION_FRACTION,
-    )
     stream_batch_size = max(1, min(2048, int(config.hgt_epoch_batch_size)))
     ranking_batches = [
         training_ranking_pairs[index:index + stream_batch_size]
