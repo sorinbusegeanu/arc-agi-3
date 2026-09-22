@@ -341,16 +341,6 @@ def apply_canonical_commit_batch(
             previous_interaction = None
             interaction_retained = False
 
-            novel_derived = any(
-                int(runtime.signature_support(int(row.relation.structural_signature))) == 0
-                for row in plan.derived_relations
-            )
-            novel_aligned = any(
-                symbol.aligned_relation is not None
-                and int(runtime.signature_support(int(symbol.aligned_relation.structural_signature))) == 0
-                for symbol in plan.symbols
-            )
-
             if plan.interaction_grounding is not None:
                 g = plan.interaction_grounding
                 previous_interaction = runtime._latest_interaction_grounding.get(
@@ -388,8 +378,12 @@ def apply_canonical_commit_batch(
                     prior_support=prior_support,
                     context=plan.context,
                     isf_static=plan.isf_static,
+                    retained_representatives=len(
+                        runtime._m1n_occurrences.get(
+                            int(plan.relation.structural_signature), ()
+                        )
+                    ),
                     novel_context=_relation_context_is_novel(runtime, plan.relation),
-                    force_novel=bool(novel_derived or novel_aligned),
                 )
                 interaction_retained = bool(interaction_decision.retain)
                 admission_reason_counts[interaction_decision.reason] = (
@@ -505,28 +499,17 @@ def apply_canonical_commit_batch(
                 symbol_prior_support = int(
                     runtime.signature_support(int(symbol.relation.structural_signature))
                 )
-                aligned_prior_support = (
-                    0
-                    if symbol.aligned_relation is None
-                    else int(
-                        runtime.signature_support(
-                            int(symbol.aligned_relation.structural_signature)
-                        )
-                    )
-                )
                 symbol_decision = should_retain_concrete(
                     runtime.config.scientific,
                     prior_support=symbol_prior_support,
                     context=plan.context,
                     isf_static=plan.isf_static,
-                    novel_context=_relation_context_is_novel(runtime, symbol.relation),
-                    force_novel=bool(
-                        novel_derived
-                        or (
-                            symbol.aligned_relation is not None
-                            and aligned_prior_support == 0
+                    retained_representatives=len(
+                        runtime._m1n_occurrences.get(
+                            int(symbol.relation.structural_signature), ()
                         )
                     ),
+                    novel_context=_relation_context_is_novel(runtime, symbol.relation),
                 )
                 symbol_retained = bool(symbol_decision.retain)
                 admission_reason_counts[symbol_decision.reason] = (
