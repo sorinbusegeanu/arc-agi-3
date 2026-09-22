@@ -473,7 +473,32 @@ def run_continuous(args: argparse.Namespace) -> int:
         runtime.wait_quiescent(args.drain_timeout)
         final = runtime.close(normal=True, timeout=args.final_save_timeout)
         metrics = runtime.metrics()
-        summary = {"games": list(games), "epochs": [asdict(row) for row in epoch_results], "actors": [asdict(row) for row in results], "automatic_transfer_experiments": {"mode": effective_validation_mode, "budget": runtime.config.scientific.transfer_validation_trials_per_interval, "attempted": 0, "completed": 0, "passed": 0, "blocker": "run separately with --transfer-validation"}, "hypotheses": runtime.scientific_statuses(), "metrics": metrics, "final_snapshot": None if final is None else {**asdict(final), "path": str(final.path)}}
+        transfer_rows = [
+            dict(row.training.get("transfer_validation") or {})
+            for row in epoch_results
+        ]
+        transfer_blockers = [
+            str(row["blocker"])
+            for row in transfer_rows
+            if row.get("blocker")
+        ]
+        summary = {
+            "games": list(games),
+            "epochs": [asdict(row) for row in epoch_results],
+            "actors": [asdict(row) for row in results],
+            "automatic_transfer_experiments": {
+                "mode": effective_validation_mode,
+                "budget": runtime.config.scientific.transfer_validation_trials_per_interval,
+                "attempted": sum(int(row.get("attempted", 0)) for row in transfer_rows),
+                "completed": sum(int(row.get("completed", 0)) for row in transfer_rows),
+                "passed": sum(int(row.get("passed", 0)) for row in transfer_rows),
+                "validated": sum(int(row.get("validated_concepts", 0)) for row in transfer_rows),
+                "blocker": transfer_blockers[-1] if transfer_blockers else None,
+            },
+            "hypotheses": runtime.scientific_statuses(),
+            "metrics": metrics,
+            "final_snapshot": None if final is None else {**asdict(final), "path": str(final.path)},
+        }
         target = Path(args.root) / "v9_run_summary.json"
         target.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return 0

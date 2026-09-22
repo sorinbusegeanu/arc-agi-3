@@ -747,10 +747,46 @@ class ResidentMemoryManager:
         scored.sort(key=lambda row: (row[0], row[1], row[2]))
         return scored
 
+    def _recover_candidate_queue(self, level: MemoryLevel, limit: int) -> int:
+        graph = self.runtime.graph
+        maximum = max(1, int(limit))
+        expected = self._candidate_type(level)
+        recovered: list[MemoryUid] = []
+        # Recovery is a bounded fallback only when the incremental feed/queue is
+        # empty while resident counts say compaction work still exists.
+        with graph._publication_lock:
+            for uid in graph._uids_by_level[level]:
+                node = graph.nodes.get(uid)
+                if node is not None and node.memory_type is expected:
+                    recovered.append(uid)
+                    if len(recovered) >= maximum:
+                        break
+        for uid in recovered:
+            self._enqueue_candidate(level, uid)
+        if recovered:
+            telemetry = self.runtime.telemetry
+            telemetry["compaction_candidate_recovery_scans"] = int(
+                telemetry.get("compaction_candidate_recovery_scans", 0)
+            ) + 1
+            telemetry["compaction_candidates_recovered"] = int(
+                telemetry.get("compaction_candidates_recovered", 0)
+            ) + len(recovered)
+        return len(recovered)
+
     def _candidate_rows(self, level: MemoryLevel, limit: int) -> list[tuple[MemoryUid, Any, dict[str, Any], MemoryUid]]:
         graph = self.runtime.graph
         self._drain_candidate_feeds()
         maximum = max(1, int(limit))
+        with self._candidate_lock:
+            queue_empty = not self._candidate_queues[level]
+        if queue_empty:
+            current_m0, current_m1g = self.counts()
+            target_m0, target_m1g = self.targets()
+            current = current_m0 if level is MemoryLevel.M0 else current_m1g
+            target = target_m0 if level is MemoryLevel.M0 else target_m1g
+            if current > target:
+                self._recover_candidate_queue(level, maximum)
+
         selected_uids: list[MemoryUid] = []
         with self._candidate_lock:
             queue = self._candidate_queues[level]
@@ -833,9 +869,22 @@ class ResidentMemoryManager:
             if len(plans) >= required:
                 break
             if replacement_uid not in group_sizes:
-                group_sizes[replacement_uid] = max(
-                    1, int(observed_group_sizes.get((replacement_uid, level), 1))
+                observed = max(
+                    0, int(observed_group_sizes.get((replacement_uid, level), 0))
                 )
+                # Incremental accounting can be incomplete after restore, bulk
+                # publication, or a missed feed. Verify small/unknown groups by
+                # bounded provenance traversal; this never scans the whole level.
+                if observed <= 1:
+                    observed = max(
+                        observed,
+                        self._group_size(
+                            replacement_uid,
+                            level,
+                            limit=max(64, min(int(scan_budget), int(required) + 16)),
+                        ),
+                    )
+                group_sizes[replacement_uid] = max(1, observed)
                 group_floors[replacement_uid] = self._effective_group_floor(
                     level, group_sizes[replacement_uid]
                 )

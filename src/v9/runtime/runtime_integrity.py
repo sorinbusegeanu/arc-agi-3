@@ -672,9 +672,18 @@ def install_runtime_integrity(
             if environment_id is not None:
                 index.setdefault(int(environment_id), set()).add(node.uid)
 
-    def on_low_level_deleted(self: Any, deleted_uids: Iterable[Any]) -> None:
+    def on_low_level_deleted(
+        self: Any,
+        deleted_uids: Iterable[Any],
+        *,
+        affected_signatures: Iterable[int] = (),
+    ) -> None:
         deleted = tuple(deleted_uids)
-        original_on_low_level_deleted(self, deleted)
+        original_on_low_level_deleted(
+            self,
+            deleted,
+            affected_signatures=tuple(int(value) for value in affected_signatures),
+        )
         grounding_index = getattr(self, "_grounding_action_payload_by_low", None)
         if isinstance(grounding_index, dict):
             for uid in deleted:
