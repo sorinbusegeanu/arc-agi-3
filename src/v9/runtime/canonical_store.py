@@ -543,13 +543,26 @@ class CanonicalStore:
         with self.pin() as handle:
             with self._lock:
                 chunks = tuple(self.chunk(chunk_id) for chunk_id in handle.all_chunk_ids)
-            state_payload = pickle.dumps({"handle": handle, "chunks": chunks}, protocol=5)
-            state_checksum = hashlib.sha256(state_payload).hexdigest()
             state_path = temporary / "canonical-state.pkl"
+            state_hasher = hashlib.sha256()
+
+            class _HashingWriter:
+                def __init__(self, stream):
+                    self.stream = stream
+
+                def write(self, payload: bytes) -> int:
+                    state_hasher.update(payload)
+                    return self.stream.write(payload)
+
             with state_path.open("wb") as output:
-                output.write(state_payload)
+                pickle.dump(
+                    {"handle": handle, "chunks": chunks},
+                    _HashingWriter(output),
+                    protocol=5,
+                )
                 output.flush()
                 os.fsync(output.fileno())
+            state_checksum = state_hasher.hexdigest()
             if crash_hook:
                 crash_hook("state_fsynced")
             manifest = {
