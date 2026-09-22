@@ -571,11 +571,12 @@ def run_epochs(runtime: Any, specs: tuple[Any, ...], args: Any, *, adapter_facto
                 on_solved_games=int(on_game["current_run_solved_games"]),
                 off_solved_games=int(off_game["current_run_solved_games"]),
             )
-            off_state = runtime.capture_experiment_state()
             process_results = on_results if decision.selected_branch == "hgt_on" else off_results
             selected_dataset_path = on_dataset.path if decision.selected_branch == "hgt_on" else off_dataset.path
-            # Continue the scientific runtime from the branch whose behavior won.
-            runtime.restore_experiment_state(on_state if decision.selected_branch == "hgt_on" else off_state)
+            # OFF is already the live runtime state. Only restore the captured ON
+            # branch when ON wins; avoid a third full experiment-state snapshot.
+            if decision.selected_branch == "hgt_on":
+                runtime.restore_experiment_state(on_state)
             runtime.set_hgt_enabled(True)
             runtime.set_telemetry_gauge("hgt_on_behavioral_success", float(on_success))
             runtime.set_telemetry_gauge("hgt_parent_behavioral_success", float(off_success))
