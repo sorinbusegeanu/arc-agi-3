@@ -210,3 +210,66 @@ def test_obsolete_raw_transition_value_head_loss_is_removed() -> None:
     assert "_transition_batch_loss" not in source
     assert "hgt_validation_ranking_accuracy" in source
     assert "policy_score_scale" in source
+
+
+
+def test_policy_feature_source_excludes_post_action_outcomes_without_torch() -> None:
+    import inspect
+
+    node_source = inspect.getsource(training._node_feature)
+    predictive_source = inspect.getsource(training._predictive_semantic_rows)
+    for forbidden in (
+        "task_success",
+        "task_failure",
+        "task_truncated",
+        "level_index",
+        "levels_completed",
+        "primary_valence",
+    ):
+        assert forbidden not in node_source
+    assert "semantic_after" not in predictive_source
+    assert "semantic_effects" not in predictive_source
+
+
+def test_auxiliary_mask_contract_keeps_non_action_memories_without_torch() -> None:
+    import inspect
+
+    source = inspect.getsource(training._loss)
+    assert "(~action_mask) | policy_mask" in source
+    assert "task_masks[objective][node_type]" in source
+
+
+def test_ranking_contract_uses_full_hgt_values_without_raw_encoder_path() -> None:
+    import inspect
+
+    source = inspect.getsource(training._explicit_action_ranking_loss)
+    assert "value_dict" in source
+    assert "model.encoders" not in source
+    module_source = inspect.getsource(training)
+    assert "_transition_batch_loss" not in module_source
+
+
+def test_sparse_contexts_generate_game_level_action_ranking_pair() -> None:
+    from v9.hgt.epoch_dataset import action_ranking_pairs
+
+    rows = [
+        {
+            "game_scenario": "game",
+            "context_signature": 101,
+            "action_id": 1,
+            "target_return": 0.75,
+        },
+        {
+            "game_scenario": "game",
+            "context_signature": 202,
+            "action_id": 2,
+            "target_return": -0.25,
+        },
+    ]
+    pairs = action_ranking_pairs(rows)
+    assert len(pairs) == 1
+    best, worst = pairs[0]
+    assert best["ranking_scope"] == "game"
+    assert worst["ranking_scope"] == "game"
+    assert best["action_id"] == 1
+    assert worst["action_id"] == 2
