@@ -96,6 +96,18 @@ _install_canonical_hotpath(MemoryPipelineService)
 _hgt_package.train_hgt_epoch = _hgt_training.train_hgt_epoch
 from v9.runtime import epoch_runner as _epoch_runner
 _epoch_runner.train_hgt_epoch = _hgt_training.train_hgt_epoch
+
+# HGT behavior switching uses lightweight policy sidecars and shallow candidate
+# state references so candidate/parent evaluation does not materialize full
+# model+optimizer checkpoints or duplicate multi-level policy maps in RAM.
+from v9.runtime.hgt_policy_memory import install as _install_hgt_policy_memory
+_install_hgt_policy_memory(
+    ContinuousMemoryRuntime,
+    _hgt_training,
+    _hgt_package,
+    _epoch_runner,
+)
+
 from v9.runtime.post_sampling_progress import install as _install_post_sampling_progress
 _install_post_sampling_progress(_epoch_runner, ContinuousMemoryRuntime)
 from v9.runtime.concurrent_transfer_validation import install as _install_concurrent_transfer_validation
