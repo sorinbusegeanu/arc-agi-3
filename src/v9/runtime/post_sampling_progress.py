@@ -9,10 +9,13 @@ from .progress import InlineProgress
 
 _status: InlineProgress | None = None
 _suppress_nested = False
+_active = False
 
 
 def _phase(detail: str) -> None:
     global _status
+    if not _active:
+        return
     if _status is None:
         _status = InlineProgress(f"{time.strftime('[%H:%M]')} post-sampling")
     _status.update(detail)
@@ -35,6 +38,20 @@ def install(epoch_runner_module: Any, runtime_cls: type) -> None:
     epoch_runner_module.run_transfer_validation_interval = (
         run_transfer_validation_interval
     )
+
+    original_run_epochs = epoch_runner_module.run_epochs
+
+    def run_epochs_with_progress(*args: Any, **kwargs: Any):
+        global _active
+        previous = _active
+        _active = True
+        try:
+            return original_run_epochs(*args, **kwargs)
+        finally:
+            _finish()
+            _active = previous
+
+    epoch_runner_module.run_epochs = run_epochs_with_progress
 
     original_train = epoch_runner_module.train_hgt_epoch
 
