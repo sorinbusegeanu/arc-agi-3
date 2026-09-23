@@ -16,21 +16,28 @@ from v9.telemetry import http_server as dashboard_http
 
 
 def _terminal_print(*values: object, sep: str = " ", end: str = "\n", file: Any = None, flush: bool = False) -> None:
-    """Write live progress straight to fd 1 so renderers/wrappers cannot swallow it."""
-    if file not in (None, sys.stdout, sys.__stdout__):
-        builtins.print(*values, sep=sep, end=end, file=file, flush=flush)
-        return
-    text = sep.join(str(value) for value in values) + end
-    try:
-        os.write(1, text.encode("utf-8", errors="replace"))
-    except (AttributeError, BrokenPipeError, OSError, ValueError):
-        builtins.print(*values, sep=sep, end=end, file=sys.__stdout__, flush=True)
+    """Use fd 1 only for an actual interactive terminal; preserve normal capture elsewhere."""
+    target = sys.stdout if file is None else file
+    direct_terminal = False
+    if target in (sys.stdout, sys.__stdout__):
+        try:
+            direct_terminal = bool(target.isatty() and target.fileno() == 1)
+        except (AttributeError, OSError, ValueError):
+            direct_terminal = False
+    if direct_terminal:
+        text = sep.join(str(value) for value in values) + end
+        try:
+            os.write(1, text.encode("utf-8", errors="replace"))
+            return
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+    builtins.print(*values, sep=sep, end=end, file=target, flush=flush)
 
 
 def _install_direct_live_observability() -> None:
     # post_sampling_progress runs from a heartbeat thread while the coordinator
-    # owns the main thread. Bypass sys.stdout renderers so those lines are always
-    # visible in the terminal, including during publication/ingestion drains.
+    # owns the main thread. On a real TTY, bypass carriage-return renderers so
+    # heartbeat lines remain visible; test/captured streams retain normal print.
     post_progress.print = _terminal_print
 
     server_cls = dashboard_http.MetricsHTTPServer
@@ -38,19 +45,21 @@ def _install_direct_live_observability() -> None:
         return
     server_cls._direct_live_cache_installed = True
 
-    original_init = server_cls.__init__
     original_start = server_cls.start
     original_close = server_cls.close
 
-    def init_with_live_cache(self: Any, *args: Any, **kwargs: Any) -> None:
-        original_init(self, *args, **kwargs)
+    def ensure_live_cache(self: Any) -> None:
+        if hasattr(self, "_live_cache_lock"):
+            return
         self._live_cache_lock = RLock()
         self._live_cache: dict[str, Any] = {}
         self._live_cache_error: dict[str, str] | None = None
         self._live_cache_stop = Event()
         self._live_cache_thread: Thread | None = None
+        self._live_cache_started = False
 
     def capture_live_snapshot(self: Any) -> dict[str, Any]:
+        ensure_live_cache(self)
         snapshot = dict(self._dashboard_provider())
         self._record_model_history(snapshot)
         snapshot["model_history"] = self._model_history_snapshot()
@@ -60,6 +69,10 @@ def _install_direct_live_observability() -> None:
         return snapshot
 
     def live_cache_loop(self: Any) -> None:
+        # The existing JSONL logger owns the immediate provider call at startup.
+        # This preserves its first-error semantics and avoids a startup race.
+        if self._live_cache_stop.wait(max(0.1, float(self.live_refresh_seconds))):
+            return
         while not self._live_cache_stop.is_set():
             try:
                 capture_live_snapshot(self)
@@ -73,15 +86,19 @@ def _install_direct_live_observability() -> None:
                 break
 
     def dashboard_snapshot_from_cache(self: Any) -> dict[str, Any]:
-        # HTTP handlers never enter runtime.metrics()/dashboard_metrics(). They
-        # only serve a snapshot prepared by the dedicated live sampler.
+        ensure_live_cache(self)
+        # Preserve direct-call semantics used by tests and tooling before the
+        # HTTP server is started. Once serving, handlers never enter the runtime.
+        if not self._live_cache_started:
+            return capture_live_snapshot(self)
+
         with self._live_cache_lock:
             if self._live_cache:
                 return dict(self._live_cache)
             error = None if self._live_cache_error is None else dict(self._live_cache_error)
 
-        # The 30-second JSONL logger is an independent fallback source. It is
-        # known-good even if a live provider call is temporarily blocked.
+        # The compact 30-second JSONL stream is an independent fallback source
+        # if the faster live sampler is temporarily blocked.
         log_path = getattr(self, "log_path", None)
         if log_path is not None:
             try:
@@ -103,7 +120,9 @@ def _install_direct_live_observability() -> None:
         return result
 
     def start_with_live_cache(self: Any) -> None:
+        ensure_live_cache(self)
         original_start(self)
+        self._live_cache_started = True
         if self._live_cache_thread is None or not self._live_cache_thread.is_alive():
             self._live_cache_stop.clear()
             self._live_cache_thread = Thread(
@@ -115,13 +134,15 @@ def _install_direct_live_observability() -> None:
             self._live_cache_thread.start()
 
     def close_with_live_cache(self: Any) -> None:
+        ensure_live_cache(self)
         self._live_cache_stop.set()
         thread = self._live_cache_thread
         if thread is not None:
             thread.join(timeout=max(0.2, min(2.0, float(self.live_refresh_seconds) + 0.2)))
         original_close(self)
 
-    server_cls.__init__ = init_with_live_cache
+    # Keep MetricsHTTPServer.__init__ untouched: HTML rendering, introspection,
+    # constructor semantics and model-history tests remain authoritative.
     server_cls._capture_live_snapshot = capture_live_snapshot
     server_cls._dashboard_snapshot = dashboard_snapshot_from_cache
     server_cls.start = start_with_live_cache
