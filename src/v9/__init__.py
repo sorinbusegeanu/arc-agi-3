@@ -94,6 +94,8 @@ from v9.runtime.post_sampling_progress import install as _install_post_sampling_
 _install_post_sampling_progress(_epoch_runner, ContinuousMemoryRuntime)
 from v9.runtime.concurrent_transfer_validation import install as _install_concurrent_transfer_validation
 _install_concurrent_transfer_validation(_epoch_runner)
+from v9.runtime.concurrent_validation_startup import install as _install_concurrent_validation_startup
+_install_concurrent_validation_startup()
 _runtime_package.ContinuousMemoryRuntime = ContinuousMemoryRuntime
 
 _LAZY_EXPORTS = {
