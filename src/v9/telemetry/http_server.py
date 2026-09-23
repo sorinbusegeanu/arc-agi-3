@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from html import escape
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,6 +36,29 @@ _COMPACT_LOG_KEYS = (
     "memory_governor_state",
 )
 
+_VISIBLE_FALLBACK_KEYS = (
+    "run_phase",
+    "sampled_steps",
+    "actor_produced_steps",
+    "causally_admitted_steps",
+    "publication_drained_steps",
+    "ingested_steps",
+    "sampling_backlog",
+    "publication_backlog",
+    "canonical_ingest_backlog",
+    "sampling_rate",
+    "ingestion_rate",
+    "derivation_rate",
+    "canonical_batch_size",
+    "canonical_apply_latency_ms",
+    "memories",
+    "edges",
+    "watermark",
+    "graph_generation",
+    "process_rss_bytes",
+    "memory_governor_state",
+)
+
 
 def _compact_log_snapshot(snapshot: dict[str, Any], *, timestamp: str) -> dict[str, Any]:
     compact: dict[str, Any] = {
@@ -45,6 +69,64 @@ def _compact_log_snapshot(snapshot: dict[str, Any], *, timestamp: str) -> dict[s
         if key in snapshot:
             compact[key] = snapshot[key]
     return compact
+
+
+def _format_dashboard_value(value: Any) -> str:
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, sort_keys=True, default=str)
+    return str(value)
+
+
+def _visible_primary_dashboard(snapshot: dict[str, Any]) -> dict[str, Any]:
+    primary = dict(snapshot.get("primary_dashboard", {}) or {})
+    diagnostics = dict(snapshot.get("telemetry_diagnostics", {}) or {})
+    for key in _VISIBLE_FALLBACK_KEYS:
+        if key in primary:
+            continue
+        if key in snapshot:
+            primary[key] = snapshot[key]
+        elif key in diagnostics:
+            primary[key] = diagnostics[key]
+    levels = snapshot.get("memory_levels")
+    if isinstance(levels, dict):
+        for level in ("M0", "M1", "M2", "M3", "M4", "M5", "M6", "M7"):
+            if level in levels and level not in primary:
+                primary[level] = levels[level]
+    error = snapshot.get("dashboard_metrics_error")
+    if isinstance(error, dict):
+        primary["dashboard_metrics_error"] = f"{error.get('type', 'Error')}: {error.get('message', '')}"
+    if not primary:
+        primary["dashboard_status"] = "no metrics available yet"
+    return primary
+
+
+def _render_dashboard_cards(primary: dict[str, Any]) -> str:
+    rows = []
+    for key, value in primary.items():
+        rows.append(
+            '<div class="card"><div class="k">'
+            + escape(str(key))
+            + '</div><div class="v">'
+            + escape(_format_dashboard_value(value))
+            + "</div></div>"
+        )
+    return "".join(rows)
+
+
+def _render_model_history(history: list[dict[str, Any]]) -> str:
+    if not history:
+        return "No trained models yet"
+    rows = []
+    for row in history:
+        rows.append(
+            f"{row.get('model', '')} | levels={row.get('run_levels_solved', 0)} "
+            f"| wins={float(row.get('run_wins', 0.0)):.4f} "
+            f"| behavioral={float(row.get('behavioral_success_rate', 0.0)):.4f} "
+            f"| VRAM={float(row.get('vram_gb', 0.0)):.2f} GB"
+        )
+    return "\n".join(rows)
 
 
 class MetricsHTTPServer:
@@ -100,7 +182,16 @@ class MetricsHTTPServer:
                     self._write(200, "application/json; charset=utf-8", raw)
                     return
                 if self.path in {"/", "/dashboard"}:
+                    initial_snapshot = server_owner._dashboard_snapshot()
+                    initial_primary = _visible_primary_dashboard(initial_snapshot)
+                    initial_cards = _render_dashboard_cards(initial_primary)
+                    initial_history = escape(
+                        _render_model_history(
+                            list(initial_snapshot.get("model_history", []) or [])
+                        )
+                    )
                     refresh_ms = int(round(self.server.refresh_seconds * 1000.0))
+                    fallback_keys = json.dumps(_VISIBLE_FALLBACK_KEYS)
                     html = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Hydra v9 Dashboard</title>
 <style>
@@ -109,20 +200,37 @@ h1{{font-size:20px}}h2{{font-size:16px;margin-top:24px}}.grid{{display:grid;grid
 .card{{background:#1d1d1d;padding:12px;border-radius:8px}}.k{{color:#aaa;font-size:12px}}.v{{font-size:20px;margin-top:4px;word-break:break-word}}
 pre{{background:#1d1d1d;padding:12px;overflow:auto;line-height:1.5}}
 </style></head>
-<body><h1>Hydra v9.7.6</h1><div id="grid" class="grid"></div>
-<h2>Model history</h2><pre id="model-history">No trained models yet</pre>
+<body><h1>Hydra v9.7.6</h1><div id="grid" class="grid">{initial_cards}</div>
+<h2>Model history</h2><pre id="model-history">{initial_history}</pre>
 <script>
+const fallbackKeys = {fallback_keys};
 function display(v, digits){{
  if(typeof v === 'number') return v.toFixed(digits);
+ if(v && typeof v === 'object') return JSON.stringify(v);
  return String(v ?? '');
+}}
+function visiblePrimary(m){{
+ const p = Object.assign({{}}, m.primary_dashboard || {{}});
+ const d = m.telemetry_diagnostics || {{}};
+ for(const k of fallbackKeys){{
+  if(p[k] !== undefined) continue;
+  if(m[k] !== undefined) p[k] = m[k];
+  else if(d[k] !== undefined) p[k] = d[k];
+ }}
+ const levels = m.memory_levels || {{}};
+ for(const k of ['M0','M1','M2','M3','M4','M5','M6','M7']){{
+  if(p[k] === undefined && levels[k] !== undefined) p[k] = levels[k];
+ }}
+ if(m.dashboard_metrics_error) p.dashboard_metrics_error = display(m.dashboard_metrics_error.type,0)+': '+display(m.dashboard_metrics_error.message,0);
+ if(!Object.keys(p).length) p.dashboard_status = 'no metrics available yet';
+ return p;
 }}
 async function refresh(){{
  const g=document.getElementById('grid');
  try {{
   const r=await fetch('/api/metrics',{{cache:'no-store'}}); const m=await r.json();
-  const p=m.primary_dashboard||{{}}; g.innerHTML='';
+  const p=visiblePrimary(m); g.innerHTML='';
   for(const [k,v] of Object.entries(p)){{const d=document.createElement('div');d.className='card';d.innerHTML='<div class="k">'+k+'</div><div class="v">'+display(v,2)+'</div>';g.appendChild(d)}}
-  if(m.dashboard_metrics_error){{const e=m.dashboard_metrics_error;const d=document.createElement('div');d.className='card';d.innerHTML='<div class="k">dashboard_metrics_error</div><div class="v">'+display(e.type,0)+': '+display(e.message,0)+'</div>';g.appendChild(d)}}
   const history=m.model_history||[]; const h=document.getElementById('model-history');
   h.textContent=history.length ? history.map(x => x.model+' | levels='+x.run_levels_solved+' | wins='+display(x.run_wins,4)+' | behavioral='+display(x.behavioral_success_rate,4)+' | VRAM='+display(x.vram_gb,2)+' GB').join('\n') : 'No trained models yet';
  }} catch(e) {{
