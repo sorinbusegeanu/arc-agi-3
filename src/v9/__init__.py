@@ -87,6 +87,12 @@ _install_inline_lowlevel_publication(ContinuousMemoryRuntime)
 from v9.runtime.publication_throughput import install_publication_throughput as _install_publication_throughput
 _install_publication_throughput(MemoryPipelineService)
 
+# Coalesce repeated normalized-support writes inside each canonical transaction,
+# preserve aggregate family support for M2 formation, and service residency work
+# outside the reducer hot path with a bounded epoch-boundary catch-up.
+from v9.runtime.canonical_hotpath import install as _install_canonical_hotpath
+_install_canonical_hotpath(MemoryPipelineService)
+
 _hgt_package.train_hgt_epoch = _hgt_training.train_hgt_epoch
 from v9.runtime import epoch_runner as _epoch_runner
 _epoch_runner.train_hgt_epoch = _hgt_training.train_hgt_epoch
