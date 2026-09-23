@@ -88,6 +88,12 @@ if not hasattr(MemoryPipelineService, "shutdown_parallel_pipeline"):
 
     MemoryPipelineService.shutdown_parallel_pipeline = _direct_shutdown_parallel_pipeline
 
+# Canonical commit budgeting must be enforced before apply_canonical_commit_batch.
+# Combined batches are split into valid ordered prefixes; a single oversized
+# primitive still raises the canonical oversized exception.
+from v9.runtime.canonical_batch_budgeting import install as _install_canonical_batch_budgeting
+_install_canonical_batch_budgeting(MemoryPipelineService)
+
 _hgt_package.train_hgt_epoch = _hgt_training.train_hgt_epoch
 from v9.runtime import epoch_runner as _epoch_runner
 _epoch_runner.train_hgt_epoch = _hgt_training.train_hgt_epoch
