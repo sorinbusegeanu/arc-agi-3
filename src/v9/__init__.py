@@ -120,6 +120,11 @@ from v9.runtime.concurrent_transfer_validation import install as _install_concur
 _install_concurrent_transfer_validation(_epoch_runner)
 from v9.runtime.concurrent_validation_startup import install as _install_concurrent_validation_startup
 _install_concurrent_validation_startup()
+
+# Observability is installed last so no later runtime wrapper can reintroduce a
+# canonical-lock dependency into dashboard reads or the heartbeat thread.
+from v9.runtime.live_observability import install as _install_live_observability
+_install_live_observability(ContinuousMemoryRuntime)
 _runtime_package.ContinuousMemoryRuntime = ContinuousMemoryRuntime
 
 _LAZY_EXPORTS = {
