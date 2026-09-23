@@ -9,7 +9,7 @@ from typing import Any
 from .grounding_objectives import _causal_bounds, _targets
 
 
-HGT_V978_MODEL_SCHEMA_VERSION = 7
+HGT_V978_MODEL_SCHEMA_VERSION = 8
 SYMBOL_SCHEMA_VERSION = 3
 
 

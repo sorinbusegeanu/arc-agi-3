@@ -91,13 +91,23 @@ def _terminal(row: dict[str, Any]) -> bool:
 
 
 def _episode_rows(raw_rows: list[dict[str, Any]], *, discount: float = 0.97) -> list[dict[str, Any]]:
-    running = 0.0
-    result: list[dict[str, Any]] = []
-    for row in reversed(raw_rows):
+    immediate_rows: list[tuple[dict[str, Any], float]] = []
+    previous_levels = 0
+    for row in raw_rows:
+        levels_completed = int(row.get("levels_completed", 0))
+        level_gain = max(0, levels_completed - previous_levels)
+        previous_levels = max(previous_levels, levels_completed)
         immediate = float(int(row.get("primary_valence", 0)))
         immediate += 1.0 if bool(row.get("task_success", False)) else 0.0
         immediate -= 1.0 if bool(row.get("task_failure", False)) else 0.0
         immediate -= 0.10 if bool(row.get("task_truncated", False)) else 0.0
+        if level_gain:
+            immediate += min(1.0, 0.5 * float(level_gain))
+        immediate_rows.append((row, max(-1.0, min(1.0, immediate))))
+
+    running = 0.0
+    result: list[dict[str, Any]] = []
+    for row, immediate in reversed(immediate_rows):
         running = max(-1.0, min(1.0, immediate + float(discount) * running))
         result.append({
             "environment_identity": tuple(row.get("environment_identity") or ()),
@@ -113,6 +123,8 @@ def _episode_rows(raw_rows: list[dict[str, Any]], *, discount: float = 0.97) -> 
             "task_success": bool(row.get("task_success", False)),
             "task_failure": bool(row.get("task_failure", False)),
             "task_truncated": bool(row.get("task_truncated", False)),
+            "level_index": int(row.get("level_index", 0)),
+            "levels_completed": int(row.get("levels_completed", 0)),
         })
     result.reverse()
     return result
@@ -242,30 +254,78 @@ def iter_action_ranking_pairs(
     max_pairs: int = DEFAULT_ACTION_RANKING_PAIRS,
 ) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
     grouped: dict[tuple[str, int], dict[int, tuple[float, int, dict[str, Any]]]] = {}
+    by_game: dict[str, dict[int, tuple[float, int, dict[str, Any]]]] = {}
     context_limit = max(1024, int(max_pairs) * 4)
     for row in rows:
-        context = str(row["game_scenario"]), int(row["context_signature"])
+        game = str(row["game_scenario"])
+        context = game, int(row["context_signature"])
         action = int(row["action_id"])
         actions = grouped.setdefault(context, {})
         total, count, example = actions.get(action, (0.0, 0, row))
         actions[action] = total + float(row["target_return"]), count + 1, example
+
+        game_actions = by_game.setdefault(game, {})
+        game_total, game_count, game_example = game_actions.get(
+            action, (0.0, 0, row)
+        )
+        game_actions[action] = (
+            game_total + float(row["target_return"]),
+            game_count + 1,
+            game_example,
+        )
         if len(grouped) > context_limit:
             for key in sorted(grouped, reverse=True)[: len(grouped) - context_limit]:
                 grouped.pop(key, None)
+
     emitted = 0
+    games_with_context_pair: set[str] = set()
     for context in sorted(grouped):
         actions = grouped[context]
-        means = {action: total / count for action, (total, count, _example) in actions.items()}
+        means = {
+            action: total / count
+            for action, (total, count, _example) in actions.items()
+        }
         if len(means) < 2:
             continue
         ordered = sorted(means, key=lambda action: (-means[action], action))
         best, worst = ordered[0], ordered[-1]
         if means[best] <= means[worst]:
             continue
-        yield actions[best][2], actions[worst][2]
+        best_row = dict(actions[best][2])
+        worst_row = dict(actions[worst][2])
+        best_row["ranking_scope"] = "context"
+        worst_row["ranking_scope"] = "context"
+        yield best_row, worst_row
+        games_with_context_pair.add(str(context[0]))
         emitted += 1
         if emitted >= max(1, int(max_pairs)):
-            break
+            return
+
+    # Opaque state signatures are often unique. The actor policy itself falls
+    # back from context scores to environment/game action scores, so train and
+    # validate the same fallback ranking when exact-context pairs are sparse.
+    for game in sorted(by_game):
+        if game in games_with_context_pair:
+            continue
+        actions = by_game[game]
+        means = {
+            action: total / count
+            for action, (total, count, _example) in actions.items()
+        }
+        if len(means) < 2:
+            continue
+        ordered = sorted(means, key=lambda action: (-means[action], action))
+        best, worst = ordered[0], ordered[-1]
+        if means[best] <= means[worst]:
+            continue
+        best_row = dict(actions[best][2])
+        worst_row = dict(actions[worst][2])
+        best_row["ranking_scope"] = "game"
+        worst_row["ranking_scope"] = "game"
+        yield best_row, worst_row
+        emitted += 1
+        if emitted >= max(1, int(max_pairs)):
+            return
 
 
 def action_ranking_pairs(rows: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
