@@ -177,35 +177,35 @@ def install(epoch_runner_module: Any, runtime_cls: type) -> None:
 
     epoch_runner_module.run_epochs = run_epochs_with_progress
 
-    original_parallel = epoch_runner_module.run_parallel_memory_jobs
-
-    def parallel_with_progress(runtime: Any, jobs: Any, *args: Any, **kwargs: Any):
-        global _sampling_active, _sampling_started, _sampling_label
-        evaluation_only = bool(kwargs.get("evaluation_only", False))
-        label = "evaluation" if evaluation_only else "sampling"
-        requested = sum(int(row[2]) for row in jobs)
-        with _state_lock:
-            _sampling_active = True
-            _sampling_started = time.monotonic()
-            _sampling_label = label
-        _set_run_phase(label, runtime)
-        try:
-            result = original_parallel(runtime, jobs, *args, **kwargs)
-        finally:
+    original_parallel = getattr(epoch_runner_module, "run_parallel_memory_jobs", None)
+    if callable(original_parallel):
+        def parallel_with_progress(runtime: Any, jobs: Any, *args: Any, **kwargs: Any):
+            global _sampling_active, _sampling_started, _sampling_label
+            evaluation_only = bool(kwargs.get("evaluation_only", False))
+            label = "evaluation" if evaluation_only else "sampling"
+            requested = sum(int(row[2]) for row in jobs)
             with _state_lock:
-                _sampling_active = False
-        produced = sum(int(getattr(row, "steps", 0)) for row in result)
-        pct = 100.0 * produced / requested if requested else 100.0
-        print(
-            f"{time.strftime('[%H:%M]')} {pct:5.1f}% sampled={produced}/{requested} "
-            f"games_finished={len(result)}/{len(jobs)} {label} complete",
-            flush=True,
-        )
-        if not evaluation_only:
-            _set_run_phase("post-sampling", runtime)
-        return result
+                _sampling_active = True
+                _sampling_started = time.monotonic()
+                _sampling_label = label
+            _set_run_phase(label, runtime)
+            try:
+                result = original_parallel(runtime, jobs, *args, **kwargs)
+            finally:
+                with _state_lock:
+                    _sampling_active = False
+            produced = sum(int(getattr(row, "steps", 0)) for row in result)
+            pct = 100.0 * produced / requested if requested else 100.0
+            print(
+                f"{time.strftime('[%H:%M]')} {pct:5.1f}% sampled={produced}/{requested} "
+                f"games_finished={len(result)}/{len(jobs)} {label} complete",
+                flush=True,
+            )
+            if not evaluation_only:
+                _set_run_phase("post-sampling", runtime)
+            return result
 
-    epoch_runner_module.run_parallel_memory_jobs = parallel_with_progress
+        epoch_runner_module.run_parallel_memory_jobs = parallel_with_progress
 
     original_train = epoch_runner_module.train_hgt_epoch
 
