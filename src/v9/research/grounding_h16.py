@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Callable
-
+import json
+from pathlib import Path
 from random import Random
-
-from v9.environments.synthetic_symbolic import SyntheticSymbolicConfig, SyntheticSymbolicEnvironment
+from typing import Callable
 
 from .hypotheses import HypothesisResult, HypothesisStatus
 
@@ -19,15 +18,58 @@ class GroundingCondition(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class H16Metrics:
+    interaction_prediction: float = 0.0
+    action_success: float = 0.0
+    symbol_conditioned_transfer: float = 0.0
+    world_to_symbol_generalization: float = 0.0
+    composition_success: float = 0.0
+    persistence_without_symbols: float = 0.0
+    grounding_calibration: float = 0.0
+
+    @property
+    def aggregate(self) -> float:
+        values = (
+            self.interaction_prediction,
+            self.action_success,
+            self.symbol_conditioned_transfer,
+            self.world_to_symbol_generalization,
+            self.composition_success,
+            self.persistence_without_symbols,
+        )
+        return sum(values) / len(values)
+
+
+@dataclass(frozen=True, slots=True)
+class H16RunState:
+    scientific_config_id: str = ""
+    model_version: str = "untrained"
+    snapshot_id: int = 0
+    symbol_schema_version: int = 3
+    source_state_id: str = ""
+    runtime_backed: bool = False
+    hgt_used: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class H16Trial:
     condition: GroundingCondition
     seed: int
     environment_config_id: int
     interaction_budget: int
     evaluation_id: int
-    prediction_score: float
-    transfer_score: float
+    metrics: H16Metrics
     held_out_causal_effect: float
+    trial_id: str = ""
+    run_state: H16RunState = H16RunState()
+
+    @property
+    def prediction_score(self) -> float:
+        return self.metrics.interaction_prediction
+
+    @property
+    def transfer_score(self) -> float:
+        return self.metrics.symbol_conditioned_transfer
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,25 +77,60 @@ class H16Report:
     result: HypothesisResult
     means: dict[str, float]
     matched: bool
+    metric_means: dict[str, dict[str, float]]
+    causal_effect: float
+
+
+def _mean(rows: tuple[H16Trial, ...], metric: str) -> float:
+    if not rows:
+        return 0.0
+    return sum(float(getattr(row.metrics, metric)) for row in rows) / len(rows)
+
+
+def _match_key(row: H16Trial) -> tuple[int, int, int, int, str]:
+    return (int(row.seed), int(row.environment_config_id), int(row.interaction_budget), int(row.evaluation_id), str(row.run_state.source_state_id))
 
 
 def evaluate_h16(trials: tuple[H16Trial, ...], *, advantage_threshold: float = 0.0, causal_threshold: float = 0.0) -> H16Report:
     by_condition = {condition: tuple(row for row in trials if row.condition is condition) for condition in GroundingCondition}
     if any(not rows for rows in by_condition.values()):
-        return H16Report(HypothesisResult("H16", HypothesisStatus.UNTESTED, None, len(trials), "all C0-C3 conditions are required"), {}, False)
-    keys = lambda rows: {(row.seed, row.environment_config_id, row.interaction_budget, row.evaluation_id) for row in rows}
-    matched = len({frozenset(keys(rows)) for rows in by_condition.values()}) == 1
-    means = {condition.value: sum(row.prediction_score + row.transfer_score for row in rows) / (2 * len(rows)) for condition, rows in by_condition.items()}
+        return H16Report(HypothesisResult("H16", HypothesisStatus.UNTESTED, None, len(trials), "all C0-C3 conditions are required"), {}, False, {}, 0.0)
+    key_sets = [{_match_key(row) for row in rows} for rows in by_condition.values()]
+    matched = all(values == key_sets[0] for values in key_sets[1:])
+    metric_names = tuple(H16Metrics.__dataclass_fields__)
+    metric_means = {condition.value: {metric: _mean(rows, metric) for metric in metric_names} for condition, rows in by_condition.items()}
+    means = {condition.value: sum(row.metrics.aggregate for row in rows) / len(rows) for condition, rows in by_condition.items()}
     aligned = means[GroundingCondition.C2_ALIGNED.value]
     control = max(means[GroundingCondition.C0_INTERACTION_ONLY.value], means[GroundingCondition.C1_SYMBOLS_ONLY.value], means[GroundingCondition.C3_SHUFFLED.value])
     causal = sum(row.held_out_causal_effect for row in by_condition[GroundingCondition.C2_ALIGNED]) / len(by_condition[GroundingCondition.C2_ALIGNED])
     effect = aligned - control
     status = HypothesisStatus.SUPPORTED if matched and effect > advantage_threshold and causal > causal_threshold else HypothesisStatus.FALSIFIED
-    return H16Report(HypothesisResult("H16", status, effect, len(trials), "matched aligned advantage and held-out causal effect" if status is HypothesisStatus.SUPPORTED else "required matched advantage was not demonstrated"), means, matched)
+    return H16Report(HypothesisResult("H16", status, effect, len(trials), "matched aligned advantage and held-out causal effect" if status is HypothesisStatus.SUPPORTED else "required matched advantage was not demonstrated"), means, matched, metric_means, causal)
 
 
-def run_matched_controls(runner: Callable[[GroundingCondition, int, int], tuple[float, float, float]], *, seeds: tuple[int, ...], environment_config_id: int, interaction_budget: int, evaluation_id: int = 1) -> tuple[H16Trial, ...]:
-    return tuple(H16Trial(condition, seed, environment_config_id, interaction_budget, evaluation_id, *runner(condition, seed, interaction_budget)) for seed in seeds for condition in GroundingCondition)
+def run_matched_controls(runner: Callable[[GroundingCondition, int, int], tuple[H16Metrics, float]], *, seeds: tuple[int, ...], environment_config_id: int, interaction_budget: int, evaluation_id: int = 1, run_state: H16RunState | None = None) -> tuple[H16Trial, ...]:
+    state = run_state or H16RunState(source_state_id=f"h16:{environment_config_id}:{evaluation_id}")
+    rows: list[H16Trial] = []
+    for seed in seeds:
+        for condition in GroundingCondition:
+            metrics, causal = runner(condition, seed, interaction_budget)
+            rows.append(H16Trial(condition, seed, environment_config_id, interaction_budget, evaluation_id, metrics, causal, f"h16:{environment_config_id}:{evaluation_id}:{seed}:{condition.value}", state))
+    return tuple(rows)
+
+
+def _matched_sequence(seed: int, budget: int) -> tuple[tuple[int, int, int, int], ...]:
+    """Return matched (cue_a, cue_b, action, target_action) opportunities."""
+    rng = Random(seed)
+    train_pairs = ((0, 0), (0, 1), (1, 0))
+    heldout_pairs = ((0, 0), (0, 1), (1, 0), (1, 1))
+    split = max(2, (2 * int(budget)) // 3)
+    rows: list[tuple[int, int, int, int]] = []
+    for index in range(int(budget)):
+        pairs = train_pairs if index < split else heldout_pairs
+        cue_a, cue_b = pairs[index % len(pairs)]
+        action = rng.randrange(2)
+        rows.append((cue_a, cue_b, action, cue_a ^ cue_b))
+    return tuple(rows)
 
 
 def _majority_model(rows: list[tuple[tuple[int, ...], int]]) -> tuple[dict[tuple[int, ...], int], int]:
@@ -67,46 +144,230 @@ def _majority_model(rows: list[tuple[tuple[int, ...], int]]) -> tuple[dict[tuple
     return {key: choose(values) for key, values in counts.items()}, choose(global_counts)
 
 
-def run_synthetic_h16_controls(*, seeds: tuple[int, ...], environment_config_id: int, interaction_budget: int, evaluation_id: int = 1) -> tuple[H16Trial, ...]:
-    """Execute deterministic arbitrary-symbol C0-C3 controls.
-
-    The held-out comparison uses the same recorded transitions with the aligned
-    symbol channel enabled versus ablated. It records evidence; callers still
-    decide the preregistered quality/dependency gates.
-    """
+def run_synthetic_h16_controls(*, seeds: tuple[int, ...], environment_config_id: int, interaction_budget: int, evaluation_id: int = 1, run_state: H16RunState | None = None) -> tuple[H16Trial, ...]:
+    """Cheap non-Hydra reference control retained for regression tests."""
     if interaction_budget < 6:
         raise ValueError("synthetic H16 requires at least six interactions")
 
-    def runner(condition: GroundingCondition, seed: int, budget: int) -> tuple[float, float, float]:
-        environment = SyntheticSymbolicEnvironment(SyntheticSymbolicConfig(seed=seed, horizon=budget + 1, aligned=True, shuffled=condition is GroundingCondition.C3_SHUFFLED))
-        rng = Random(seed)
-        transitions: list[tuple[int, int, int]] = []
-        for _ in range(budget):
-            symbol = int(environment.optional_symbol_stream()[0])
-            action = rng.randrange(2)
-            target = int(environment.step(action))
-            transitions.append((symbol, action, target))
+    def runner(condition: GroundingCondition, seed: int, budget: int) -> tuple[H16Metrics, float]:
+        transitions = _matched_sequence(seed, budget)
         split = max(2, (2 * len(transitions)) // 3)
 
-        def features(row: tuple[int, int, int], selected: GroundingCondition) -> tuple[int, ...]:
-            symbol, action, _target = row
+        def features(row: tuple[int, int, int, int], selected: GroundingCondition) -> tuple[int, ...]:
+            cue_a, cue_b, action, _target = row
             if selected is GroundingCondition.C0_INTERACTION_ONLY:
                 return (action,)
             if selected is GroundingCondition.C1_SYMBOLS_ONLY:
-                return (symbol,)
-            return symbol, action
+                return (cue_a, cue_b)
+            if selected is GroundingCondition.C3_SHUFFLED:
+                return (cue_b, 1 - cue_a, action)
+            return cue_a, cue_b, action
 
-        training = [(features(row, condition), row[2]) for row in transitions[:split]]
+        training = [(features(row, condition), row[3]) for row in transitions[:split]]
         model, fallback = _majority_model(training)
         evaluation = transitions[split:]
-        correct = sum(model.get(features(row, condition), fallback) == row[2] for row in evaluation)
+        correct = sum(model.get(features(row, condition), fallback) == row[3] for row in evaluation)
         prediction = correct / len(evaluation)
-        transfer = prediction
-        causal = 0.0
-        if condition is GroundingCondition.C2_ALIGNED:
-            ablated_model, ablated_fallback = _majority_model([((row[1],), row[2]) for row in transitions[:split]])
-            ablated_correct = sum(ablated_model.get((row[1],), ablated_fallback) == row[2] for row in evaluation)
-            causal = prediction - ablated_correct / len(evaluation)
-        return prediction, transfer, causal
+        ablated_model, ablated_fallback = _majority_model([((row[2],), row[3]) for row in transitions[:split]])
+        ablated_correct = sum(ablated_model.get((row[2],), ablated_fallback) == row[3] for row in evaluation)
+        persistence = ablated_correct / len(evaluation)
+        causal = prediction - persistence if condition is GroundingCondition.C2_ALIGNED else 0.0
+        composition_rows = [row for row in evaluation if row[:2] == (1, 1)]
+        composition = (sum(model.get(features(row, condition), fallback) == row[3] for row in composition_rows) / len(composition_rows)) if composition_rows else 0.0
+        metrics = H16Metrics(prediction, prediction, prediction if condition is GroundingCondition.C2_ALIGNED else 0.0, prediction if condition is not GroundingCondition.C0_INTERACTION_ONLY else 0.0, composition if condition is GroundingCondition.C2_ALIGNED else 0.0, persistence, max(0.0, 1.0 - abs(causal)))
+        return metrics, causal
 
-    return run_matched_controls(runner, seeds=seeds, environment_config_id=environment_config_id, interaction_budget=interaction_budget, evaluation_id=evaluation_id)
+    return run_matched_controls(runner, seeds=seeds, environment_config_id=environment_config_id, interaction_budget=interaction_budget, evaluation_id=evaluation_id, run_state=run_state)
+
+
+def run_hydra_h16_controls(
+    *,
+    root: str | Path,
+    seeds: tuple[int, ...],
+    environment_config_id: int,
+    interaction_budget: int,
+    evaluation_id: int = 1,
+    train_hgt: bool = True,
+) -> tuple[H16Trial, ...]:
+    """Run matched C0-C3 through the actual Hydra runtime and optional HGT training."""
+    if interaction_budget < 9:
+        raise ValueError("Hydra H16 requires at least nine interactions")
+    root = Path(root)
+    rows: list[H16Trial] = []
+    source_state_id = f"hydra-h16:{environment_config_id}:{evaluation_id}"
+
+    for seed in seeds:
+        sequence = _matched_sequence(seed, interaction_budget)
+        split = max(3, (2 * len(sequence)) // 3)
+        for condition in GroundingCondition:
+            from v9 import ContinuousMemoryRuntime
+            from v9.memory.symbolic_relations import SymbolicRelation, derive_symbolic_relations
+            from v9.runtime import RuntimeConfig
+            from v9.runtime.memory_pipeline import IngestionTask, prepare_ingestion
+            from v9.runtime.multiprocess import EncodedTransition
+
+            condition_root = root / f"seed-{seed}" / condition.value
+            runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(condition_root, restore=False, enable_snapshots=False))
+            correct_predictions = 0
+            baseline_correct = 0
+            transfer_available = 0
+            generalization_correct = 0
+            generalization_trials = 0
+            composition_correct = 0
+            composition_trials = 0
+            calibration_sum = 0.0
+            evaluation_rows = 0
+            model_version = "untrained"
+            hgt_used = False
+            try:
+                for index, (cue_a, cue_b, sampled_action, target_action) in enumerate(sequence):
+                    presented = (cue_a, cue_b) if condition is not GroundingCondition.C3_SHUFFLED else (cue_b, 1 - cue_a)
+                    symbols: tuple[object, ...] = ()
+                    if condition is not GroundingCondition.C0_INTERACTION_ONLY:
+                        symbols = (
+                            {"token": presented[0], "phase": "BEFORE_ACTION", "macro_step": index, "micro_step": 0},
+                            {"token": presented[1], "phase": "BEFORE_ACTION", "macro_step": index, "micro_step": 1},
+                        )
+                    correct_observed_action = int(sampled_action) == int(target_action)
+                    transition = EncodedTransition(
+                        actor_id=0,
+                        producer_sequence=index + 1,
+                        global_step=index,
+                        environment_identity=("h16", "symbolic_grounding", str(environment_config_id), f"seed-{seed}"),
+                        episode_id=1,
+                        observation_schema_id=1,
+                        before_signature=0,
+                        action_id=int(sampled_action),
+                        after_signature=1 if correct_observed_action else 2,
+                        available_actions_after=2,
+                        primary_valence=1 if correct_observed_action else -1,
+                        symbols=symbols,
+                        curriculum_step=None,
+                        game_scenario="h16-symbolic-grounding",
+                        symbols_only=condition is GroundingCondition.C1_SYMBOLS_ONLY,
+                        action_schema_id=1,
+                        available_action_set_signature=3,
+                        boundary_scope="NONE",
+                        task_success=correct_observed_action,
+                        task_failure=not correct_observed_action,
+                    )
+                    task = IngestionTask(index + 1, int(runtime.watermark) + 1, transition, int(runtime.config.scientific.symbol_budget_per_window), int(runtime.config.scientific.symbol_payload_bytes))
+                    prepared = prepare_ingestion(task)
+                    pair_uid = None
+                    environment_id = None
+                    if prepared.symbols and prepared.m1g is not None:
+                        derived = derive_symbolic_relations(prepared.symbols, interaction_grounding=prepared.m1g, previous_interaction_grounding=None, transition=transition, causal_watermark=max(int(row.event.identity.causal_watermark) for row in prepared.symbols), occurrences=prepared.symbol_occurrences)
+                        pair = next((row for row in derived if row.relation_kind == SymbolicRelation.SYMBOL_PRECEDES_SYMBOL), None)
+                        if pair is not None:
+                            pair_uid = int(pair.relation.uid.lo)
+                        environment_id = int(prepared.m1g.environment_instance_id)
+
+                    if index >= split:
+                        evaluation_rows += 1
+                        symbol_scores = {} if pair_uid is None else runtime.grounding_action_scores(pair_uid, environment_instance_id=environment_id)
+                        snapshot = runtime.actor_policy_snapshot()
+                        hgt_scores = {} if environment_id is None else snapshot.learned_scores(environment_id, (0, 1), environment_type="symbolic_grounding", context_signature=0)
+                        combined = {action: float(symbol_scores.get(action, 0.0)) + float(hgt_scores.get(action, 0.0)) for action in (0, 1)}
+                        predicted_action = min((0, 1), key=lambda action: (-combined[action], action))
+                        correct = int(predicted_action == target_action)
+                        correct_predictions += correct
+                        transfer_available += int(bool(symbol_scores))
+                        confidence = max(symbol_scores.values(), default=0.0)
+                        calibration_sum += 1.0 - abs(max(0.0, min(1.0, confidence)) - float(correct))
+                        global_grounded = snapshot.grounded_action_scores_by_type.get("symbolic_grounding", {})
+                        baseline_action = min((0, 1), key=lambda action: (-float(global_grounded.get(action, 0.0)), action))
+                        baseline_correct += int(baseline_action == target_action)
+                        if (cue_a, cue_b) == (1, 1):
+                            generalization_trials += 1
+                            composition_trials += 1
+                            generalization_correct += correct
+                            composition_correct += correct
+
+                    runtime.apply_prepared_ingestion(prepared)
+                    if pair_uid is not None and prepared.m1g is not None:
+                        if condition is GroundingCondition.C2_ALIGNED:
+                            kind = "prediction" if index < split else ("composition" if (cue_a, cue_b) == (1, 1) else "heldout_transfer")
+                            runtime.record_symbolic_validation(
+                                symbol_structure_uid=pair_uid,
+                                interaction_structure_uid=int(prepared.m1g.uid.lo),
+                                environment_instance_id=int(prepared.m1g.environment_instance_id),
+                                validation_kind=kind,
+                                trial_id=f"h16:{evaluation_id}:{seed}:{condition.value}:{index}",
+                                effect=1.0 if correct_observed_action else -1.0,
+                            )
+                        elif condition is GroundingCondition.C3_SHUFFLED:
+                            runtime.record_symbolic_validation(
+                                symbol_structure_uid=pair_uid,
+                                interaction_structure_uid=int(prepared.m1g.uid.lo),
+                                environment_instance_id=int(prepared.m1g.environment_instance_id),
+                                validation_kind="prediction" if index < split else "heldout_transfer",
+                                trial_id=f"h16:{evaluation_id}:{seed}:{condition.value}:{index}",
+                                effect=-1.0,
+                            )
+
+                    if index + 1 == split and train_hgt:
+                        from v9.hgt.training import train_hgt_epoch
+                        trained = train_hgt_epoch(runtime, epoch=1, training_epochs=1, learning_rate=1e-3, root=condition_root, allow_promotion=False)
+                        model_version = str(trained.model_version)
+                        hgt_used = trained.status != "SKIPPED_DEPENDENCY"
+
+                denominator = max(1, evaluation_rows)
+                action_success = correct_predictions / denominator
+                persistence = baseline_correct / denominator
+                metrics = H16Metrics(
+                    interaction_prediction=action_success,
+                    action_success=action_success,
+                    symbol_conditioned_transfer=transfer_available / denominator,
+                    world_to_symbol_generalization=generalization_correct / max(1, generalization_trials),
+                    composition_success=composition_correct / max(1, composition_trials),
+                    persistence_without_symbols=persistence,
+                    grounding_calibration=calibration_sum / denominator,
+                )
+                causal = action_success - persistence if condition is GroundingCondition.C2_ALIGNED else 0.0
+                state = H16RunState(runtime.config.scientific.config_id.value, model_version, int(getattr(runtime, "_snapshot_id", 0)), 3, source_state_id, True, hgt_used)
+                rows.append(H16Trial(condition, seed, environment_config_id, interaction_budget, evaluation_id, metrics, causal, f"h16:{environment_config_id}:{evaluation_id}:{seed}:{condition.value}", state))
+            finally:
+                close = getattr(runtime, "close", None)
+                if callable(close):
+                    close()
+    return tuple(rows)
+
+
+def save_h16_evidence(path: str | Path, trials: tuple[H16Trial, ...], report: H16Report | None = None) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    report = report or evaluate_h16(trials)
+    payload = {
+        "schema_version": 2,
+        "trials": [{**asdict(row), "condition": row.condition.value} for row in trials],
+        "report": {"status": report.result.status.value, "effect": report.result.effect, "trials": report.result.trials, "reason": report.result.reason, "means": report.means, "matched": report.matched, "metric_means": report.metric_means, "causal_effect": report.causal_effect},
+    }
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(target)
+
+
+def load_h16_trials(path: str | Path) -> tuple[H16Trial, ...]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if int(payload.get("schema_version", 0)) not in {1, 2}:
+        raise ValueError("unsupported H16 evidence schema")
+    rows: list[H16Trial] = []
+    for raw in payload.get("trials", []):
+        state = dict(raw.get("run_state", {}))
+        state.setdefault("symbol_schema_version", 3)
+        state.setdefault("runtime_backed", False)
+        state.setdefault("hgt_used", False)
+        rows.append(H16Trial(condition=GroundingCondition(str(raw["condition"])), seed=int(raw["seed"]), environment_config_id=int(raw["environment_config_id"]), interaction_budget=int(raw["interaction_budget"]), evaluation_id=int(raw["evaluation_id"]), metrics=H16Metrics(**dict(raw["metrics"])), held_out_causal_effect=float(raw["held_out_causal_effect"]), trial_id=str(raw.get("trial_id", "")), run_state=H16RunState(**state)))
+    return tuple(rows)
+
+
+def publish_h16_report(runtime: object, report: H16Report) -> None:
+    setter = getattr(runtime, "set_telemetry_gauge")
+    for condition in GroundingCondition:
+        setter(f"h16_{condition.value}_score", float(report.means.get(condition.value, 0.0)))
+    setter("h16_aligned_advantage", float(report.result.effect or 0.0))
+    setter("h16_heldout_causal_effect", float(report.causal_effect))
+    setter("h16_matched", int(report.matched))
+    aligned = report.metric_means.get(GroundingCondition.C2_ALIGNED.value, {})
+    for metric, value in aligned.items():
+        setter(f"h16_aligned_{metric}", float(value))

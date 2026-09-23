@@ -59,7 +59,7 @@ def run_process_jobs(
         levels = dict(metrics.get("memory_levels", {}))
         percent = (100.0 * published / total_steps) if total_steps else 100.0
         print(
-            "v9 progress "
+            f"{time.strftime('[%H:%M]')} progress "
             f"{percent:5.1f}% "
             f"steps={published}/{total_steps} "
             f"memories={metrics.get('memories', 0)} "
@@ -135,10 +135,7 @@ def run_process_jobs(
                     break
                 if not isinstance(done, ActorDone):
                     continue
-                slot, process = active.pop(done.actor_id)
-                process.join(timeout=30)
-                if process.exitcode not in (0, None):
-                    raise RuntimeError(f"actor process {done.actor_id} exited with code {process.exitcode}")
+                slot, _ = active.pop(done.actor_id)
                 free_slots.append(slot)
                 free_slots.sort()
                 results.append(ProcessActorResult(
@@ -164,6 +161,21 @@ def run_process_jobs(
             if not progressed:
                 time.sleep(0.001)
 
+        while any(process.is_alive() for process in topology.actor_processes):
+            progressed = False
+            while True:
+                try:
+                    item = topology.publication_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(item, tuple) and len(item) == 4 and item[0] == "transition":
+                    publish_encoded_transition(runtime, item[3])
+                    published += 1
+                    progressed = True
+            if not progressed:
+                time.sleep(0.001)
+        topology.join_actor_workers()
+
         topology.signal_stage_stop()
         while any(process.is_alive() for process in topology.stage_processes):
             try:
@@ -186,10 +198,10 @@ def run_process_jobs(
                 shard_done += 1
         topology.join_shard_workers()
 
-        runtime.unified_telemetry.set_gauge("actor_processes", min(int(actor_limit), len(jobs)))
-        runtime.unified_telemetry.set_gauge("stage_worker_processes", int(stage_workers))
-        runtime.unified_telemetry.set_gauge("shard_worker_processes", int(shards))
-        runtime.unified_telemetry.set_gauge("multiprocess_transitions_published", int(published))
+        runtime.set_telemetry_gauge("actor_processes", min(int(actor_limit), len(jobs)))
+        runtime.set_telemetry_gauge("stage_worker_processes", int(stage_workers))
+        runtime.set_telemetry_gauge("shard_worker_processes", int(shards))
+        runtime.set_telemetry_gauge("multiprocess_transitions_published", int(published))
         _print_progress()
         return sorted(results, key=lambda row: row.actor_id)
     except BaseException:

@@ -10,6 +10,7 @@ from v9.memory import (
     MemoryLevel, MemoryUid,
 )
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
+from v9.runtime.memory_pipeline import DerivationTask, derive_memory
 
 
 def _runtime(tmp_path: Path) -> ContinuousMemoryRuntime:
@@ -70,3 +71,75 @@ def test_outcome_has_no_terminal_label_and_efficiency_is_same_outcome_only() -> 
     scores = relative_efficiency((fast, slow))
     assert scores[fast.uid.lo] == 1.0
     assert scores[slow.uid.lo] == 0.5
+
+
+def test_parallel_derivation_forms_m4_from_recurrent_single_source_scope(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    for index in range(2):
+        runtime.submit(
+            runtime.make_experience(
+                producer_id=1,
+                producer_sequence=index + 1,
+                environment_instance_id=7,
+                global_step=index,
+                context_signature=3,
+                action_id=2,
+                outcome_signature=4,
+                family_signature=5,
+            )
+        )
+    signature = next(iter(runtime._m1n_occurrences))
+    rows = tuple(runtime._m1n_occurrences[signature])
+    result = derive_memory(
+        DerivationTask(
+            task_id=1,
+            structural_signature=signature,
+            rows=rows,
+            support=2,
+            formation_scope=(7,),
+            causal_watermark=runtime.watermark,
+        )
+    )
+    assert result.roles
+    assert result.concepts
+    assert result.concepts[0].provenance.formation_scope == (7,)
+
+
+def test_missing_canonical_m4_is_republished_by_batch_derivation(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    for index in range(2):
+        runtime.submit(
+            runtime.make_experience(
+                producer_id=1,
+                producer_sequence=index + 1,
+                environment_instance_id=7,
+                global_step=index,
+                context_signature=3,
+                action_id=2,
+                outcome_signature=4,
+                family_signature=5,
+            )
+        )
+    signature = next(iter(runtime._m1n_occurrences))
+    rows = tuple(runtime._m1n_occurrences[signature])
+    result = derive_memory(
+        DerivationTask(
+            task_id=1,
+            structural_signature=signature,
+            rows=rows,
+            support=4,
+            formation_scope=(7,),
+            causal_watermark=runtime.watermark,
+        )
+    )
+    assert result.concepts
+    concept = result.concepts[0]
+    runtime._m4[concept.uid] = concept
+    runtime.graph.nodes.pop(concept.uid, None)
+    runtime.graph.payloads.pop(concept.uid, None)
+    runtime.graph._uids_by_level[MemoryLevel.M4].discard(concept.uid)
+
+    runtime.apply_derivation_results_batch((result,))
+
+    assert concept.uid in runtime.graph.nodes
+    assert runtime.graph.nodes[concept.uid].level is MemoryLevel.M4

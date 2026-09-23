@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from threading import Event, Thread
+
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
 from v9.telemetry import (
     ConsolidationSample,
@@ -8,6 +10,8 @@ from v9.telemetry import (
     ModelEvolutionSample,
     OptimizationSample,
 )
+from v9.telemetry.dashboard import PRIMARY_KEYS
+
 
 
 def test_unified_telemetry_covers_all_v976_categories_and_persists(tmp_path) -> None:
@@ -118,21 +122,22 @@ def test_unified_telemetry_covers_all_v976_categories_and_persists(tmp_path) -> 
     dashboard = metrics["primary_dashboard"]
     diagnostics = metrics["telemetry_diagnostics"]
 
-    assert dashboard["reasoning_cycles"] == 3.0
-    assert dashboard["final_vs_initial_candidate_improvement"] == 1.0
-    assert dashboard["HGT_consequence_error"] == 0.2
-    assert dashboard["HGT_strategy_ranking_accuracy"] == 1.0
-    assert dashboard["HGT_candidate_refinement_success"] == 1.0
-    assert dashboard["HGT_training_loss"] == 0.5
-    assert dashboard["HGT_validation_loss"] == 0.6
-    assert dashboard["historical_retention"] == 0.93
-    assert dashboard["current_curriculum_gain"] == 0.08
-    assert dashboard["cross_family_validation_gain"] == 0.04
+    assert tuple(dashboard) == PRIMARY_KEYS
+    assert len(dashboard) == 24
     assert dashboard["ModelVersion"] == "hgt-2"
-    assert dashboard["GPU_memory"] == 4_000_000_000
-    assert dashboard["inference_latency"] == 12.0
-    assert dashboard["training_step_latency"] == 18.0
+    assert dashboard["GPU_memory_GB"] == round(4_000_000_000 / (1024.0 ** 3), 2)
 
+    assert diagnostics["reasoning_cycles"] == 3.0
+    assert diagnostics["initial_candidate_score"] == 1.0
+    assert diagnostics["best_candidate_score"] == 2.0
+    assert diagnostics["hgt_consequence_error"] == 0.2
+    assert diagnostics["hgt_strategy_ranking_accuracy"] == 1.0
+    assert diagnostics["hgt_candidate_refinement_success"] == 1.0
+    assert diagnostics["hgt_training_loss"] == 0.5
+    assert diagnostics["hgt_validation_loss"] == 0.6
+    assert diagnostics["historical_retention"] == 0.93
+    assert diagnostics["current_curriculum_gain"] == 0.08
+    assert diagnostics["cross_family_validation_gain"] == 0.04
     assert diagnostics["reasoning_stop_reasons"]["AMBIGUITY_RESOLVED"] == 1
     assert diagnostics["replay_compression_ratio"] == 0.75
     assert diagnostics["mean_relative_efficiency_gain"] == 0.4
@@ -167,3 +172,56 @@ def test_dashboard_exposes_all_memory_levels(tmp_path) -> None:
     for level in range(8):
         assert f"M{level}_count" in dashboard
     assert "M4_validated" in dashboard
+
+
+def test_metrics_waits_for_an_in_progress_runtime_mutation(tmp_path) -> None:
+    runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False, enable_snapshots=False))
+    mutation_started = Event()
+    release_mutation = Event()
+    metrics_finished = Event()
+    failures: list[BaseException] = []
+
+    def hold_runtime_mutation() -> None:
+        with runtime._lock:
+            mutation_started.set()
+            release_mutation.wait(timeout=2.0)
+
+    def read_metrics() -> None:
+        try:
+            runtime.metrics()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            metrics_finished.set()
+
+    mutation = Thread(target=hold_runtime_mutation)
+    reader = Thread(target=read_metrics)
+    mutation.start()
+    assert mutation_started.wait(timeout=1.0)
+    reader.start()
+    assert not metrics_finished.wait(timeout=0.05)
+    release_mutation.set()
+    mutation.join(timeout=1.0)
+    reader.join(timeout=1.0)
+
+    assert metrics_finished.is_set()
+    assert not failures
+
+
+def test_hgt_probability_metrics_are_bounded(tmp_path) -> None:
+    runtime = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path, restore=False))
+    runtime.record_hgt_inference(
+        HGTInferenceSample(
+            consequence_error=0.0,
+            strategy_ranking_correct=True,
+            candidate_refinement_success=True,
+            subgraph_nodes=1,
+            subgraph_edges=1,
+            inference_latency_ms=1.0,
+            relevance_precision=1.5,
+            correspondence_accuracy=2.0,
+        )
+    )
+    metrics = runtime.metrics()["telemetry_diagnostics"]
+    assert metrics["relevance_precision"] == 1.0
+    assert metrics["correspondence_accuracy"] == 1.0

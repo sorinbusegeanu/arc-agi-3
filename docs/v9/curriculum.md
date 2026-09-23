@@ -57,6 +57,7 @@ Also provide useful aliases:
 --games gym_broad
 --games semantics
 --games cross_family
+--games broad
 ```
 
 The resolver returns structured environment specifications containing the adapter, native ID, options and condition.
@@ -889,3 +890,35 @@ Step 14     long-horizon grounded M6/M7 behavior
 ```
 
 The central curriculum success criterion is not that every environment is solved. It is that increasingly different M0/M1 experiences converge into reusable higher-level structure while preserving target-local execution and causal evidence.
+
+
+## Broad preset
+
+`--games broad` is the primary heterogeneous continuous-learning preset. It is an explicit stable list of 30 games so its composition remains unchanged when individual diagnostic curriculum steps evolve.
+
+Composition:
+
+- 6 synthetic causal scenarios
+- 4 Gym discrete environments
+- 4 Gym structured environments
+- 2 Sokoban environments
+- 4 MiniGrid environments
+- 4 BabyAI environments
+- 6 ARC environments
+
+Recommended baseline:
+
+```bash
+PYTHONPATH=src python -m v9 continuous-run \
+  --root runs/v9/continuous \
+  --games broad \
+  --steps-per-game 2000 \
+  --epochs 10 \
+  --actors 30 \
+  --shards 4 \
+  --stage-workers 2 \
+  --ingest-workers 4 \
+  --derivation-workers 4
+```
+
+One epoch contains 30 × 2,000 = 60,000 sampled steps. With 30 actors, the default round-robin allocator assigns one actor to each broad-preset game.

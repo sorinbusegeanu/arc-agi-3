@@ -85,10 +85,10 @@ class UnifiedTelemetry:
         self._sum("hgt_inference_latency_ms", sample.inference_latency_ms)
         if sample.relevance_precision is not None:
             self.counters["hgt_relevance_samples"] += 1
-            self._sum("hgt_relevance_precision", sample.relevance_precision)
+            self._sum("hgt_relevance_precision", max(0.0, min(1.0, float(sample.relevance_precision))))
         if sample.correspondence_accuracy is not None:
             self.counters["hgt_correspondence_samples"] += 1
-            self._sum("hgt_correspondence_accuracy", sample.correspondence_accuracy)
+            self._sum("hgt_correspondence_accuracy", max(0.0, min(1.0, float(sample.correspondence_accuracy))))
         if sample.behavior_delta is not None:
             self.counters["hgt_behavior_samples"] += 1
             self._sum("hgt_behavior_delta", sample.behavior_delta)
@@ -215,6 +215,8 @@ class UnifiedTelemetry:
         result["mean_subgraph_edges"] = self._ratio(self.sums.get("hgt_subgraph_edges", 0.0), i)
         result["relevance_precision"] = self._ratio(self.sums.get("hgt_relevance_precision", 0.0), self.counters["hgt_relevance_samples"])
         result["correspondence_accuracy"] = self._ratio(self.sums.get("hgt_correspondence_accuracy", 0.0), self.counters["hgt_correspondence_samples"])
+        result["hgt_relevance_precision"] = result["relevance_precision"]
+        result["hgt_correspondence_accuracy"] = result["correspondence_accuracy"]
         result["hgt_behavior_improvement_rate"] = self._ratio(self.counters["hgt_behavior_improvements"], self.counters["hgt_behavior_samples"])
         result["hgt_behavior_regression_rate"] = self._ratio(self.counters["hgt_behavior_regressions"], self.counters["hgt_behavior_samples"])
         result["hgt_contribution"] = self._ratio(self.sums.get("hgt_contribution", 0.0), self.counters["hgt_ablation_samples"])
@@ -232,7 +234,11 @@ class UnifiedTelemetry:
             status = "GRADIENT_INSTABILITY"
         elif validation_loss > train_loss * 1.5 and train_loss > 0:
             status = "OVERFITTING"
-        elif current_gain > 0 and retention < 0.8:
+        elif (
+            current_gain > 0
+            and bool(str(self.gauges.get("parent_model_version", "")))
+            and float(self.gauges.get("historical_retention_delta", 0.0)) < -0.05
+        ):
             status = "CATASTROPHIC_FORGETTING"
         elif current_gain > 0 and cross_gain <= 0:
             status = "POOR_CROSS_FAMILY_GENERALIZATION"

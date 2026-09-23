@@ -1,0 +1,92 @@
+name: Finalize Option A parallel preparation
+
+on:
+  push:
+    paths:
+      - '.github/workflows/implement-option-a-final.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply Option A patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import textwrap
+          text = Path('.github/workflows/implement-option-a.yml').read_text()
+          marker = "          python - <<'PY'\n"
+          start = text.index(marker) + len(marker)
+          end = text.index("\n          PY\n", start)
+          exec(compile(textwrap.dedent(text[start:end]), 'option-a-patch', 'exec'), {})
+          PY
+      - name: Remove remaining integrity worker override
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/v9/runtime/runtime_integrity_followup.py')
+          text = p.read_text()
+          start = text.index('def ingest_batch_worker_main(')
+          prefix = text[:start]
+          p.write_text(prefix + '''def install(runtime_integrity_module: Any, pipeline_cls: type) -> None:\n    preserve_pipeline_viability_dispatch(pipeline_cls)\n    runtime_integrity_module._VIABILITY_PROFILE_LIMIT = 256\n    runtime_integrity_module._cleanup_owned_shared_memory = cleanup_owned_shared_memory\n\n    # memory_pipeline.py owns the spawn-safe ingest and derivation worker targets.\n    # Integrity follow-up only preserves viability dispatch and cleanup helpers.\n''')
+          PY
+      - name: Use daemon decoder workers
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/v9/runtime/publication_throughput.py')
+          text = p.read_text()
+          text = text.replace('from concurrent.futures import Future, ThreadPoolExecutor\n', '')
+          marker = 'class _CanonicalReducer:\n'
+          decoder = '''class _IntentDecoderPool:\n    \"\"\"Daemon decoder workers keep pickle/shared-memory work off the coordinator.\"\"\"\n\n    def __init__(self, workers: int, output: queue.Queue[Any]) -> None:\n        self.input: queue.Queue[Any] = queue.Queue()\n        self.output = output\n        self.threads = [\n            Thread(target=self._run, name=f\"v9-intent-decode-{index}\", daemon=True)\n            for index in range(max(1, int(workers)))\n        ]\n        for thread in self.threads:\n            thread.start()\n\n    def _run(self) -> None:\n        while True:\n            descriptor = self.input.get()\n            if descriptor is None:\n                return\n            try:\n                batch, decode_ms = consume_shared_batch(descriptor)\n            except BaseException as exc:\n                self.output.put((int(descriptor.start_sequence), exc, -1.0))\n                continue\n            self.output.put((int(descriptor.start_sequence), batch, float(decode_ms)))\n\n    def submit(self, descriptor: SharedBatchDescriptor) -> None:\n        self.input.put(descriptor)\n\n    def close(self) -> None:\n        for _ in self.threads:\n            self.input.put(None)\n        for thread in self.threads:\n            thread.join(timeout=5.0)\n\n\n'''
+          if marker not in text:
+              raise SystemExit('CanonicalReducer marker missing')
+          text = text.replace(marker, decoder + marker, 1)
+          old = '''def _submit_decode(service: Any, descriptor: SharedBatchDescriptor) -> None:\n    service._decode_pending += 1\n\n    def decode() -> tuple[Any, float]:\n        return consume_shared_batch(descriptor)\n\n    future: Future[Any] = service._decode_pool.submit(decode)\n\n    def done(completed: Future[Any]) -> None:\n        try:\n            batch, decode_ms = completed.result()\n        except BaseException as exc:\n            service._decoded_ingest_queue.put((int(descriptor.start_sequence), exc, -1.0))\n            return\n        service._decoded_ingest_queue.put((int(descriptor.start_sequence), batch, float(decode_ms)))\n\n    future.add_done_callback(done)\n'''
+          new = '''def _submit_decode(service: Any, descriptor: SharedBatchDescriptor) -> None:\n    service._decode_pending += 1\n    service._decode_pool.submit(descriptor)\n'''
+          if old not in text:
+              raise SystemExit('old submit_decode block missing')
+          text = text.replace(old, new, 1)
+          old_init = '        self._decode_pool = ThreadPoolExecutor(max_workers=max(2, ingest_workers), thread_name_prefix="v9-intent-decode")\n'
+          new_init = '        self._decode_pool = _IntentDecoderPool(max(2, ingest_workers), self._decoded_ingest_queue)\n'
+          if old_init not in text:
+              raise SystemExit('decode pool init missing')
+          text = text.replace(old_init, new_init, 1)
+          text = text.replace('        self._decode_pool.shutdown(wait=True, cancel_futures=False)\n', '        self._decode_pool.close()\n', 1)
+          p.write_text(text)
+
+          t = Path('src/v9/tests/test_publication_throughput.py')
+          tests = t.read_text().replace('    assert "ThreadPoolExecutor" in source\n', '    assert "class _IntentDecoderPool" in source\n')
+          t.write_text(tests)
+          PY
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Compile v9
+        run: python -m compileall -q src/v9
+      - name: Run focused tests
+        env:
+          PYTHONPATH: src
+        run: timeout 120s python -m pytest -q src/v9/tests/test_publication_throughput.py src/v9/tests/test_canonical_pipeline_v2.py src/v9/tests/test_gap_closure_plan.py
+      - name: Run all v9 tests
+        env:
+          PYTHONPATH: src
+        run: timeout 300s python -m pytest -q src/v9/tests
+      - name: Commit implementation
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/implement-option-a.yml .github/workflows/implement-option-a-fix.yml .github/workflows/implement-option-a-final.yml
+          git add src/v9
+          git commit -m "Implement parallel canonical intent pipeline"
+          git push origin HEAD:main

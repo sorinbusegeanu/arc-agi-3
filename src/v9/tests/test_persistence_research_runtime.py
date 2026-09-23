@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from v9.research.grounding_h16 import GroundingCondition, evaluate_h16, run_matched_controls, run_synthetic_h16_controls
+from v9.research.grounding_h16 import GroundingCondition, H16Metrics, evaluate_h16, run_matched_controls, run_synthetic_h16_controls
+from v9.research.evidence import EvidenceLedger
 from v9.research.hypotheses import HypothesisStatus
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig
 
@@ -38,18 +39,54 @@ def test_predecessor_root_is_rejected(tmp_path: Path) -> None:
         ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path))
 
 
-def test_evidence_is_append_only_across_restart(tmp_path: Path) -> None:
+def test_audit_ledger_is_disabled_across_restart(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "evidence" / "ledger.jsonl"
     first = _learn(tmp_path, 2, restore=False)
-    count = len(first.evidence.records)
+    assert first.evidence.records == []
+    assert not ledger_path.exists()
     first.close()
+
     restored = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path))
-    assert len(restored.evidence.records) == count
+    assert restored.evidence.records == []
+    assert not ledger_path.exists()
+
+
+def test_legacy_ledger_is_deleted_and_new_records_are_discarded(tmp_path: Path) -> None:
+    path = tmp_path / "evidence" / "ledger.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"legacy":true}\n', encoding="utf-8")
+
+    ledger = EvidenceLedger(path, "config")
+    ledger.append("INGESTION", 1, {"event": 1})
+    ledger.append("ISF_DECISION", 2, {"score": 0.5})
+    ledger.flush()
+    ledger.load_state({"schema_version": 1, "records": [{"legacy": True}]})
+
+    assert ledger.records == []
+    assert ledger.state_dict() == {"schema_version": 1, "disabled": True}
+    assert not path.exists()
 
 
 def test_h16_requires_matched_c0_through_c3_and_aligned_advantage() -> None:
     def runner(condition: GroundingCondition, seed: int, budget: int):
         del seed, budget
-        return (1.0, 1.0, 0.5) if condition is GroundingCondition.C2_ALIGNED else (0.1, 0.1, 0.0)
+        if condition is GroundingCondition.C2_ALIGNED:
+            return H16Metrics(
+                interaction_prediction=1.0,
+                action_success=1.0,
+                symbol_conditioned_transfer=1.0,
+                world_to_symbol_generalization=1.0,
+                composition_success=1.0,
+                persistence_without_symbols=1.0,
+            ), 0.5
+        return H16Metrics(
+            interaction_prediction=0.1,
+            action_success=0.1,
+            symbol_conditioned_transfer=0.1,
+            world_to_symbol_generalization=0.1,
+            composition_success=0.1,
+            persistence_without_symbols=0.1,
+        ), 0.0
 
     trials = run_matched_controls(runner, seeds=(1, 2), environment_config_id=9, interaction_budget=10)
     report = evaluate_h16(trials)
@@ -67,8 +104,45 @@ def test_cli_smoke_uses_only_v9_named_artifacts(tmp_path: Path) -> None:
     environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[2]))
     result = subprocess.run([sys.executable, "-m", "v9", "smoke", "--root", str(tmp_path), "--events", "4", "--no-restore"], env=environment, text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
-    assert "v9 smoke done" in result.stdout
+    assert "smoke done" in result.stdout
+    assert "v9 smoke done" not in result.stdout
     assert (tmp_path / "snapshots").is_dir()
     assert not (tmp_path / "v8_run_summary.json").exists()
+    assert not (tmp_path / "evidence" / "ledger.jsonl").exists()
     report = json.loads((tmp_path / "reports" / "reporting_cut.json").read_text())
-    assert report["scientific_config"]["design_version"] == "9.7.6"
+    assert report["scientific_config"]["design_version"] == "9.7.9"
+
+
+def test_native_snapshot_uses_content_addressed_binary_graph_shards(tmp_path: Path) -> None:
+    runtime = _learn(tmp_path, 3, restore=False)
+    result = runtime.close()
+    assert result is not None
+    assert result.path.is_dir()
+    assert (result.path / "manifest.json").is_file()
+    assert (result.path / "COMPLETE").is_file()
+    chunks = list((tmp_path / "snapshot_chunks").glob("*.bin"))
+    assert chunks
+
+    manifest = json.loads((result.path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["snapshot_version"] == 4
+    assert manifest["state_format"] == "pickle5-fixed-graph-shards-v1"
+    assert len(manifest["graph_shards"]) == runtime.graph.partition_count
+    assert sum(int(row["nodes"]) for row in manifest["graph_shards"]) == runtime.graph.memory_count()
+    assert sum(int(row["edges"]) for row in manifest["graph_shards"]) == len(runtime.graph.edges)
+
+    restored = ContinuousMemoryRuntime(RuntimeConfig.from_path(tmp_path))
+    assert restored.metrics()["memory_levels"]["M0"] >= 3
+
+
+def test_snapshot_chunks_are_content_addressed_and_reused(tmp_path: Path) -> None:
+    from v9.runtime.snapshot_chunks import write_chunks
+
+    payload = b"x" * (4 * 1024 * 1024 + 17)
+    first = write_chunks(tmp_path, payload)
+    before = {path.name for path in (tmp_path / "snapshot_chunks").glob("*.bin")}
+    second = write_chunks(tmp_path, payload)
+    after = {path.name for path in (tmp_path / "snapshot_chunks").glob("*.bin")}
+
+    assert first == second
+    assert before == after
+    assert len(after) == 2

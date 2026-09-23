@@ -8,6 +8,8 @@ from tempfile import NamedTemporaryFile
 from typing import Any
 
 NATIVE_SCHEMA = "arc-agi3-hydra-v9"
+NATIVE_DESIGN_VERSION = "9.7.9"
+MIGRATABLE_DESIGN_VERSIONS = frozenset({"9.7.8", NATIVE_DESIGN_VERSION})
 SNAPSHOT_VERSION = 2
 
 
@@ -25,11 +27,14 @@ def assert_native_root(root: Path) -> None:
     manifest = root / "scientific_config.json"
     if manifest.exists():
         raw = json.loads(manifest.read_text(encoding="utf-8"))
-        if str(raw.get("design_version")) != "9.7.6":
-            raise RuntimeError("predecessor run root is not a native v9.7.6 root; use a fresh v9 root")
+        design_version = str(raw.get("design_version", ""))
+        if design_version not in MIGRATABLE_DESIGN_VERSIONS:
+            raise RuntimeError(
+                f"run root design version {design_version or 'unknown'} requires explicit migration to v{NATIVE_DESIGN_VERSION}"
+            )
     predecessor_markers = (root / "v8_run_summary.json", root / "v9_auxiliary_state.json")
     if any(path.exists() for path in predecessor_markers):
-        raise RuntimeError("predecessor run roots are not migrated; use a fresh v9 root")
+        raise RuntimeError("predecessor run roots require explicit migration to the current v9 runtime")
 
 
 def latest_snapshot(root: Path) -> Path | None:

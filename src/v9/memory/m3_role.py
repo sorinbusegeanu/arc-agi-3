@@ -14,6 +14,7 @@ class M3FunctionalRole:
     relational_signature: int
     consequence_signature: int
     provenance: DerivationProvenance
+    support_decomposition: tuple[tuple[str, int], ...] = ()
 
     @classmethod
     def form(cls, families: tuple[M2TransformationFamily, ...], *, consequence_signature: int) -> "M3FunctionalRole":
@@ -25,4 +26,14 @@ class M3FunctionalRole:
         uid = MemoryUid.from_key(MemoryLevel.M3, MemoryType.ROLE, (relational, int(consequence_signature)))
         parents = tuple(sorted(row.uid for row in families))
         evidence = tuple(sorted({uid for row in families for uid in row.provenance.evidence}))
-        return cls(uid, relational, int(consequence_signature), DerivationProvenance(parents, evidence))
+        support: dict[str, int] = {}
+        for family in families:
+            for key, value in family.support_decomposition:
+                support[key] = support.get(key, 0) + int(value)
+        return cls(
+            uid,
+            relational,
+            int(consequence_signature),
+            DerivationProvenance(parents, evidence),
+            tuple(sorted(support.items())),
+        )
