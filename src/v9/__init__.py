@@ -94,6 +94,13 @@ if not hasattr(MemoryPipelineService, "shutdown_parallel_pipeline"):
 from v9.runtime.canonical_batch_budgeting import install as _install_canonical_batch_budgeting
 _install_canonical_batch_budgeting(MemoryPipelineService)
 
+# Actor multiprocessing should use the normal adapter path. The passive capture
+# wrapper samples symbols inside observe() and can stall actors before their first
+# transition on broad runs.
+from v9.runtime.multiprocess import ProcessTopology
+from v9.runtime.direct_actor_adapter import install as _install_direct_actor_adapter
+_install_direct_actor_adapter(ProcessTopology)
+
 _hgt_package.train_hgt_epoch = _hgt_training.train_hgt_epoch
 from v9.runtime import epoch_runner as _epoch_runner
 _epoch_runner.train_hgt_epoch = _hgt_training.train_hgt_epoch
