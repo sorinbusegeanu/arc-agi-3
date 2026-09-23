@@ -108,6 +108,12 @@ _install_hgt_policy_memory(
     _epoch_runner,
 )
 
+# Higher-memory identities and empirical state must survive repeated formation.
+# Distinct M5 evidence expands one M6 outcome class without resetting learned
+# M6 equivalence/preference evidence or M7 reliability statistics.
+from v9.runtime.higher_memory_integrity import install as _install_higher_memory_integrity
+_install_higher_memory_integrity(ContinuousMemoryRuntime)
+
 from v9.runtime.post_sampling_progress import install as _install_post_sampling_progress
 _install_post_sampling_progress(_epoch_runner, ContinuousMemoryRuntime)
 from v9.runtime.concurrent_transfer_validation import install as _install_concurrent_transfer_validation
