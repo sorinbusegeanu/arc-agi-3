@@ -8,9 +8,7 @@ from threading import Event, RLock, Thread
 from typing import Any, Callable
 
 
-# Preserve the established JSONL cadence and refresh_seconds API semantics.
 DASHBOARD_REFRESH_SECONDS = 30.0
-# Browser polling is intentionally independent from the persistent telemetry log.
 DASHBOARD_LIVE_REFRESH_SECONDS = 2.0
 
 
@@ -65,7 +63,6 @@ class MetricsHTTPServer:
         dashboard_provider = getattr(owner, "dashboard_metrics", None)
         provider = dashboard_provider if callable(dashboard_provider) else metrics_provider
         self._dashboard_provider = provider
-        # refresh_seconds remains the JSONL cadence for backward compatibility.
         self.refresh_seconds = max(0.1, float(refresh_seconds))
         self.log_refresh_seconds = self.refresh_seconds
         self.live_refresh_seconds = max(0.1, float(live_refresh_seconds))
@@ -77,6 +74,12 @@ class MetricsHTTPServer:
         self.log_path = None if log_path is None else Path(log_path)
         self._stop_logging = Event()
         self._log_thread: Thread | None = None
+        self._stop_live = Event()
+        self._live_thread: Thread | None = None
+        self._live_cache_lock = RLock()
+        self._live_cache: dict[str, Any] = {}
+        self._live_cache_error: dict[str, str] | None = None
+        self._serving = False
         self._model_history_lock = RLock()
         self._model_history: dict[str, dict[str, Any]] = {}
         server_owner = self
@@ -92,21 +95,7 @@ class MetricsHTTPServer:
 
             def do_GET(self) -> None:
                 if self.path in {"/api/metrics", "/metrics"}:
-                    try:
-                        snapshot = server_owner._dashboard_snapshot()
-                    except Exception as exc:
-                        raw = json.dumps(
-                            {
-                                "dashboard_metrics_error": {
-                                    "type": type(exc).__name__,
-                                    "message": str(exc),
-                                }
-                            },
-                            sort_keys=True,
-                            default=str,
-                        ).encode("utf-8")
-                        self._write(503, "application/json; charset=utf-8", raw)
-                        return
+                    snapshot = server_owner._dashboard_snapshot()
                     raw = json.dumps(snapshot, sort_keys=True, default=str).encode("utf-8")
                     self._write(200, "application/json; charset=utf-8", raw)
                     return
@@ -117,7 +106,7 @@ class MetricsHTTPServer:
 <style>
 body{{font-family:system-ui,sans-serif;margin:24px;background:#111;color:#eee}}
 h1{{font-size:20px}}h2{{font-size:16px;margin-top:24px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}}
-.card{{background:#1d1d1d;padding:12px;border-radius:8px}}.k{{color:#aaa;font-size:12px}}.v{{font-size:20px;margin-top:4px}}
+.card{{background:#1d1d1d;padding:12px;border-radius:8px}}.k{{color:#aaa;font-size:12px}}.v{{font-size:20px;margin-top:4px;word-break:break-word}}
 pre{{background:#1d1d1d;padding:12px;overflow:auto;line-height:1.5}}
 </style></head>
 <body><h1>Hydra v9.7.6</h1><div id="grid" class="grid"></div>
@@ -128,11 +117,17 @@ function display(v, digits){{
  return String(v ?? '');
 }}
 async function refresh(){{
- const r=await fetch('/api/metrics',{{cache:'no-store'}}); const m=await r.json();
- const p=m.primary_dashboard||{{}}; const g=document.getElementById('grid'); g.innerHTML='';
- for(const [k,v] of Object.entries(p)){{const d=document.createElement('div');d.className='card';d.innerHTML='<div class="k">'+k+'</div><div class="v">'+v+'</div>';g.appendChild(d)}}
- const history=m.model_history||[]; const h=document.getElementById('model-history');
- h.textContent=history.length ? history.map(x => x.model+' | levels='+x.run_levels_solved+' | wins='+display(x.run_wins,4)+' | behavioral='+display(x.behavioral_success_rate,4)+' | VRAM='+display(x.vram_gb,2)+' GB').join('\n') : 'No trained models yet';
+ const g=document.getElementById('grid');
+ try {{
+  const r=await fetch('/api/metrics',{{cache:'no-store'}}); const m=await r.json();
+  const p=m.primary_dashboard||{{}}; g.innerHTML='';
+  for(const [k,v] of Object.entries(p)){{const d=document.createElement('div');d.className='card';d.innerHTML='<div class="k">'+k+'</div><div class="v">'+display(v,2)+'</div>';g.appendChild(d)}}
+  if(m.dashboard_metrics_error){{const e=m.dashboard_metrics_error;const d=document.createElement('div');d.className='card';d.innerHTML='<div class="k">dashboard_metrics_error</div><div class="v">'+display(e.type,0)+': '+display(e.message,0)+'</div>';g.appendChild(d)}}
+  const history=m.model_history||[]; const h=document.getElementById('model-history');
+  h.textContent=history.length ? history.map(x => x.model+' | levels='+x.run_levels_solved+' | wins='+display(x.run_wins,4)+' | behavioral='+display(x.behavioral_success_rate,4)+' | VRAM='+display(x.vram_gb,2)+' GB').join('\n') : 'No trained models yet';
+ }} catch(e) {{
+  g.innerHTML='<div class="card"><div class="k">dashboard_fetch_error</div><div class="v">'+String(e)+'</div></div>';
+ }}
 }}
 refresh(); setInterval(refresh,{refresh_ms});
 </script></body></html>""".encode("utf-8")
@@ -168,29 +163,69 @@ refresh(); setInterval(refresh,{refresh_ms});
         with self._model_history_lock:
             return [dict(row) for row in self._model_history.values()]
 
+    def _publish_live_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        published = dict(snapshot)
+        self._record_model_history(published)
+        published["model_history"] = self._model_history_snapshot()
+        with self._live_cache_lock:
+            self._live_cache = published
+            self._live_cache_error = None
+        return published
+
+    def _publish_live_error(self, exc: BaseException) -> None:
+        with self._live_cache_lock:
+            self._live_cache_error = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+
+    def _capture_live_snapshot(self) -> dict[str, Any]:
+        return self._publish_live_snapshot(dict(self._dashboard_provider()))
+
     def _dashboard_snapshot(self) -> dict[str, Any]:
-        snapshot = dict(self._dashboard_provider())
-        self._record_model_history(snapshot)
-        snapshot["model_history"] = self._model_history_snapshot()
+        # Direct pre-start calls keep the established provider semantics used by
+        # tests/tooling. Once serving, HTTP requests only read this server-owned
+        # cache and therefore never block on the runtime lock.
+        if not self._serving:
+            return self._capture_live_snapshot()
+        with self._live_cache_lock:
+            snapshot = dict(self._live_cache)
+            error = None if self._live_cache_error is None else dict(self._live_cache_error)
+        if not snapshot:
+            snapshot = {
+                "primary_dashboard": {"dashboard_status": "starting"},
+                "model_history": self._model_history_snapshot(),
+            }
+        if error is not None:
+            snapshot["dashboard_metrics_error"] = error
         return snapshot
+
+    def _live_dashboard_loop(self) -> None:
+        # The logger performs the first immediate provider read. The faster live
+        # sampler starts afterwards, avoiding races with the auditable first log row.
+        if self._stop_live.wait(self.live_refresh_seconds):
+            return
+        while not self._stop_live.is_set():
+            try:
+                self._capture_live_snapshot()
+            except Exception as exc:
+                self._publish_live_error(exc)
+            if self._stop_live.wait(self.live_refresh_seconds):
+                break
 
     def _log_dashboard_metrics(self) -> None:
         if self.log_path is None:
             return
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        # One process run owns one dashboard log. Reusing --root must not append
-        # previous runs indefinitely.
         with self.log_path.open("w", encoding="utf-8", buffering=1) as handle:
             while not self._stop_logging.is_set():
                 timestamp = datetime.now(timezone.utc).isoformat()
                 try:
-                    snapshot = self._dashboard_provider()
-                    self._record_model_history(snapshot)
-                    snapshot = _compact_log_snapshot(snapshot, timestamp=timestamp)
+                    full_snapshot = dict(self._dashboard_provider())
+                    self._publish_live_snapshot(full_snapshot)
+                    snapshot = _compact_log_snapshot(full_snapshot, timestamp=timestamp)
                 except Exception as exc:
-                    # A telemetry read must never terminate the long-lived
-                    # logger. Preserve an auditable failure row and retry at the
-                    # next fixed refresh interval.
+                    self._publish_live_error(exc)
                     snapshot = {
                         "timestamp_utc": timestamp,
                         "dashboard_metrics_error": {
@@ -203,15 +238,27 @@ refresh(); setInterval(refresh,{refresh_ms});
                     break
 
     def start(self) -> None:
+        self._serving = True
         self._thread.start()
         if self.log_path is not None:
             self._log_thread = Thread(target=self._log_dashboard_metrics, name="v9-dashboard-telemetry-log", daemon=True)
             self._log_thread.start()
+        else:
+            try:
+                self._capture_live_snapshot()
+            except Exception as exc:
+                self._publish_live_error(exc)
+        self._live_thread = Thread(target=self._live_dashboard_loop, name="v9-dashboard-live", daemon=True)
+        self._live_thread.start()
 
     def close(self) -> None:
         self._stop_logging.set()
+        self._stop_live.set()
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=5.0)
         if self._log_thread is not None:
             self._log_thread.join(timeout=5.0)
+        if self._live_thread is not None:
+            self._live_thread.join(timeout=5.0)
+        self._serving = False
