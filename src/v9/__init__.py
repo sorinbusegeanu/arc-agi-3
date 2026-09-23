@@ -92,6 +92,8 @@ from v9.runtime import epoch_runner as _epoch_runner
 _epoch_runner.train_hgt_epoch = _hgt_training.train_hgt_epoch
 from v9.runtime.post_sampling_progress import install as _install_post_sampling_progress
 _install_post_sampling_progress(_epoch_runner, ContinuousMemoryRuntime)
+from v9.runtime.concurrent_transfer_validation import install as _install_concurrent_transfer_validation
+_install_concurrent_transfer_validation(_epoch_runner)
 _runtime_package.ContinuousMemoryRuntime = ContinuousMemoryRuntime
 
 _LAZY_EXPORTS = {
