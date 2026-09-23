@@ -1,24 +1,31 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from types import SimpleNamespace
 from urllib.request import urlopen
 
-from v9.runtime import post_sampling_progress
+from v9.runtime import concurrent_validation_startup as startup
 from v9.telemetry.http_server import MetricsHTTPServer
 
 
-def test_post_sampling_progress_writes_directly_to_stdout_fd(monkeypatch) -> None:
+def test_post_sampling_progress_writes_directly_to_tty_fd(monkeypatch) -> None:
     writes: list[tuple[int, bytes]] = []
+
+    class TTY:
+        def isatty(self) -> bool:
+            return True
+
+        def fileno(self) -> int:
+            return 1
 
     def fake_write(fd: int, payload: bytes) -> int:
         writes.append((fd, payload))
         return len(payload)
 
-    monkeypatch.setattr(os, "write", fake_write)
-    post_sampling_progress.print("heartbeat", "visible", flush=True)
+    monkeypatch.setattr(startup.sys, "stdout", TTY())
+    monkeypatch.setattr(startup.os, "write", fake_write)
+    startup._terminal_print("heartbeat", "visible", flush=True)
 
     assert writes == [(1, b"heartbeat visible\n")]
 
