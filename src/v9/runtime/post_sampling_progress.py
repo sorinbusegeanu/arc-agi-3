@@ -29,25 +29,26 @@ def _phase_state() -> tuple[str, float]:
     return detail, elapsed
 
 
-def _set_run_phase(value: str) -> None:
-    runtime = _current_runtime
-    if runtime is None:
+def _set_run_phase(value: str, runtime: Any | None = None) -> None:
+    selected = runtime if runtime is not None else _current_runtime
+    if selected is None:
         return
     try:
-        runtime.set_telemetry_gauge("run_phase", str(value))
+        selected.set_telemetry_gauge("run_phase", str(value))
     except Exception:
         return
 
 
 def _heartbeat_loop(stop: Event) -> None:
     while not stop.wait(max(0.1, float(_progress_interval_seconds))):
+        runtime = _current_runtime
         with _state_lock:
             sampling_active = bool(_sampling_active)
             sampling_started = float(_sampling_started)
             sampling_label = str(_sampling_label)
         if sampling_active:
             elapsed = max(0.0, time.monotonic() - sampling_started)
-            _set_run_phase(f"{sampling_label}/pipeline")
+            _set_run_phase(f"{sampling_label}/pipeline", runtime)
             print(
                 f"{time.strftime('[%H:%M]')} {sampling_label}/pipeline still active elapsed={elapsed:.0f}s",
                 flush=True,
@@ -56,7 +57,7 @@ def _heartbeat_loop(stop: Event) -> None:
         detail, elapsed = _phase_state()
         if not _active or not detail:
             continue
-        _set_run_phase(detail)
+        _set_run_phase(detail, runtime)
         print(
             f"{time.strftime('[%H:%M]')} post-sampling phase={detail} elapsed={elapsed:.0f}s",
             flush=True,
@@ -169,7 +170,7 @@ def install(epoch_runner_module: Any, runtime_cls: type) -> None:
         finally:
             _finish()
             _stop_heartbeat()
-            _set_run_phase("complete")
+            _set_run_phase("complete", runtime)
             _active = previous_active
             _current_runtime = previous_runtime
             _progress_interval_seconds = previous_interval
@@ -187,7 +188,7 @@ def install(epoch_runner_module: Any, runtime_cls: type) -> None:
             _sampling_active = True
             _sampling_started = time.monotonic()
             _sampling_label = label
-        _set_run_phase(label)
+        _set_run_phase(label, runtime)
         try:
             result = original_parallel(runtime, jobs, *args, **kwargs)
         finally:
@@ -201,7 +202,7 @@ def install(epoch_runner_module: Any, runtime_cls: type) -> None:
             flush=True,
         )
         if not evaluation_only:
-            _set_run_phase("post-sampling")
+            _set_run_phase("post-sampling", runtime)
         return result
 
     epoch_runner_module.run_parallel_memory_jobs = parallel_with_progress
