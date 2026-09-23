@@ -90,6 +90,8 @@ _install_publication_throughput(MemoryPipelineService)
 _hgt_package.train_hgt_epoch = _hgt_training.train_hgt_epoch
 from v9.runtime import epoch_runner as _epoch_runner
 _epoch_runner.train_hgt_epoch = _hgt_training.train_hgt_epoch
+from v9.runtime.post_sampling_progress import install as _install_post_sampling_progress
+_install_post_sampling_progress(_epoch_runner, ContinuousMemoryRuntime)
 _runtime_package.ContinuousMemoryRuntime = ContinuousMemoryRuntime
 
 _LAZY_EXPORTS = {
