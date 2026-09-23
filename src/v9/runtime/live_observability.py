@@ -48,6 +48,8 @@ def _set_run_phase_without_runtime_lock(value: str, runtime: Any | None = None) 
     telemetry = getattr(selected, "unified_telemetry", None)
     gauges = getattr(telemetry, "gauges", None)
     if gauges is None:
+        gauges = getattr(selected, "gauges", None)
+    if gauges is None:
         return
     try:
         gauges["run_phase"] = str(value)
