@@ -19,20 +19,8 @@ class M5ConsequenceStructure:
     def form(cls, concepts: tuple[M4Concept, ...], descriptor: tuple[int, ...]) -> "M5ConsequenceStructure":
         if not concepts:
             raise ValueError("M5 requires concept evidence")
-        normalized_descriptor = tuple(int(v) for v in descriptor)
-        parents = tuple(sorted({row.uid for row in concepts}))
-        identity = (
-            len(normalized_descriptor),
-            *normalized_descriptor,
-            len(parents),
-            *(value for uid in parents for value in (int(uid.hi), int(uid.lo))),
-        )
-        uid = MemoryUid.from_key(MemoryLevel.M5, MemoryType.CONSEQUENCE, identity)
-        evidence = tuple(sorted({uid for row in concepts for uid in row.provenance.evidence}))
-        return cls(
-            uid,
-            normalized_descriptor,
-            DerivationProvenance(parents, evidence),
-            all(row.validated for row in concepts),
-        )
+        uid = MemoryUid.from_key(MemoryLevel.M5, MemoryType.CONSEQUENCE, descriptor)
+        parents = tuple(sorted(row.uid for row in concepts))
+        evidence = tuple(uid for row in concepts for uid in row.provenance.evidence)
+        return cls(uid, tuple(int(v) for v in descriptor), DerivationProvenance(parents, evidence), all(row.validated for row in concepts))
 

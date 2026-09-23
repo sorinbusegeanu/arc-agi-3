@@ -59,25 +59,6 @@ class SyntheticSymbolicEnvironment(StructuralAdapter):
     def optional_symbol_stream(self) -> tuple[object, ...]:
         return self._symbols if self.config.emit_symbols else ()
 
-
-    def capture_state(self) -> dict[str, Any]:
-        return {
-            "state": int(self._state),
-            "step": int(self._step),
-            "boundary": self._boundary,
-            "symbols": tuple(self._symbols),
-            "rng_state": self._rng.getstate(),
-            "last_trace": self._last_trace,
-        }
-
-    def restore_state(self, state: dict[str, Any]) -> None:
-        self._state = int(state["state"])
-        self._step = int(state["step"])
-        self._boundary = state["boundary"]
-        self._symbols = tuple(state["symbols"])
-        self._rng.setstate(state["rng_state"])
-        self._last_trace = state.get("last_trace")
-
     def step(self, native_action: Any) -> int:
         before = self._state
         action = int(native_action)
@@ -86,12 +67,7 @@ class SyntheticSymbolicEnvironment(StructuralAdapter):
         self._state = (self._state + (1 if action else -1)) % 4
         self._step += 1
         terminal = self._step >= self.config.horizon
-        # With an even horizon and ±1 transitions, only even modulo-4 terminal
-        # states are reachable from zero. Use a reachable terminal target so
-        # positive evidence exists for every configured synthetic scenario.
-        target_state = 2 if self.config.horizon % 2 == 0 else 3
-        valence = 1 if terminal and self._state == target_state else (-1 if terminal else 0)
-        self._boundary = BoundaryEvent(BoundaryScope.EPISODE if terminal else BoundaryScope.NONE, valence, not terminal)
+        self._boundary = BoundaryEvent(BoundaryScope.EPISODE, 1 if terminal and self._state == 3 else 0, not terminal)
         self._symbols = (self._symbol_for_state(),)
         self._last_trace = WithinActionTrace(before, (WithinActionFrame(self._state, 0),), self._state)
         return self.observe()

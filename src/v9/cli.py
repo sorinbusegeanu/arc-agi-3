@@ -17,15 +17,7 @@ from v9.environments import ARCAdapter, ChessAdapter, GymDiscreteAdapter, GymStr
 from v9.environments.synthetic_symbolic import SyntheticSymbolicConfig
 from v9.modalities.symbols import DeterministicSymbolCodec
 from v9.runtime import ContinuousMemoryRuntime, RuntimeConfig, ScientificConfig
-from v9.runtime.scientific_modes import (
-    LearnedDevelopmentalFeedbackProfile,
-    ScientificVisibilityMode,
-)
-from v9.runtime.epoch_runner import run_epochs
-from v9.runtime.snapshot import latest_snapshot
-from v9.runtime.transfer_validation import run_transfer_validation_interval
-from v9.runtime.trace_runner import run_trace_bundle
-from v9.runtime.retention_audit import run_retention_audit
+from v9.runtime.process_coordinator import run_process_jobs
 from v9.telemetry import MetricsHTTPServer
 
 MIX_GAMES = ("gp03", "tp02", "FrozenLake-v1", "Chess-v0", "Sudoku-v0")
@@ -49,12 +41,7 @@ class ActorResult:
     steps: int
     positive_boundaries: int
     negative_boundaries: int
-    episode_boundaries: int
     resets: int
-    task_successes: int = 0
-    task_failures: int = 0
-    task_truncations: int = 0
-    levels_completed: int = 0
 
 
 def resolve_game_specs(selector: str, *, curriculum_config: str | None = None) -> tuple[EnvironmentSpec, ...]:
@@ -75,28 +62,6 @@ def resolve_game_specs(selector: str, *, curriculum_config: str | None = None) -
 
 def resolve_games(selector: str, *, curriculum_config: str | None = None) -> tuple[str, ...]:
     return tuple(spec.display_name for spec in resolve_game_specs(selector, curriculum_config=curriculum_config))
-
-
-def _configure_alfred_specs(
-    specs: tuple[EnvironmentSpec, ...],
-    *,
-    mode: str | None,
-    x_display: str | None,
-) -> tuple[EnvironmentSpec, ...]:
-    if x_display is not None and mode != "thor":
-        raise ValueError("--alfred-x-display requires --alfred-mode thor")
-    if mode is None:
-        return specs
-    configured = []
-    for spec in specs:
-        if spec.adapter.lower() != "alfred":
-            configured.append(spec)
-            continue
-        kwargs = {**spec.kwargs, "mode": mode}
-        if x_display is not None:
-            kwargs["x_display"] = x_display
-        configured.append(replace(spec, kwargs=kwargs))
-    return tuple(configured)
 
 
 def _condition_config(condition: str | None) -> tuple[bool, bool, bool]:
@@ -170,19 +135,15 @@ def make_adapter(spec: EnvironmentSpec | str, *, seed: int, env_root: str | None
             )
         )
     if adapter == "alfred":
-        if alfred_backend_factory:
-            module_name, separator, attribute = alfred_backend_factory.partition(":")
-            if not separator:
-                raise ValueError("--alfred-backend-factory must use module:function")
-            factory = getattr(importlib.import_module(module_name), attribute)
-        else:
-            from v9.environments import make_alfworld_backend
-            factory = make_alfworld_backend
+        if not alfred_backend_factory:
+            raise RuntimeError("ALFRED curriculum execution requires --alfred-backend-factory module:function")
+        module_name, separator, attribute = alfred_backend_factory.partition(":")
+        if not separator:
+            raise ValueError("--alfred-backend-factory must use module:function")
+        factory = getattr(importlib.import_module(module_name), attribute)
         from v9.environments import AlfredAdapter
         backend = factory(game_id=game_id, seed=seed, **kwargs)
-        result = AlfredAdapter(backend)
-        result.reset()
-        return result
+        return AlfredAdapter(backend)
     if adapter == "arc":
         return ARCAdapter(game_id, seed=seed, env_root=env_root)
     raise ValueError(f"unsupported curriculum adapter: {spec.adapter}")
@@ -203,53 +164,19 @@ def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--reset-persistent-identity", action="store_true")
     parser.add_argument("--no-snapshots", action="store_true")
     parser.add_argument("--no-peers", action="store_true")
-    parser.add_argument(
-        "--scientific-mode",
-        choices=tuple(mode.value for mode in ScientificVisibilityMode),
-        default=ScientificVisibilityMode.ASYNC_DEVELOPMENT.value,
-    )
-    parser.add_argument(
-        "--learned-developmental-feedback",
-        choices=tuple(profile.value for profile in LearnedDevelopmentalFeedbackProfile),
-        default=LearnedDevelopmentalFeedbackProfile.DISABLED.value,
-    )
-    parser.add_argument("--experiment-manifest", default=None, metavar="FILE")
 
 
 def _runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     scientific = ScientificConfig()
     overrides = {name: value for name, value in vars(args).items() if name.startswith("allocation_") and value is not None}
     overrides["random_seeds"] = (int(getattr(args, "seed", 0)),)
-    if hasattr(args, "hgt_eval_steps_per_game"):
-        overrides["hgt_evaluation_steps_per_game"] = int(args.hgt_eval_steps_per_game)
-    if hasattr(args, "hgt_training_batch_size"):
-        overrides["hgt_epoch_batch_size"] = int(args.hgt_training_batch_size)
-    overrides["scientific_visibility_mode"] = getattr(
-        args, "scientific_mode", ScientificVisibilityMode.ASYNC_DEVELOPMENT.value
-    )
-    overrides["learned_developmental_feedback"] = getattr(
-        args,
-        "learned_developmental_feedback",
-        LearnedDevelopmentalFeedbackProfile.DISABLED.value,
-    )
     if hasattr(args, "validation_mode"):
         overrides["transfer_validation_mode"] = "learning_only" if args.no_automatic_experiments else args.validation_mode
-        if args.max_transfer_experiments is not None:
-            overrides["transfer_validation_trials_per_interval"] = args.max_transfer_experiments
-        if args.transfer_experiment_time_budget_seconds is not None:
-            overrides["transfer_validation_time_budget_seconds"] = args.transfer_experiment_time_budget_seconds
+        overrides["transfer_validation_trials_per_interval"] = args.max_transfer_experiments
+        overrides["transfer_validation_time_budget_seconds"] = args.transfer_experiment_time_budget_seconds
     if overrides:
         scientific = replace(scientific, **overrides)
-    manifest_path = getattr(args, "experiment_manifest", None)
-    if manifest_path is not None:
-        from v9.research.experiment_manifest import ExperimentManifest
-
-        manifest = ExperimentManifest.load(manifest_path)
-        if manifest.scientific_config_id != scientific.config_id.value:
-            raise ValueError("ExperimentManifest ScientificConfigId does not match runtime configuration")
-        if manifest.visibility_mode is not scientific.scientific_visibility_mode:
-            raise ValueError("ExperimentManifest visibility mode does not match runtime configuration")
-    return RuntimeConfig.from_path(args.root, shards=args.shards, stage_workers=args.stage_workers, stage_ring_capacity=args.stage_ring_capacity, shard_ring_capacity=args.shard_ring_capacity, node_capacity_per_shard=args.node_capacity_per_shard, edge_capacity_per_shard=args.edge_capacity_per_shard, action_capacity_per_shard=args.action_capacity_per_shard, snapshot_interval_seconds=args.snapshot_interval_seconds, peer_interval_seconds=args.peer_interval_seconds, enable_snapshots=not args.no_snapshots, restore=not args.no_restore, enable_peers=not args.no_peers, enable_lifecycle=getattr(args, "lifecycle", "on") == "on", reset_persistent_identity=args.reset_persistent_identity, experiment_manifest=None if manifest_path is None else Path(manifest_path), enable_canonical_durability=scientific.scientific_visibility_mode is ScientificVisibilityMode.MATCHED_REASONING, scientific=scientific)
+    return RuntimeConfig.from_path(args.root, shards=args.shards, stage_workers=args.stage_workers, stage_ring_capacity=args.stage_ring_capacity, shard_ring_capacity=args.shard_ring_capacity, node_capacity_per_shard=args.node_capacity_per_shard, edge_capacity_per_shard=args.edge_capacity_per_shard, action_capacity_per_shard=args.action_capacity_per_shard, snapshot_interval_seconds=args.snapshot_interval_seconds, peer_interval_seconds=args.peer_interval_seconds, enable_snapshots=not args.no_snapshots, restore=not args.no_restore, enable_peers=not args.no_peers, enable_lifecycle=getattr(args, "lifecycle", "on") == "on", reset_persistent_identity=args.reset_persistent_identity, scientific=scientific)
 
 
 def _actor(runtime: ContinuousMemoryRuntime, spec: EnvironmentSpec, *, actor_id: int, steps: int, seed: int, env_root: str | None, epsilon: float, progress_interval: float, verbose: bool, wait: float) -> ActorResult:
@@ -259,7 +186,7 @@ def _actor(runtime: ContinuousMemoryRuntime, spec: EnvironmentSpec, *, actor_id:
     episode = runtime.environments.next_episode(identity)
     codec = DeterministicSymbolCodec(f"{adapter.identity().family}-raw-symbols")
     rng = Random(seed)
-    positives = negatives = episode_boundaries = resets = completed = 0
+    positives = negatives = resets = completed = 0
     next_progress = time.monotonic() + progress_interval
     try:
         for index in range(int(steps)):
@@ -278,12 +205,11 @@ def _actor(runtime: ContinuousMemoryRuntime, spec: EnvironmentSpec, *, actor_id:
                 runtime.record_symbol_stream(adapter, producer_id=actor_id, producer_sequence=index + 1, episode_id=episode, symbol_codec=codec)
             else:
                 runtime.record_interaction(adapter, producer_id=actor_id, producer_sequence=index + 1, global_step=index, native_action=action, before_observation=before, after_observation=after, episode_id=episode, symbol_codec=codec)
-            runtime.record_curriculum_event(step=spec.curriculum_step, environment_family=adapter.identity().family, game_scenario=spec.game_id)
+            runtime.unified_telemetry.record_curriculum_event(step=spec.curriculum_step, environment_family=adapter.identity().family, game_scenario=spec.game_id)
             completed += 1
             boundary = adapter.boundary_event()
             positives += int(boundary.primary_valence > 0)
             negatives += int(boundary.primary_valence < 0)
-            episode_boundaries += int(not boundary.continuation)
             if not boundary.continuation:
                 if wait:
                     time.sleep(wait)
@@ -291,16 +217,17 @@ def _actor(runtime: ContinuousMemoryRuntime, spec: EnvironmentSpec, *, actor_id:
                 episode = runtime.environments.next_episode(identity)
                 resets += 1
             if verbose and time.monotonic() >= next_progress:
-                print(f"{time.strftime('[%H:%M]')} progress actor={actor_id} game={game_id} steps={completed}", flush=True)
+                print(f"v9 progress actor={actor_id} game={game_id} steps={completed}", flush=True)
                 next_progress = time.monotonic() + progress_interval
     finally:
         close = getattr(adapter, "close", None)
         if callable(close):
             close()
-    return ActorResult(actor_id, game_id, completed, positives, negatives, episode_boundaries, resets)
+    return ActorResult(actor_id, game_id, completed, positives, negatives, resets)
 
 
 def _trajectory_rows(root: Path) -> list[dict[str, Any]]:
+    from v9.runtime.snapshot import latest_snapshot
     path = latest_snapshot(root)
     if path is None:
         return []
@@ -309,90 +236,7 @@ def _trajectory_rows(root: Path) -> list[dict[str, Any]]:
     return [dict(row) for row in nodes if int(row.get("level", -1)) == 7]
 
 
-def _persisted_epoch(root: Path) -> int:
-    summary_path = root / "v9_run_summary.json"
-    if not summary_path.is_file():
-        return 0
-    try:
-        rows = json.loads(summary_path.read_text(encoding="utf-8")).get("epochs", ())
-        return max((int(row.get("epoch", 0)) for row in rows), default=0)
-    except (AttributeError, OSError, TypeError, ValueError):
-        return 0
-
-
-def _run_transfer_validation(args: argparse.Namespace, specs: tuple[EnvironmentSpec, ...]) -> int:
-    root = Path(args.root)
-    if args.no_restore:
-        raise ValueError("--transfer-validation requires persisted state; remove --no-restore")
-    if args.no_snapshots:
-        raise ValueError("--transfer-validation must persist its evidence; remove --no-snapshots")
-    if latest_snapshot(root) is None:
-        raise RuntimeError(f"--transfer-validation requires an existing completed snapshot under {root}")
-
-    runtime = ContinuousMemoryRuntime(_runtime_config(args))
-    runtime.start()
-    try:
-        epoch = _persisted_epoch(root)
-        model_version = str(runtime.unified_telemetry.model_version or "untrained")
-        result = run_transfer_validation_interval(
-            runtime,
-            specs,
-            args,
-            epoch=epoch,
-            adapter_factory=make_adapter,
-        )
-        runtime.wait_quiescent(args.drain_timeout)
-        final = runtime.close(normal=True, timeout=args.final_save_timeout)
-        summary = {
-            "epoch": epoch,
-            "games": [spec.display_name for spec in specs],
-            "model_version": model_version,
-            "scientific_config_id": runtime.config.scientific.config_id.value,
-            "validation_configuration": {
-                "mode": runtime.config.scientific.transfer_validation_mode,
-                "trials_per_interval": runtime.config.scientific.transfer_validation_trials_per_interval,
-                "workers": runtime.config.scientific.transfer_validation_workers,
-                "time_budget_seconds": runtime.config.scientific.transfer_validation_time_budget_seconds,
-            },
-            "validation": asdict(result),
-            "metrics": runtime.metrics(),
-            "snapshot": None if final is None else {**asdict(final), "path": str(final.path)},
-        }
-        target = root / "transfer_validation_summary.json"
-        target.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        print(
-            f"{time.strftime('[%H:%M]')} transfer validation complete "
-            f"model={model_version} attempted={result.attempted} completed={result.completed} "
-            f"passed={result.passed} validated={result.validated_concepts} "
-            f"report={target}",
-            flush=True,
-        )
-        return 0
-    except BaseException:
-        runtime.close(normal=False)
-        raise
-
-
 def run_continuous(args: argparse.Namespace) -> int:
-    if args.transfer_validation and (
-        args.trace
-        or args.trace_retention is not None
-        or args.show_best_trajectory
-        or args.save_best_trajectory
-    ):
-        raise ValueError("--transfer-validation cannot be combined with trace or trajectory modes")
-    if getattr(args, "trace_retention", None) is not None:
-        trace_bundle = (
-            Path(args.trace_retention)
-            if str(args.trace_retention).strip()
-            else Path(args.root) / "trace" / "trace_bundle.zip"
-        )
-        bundle = run_retention_audit(trace_bundle, root=args.root)
-        print(
-            f"{time.strftime('[%H:%M]')} retention audit complete source={trace_bundle} bundle={bundle}",
-            flush=True,
-        )
-        return 0
     if args.show_best_trajectory:
         rows = _trajectory_rows(Path(args.root))
         print(json.dumps(rows, indent=2, sort_keys=True))
@@ -401,63 +245,47 @@ def run_continuous(args: argparse.Namespace) -> int:
         Path(args.save_best_trajectory).write_text(json.dumps(_trajectory_rows(Path(args.root)), indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return 0
     if not args.games:
-        raise ValueError("--games is required for continuous run or transfer validation")
-    specs = _configure_alfred_specs(
-        resolve_game_specs(args.games, curriculum_config=args.curriculum_config),
-        mode=getattr(args, "alfred_mode", None),
-        x_display=getattr(args, "alfred_x_display", None),
-    )
-    games = tuple(spec.display_name for spec in specs)
-    if getattr(args, "trace", False):
-        trace_runtime = ContinuousMemoryRuntime(_runtime_config(args))
-        try:
-            policy = trace_runtime.actor_policy_snapshot()
-            bundle = run_trace_bundle(
-                specs,
-                root=args.root,
-                seed=int(args.seed),
-                env_root=args.env_root,
-                alfred_backend_factory=args.alfred_backend_factory,
-                make_adapter=make_adapter,
-                steps_per_game=100,
-                policy=policy,
-                epsilon=float(args.epsilon),
-            )
-        finally:
-            trace_runtime.close()
-        print(
-            f"{time.strftime('[%H:%M]')} trace complete games={len(games)} steps/game=100 bundle={bundle}",
-            flush=True,
-        )
-        return 0
-    curriculum_modes = sorted({spec.validation_mode for spec in specs if spec.validation_mode})
-    effective_validation_mode = (
-        "learning_only"
-        if args.no_automatic_experiments
-        else (curriculum_modes[0] if len(curriculum_modes) == 1 else args.validation_mode)
-    )
-    args.validation_mode = effective_validation_mode
-    if args.transfer_validation:
-        return _run_transfer_validation(args, specs)
-    if args.actors <= 0 or args.steps_per_game <= 0 or args.min_episode_opportunities <= 0 or args.epochs <= 0 or args.hgt_training_epochs <= 0 or args.hgt_learning_rate <= 0 or args.hgt_eval_steps_per_game <= 0 or args.hgt_training_batch_size <= 0 or args.graph_check <= 0 or args.wait < 0 or args.progress_interval_seconds <= 0 or not 0 <= args.epsilon <= 1:
+        raise ValueError("--games is required for a normal continuous run")
+    if args.actors <= 0 or args.steps_per_game <= 0 or args.graph_check <= 0 or args.wait < 0 or args.progress_interval_seconds <= 0 or not 0 <= args.epsilon <= 1:
         raise ValueError("actors, steps-per-game, graph-check and progress interval must be positive; wait and epsilon must be valid")
-    if min(args.ingest_workers, args.derivation_workers, args.ingest_queue_capacity, args.derivation_queue_capacity, args.publication_queue_capacity, args.actor_view_refresh_steps) <= 0 or args.actor_view_refresh_ms <= 0:
-        raise ValueError("memory worker counts, queue capacities and actor policy refresh controls must be positive")
+    specs = resolve_game_specs(args.games, curriculum_config=args.curriculum_config)
+    games = tuple(spec.display_name for spec in specs)
     runtime = ContinuousMemoryRuntime(_runtime_config(args))
-    runtime.set_telemetry_gauge("curriculum_validation_mode", effective_validation_mode)
+    curriculum_modes = sorted({spec.validation_mode for spec in specs if spec.validation_mode})
+    effective_validation_mode = ("learning_only" if args.no_automatic_experiments else (curriculum_modes[0] if len(curriculum_modes) == 1 else args.validation_mode))
+    runtime.unified_telemetry.set_gauge("curriculum_validation_mode", effective_validation_mode)
     runtime.start()
     dashboard = None
     if not args.no_dashboard:
         dashboard = MetricsHTTPServer(runtime.metrics, host=args.dashboard_host, port=args.dashboard_port)
         dashboard.start()
-        print(f"{time.strftime('[%H:%M]')} dashboard: http://{args.dashboard_host}:{args.dashboard_port}/", flush=True)
-    print(
-        f"{time.strftime('[%H:%M]')} continuous games={len(games)} actors={args.actors} "
-        f"epochs={args.epochs} steps/game={args.steps_per_game}",
-        flush=True,
-    )
+        print(f"v9 dashboard: http://{args.dashboard_host}:{args.dashboard_port}/", flush=True)
+    jobs: list[tuple[int, EnvironmentSpec, int, int]] = []
+    lanes, actor_id = max(len(specs), args.actors), 1
+    base_lanes, extra_lanes = divmod(lanes, len(specs))
+    for game_index, spec in enumerate(specs):
+        lane_count = base_lanes + int(game_index < extra_lanes)
+        base_steps, extra_steps = divmod(args.steps_per_game, lane_count)
+        for lane in range(lane_count):
+            steps = base_steps + int(lane < extra_steps)
+            if steps:
+                jobs.append((actor_id, spec, steps, args.seed + actor_id * 1009))
+                actor_id += 1
+    print(f"v9 continuous: games={len(games)} actors={min(args.actors, len(jobs))} shards={args.shards} stage_workers={args.stage_workers} peers={'off' if args.no_peers else 'on'} lifecycle={args.lifecycle} snapshots={'off' if args.no_snapshots else 'native'} game_ids={','.join(games)}", flush=True)
     try:
-        process_results, epoch_results = run_epochs(runtime, specs, args)
+        process_results = run_process_jobs(
+            runtime,
+            jobs,
+            actor_limit=args.actors,
+            stage_workers=args.stage_workers,
+            shards=args.shards,
+            queue_capacity=max(args.stage_ring_capacity, args.shard_ring_capacity),
+            epsilon=args.epsilon,
+            env_root=args.env_root,
+            alfred_backend_factory=getattr(args, "alfred_backend_factory", None),
+            start_method=runtime.config.multiprocessing_start_method,
+            progress_interval_seconds=args.progress_interval_seconds,
+        )
         results = [
             ActorResult(
                 row.actor_id,
@@ -465,44 +293,14 @@ def run_continuous(args: argparse.Namespace) -> int:
                 row.steps,
                 row.positive_boundaries,
                 row.negative_boundaries,
-                row.episode_boundaries,
                 row.resets,
-                row.task_successes,
-                row.task_failures,
-                row.task_truncations,
-                row.levels_completed,
             )
             for row in process_results
         ]
         runtime.wait_quiescent(args.drain_timeout)
         final = runtime.close(normal=True, timeout=args.final_save_timeout)
         metrics = runtime.metrics()
-        transfer_rows = [
-            dict(row.training.get("transfer_validation") or {})
-            for row in epoch_results
-        ]
-        transfer_blockers = [
-            str(row["blocker"])
-            for row in transfer_rows
-            if row.get("blocker")
-        ]
-        summary = {
-            "games": list(games),
-            "epochs": [asdict(row) for row in epoch_results],
-            "actors": [asdict(row) for row in results],
-            "automatic_transfer_experiments": {
-                "mode": effective_validation_mode,
-                "budget": runtime.config.scientific.transfer_validation_trials_per_interval,
-                "attempted": sum(int(row.get("attempted", 0)) for row in transfer_rows),
-                "completed": sum(int(row.get("completed", 0)) for row in transfer_rows),
-                "passed": sum(int(row.get("passed", 0)) for row in transfer_rows),
-                "validated": sum(int(row.get("validated_concepts", 0)) for row in transfer_rows),
-                "blocker": transfer_blockers[-1] if transfer_blockers else None,
-            },
-            "hypotheses": runtime.scientific_statuses(),
-            "metrics": metrics,
-            "final_snapshot": None if final is None else {**asdict(final), "path": str(final.path)},
-        }
+        summary = {"games": list(games), "actors": [asdict(row) for row in results], "automatic_transfer_experiments": {"mode": effective_validation_mode, "budget": runtime.config.scientific.transfer_validation_trials_per_interval, "attempted": 0, "completed": 0, "passed": 0, "blocker": "no eligible target exposes exact snapshot/restore support" if effective_validation_mode != "learning_only" else None}, "hypotheses": runtime.scientific_statuses(), "metrics": metrics, "final_snapshot": None if final is None else {**asdict(final), "path": str(final.path)}}
         target = Path(args.root) / "v9_run_summary.json"
         target.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return 0
@@ -522,7 +320,7 @@ def run_smoke(args: argparse.Namespace) -> int:
             runtime.submit(runtime.make_experience(producer_id=1, producer_sequence=index + 1, environment_instance_id=1, global_step=index, context_signature=10 + index % 3, action_id=index % 4, outcome_signature=100 + index % 5, family_signature=200 + index % 3, carrier_signature=300 + index % 7, future_option_delta=float(index % 3 - 1), changed_cells=1 + index % 12, trajectory_signature=400 + index % 9, next_context_signature=10 + (index + 1) % 3))
         runtime.wait_quiescent(args.drain_timeout)
         metrics = runtime.metrics()
-        print(f"{time.strftime('[%H:%M]')} smoke done events={args.events} memories={metrics['memories']} edges={metrics['edges']}", flush=True)
+        print(f"v9 smoke done events={args.events} memories={metrics['memories']} edges={metrics['edges']}", flush=True)
         runtime.close(normal=True, timeout=args.final_save_timeout)
         return 0
     except BaseException:
@@ -540,27 +338,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_runtime_arguments(continuous)
     continuous.add_argument("--games", default=None)
     continuous.add_argument("--curriculum-config", default=None)
-    continuous.add_argument("--alfred-backend-factory", default=None, metavar="MODULE:FUNCTION")
-    continuous.add_argument("--alfred-mode", choices=("text", "thor"), default=None)
-    continuous.add_argument("--alfred-x-display", default=None, metavar="DISPLAY")
     trajectory = continuous.add_mutually_exclusive_group()
     trajectory.add_argument("--show-best-trajectory", metavar="GAME_ID", default=None)
     trajectory.add_argument("--save-best-trajectory", metavar="FILE", default=None)
-    continuous.add_argument("--steps-per-game", type=int, default=1000, help="minimum per-game epoch step budget")
-    continuous.add_argument("--min-episode-opportunities", type=int, default=2, help="minimum complete episode horizons budgeted per game per epoch")
-    continuous.add_argument("--epochs", type=int, default=1)
-    continuous.add_argument("--hgt-training-epochs", type=int, default=1)
-    continuous.add_argument("--hgt-learning-rate", type=float, default=0.0003)
-    continuous.add_argument("--hgt-eval-steps-per-game", type=int, default=50)
-    continuous.add_argument("--hgt-training-batch-size", type=int, default=512)
+    continuous.add_argument("--steps-per-game", type=int, default=1000)
     continuous.add_argument("--actors", type=int, default=8)
-    continuous.add_argument("--actor-view-refresh-steps", type=int, default=64)
-    continuous.add_argument("--actor-view-refresh-ms", type=float, default=250.0)
-    continuous.add_argument("--ingest-workers", type=int, default=4)
-    continuous.add_argument("--derivation-workers", type=int, default=4)
-    continuous.add_argument("--ingest-queue-capacity", type=int, default=8192)
-    continuous.add_argument("--derivation-queue-capacity", type=int, default=4096)
-    continuous.add_argument("--publication-queue-capacity", type=int, default=8192)
     continuous.add_argument("--seed", type=int, default=0)
     continuous.add_argument("--env-root", default=None)
     continuous.add_argument("--epsilon", type=float, default=0.10)
@@ -572,17 +354,14 @@ def build_parser() -> argparse.ArgumentParser:
     continuous.add_argument("--dashboard-host", default="0.0.0.0")
     continuous.add_argument("--dashboard-port", type=int, default=8765)
     continuous.add_argument("--no-dashboard", action="store_true")
-    continuous.add_argument("--trace", action="store_true", help="collect 100 diagnostic interaction steps per selected game and write trace_bundle.zip")
-    continuous.add_argument("--trace-retention", nargs="?", const="", default=None, metavar="TRACE_BUNDLE", help="audit trace-to-memory/HGT information retention and write retention_bundle.zip; defaults to ROOT/trace/trace_bundle.zip")
     continuous.add_argument("--verbose-progress", action="store_true")
     continuous.add_argument("--drain-timeout", type=float, default=300.0)
     continuous.add_argument("--final-save-timeout", type=float, default=300.0)
     continuous.add_argument("--transfer-experiment-steps", type=int, default=32)
-    continuous.add_argument("--max-transfer-experiments", type=int, default=None)
-    continuous.add_argument("--transfer-experiment-time-budget-seconds", type=float, default=None)
+    continuous.add_argument("--max-transfer-experiments", type=int, default=8)
+    continuous.add_argument("--transfer-experiment-time-budget-seconds", type=float, default=30.0)
     continuous.add_argument("--validation-mode", choices=("learning_only", "validation_budgeted", "validation_full"), default="validation_budgeted")
     continuous.add_argument("--no-automatic-experiments", action="store_true")
-    continuous.add_argument("--transfer-validation", action="store_true", help="validate transfer evidence from persisted state and exit without training")
     smoke = sub.add_parser("smoke")
     _add_runtime_arguments(smoke)
     smoke.add_argument("--events", type=int, default=1000)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from v9.environments.base import StructuralAdapter, preserving_stdio_call
+from v9.environments.base import StructuralAdapter
 from v9.environments.contract import BoundaryEvent, BoundaryScope, WithinActionFrame, WithinActionTrace
 from v9.environments.schemas import ActionSchema, EnvironmentIdentity, ObservationSchema
 from v9.modalities.symbols import DeterministicSymbolCodec, SymbolObservation
@@ -13,10 +13,6 @@ from v9.modalities.symbols import DeterministicSymbolCodec, SymbolObservation
 class BabyAIObservation:
     world: Any
     instruction_bytes: bytes
-
-
-def _quiet_native_call(callable_obj, *args, **kwargs):
-    return preserving_stdio_call(callable_obj, *args, quiet=True, **kwargs)
 
 
 class BabyAIAdapter(StructuralAdapter):
@@ -44,7 +40,7 @@ class BabyAIAdapter(StructuralAdapter):
         return BabyAIObservation(world, mission.encode("utf-8") if isinstance(mission, str) else bytes(mission))
 
     def reset(self) -> BabyAIObservation:
-        raw = _quiet_native_call(self.native_env.reset)
+        raw = self.native_env.reset()
         observation = raw[0] if isinstance(raw, tuple) and len(raw) == 2 else raw
         self._last = self._split(observation)
         self._boundary = BoundaryEvent()
@@ -74,7 +70,7 @@ class BabyAIAdapter(StructuralAdapter):
         observation, reward, terminated, truncated, _ = raw[:5]
         self._last = self._split(observation)
         done = bool(terminated or truncated)
-        valence = 1 if bool(terminated) and float(reward) > 0 else (-1 if bool(terminated) else 0)
+        valence = 1 if bool(terminated) and float(reward) > 0 else (-1 if done else 0)
         self._boundary = BoundaryEvent(BoundaryScope.EPISODE if done else BoundaryScope.NONE, valence, not done)
         self._last_trace = WithinActionTrace(before.world, (WithinActionFrame(self._last.world, 0),), self._last.world)
         return self._last
@@ -83,14 +79,12 @@ class BabyAIAdapter(StructuralAdapter):
 def make_babyai_adapter(environment_id: str, *, seed: int = 0, suppress_symbols: bool = False, **kwargs: object) -> BabyAIAdapter:
     try:
         import gymnasium as gym
-        import minigrid  # noqa: F401  # registers MiniGrid and BabyAI environments
     except ImportError as exc:
         raise RuntimeError("BabyAI live support requires the optional minigrid dependency") from exc
-    env = _quiet_native_call(gym.make, environment_id, **kwargs)
+    env = gym.make(environment_id, **kwargs)
     try:
-        _quiet_native_call(env.reset, seed=int(seed))
+        env.reset(seed=int(seed))
     except TypeError:
         pass
-    adapter = BabyAIAdapter(env, environment_name=environment_id, suppress_symbols=suppress_symbols)
-    adapter.reset()
-    return adapter
+    return BabyAIAdapter(env, environment_name=environment_id, suppress_symbols=suppress_symbols)
+

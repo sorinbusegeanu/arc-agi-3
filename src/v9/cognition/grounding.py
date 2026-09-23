@@ -25,13 +25,8 @@ class GroundingEvidence:
     cross_modal_association: bool = False
     prospective_prediction: bool = False
     causal_intervention: bool = False
-    heldout_transfer: bool = False
     novel_composition: bool = False
     unexperienced_interaction: bool = False
-    symbol_mediated_learning: bool = False
-    validation_trial_id: str | None = None
-    support: float = 1.0
-    contradiction: float = 0.0
     positive: bool = True
 
 
@@ -41,148 +36,47 @@ class GroundingState:
     historical_peak: GroundingMaturity = GroundingMaturity.G0
     positive_evidence: int = 0
     negative_evidence: int = 0
-    support: float = 0.0
-    contradiction: float = 0.0
-    last_causal_watermark: int = 0
-    validation_trial_ids: tuple[str, ...] = ()
     suspended: bool = False
 
     @property
-    def behavior_eligible(self) -> bool:
-        return not self.suspended and self.maturity >= GroundingMaturity.G3 and self.support > self.contradiction
-
-    @property
     def active(self) -> bool:
-        return self.behavior_eligible
+        return not self.suspended and self.maturity >= GroundingMaturity.G4
 
 
 class GroundingRegistry:
-    SCHEMA_VERSION = 3
-
     def __init__(self) -> None:
         self.states: dict[tuple[int, int, int, int, int], GroundingState] = {}
 
-    @staticmethod
-    def _candidate_maturity(evidence: GroundingEvidence) -> GroundingMaturity:
+    def observe(self, evidence: GroundingEvidence) -> GroundingState:
+        key = (evidence.symbol_structure_uid, evidence.interaction_structure_uid, evidence.environment_instance_id, evidence.context_scope_id, evidence.lineage_uid)
+        current = self.states.get(key, GroundingState())
         maturity = GroundingMaturity.G0
         if evidence.recurrent_symbol:
             maturity = GroundingMaturity.G1
         if evidence.cross_modal_association:
             maturity = GroundingMaturity.G2
-        if evidence.prospective_prediction or evidence.heldout_transfer:
+        if evidence.prospective_prediction:
             maturity = GroundingMaturity.G3
-        if (evidence.novel_composition or evidence.causal_intervention) and evidence.positive:
+        if evidence.causal_intervention and evidence.positive:
             maturity = GroundingMaturity.G4
-        if (evidence.symbol_mediated_learning or evidence.unexperienced_interaction) and evidence.positive:
+        if evidence.novel_composition and evidence.causal_intervention and evidence.positive:
+            maturity = GroundingMaturity.G4
+        if evidence.unexperienced_interaction and evidence.causal_intervention and evidence.positive:
             maturity = GroundingMaturity.G5
-        return maturity
-
-    def observe(self, evidence: GroundingEvidence) -> GroundingState:
-        key = (
-            int(evidence.symbol_structure_uid),
-            int(evidence.interaction_structure_uid),
-            int(evidence.environment_instance_id),
-            int(evidence.context_scope_id),
-            int(evidence.lineage_uid),
-        )
-        current = self.states.get(key, GroundingState())
-        candidate = self._candidate_maturity(evidence)
-        support_delta = max(0.0, float(evidence.support)) if evidence.positive else 0.0
-        contradiction_delta = max(
-            0.0,
-            float(evidence.contradiction)
-            if evidence.contradiction > 0.0
-            else (float(evidence.support) if not evidence.positive else 0.0),
-        )
-        support = current.support + support_delta
-        contradiction = current.contradiction + contradiction_delta
-        causal_contradiction = bool(
-            not evidence.positive
-            and evidence.causal_intervention
-            and current.maturity >= GroundingMaturity.G3
-        )
-        suspended = causal_contradiction or (contradiction >= support and contradiction > 0.0)
-        if evidence.positive:
-            maturity = max(current.maturity, candidate)
-        else:
-            maturity = min(current.maturity, GroundingMaturity.G2 if suspended else GroundingMaturity.G3)
-        validation_trial_ids = current.validation_trial_ids
-        if evidence.validation_trial_id and evidence.validation_trial_id not in validation_trial_ids:
-            validation_trial_ids = validation_trial_ids + (str(evidence.validation_trial_id),)
-        row = replace(
-            current,
-            maturity=maturity,
-            historical_peak=max(current.historical_peak, candidate),
-            positive_evidence=current.positive_evidence + int(evidence.positive),
-            negative_evidence=current.negative_evidence + int(not evidence.positive),
-            support=support,
-            contradiction=contradiction,
-            last_causal_watermark=max(current.last_causal_watermark, int(evidence.watermark)),
-            validation_trial_ids=validation_trial_ids,
-            suspended=suspended,
-        )
+        if not evidence.positive:
+            maturity = min(current.maturity, GroundingMaturity.G3)
+        row = replace(current, maturity=maturity, historical_peak=max(current.historical_peak, maturity), positive_evidence=current.positive_evidence + int(evidence.positive), negative_evidence=current.negative_evidence + int(not evidence.positive), suspended=bool(evidence.causal_intervention and not evidence.positive))
         self.states[key] = row
         return row
 
-    def eligible_states(
-        self,
-        *,
-        environment_instance_id: int | None = None,
-        minimum_maturity: GroundingMaturity = GroundingMaturity.G3,
-    ) -> tuple[tuple[tuple[int, int, int, int, int], GroundingState], ...]:
-        return tuple(
-            (key, row)
-            for key, row in self.states.items()
-            if row.behavior_eligible
-            and row.maturity >= minimum_maturity
-            and (environment_instance_id is None or key[2] == int(environment_instance_id))
-        )
-
-    def authority(
-        self,
-        symbol_structure_uid: int,
-        interaction_structure_uid: int,
-        environment_instance_id: int,
-        context_scope_id: int = 0,
-        lineage_uid: int = 0,
-    ) -> float:
-        row = self.states.get((int(symbol_structure_uid), int(interaction_structure_uid), int(environment_instance_id), int(context_scope_id), int(lineage_uid)))
-        if row is None or not row.behavior_eligible:
-            return 0.0
-        confidence = row.support / max(1e-9, row.support + row.contradiction)
-        maturity_scale = (int(row.maturity) - int(GroundingMaturity.G2)) / 3.0
-        return max(0.0, min(1.0, confidence * maturity_scale))
-
     def state_dict(self) -> dict[str, object]:
-        return {
-            "schema_version": self.SCHEMA_VERSION,
-            "states": [
-                {
-                    "key": list(key),
-                    **asdict(row),
-                    "maturity": int(row.maturity),
-                    "historical_peak": int(row.historical_peak),
-                    "validation_trial_ids": list(row.validation_trial_ids),
-                }
-                for key, row in sorted(self.states.items())
-            ],
-        }
+        return {"states": [{"key": list(key), **asdict(row), "maturity": int(row.maturity), "historical_peak": int(row.historical_peak)} for key, row in sorted(self.states.items())]}
 
     @classmethod
     def from_state_dict(cls, state: dict[str, object]) -> "GroundingRegistry":
         result = cls()
         for raw in state.get("states", []):
             key = tuple(int(value) for value in raw["key"])
-            row = GroundingState(
-                maturity=GroundingMaturity(int(raw["maturity"])),
-                historical_peak=GroundingMaturity(int(raw.get("historical_peak", raw["maturity"]))),
-                positive_evidence=int(raw.get("positive_evidence", 0)),
-                negative_evidence=int(raw.get("negative_evidence", 0)),
-                support=float(raw.get("support", raw.get("positive_evidence", 0))),
-                contradiction=float(raw.get("contradiction", raw.get("negative_evidence", 0))),
-                last_causal_watermark=int(raw.get("last_causal_watermark", 0)),
-                validation_trial_ids=tuple(str(value) for value in raw.get("validation_trial_ids", ())),
-                suspended=bool(raw.get("suspended", False)),
-            )
+            row = GroundingState(GroundingMaturity(int(raw["maturity"])), GroundingMaturity(int(raw["historical_peak"])), int(raw["positive_evidence"]), int(raw["negative_evidence"]), bool(raw["suspended"]))
             result.states[key] = row
         return result

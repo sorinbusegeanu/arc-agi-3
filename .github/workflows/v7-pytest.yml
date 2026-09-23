@@ -1,0 +1,39 @@
+name: v7 parallelization tests
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  v7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+      - name: Compile v7
+        env:
+          PYTHONPATH: src
+        run: python -m compileall -q src/v7
+      - name: Run v7 tests
+        env:
+          PYTHONPATH: src
+        run: pytest -q src/v7/tests --import-mode=importlib
+      - name: Check parallel CLI
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m v7 experiment -h | grep -- '--workers'
+          python -m v7 experiment -h | grep -- '--initial-workers'
+          python -m v7 continuous-research-run -h | grep -- '--derivation-workers'
+          python -m v7 continuous-research-run -h | grep -- '--report-workers'

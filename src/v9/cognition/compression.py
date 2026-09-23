@@ -11,10 +11,10 @@ def form_families(records: tuple[M1NormalizedRelation, ...], *, minimum_recurren
         raise ValueError("minimum recurrence must be at least two")
     groups: dict[int, list[M1NormalizedRelation]] = defaultdict(list)
     for row in records:
-        family_signature = int(row.family_signature or row.structural_signature)
-        groups[family_signature].append(row)
+        groups[row.structural_signature].append(row)
     return tuple(
         M2TransformationFamily.form(tuple(groups[key]))
         for key in sorted(groups)
         if len(groups[key]) >= minimum_recurrence
     )
+

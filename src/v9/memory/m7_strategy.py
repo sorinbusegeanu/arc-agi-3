@@ -28,16 +28,6 @@ class M7Strategy:
     def expected_cost(self) -> float | None:
         return self.realized_cost_sum / self.reliability_successes if self.reliability_successes else None
 
-    def observe(self, *, success: bool, realized_cost: int, primary_valence: int = 0) -> "M7Strategy":
-        from dataclasses import replace
-        return replace(
-            self,
-            reliability_successes=self.reliability_successes + int(bool(success)),
-            reliability_trials=self.reliability_trials + 1,
-            primary_valence_sum=self.primary_valence_sum + int(primary_valence),
-            realized_cost_sum=self.realized_cost_sum + (max(1, int(realized_cost)) if success else 0),
-        )
-
     @classmethod
     def form(cls, outcome: M6Outcome, *, target_environment_id: int, native_actions: tuple[int, ...], successes: int, trials: int, primary_valence_sum: int, realized_cost_sum: int) -> "M7Strategy":
         if not native_actions or trials <= 0 or not 0 <= successes <= trials:

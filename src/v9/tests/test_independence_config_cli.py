@@ -45,7 +45,7 @@ def test_scientific_config_id_is_deterministic_and_complete() -> None:
     assert left.config_id == right.config_id
     assert left.as_dict()["scientific_config_id"] == left.config_id.value
     assert left.research_contract_version == "0.7.0"
-    assert left.design_version == "9.7.9"
+    assert left.design_version == "9.7.6"
 
 
 def test_scientific_config_changes_change_identity() -> None:

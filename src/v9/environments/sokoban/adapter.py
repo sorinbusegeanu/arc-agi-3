@@ -27,11 +27,9 @@ DIRECTIONS = {
 class SokobanAdapter(StructuralAdapter):
     """Small deterministic native Sokoban family for curriculum training."""
 
-    def __init__(self, *, environment_name: str = "Sokoban-small-v0", seed: int = 0, max_episode_steps: int = 200) -> None:
+    def __init__(self, *, environment_name: str = "Sokoban-small-v0", seed: int = 0) -> None:
         self.environment_name = str(environment_name)
         self.seed = int(seed)
-        self.max_episode_steps = max(1, int(max_episode_steps))
-        self._steps = 0
         self._episode = 0
         self._identity = EnvironmentIdentity("sokoban", self.environment_name, "native-v9", f"seed={seed}")
         self._observation_schema = ObservationSchema("grid", "native-sokoban")
@@ -107,7 +105,6 @@ class SokobanAdapter(StructuralAdapter):
         self._episode += 1
         self._boundary = BoundaryEvent()
         self._last_trace = None
-        self._steps = 0
         return self.observe()
 
     def observe(self) -> tuple[tuple[int, ...], ...]:
@@ -167,14 +164,8 @@ class SokobanAdapter(StructuralAdapter):
                 self._place_player(nr, nc)
                 moved = True
 
-        self._steps += 1
         solved = self._solved()
-        if solved:
-            self._boundary = BoundaryEvent(BoundaryScope.EPISODE, 1, False)
-        elif self._steps >= self.max_episode_steps:
-            self._boundary = BoundaryEvent(BoundaryScope.EPISODE, 0, False)
-        else:
-            self._boundary = BoundaryEvent()
+        self._boundary = BoundaryEvent(BoundaryScope.EPISODE, 1, False) if solved else BoundaryEvent()
         after = self.observe()
         self._last_trace = WithinActionTrace(before, (WithinActionFrame(after, 0),), after)
         return after

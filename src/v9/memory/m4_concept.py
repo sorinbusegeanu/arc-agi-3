@@ -34,8 +34,8 @@ class M4Concept:
             raise ValueError("concept candidates require roles, compression and explanatory reach")
         structural = tuple(value for row in sorted(roles, key=lambda item: (item.relational_signature, item.consequence_signature)) for value in (row.relational_signature, row.consequence_signature))
         uid = MemoryUid.from_key(MemoryLevel.M4, MemoryType.CONCEPT, structural)
-        parents = tuple(sorted({row.uid for row in roles}))
-        evidence = tuple(sorted({uid for row in roles for uid in row.provenance.evidence}))
+        parents = tuple(sorted(row.uid for row in roles))
+        evidence = tuple(uid for row in roles for uid in row.provenance.evidence)
         return cls(uid, structural, DerivationProvenance(parents, evidence, tuple(sorted(set(formation_scope)))), float(compression_benefit), int(explanatory_reach), float(transfer_prior), state=ConceptState.TRANSFER_TEST_ELIGIBLE)
 
     def with_validation(self, targets: tuple[int, ...]) -> "M4Concept":
