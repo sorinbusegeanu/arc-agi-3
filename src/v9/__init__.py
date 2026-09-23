@@ -74,24 +74,13 @@ _install_runtime_integrity(
 from v9.runtime.runtime_integrity_followup import install as _install_runtime_integrity_followup
 _install_runtime_integrity_followup(_runtime_integrity_module, MemoryPipelineService)
 
-# Unique M0/grounded-M1 and first-seen normalized M1 rows are append-only.
-# Publish them continuously in bounded canonical batches instead of accumulating
-# a second large deferred publication debt. Repeated M1N support remains dirty
-# and coalesced until the normal flush boundary.
+# Keep continuous low-level publication, but run the memory coordinator directly.
+# The reducer/hotpath wrappers introduced extra queues, background reducer state,
+# and shutdown catch-up work that hid progress and made stdout/dashboard depend on
+# the coordinator reaching those wrapper checkpoints. The direct coordinator is
+# slower but observable and matches the simpler working path.
 from v9.runtime.inline_lowlevel_publication import install_inline_lowlevel_publication as _install_inline_lowlevel_publication
 _install_inline_lowlevel_publication(ContinuousMemoryRuntime)
-
-# Canonical commit remains strictly ordered, but it runs independently from the
-# coordinator's queue-draining loop so actor publication and worker preparation
-# continue while the authoritative graph mutation is in progress.
-from v9.runtime.publication_throughput import install_publication_throughput as _install_publication_throughput
-_install_publication_throughput(MemoryPipelineService)
-
-# Coalesce repeated normalized-support writes inside each canonical transaction,
-# preserve aggregate family support for M2 formation, and service residency work
-# outside the reducer hot path with a bounded epoch-boundary catch-up.
-from v9.runtime.canonical_hotpath import install as _install_canonical_hotpath
-_install_canonical_hotpath(MemoryPipelineService)
 
 _hgt_package.train_hgt_epoch = _hgt_training.train_hgt_epoch
 from v9.runtime import epoch_runner as _epoch_runner
