@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, RLock, Thread
 from typing import Any, Callable
 
 
@@ -70,6 +70,9 @@ class MetricsHTTPServer:
         self.log_path = None if log_path is None else Path(log_path)
         self._stop_logging = Event()
         self._log_thread: Thread | None = None
+        self._model_history_lock = RLock()
+        self._model_history: dict[str, dict[str, Any]] = {}
+        server_owner = self
 
         class Handler(BaseHTTPRequestHandler):
             def _write(self, status: int, content_type: str, payload: bytes) -> None:
@@ -83,7 +86,7 @@ class MetricsHTTPServer:
             def do_GET(self) -> None:
                 if self.path in {"/api/metrics", "/metrics"}:
                     try:
-                        snapshot = provider()
+                        snapshot = server_owner._dashboard_snapshot()
                     except Exception as exc:
                         raw = json.dumps(
                             {
@@ -106,16 +109,23 @@ class MetricsHTTPServer:
 <html><head><meta charset="utf-8"><title>Hydra v9 Dashboard</title>
 <style>
 body{{font-family:system-ui,sans-serif;margin:24px;background:#111;color:#eee}}
-h1{{font-size:20px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}}
+h1{{font-size:20px}}h2{{font-size:16px;margin-top:24px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}}
 .card{{background:#1d1d1d;padding:12px;border-radius:8px}}.k{{color:#aaa;font-size:12px}}.v{{font-size:20px;margin-top:4px}}
-pre{{background:#1d1d1d;padding:12px;overflow:auto}}
+pre{{background:#1d1d1d;padding:12px;overflow:auto;line-height:1.5}}
 </style></head>
 <body><h1>Hydra v9.7.6</h1><div id="grid" class="grid"></div>
+<h2>Model history</h2><pre id="model-history">No trained models yet</pre>
 <script>
+function display(v, digits){{
+ if(typeof v === 'number') return v.toFixed(digits);
+ return String(v ?? '');
+}}
 async function refresh(){{
  const r=await fetch('/api/metrics',{{cache:'no-store'}}); const m=await r.json();
  const p=m.primary_dashboard||{{}}; const g=document.getElementById('grid'); g.innerHTML='';
  for(const [k,v] of Object.entries(p)){{const d=document.createElement('div');d.className='card';d.innerHTML='<div class="k">'+k+'</div><div class="v">'+v+'</div>';g.appendChild(d)}}
+ const history=m.model_history||[]; const h=document.getElementById('model-history');
+ h.textContent=history.length ? history.map(x => x.model+' | levels='+x.run_levels_solved+' | wins='+display(x.run_wins,4)+' | behavioral='+display(x.behavioral_success_rate,4)+' | VRAM='+display(x.vram_gb,2)+' GB').join('\n') : 'No trained models yet';
 }}
 refresh(); setInterval(refresh,{refresh_ms});
 </script></body></html>""".encode("utf-8")
@@ -132,6 +142,31 @@ refresh(); setInterval(refresh,{refresh_ms});
         self.port = int(port)
         self._thread = Thread(target=self._server.serve_forever, name="v9-metrics-http", daemon=True)
 
+    def _record_model_history(self, snapshot: dict[str, Any]) -> None:
+        primary = dict(snapshot.get("primary_dashboard", {}))
+        model = str(primary.get("ModelVersion", "untrained"))
+        if not model or model == "untrained":
+            return
+        row = {
+            "model": model,
+            "run_levels_solved": int(primary.get("current_run_levels_solved", 0)),
+            "run_wins": float(primary.get("current_run_wins", 0.0)),
+            "behavioral_success_rate": float(primary.get("behavioral_success_rate", 0.0)),
+            "vram_gb": float(primary.get("GPU_memory_GB", 0.0)),
+        }
+        with self._model_history_lock:
+            self._model_history[model] = row
+
+    def _model_history_snapshot(self) -> list[dict[str, Any]]:
+        with self._model_history_lock:
+            return [dict(row) for row in self._model_history.values()]
+
+    def _dashboard_snapshot(self) -> dict[str, Any]:
+        snapshot = dict(self._dashboard_provider())
+        self._record_model_history(snapshot)
+        snapshot["model_history"] = self._model_history_snapshot()
+        return snapshot
+
     def _log_dashboard_metrics(self) -> None:
         if self.log_path is None:
             return
@@ -142,10 +177,9 @@ refresh(); setInterval(refresh,{refresh_ms});
             while not self._stop_logging.is_set():
                 timestamp = datetime.now(timezone.utc).isoformat()
                 try:
-                    snapshot = _compact_log_snapshot(
-                        self._dashboard_provider(),
-                        timestamp=timestamp,
-                    )
+                    snapshot = self._dashboard_provider()
+                    self._record_model_history(snapshot)
+                    snapshot = _compact_log_snapshot(snapshot, timestamp=timestamp)
                 except Exception as exc:
                     # A telemetry read must never terminate the long-lived
                     # logger. Preserve an auditable failure row and retry at the
