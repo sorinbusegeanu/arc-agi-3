@@ -88,6 +88,11 @@ if not hasattr(MemoryPipelineService, "shutdown_parallel_pipeline"):
 
     MemoryPipelineService.shutdown_parallel_pipeline = _direct_shutdown_parallel_pipeline
 
+# Direct coordinator mode must stay plain: no reducer queue, no hotpath wrapper,
+# no shared actor publication slabs, and bounded canonical splitting in place.
+from v9.runtime.direct_coordinator_safety import install as _install_direct_coordinator_safety
+_install_direct_coordinator_safety(MemoryPipelineService)
+
 _hgt_package.train_hgt_epoch = _hgt_training.train_hgt_epoch
 from v9.runtime import epoch_runner as _epoch_runner
 _epoch_runner.train_hgt_epoch = _hgt_training.train_hgt_epoch
