@@ -18,15 +18,27 @@ _EPOCH_COMPACTION_MAX_SECONDS = 5.0
 _IDLE_COMPACTION_BACKLOG_MULTIPLIER = 1
 
 
+def _set_gauge(runtime: Any, key: str, value: Any) -> None:
+    setter = getattr(runtime, "set_telemetry_gauge", None)
+    if callable(setter):
+        setter(key, value)
+
+
 def _aggregate_family_support(runtime: Any, rows: Iterable[Any]) -> int:
     """Count all observations behind retained representatives once per M1N signature."""
+    retained = tuple(rows)
+    signature_support = getattr(runtime, "signature_support", None)
+    if not callable(signature_support):
+        # Minimal/test runtimes do not maintain aggregate support. Preserve the
+        # historical candidate semantics rather than requiring telemetry state.
+        return len(retained)
     signatures = {
         int(getattr(row, "structural_signature", 0))
-        for row in rows
+        for row in retained
         if int(getattr(row, "structural_signature", 0)) != 0
     }
     return sum(
-        max(1, int(runtime.signature_support(signature)))
+        max(1, int(signature_support(signature)))
         for signature in signatures
     )
 
@@ -151,13 +163,13 @@ def _derivation_candidates_with_aggregate_support(
             else replace(candidate, support=aggregate_support)
         )
     if max_support:
-        runtime.set_telemetry_gauge(
-            "m1_touched_family_max_aggregate_support", max_support
-        )
+        _set_gauge(runtime, "m1_touched_family_max_aggregate_support", max_support)
     return tuple(upgraded)
 
 
 def _publish_family_diagnostics(runtime: Any) -> None:
+    if not callable(getattr(runtime, "set_telemetry_gauge", None)):
+        return
     family_index = getattr(runtime, "_m1n_family_occurrences", {})
     supports: list[int] = []
     recurrent = 0
@@ -179,18 +191,11 @@ def _publish_family_diagnostics(runtime: Any) -> None:
             independently_evidenced += 1
 
     m2_count = len(getattr(runtime, "_m2", {}))
-    runtime.set_telemetry_gauge("m1_family_count", len(supports))
-    runtime.set_telemetry_gauge("m1_recurrent_family_count", recurrent)
-    runtime.set_telemetry_gauge(
-        "m1_independently_evidenced_family_count", independently_evidenced
-    )
-    runtime.set_telemetry_gauge(
-        "m1_family_max_aggregate_support", max(supports, default=0)
-    )
-    runtime.set_telemetry_gauge(
-        "m2_family_coverage",
-        float(m2_count) / max(1, independently_evidenced),
-    )
+    _set_gauge(runtime, "m1_family_count", len(supports))
+    _set_gauge(runtime, "m1_recurrent_family_count", recurrent)
+    _set_gauge(runtime, "m1_independently_evidenced_family_count", independently_evidenced)
+    _set_gauge(runtime, "m1_family_max_aggregate_support", max(supports, default=0))
+    _set_gauge(runtime, "m2_family_coverage", float(m2_count) / max(1, independently_evidenced))
 
 
 def _request_residency_work(service: Any, *, force: bool = False) -> Any | None:
@@ -220,9 +225,7 @@ def _service_prepared_compaction_if_idle(
         return 0
     deleted = int(manager.service_prepared_compaction(max_batches=max_batches))
     if deleted:
-        service.runtime.set_telemetry_gauge(
-            "idle_compaction_last_deleted", deleted
-        )
+        _set_gauge(service.runtime, "idle_compaction_last_deleted", deleted)
     return deleted
 
 
@@ -247,19 +250,11 @@ def _catch_up_residency_at_epoch_boundary(service: Any) -> int:
         deleted_total += deleted
         batches += 1
     elapsed = time.perf_counter() - started
-    service.runtime.set_telemetry_gauge(
-        "epoch_compaction_start_backlog", starting_backlog
-    )
-    service.runtime.set_telemetry_gauge(
-        "epoch_compaction_deleted", deleted_total
-    )
-    service.runtime.set_telemetry_gauge("epoch_compaction_batches", batches)
-    service.runtime.set_telemetry_gauge(
-        "epoch_compaction_seconds", elapsed
-    )
-    service.runtime.set_telemetry_gauge(
-        "epoch_compaction_remaining_backlog", int(manager.backlog())
-    )
+    _set_gauge(service.runtime, "epoch_compaction_start_backlog", starting_backlog)
+    _set_gauge(service.runtime, "epoch_compaction_deleted", deleted_total)
+    _set_gauge(service.runtime, "epoch_compaction_batches", batches)
+    _set_gauge(service.runtime, "epoch_compaction_seconds", elapsed)
+    _set_gauge(service.runtime, "epoch_compaction_remaining_backlog", int(manager.backlog()))
     return deleted_total
 
 
