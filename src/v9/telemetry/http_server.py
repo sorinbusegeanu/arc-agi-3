@@ -8,7 +8,10 @@ from threading import Event, RLock, Thread
 from typing import Any, Callable
 
 
+# Preserve the established JSONL cadence and refresh_seconds API semantics.
 DASHBOARD_REFRESH_SECONDS = 30.0
+# Browser polling is intentionally independent from the persistent telemetry log.
+DASHBOARD_LIVE_REFRESH_SECONDS = 2.0
 
 
 _COMPACT_LOG_KEYS = (
@@ -55,13 +58,17 @@ class MetricsHTTPServer:
         port: int = 8765,
         log_path: str | Path | None = None,
         refresh_seconds: float = DASHBOARD_REFRESH_SECONDS,
+        live_refresh_seconds: float = DASHBOARD_LIVE_REFRESH_SECONDS,
     ) -> None:
         self.metrics_provider = metrics_provider
         owner = getattr(metrics_provider, "__self__", None)
         dashboard_provider = getattr(owner, "dashboard_metrics", None)
         provider = dashboard_provider if callable(dashboard_provider) else metrics_provider
         self._dashboard_provider = provider
+        # refresh_seconds remains the JSONL cadence for backward compatibility.
         self.refresh_seconds = max(0.1, float(refresh_seconds))
+        self.log_refresh_seconds = self.refresh_seconds
+        self.live_refresh_seconds = max(0.1, float(live_refresh_seconds))
         if log_path is None:
             config = getattr(owner, "config", None)
             root = getattr(config, "root", None)
@@ -137,7 +144,7 @@ refresh(); setInterval(refresh,{refresh_ms});
                 return
 
         self._server = ThreadingHTTPServer((str(host), int(port)), Handler)
-        self._server.refresh_seconds = self.refresh_seconds
+        self._server.refresh_seconds = self.live_refresh_seconds
         self.host = str(host)
         self.port = int(port)
         self._thread = Thread(target=self._server.serve_forever, name="v9-metrics-http", daemon=True)
@@ -192,7 +199,7 @@ refresh(); setInterval(refresh,{refresh_ms});
                         },
                     }
                 handle.write(json.dumps(snapshot, sort_keys=True, default=str) + "\n")
-                if self._stop_logging.wait(self.refresh_seconds):
+                if self._stop_logging.wait(self.log_refresh_seconds):
                     break
 
     def start(self) -> None:
