@@ -8,7 +8,8 @@ from threading import Event, RLock, Thread
 from typing import Any, Callable
 
 
-DASHBOARD_REFRESH_SECONDS = 30.0
+DASHBOARD_REFRESH_SECONDS = 2.0
+DASHBOARD_LOG_REFRESH_SECONDS = 30.0
 
 
 _COMPACT_LOG_KEYS = (
@@ -55,6 +56,7 @@ class MetricsHTTPServer:
         port: int = 8765,
         log_path: str | Path | None = None,
         refresh_seconds: float = DASHBOARD_REFRESH_SECONDS,
+        log_refresh_seconds: float = DASHBOARD_LOG_REFRESH_SECONDS,
     ) -> None:
         self.metrics_provider = metrics_provider
         owner = getattr(metrics_provider, "__self__", None)
@@ -62,6 +64,7 @@ class MetricsHTTPServer:
         provider = dashboard_provider if callable(dashboard_provider) else metrics_provider
         self._dashboard_provider = provider
         self.refresh_seconds = max(0.1, float(refresh_seconds))
+        self.log_refresh_seconds = max(0.1, float(log_refresh_seconds))
         if log_path is None:
             config = getattr(owner, "config", None)
             root = getattr(config, "root", None)
@@ -192,7 +195,7 @@ refresh(); setInterval(refresh,{refresh_ms});
                         },
                     }
                 handle.write(json.dumps(snapshot, sort_keys=True, default=str) + "\n")
-                if self._stop_logging.wait(self.refresh_seconds):
+                if self._stop_logging.wait(self.log_refresh_seconds):
                     break
 
     def start(self) -> None:
