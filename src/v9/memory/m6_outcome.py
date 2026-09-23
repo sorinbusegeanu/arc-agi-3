@@ -38,7 +38,7 @@ class M6Outcome:
         if descriptors and max(descriptors) - min(descriptors) > int(diameter_bound):
             raise ValueError("outcome candidates exceed declared within-class diameter")
         uid = MemoryUid.from_key(MemoryLevel.M6, MemoryType.OUTCOME, descriptors)
-        members = tuple(sorted(row.uid for row in consequences))
-        evidence = tuple(uid for row in consequences for uid in row.provenance.evidence)
+        members = tuple(sorted({row.uid for row in consequences}))
+        evidence = tuple(sorted({uid for row in consequences for uid in row.provenance.evidence}))
         return cls(uid, descriptors, members, DerivationProvenance(members, evidence))
 
