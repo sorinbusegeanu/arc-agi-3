@@ -5,16 +5,17 @@ from threading import Event, RLock, Thread, current_thread
 from typing import Any
 
 from .bounded_transfer_validation import run_transfer_validation_interval
-from .progress import InlineProgress
 
 
-_status: InlineProgress | None = None
 _suppress_nested = False
 _active = False
 _current_runtime: Any | None = None
 _progress_interval_seconds = 60.0
 _phase_detail = ""
 _phase_started = 0.0
+_sampling_active = False
+_sampling_started = 0.0
+_sampling_label = "sampling"
 _heartbeat_event: Event | None = None
 _heartbeat_thread: Thread | None = None
 _state_lock = RLock()
@@ -28,14 +29,38 @@ def _phase_state() -> tuple[str, float]:
     return detail, elapsed
 
 
+def _set_run_phase(value: str) -> None:
+    runtime = _current_runtime
+    if runtime is None:
+        return
+    try:
+        runtime.set_telemetry_gauge("run_phase", str(value))
+    except Exception:
+        return
+
+
 def _heartbeat_loop(stop: Event) -> None:
     while not stop.wait(max(0.1, float(_progress_interval_seconds))):
+        with _state_lock:
+            sampling_active = bool(_sampling_active)
+            sampling_started = float(_sampling_started)
+            sampling_label = str(_sampling_label)
+        if sampling_active:
+            elapsed = max(0.0, time.monotonic() - sampling_started)
+            _set_run_phase(f"{sampling_label}/pipeline")
+            print(
+                f"{time.strftime('[%H:%M]')} {sampling_label}/pipeline still active elapsed={elapsed:.0f}s",
+                flush=True,
+            )
+            continue
         detail, elapsed = _phase_state()
         if not _active or not detail:
             continue
-        with _state_lock:
-            if _status is not None:
-                _status.update(f"{detail} elapsed={elapsed:.0f}s")
+        _set_run_phase(detail)
+        print(
+            f"{time.strftime('[%H:%M]')} post-sampling phase={detail} elapsed={elapsed:.0f}s",
+            flush=True,
+        )
 
 
 def _start_heartbeat() -> None:
@@ -47,7 +72,7 @@ def _start_heartbeat() -> None:
         thread = Thread(
             target=_heartbeat_loop,
             args=(stop,),
-            name="v9-post-sampling-progress",
+            name="v9-live-progress",
             daemon=True,
         )
         _heartbeat_event = stop
@@ -69,29 +94,33 @@ def _stop_heartbeat() -> None:
 
 
 def _phase(detail: str) -> None:
-    global _status, _phase_detail, _phase_started
+    global _phase_detail, _phase_started
     if not _active:
         return
     now = time.monotonic()
+    changed = False
     with _state_lock:
-        if _status is None:
-            _status = InlineProgress(f"{time.strftime('[%H:%M]')} post-sampling")
         if str(detail) != _phase_detail:
             _phase_detail = str(detail)
             _phase_started = now
-        _status.update(f"{_phase_detail} elapsed={max(0.0, now - _phase_started):.0f}s")
-    _start_heartbeat()
+            changed = True
+        elapsed = max(0.0, now - _phase_started)
+    _set_run_phase(str(detail))
+    if changed:
+        print(
+            f"{time.strftime('[%H:%M]')} post-sampling phase={detail} elapsed={elapsed:.0f}s",
+            flush=True,
+        )
 
 
 def _finish(detail: str = "complete") -> None:
-    global _status, _phase_detail, _phase_started
-    _stop_heartbeat()
+    global _phase_detail, _phase_started
     with _state_lock:
-        if _status is not None:
-            _status.finish(detail)
-            _status = None
+        had_phase = bool(_phase_detail)
         _phase_detail = ""
         _phase_started = 0.0
+    if had_phase:
+        print(f"{time.strftime('[%H:%M]')} post-sampling {detail}", flush=True)
 
 
 def _dashboard_with_phase(snapshot: dict[str, Any], *, busy: bool = False) -> dict[str, Any]:
@@ -111,7 +140,7 @@ def _dashboard_with_phase(snapshot: dict[str, Any], *, busy: bool = False) -> di
 
 
 def install(epoch_runner_module: Any, runtime_cls: type) -> None:
-    """Install live visibility for long post-sampling work and dashboard reads."""
+    """Install live visibility for sampling drains, post-sampling work, and dashboard reads."""
     if getattr(epoch_runner_module, "_post_sampling_progress_installed", False):
         return
     epoch_runner_module._post_sampling_progress_installed = True
@@ -134,15 +163,48 @@ def install(epoch_runner_module: Any, runtime_cls: type) -> None:
             float(getattr(run_args, "progress_interval_seconds", 60.0)),
         )
         _active = True
+        _start_heartbeat()
         try:
             return original_run_epochs(*args, **kwargs)
         finally:
             _finish()
+            _stop_heartbeat()
+            _set_run_phase("complete")
             _active = previous_active
             _current_runtime = previous_runtime
             _progress_interval_seconds = previous_interval
 
     epoch_runner_module.run_epochs = run_epochs_with_progress
+
+    original_parallel = epoch_runner_module.run_parallel_memory_jobs
+
+    def parallel_with_progress(runtime: Any, jobs: Any, *args: Any, **kwargs: Any):
+        global _sampling_active, _sampling_started, _sampling_label
+        evaluation_only = bool(kwargs.get("evaluation_only", False))
+        label = "evaluation" if evaluation_only else "sampling"
+        requested = sum(int(row[2]) for row in jobs)
+        with _state_lock:
+            _sampling_active = True
+            _sampling_started = time.monotonic()
+            _sampling_label = label
+        _set_run_phase(label)
+        try:
+            result = original_parallel(runtime, jobs, *args, **kwargs)
+        finally:
+            with _state_lock:
+                _sampling_active = False
+        produced = sum(int(getattr(row, "steps", 0)) for row in result)
+        pct = 100.0 * produced / requested if requested else 100.0
+        print(
+            f"{time.strftime('[%H:%M]')} {pct:5.1f}% sampled={produced}/{requested} "
+            f"games_finished={len(result)}/{len(jobs)} {label} complete",
+            flush=True,
+        )
+        if not evaluation_only:
+            _set_run_phase("post-sampling")
+        return result
+
+    epoch_runner_module.run_parallel_memory_jobs = parallel_with_progress
 
     original_train = epoch_runner_module.train_hgt_epoch
 
@@ -208,7 +270,7 @@ def install(epoch_runner_module: Any, runtime_cls: type) -> None:
     original_dashboard = getattr(runtime_cls, "dashboard_metrics", None)
     if callable(original_dashboard):
         def dashboard_with_progress(self: Any) -> dict[str, Any]:
-            # Long post-sampling operations can own the runtime RLock for minutes.
+            # Long sampling/post-sampling operations can own the runtime RLock for minutes.
             # Dashboard reads must remain non-blocking and serve the last good cut.
             lock = getattr(self, "_lock", None)
             acquired = lock is None
@@ -222,15 +284,39 @@ def install(epoch_runner_module: Any, runtime_cls: type) -> None:
                     snapshot = dict(original_dashboard(self))
                     snapshot = _dashboard_with_phase(snapshot)
                     self.__dict__["_post_sampling_dashboard_cache"] = snapshot
-                    return snapshot
                 finally:
                     if lock is not None:
                         lock.release()
+            else:
+                cached = self.__dict__.get("_post_sampling_dashboard_cache")
+                if cached is None:
+                    cached = dict(getattr(self, "_metrics_cache", {}) or {})
+                    cached.setdefault("primary_dashboard", {})
+                snapshot = _dashboard_with_phase(dict(cached), busy=True)
 
-            cached = self.__dict__.get("_post_sampling_dashboard_cache")
-            if cached is None:
-                cached = dict(getattr(self, "_metrics_cache", {}) or {})
-                cached.setdefault("primary_dashboard", {})
-            return _dashboard_with_phase(dict(cached), busy=True)
+            # These gauges are lock-independent and stay live even when the graph
+            # snapshot itself must come from cache.
+            try:
+                diagnostic = dict(self.unified_telemetry.diagnostic_metrics())
+            except Exception:
+                diagnostic = {}
+            primary = dict(snapshot.get("primary_dashboard", {}) or {})
+            run_phase = diagnostic.get("run_phase")
+            if run_phase is not None:
+                primary["run_phase"] = str(run_phase)
+                snapshot["run_phase"] = str(run_phase)
+            for key in (
+                "sampled_steps",
+                "ingested_steps",
+                "sampling_backlog",
+                "publication_backlog",
+                "canonical_ingest_backlog",
+                "active_actor_processes",
+                "pending_environment_jobs",
+            ):
+                if key in diagnostic:
+                    primary[key] = diagnostic[key]
+            snapshot["primary_dashboard"] = primary
+            return snapshot
 
         runtime_cls.dashboard_metrics = dashboard_with_progress
