@@ -119,12 +119,10 @@ def test_budgeted_transfer_validation_stops_submitting_after_deadline(
     assert elapsed < 1.0
 
 
-def test_v9_installs_bounded_transfer_validation() -> None:
+def test_v9_installs_concurrent_transfer_validation_with_bounded_fallback() -> None:
     import v9
     from v9.runtime import epoch_runner
 
-    assert (
-        epoch_runner.run_transfer_validation_interval
-        is bounded.run_transfer_validation_interval
-    )
     assert getattr(epoch_runner, "_post_sampling_progress_installed", False)
+    assert getattr(epoch_runner, "_concurrent_transfer_validation_installed", False)
+    assert epoch_runner.run_transfer_validation_interval is not bounded.run_transfer_validation_interval
