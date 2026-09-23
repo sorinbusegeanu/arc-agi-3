@@ -6,19 +6,25 @@ from types import SimpleNamespace
 
 from v9.runtime import post_sampling_progress
 from v9.telemetry.http_server import (
-    DASHBOARD_LOG_REFRESH_SECONDS,
+    DASHBOARD_LIVE_REFRESH_SECONDS,
     DASHBOARD_REFRESH_SECONDS,
     MetricsHTTPServer,
 )
 
 
 def test_live_dashboard_refresh_is_decoupled_from_jsonl_cadence() -> None:
-    server = MetricsHTTPServer(lambda: {"primary_dashboard": {}}, host="127.0.0.1", port=0, log_path=None)
+    server = MetricsHTTPServer(
+        lambda: {"primary_dashboard": {}},
+        host="127.0.0.1",
+        port=0,
+        log_path=None,
+    )
     try:
-        assert DASHBOARD_REFRESH_SECONDS == 2.0
-        assert DASHBOARD_LOG_REFRESH_SECONDS == 30.0
-        assert server.refresh_seconds == 2.0
+        assert DASHBOARD_REFRESH_SECONDS == 30.0
+        assert DASHBOARD_LIVE_REFRESH_SECONDS == 2.0
+        assert server.refresh_seconds == 30.0
         assert server.log_refresh_seconds == 30.0
+        assert server.live_refresh_seconds == 2.0
         assert server._server.refresh_seconds == 2.0
     finally:
         server._server.server_close()
@@ -30,7 +36,9 @@ def test_parallel_wrapper_prints_sampling_completion_as_normal_line() -> None:
             self.gauges: dict[str, object] = {}
             self._lock = None
             self._metrics_cache = {}
-            self.unified_telemetry = SimpleNamespace(diagnostic_metrics=lambda: dict(self.gauges))
+            self.unified_telemetry = SimpleNamespace(
+                diagnostic_metrics=lambda: dict(self.gauges)
+            )
 
         def set_telemetry_gauge(self, key: str, value: object) -> None:
             self.gauges[key] = value
@@ -55,7 +63,9 @@ def test_parallel_wrapper_prints_sampling_completion_as_normal_line() -> None:
         run_parallel_memory_jobs=lambda runtime, jobs, *args, **kwargs: [
             SimpleNamespace(steps=int(job[2])) for job in jobs
         ],
-        train_hgt_epoch=lambda *args, **kwargs: SimpleNamespace(model_version="hgt-test"),
+        train_hgt_epoch=lambda *args, **kwargs: SimpleNamespace(
+            model_version="hgt-test"
+        ),
         run_lifecycle_maintenance=lambda *args, **kwargs: {},
     )
     post_sampling_progress.install(module, Runtime)
@@ -63,7 +73,9 @@ def test_parallel_wrapper_prints_sampling_completion_as_normal_line() -> None:
     jobs = [(1, SimpleNamespace(), 7, 0), (2, SimpleNamespace(), 5, 0)]
     output = StringIO()
     with redirect_stdout(output):
-        rows = module.run_parallel_memory_jobs(runtime, jobs, evaluation_only=False)
+        rows = module.run_parallel_memory_jobs(
+            runtime, jobs, evaluation_only=False
+        )
     assert len(rows) == 2
     text = output.getvalue()
     assert "100.0% sampled=12/12" in text
