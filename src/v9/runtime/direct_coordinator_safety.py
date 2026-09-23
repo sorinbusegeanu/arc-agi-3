@@ -7,8 +7,10 @@ from .canonical_commit import (
     apply_canonical_commit_batch,
     canonical_commit_prefix_length,
 )
-from .canonical_transaction import CanonicalTransactionQuarantined
 from .memory_pipeline import PreparedCommitBatch
+
+
+_DIRECT_ACTOR_FACTORY = "v9.environments.direct_adapter:make_adapter"
 
 
 def _split_bytes(total_bytes: int, rows: int) -> tuple[int, ...]:
@@ -39,10 +41,10 @@ def _consume_ingest_prefix(service: Any, row_count: int) -> None:
         if remaining < len(rows):
             rest_rows = rows[remaining:]
             rest_bytes = row_bytes[remaining:]
-            new_start = int(batch.start_sequence) + remaining
+            new_start = int(rest_rows[0].sequence)
             service.ingest_results[new_start] = PreparedCommitBatch(
                 new_start,
-                int(batch.end_sequence),
+                int(rest_rows[-1].sequence),
                 rest_rows,
                 sum(rest_bytes),
                 rest_bytes,
@@ -52,24 +54,6 @@ def _consume_ingest_prefix(service: Any, row_count: int) -> None:
         remaining -= len(rows)
         sequence = int(batch.end_sequence) + 1
     service.ingest_apply = sequence
-
-
-def _quarantine_first_ready_row(service: Any, reason: str) -> bool:
-    batch = service.ingest_results.get(int(service.ingest_apply))
-    if batch is None or not tuple(batch.rows):
-        return False
-    first_bytes = _batch_row_bytes(batch)[0]
-    _consume_ingest_prefix(service, 1)
-    service.ingested += 1
-    service.release_ingest_input_bytes(first_bytes)
-    runtime = service.runtime
-    current = int(getattr(runtime, "telemetry", {}).get("canonical_quarantined_rows", 0) or 0)
-    try:
-        runtime.set_telemetry_gauge("canonical_quarantined_rows", current + 1)
-        runtime.set_telemetry_gauge("canonical_last_quarantine_reason", str(reason))
-    except Exception:
-        pass
-    return True
 
 
 def _apply_ingest_ready_direct_safe(service: Any) -> bool:
@@ -93,45 +77,29 @@ def _apply_ingest_ready_direct_safe(service: Any) -> bool:
     if not plans:
         return False
 
-    try:
-        prefix = canonical_commit_prefix_length(
-            service.runtime,
-            plans,
-            row_input_bytes=tuple(row_input_bytes),
-        )
-    except CanonicalTransactionQuarantined as exc:
-        return _quarantine_first_ready_row(service, getattr(exc, "status", type(exc).__name__))
-
+    prefix = canonical_commit_prefix_length(
+        service.runtime,
+        plans,
+        row_input_bytes=tuple(row_input_bytes),
+    )
     if prefix <= 0:
-        return _quarantine_first_ready_row(service, "empty_canonical_prefix")
+        raise RuntimeError("canonical budget prefixer returned no admissible row")
 
-    result = None
-    last_error: BaseException | None = None
-    while prefix > 0:
-        started = time.perf_counter()
-        selected_rows = tuple(plans[:prefix])
-        selected_bytes = sum(row_input_bytes[:prefix])
-        try:
-            result = apply_canonical_commit_batch(
-                service.runtime,
-                selected_rows,
-                input_bytes=selected_bytes,
-            )
-            elapsed = time.perf_counter() - started
-            break
-        except CanonicalTransactionQuarantined as exc:
-            last_error = exc
-            if prefix == 1:
-                return _quarantine_first_ready_row(service, getattr(exc, "status", type(exc).__name__))
-            prefix = max(1, prefix // 2)
-    else:
-        return _quarantine_first_ready_row(service, type(last_error).__name__ if last_error else "canonical_quarantine")
+    started = time.perf_counter()
+    selected_rows = tuple(plans[:prefix])
+    selected_bytes = sum(row_input_bytes[:prefix])
+    result = apply_canonical_commit_batch(
+        service.runtime,
+        selected_rows,
+        input_bytes=selected_bytes,
+    )
+    elapsed = time.perf_counter() - started
 
     service.canonical_apply_seconds += elapsed
     service.canonical_apply_events += prefix
     service.last_canonical_ingest_batch = prefix
     service.ingested += prefix
-    service.release_ingest_input_bytes(sum(row_input_bytes[:prefix]))
+    service.release_ingest_input_bytes(selected_bytes)
     _consume_ingest_prefix(service, prefix)
 
     resident_manager = getattr(service.runtime, "_resident_memory", None)
@@ -178,9 +146,26 @@ def _install_plain_actor_publication() -> None:
     multiprocess._plain_direct_publication_installed = True
 
 
-def install(memory_pipeline_service_cls: type) -> None:
-    if getattr(memory_pipeline_service_cls, "_direct_coordinator_safety_installed", False):
+def _install_direct_actor_factory() -> None:
+    from . import multiprocess
+
+    if getattr(multiprocess.ProcessTopology, "_direct_actor_adapter_installed", False):
         return
-    memory_pipeline_service_cls.apply_ingest_ready = _apply_ingest_ready_direct_safe
-    memory_pipeline_service_cls._direct_coordinator_safety_installed = True
+    original_start_actor = multiprocess.ProcessTopology.start_actor
+
+    def start_actor(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("adapter_factory_path") == "v9.cli:make_adapter":
+            kwargs = dict(kwargs)
+            kwargs["adapter_factory_path"] = _DIRECT_ACTOR_FACTORY
+        return original_start_actor(self, *args, **kwargs)
+
+    multiprocess.ProcessTopology.start_actor = start_actor
+    multiprocess.ProcessTopology._direct_actor_adapter_installed = True
+
+
+def install(memory_pipeline_service_cls: type) -> None:
+    if not getattr(memory_pipeline_service_cls, "_direct_coordinator_safety_installed", False):
+        memory_pipeline_service_cls.apply_ingest_ready = _apply_ingest_ready_direct_safe
+        memory_pipeline_service_cls._direct_coordinator_safety_installed = True
     _install_plain_actor_publication()
+    _install_direct_actor_factory()
