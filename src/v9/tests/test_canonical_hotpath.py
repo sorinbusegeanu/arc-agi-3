@@ -158,4 +158,4 @@ def test_authoritative_install_wires_hotpath_into_reducer_and_derivation() -> No
     assert publication_throughput.apply_canonical_commit_batch is canonical_hotpath._apply_canonical_commit_coalesced
     assert canonical_commit_derivation.derivation_candidates is canonical_hotpath._derivation_candidates_with_aggregate_support
     assert canonical_commit.derivation_candidates is canonical_hotpath._derivation_candidates_with_aggregate_support
-    assert residency._PREPARED_COMPACTION_BATCH_LIMIT >= 8
+    assert residency._PREPARED_COMPACTION_BATCH_LIMIT >= 16
