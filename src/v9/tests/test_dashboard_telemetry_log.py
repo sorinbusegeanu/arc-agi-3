@@ -98,34 +98,14 @@ def test_dashboard_logger_records_provider_failure_and_keeps_polling(tmp_path) -
 def test_dashboard_html_hides_diagnostics_block(tmp_path) -> None:
     provider = _MetricsProvider(tmp_path)
     server = MetricsHTTPServer(provider.metrics, host="127.0.0.1", port=0, refresh_seconds=0.1)
-    log_path = tmp_path / "telemetry" / "dashboard_metrics.jsonl"
     server.start()
     try:
-        deadline = time.monotonic() + 2.0
-        while (not log_path.exists() or not log_path.stat().st_size) and time.monotonic() < deadline:
-            time.sleep(0.01)
         port = int(server._server.server_address[1])
         with urlopen(f"http://127.0.0.1:{port}/dashboard", timeout=2.0) as response:
             html = response.read().decode("utf-8")
         assert 'id="grid"' in html
         assert 'id="diag"' not in html
         assert "<h2>Diagnostics</h2>" not in html
-        assert "M0_count" in html
-        assert "behavioral_success_rate" in html
-    finally:
-        server.close()
-
-
-def test_dashboard_html_renders_status_without_javascript_or_cache(tmp_path) -> None:
-    provider = _MetricsProvider(tmp_path)
-    server = MetricsHTTPServer(provider.metrics, host="127.0.0.1", port=0, refresh_seconds=30.0)
-    server.start()
-    try:
-        port = int(server._server.server_address[1])
-        with urlopen(f"http://127.0.0.1:{port}/dashboard", timeout=2.0) as response:
-            html = response.read().decode("utf-8")
-        assert 'id="grid"' in html
-        assert "dashboard_status" in html or "M0_count" in html
     finally:
         server.close()
 

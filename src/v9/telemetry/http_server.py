@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from html import escape
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, RLock, Thread
 from typing import Any, Callable
 
 
@@ -47,56 +46,6 @@ def _compact_log_snapshot(snapshot: dict[str, Any], *, timestamp: str) -> dict[s
     return compact
 
 
-def _format_dashboard_value(value: Any) -> str:
-    if isinstance(value, float):
-        return f"{value:.2f}"
-    if isinstance(value, (dict, list, tuple)):
-        return json.dumps(value, sort_keys=True, default=str)
-    return str(value)
-
-
-def _primary_dashboard(snapshot: dict[str, Any]) -> dict[str, Any]:
-    primary = dict(snapshot.get("primary_dashboard", {}) or {})
-    if not primary:
-        error = snapshot.get("dashboard_metrics_error")
-        if isinstance(error, dict):
-            primary["dashboard_metrics_error"] = f"{error.get('type', 'Error')}: {error.get('message', '')}"
-        else:
-            primary["dashboard_status"] = "no metrics available yet"
-    return primary
-
-
-def _render_dashboard_cards(primary: dict[str, Any]) -> str:
-    rows = []
-    for key, value in primary.items():
-        rows.append(
-            '<div class="card"><div class="k">'
-            + escape(str(key))
-            + '</div><div class="v">'
-            + escape(_format_dashboard_value(value))
-            + "</div></div>"
-        )
-    return "".join(rows)
-
-
-def _render_dashboard_html(snapshot: dict[str, Any], *, refresh_seconds: float) -> bytes:
-    cards = _render_dashboard_cards(_primary_dashboard(snapshot))
-    refresh = max(1, int(round(refresh_seconds)))
-    generated_at = escape(datetime.now(timezone.utc).isoformat())
-    html = f"""<!doctype html>
-<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="{refresh}"><title>Hydra v9 Dashboard</title>
-<style>
-body{{font-family:system-ui,sans-serif;margin:24px;background:#111;color:#eee}}
-h1{{font-size:20px;margin-bottom:6px}}.sub{{color:#999;font-size:12px;margin-bottom:16px}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}}
-.card{{background:#1d1d1d;padding:12px;border-radius:8px}}.k{{color:#aaa;font-size:12px}}.v{{font-size:20px;margin-top:4px;word-break:break-word}}
-a{{color:#9cf}}
-</style></head>
-<body><h1>Hydra v9.7.6</h1><div class="sub">Generated {generated_at}. Auto-refresh every {refresh}s. <a href="/dashboard">Refresh now</a>.</div>
-<div class="grid">{cards}</div></body></html>"""
-    return html.encode("utf-8")
-
-
 class MetricsHTTPServer:
     def __init__(
         self,
@@ -106,14 +55,13 @@ class MetricsHTTPServer:
         port: int = 8765,
         log_path: str | Path | None = None,
         refresh_seconds: float = DASHBOARD_REFRESH_SECONDS,
-        live_refresh_seconds: float | None = None,
     ) -> None:
         self.metrics_provider = metrics_provider
         owner = getattr(metrics_provider, "__self__", None)
         dashboard_provider = getattr(owner, "dashboard_metrics", None)
-        self._dashboard_provider = dashboard_provider if callable(dashboard_provider) else metrics_provider
-        self.refresh_seconds = max(1.0, float(refresh_seconds))
-        self.log_refresh_seconds = self.refresh_seconds
+        provider = dashboard_provider if callable(dashboard_provider) else metrics_provider
+        self._dashboard_provider = provider
+        self.refresh_seconds = max(0.1, float(refresh_seconds))
         if log_path is None:
             config = getattr(owner, "config", None)
             root = getattr(config, "root", None)
@@ -122,6 +70,8 @@ class MetricsHTTPServer:
         self.log_path = None if log_path is None else Path(log_path)
         self._stop_logging = Event()
         self._log_thread: Thread | None = None
+        self._model_history_lock = RLock()
+        self._model_history: dict[str, dict[str, Any]] = {}
         server_owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -135,13 +85,50 @@ class MetricsHTTPServer:
 
             def do_GET(self) -> None:
                 if self.path in {"/api/metrics", "/metrics"}:
-                    snapshot = server_owner._dashboard_snapshot()
+                    try:
+                        snapshot = server_owner._dashboard_snapshot()
+                    except Exception as exc:
+                        raw = json.dumps(
+                            {
+                                "dashboard_metrics_error": {
+                                    "type": type(exc).__name__,
+                                    "message": str(exc),
+                                }
+                            },
+                            sort_keys=True,
+                            default=str,
+                        ).encode("utf-8")
+                        self._write(503, "application/json; charset=utf-8", raw)
+                        return
                     raw = json.dumps(snapshot, sort_keys=True, default=str).encode("utf-8")
                     self._write(200, "application/json; charset=utf-8", raw)
                     return
                 if self.path in {"/", "/dashboard"}:
-                    snapshot = server_owner._dashboard_snapshot()
-                    html = _render_dashboard_html(snapshot, refresh_seconds=server_owner.refresh_seconds)
+                    refresh_ms = int(round(self.server.refresh_seconds * 1000.0))
+                    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Hydra v9 Dashboard</title>
+<style>
+body{{font-family:system-ui,sans-serif;margin:24px;background:#111;color:#eee}}
+h1{{font-size:20px}}h2{{font-size:16px;margin-top:24px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}}
+.card{{background:#1d1d1d;padding:12px;border-radius:8px}}.k{{color:#aaa;font-size:12px}}.v{{font-size:20px;margin-top:4px}}
+pre{{background:#1d1d1d;padding:12px;overflow:auto;line-height:1.5}}
+</style></head>
+<body><h1>Hydra v9.7.6</h1><div id="grid" class="grid"></div>
+<h2>Model history</h2><pre id="model-history">No trained models yet</pre>
+<script>
+function display(v, digits){{
+ if(typeof v === 'number') return v.toFixed(digits);
+ return String(v ?? '');
+}}
+async function refresh(){{
+ const r=await fetch('/api/metrics',{{cache:'no-store'}}); const m=await r.json();
+ const p=m.primary_dashboard||{{}}; const g=document.getElementById('grid'); g.innerHTML='';
+ for(const [k,v] of Object.entries(p)){{const d=document.createElement('div');d.className='card';d.innerHTML='<div class="k">'+k+'</div><div class="v">'+v+'</div>';g.appendChild(d)}}
+ const history=m.model_history||[]; const h=document.getElementById('model-history');
+ h.textContent=history.length ? history.map(x => x.model+' | levels='+x.run_levels_solved+' | wins='+display(x.run_wins,4)+' | behavioral='+display(x.behavioral_success_rate,4)+' | VRAM='+display(x.vram_gb,2)+' GB').join('\n') : 'No trained models yet';
+}}
+refresh(); setInterval(refresh,{refresh_ms});
+</script></body></html>""".encode("utf-8")
                     self._write(200, "text/html; charset=utf-8", html)
                     return
                 self._write(404, "text/plain; charset=utf-8", b"not found")
@@ -150,32 +137,62 @@ class MetricsHTTPServer:
                 return
 
         self._server = ThreadingHTTPServer((str(host), int(port)), Handler)
+        self._server.refresh_seconds = self.refresh_seconds
         self.host = str(host)
         self.port = int(port)
         self._thread = Thread(target=self._server.serve_forever, name="v9-metrics-http", daemon=True)
 
+    def _record_model_history(self, snapshot: dict[str, Any]) -> None:
+        primary = dict(snapshot.get("primary_dashboard", {}))
+        model = str(primary.get("ModelVersion", "untrained"))
+        if not model or model == "untrained":
+            return
+        row = {
+            "model": model,
+            "run_levels_solved": int(primary.get("current_run_levels_solved", 0)),
+            "run_wins": float(primary.get("current_run_wins", 0.0)),
+            "behavioral_success_rate": float(primary.get("behavioral_success_rate", 0.0)),
+            "vram_gb": float(primary.get("GPU_memory_GB", 0.0)),
+        }
+        with self._model_history_lock:
+            self._model_history[model] = row
+
+    def _model_history_snapshot(self) -> list[dict[str, Any]]:
+        with self._model_history_lock:
+            return [dict(row) for row in self._model_history.values()]
+
     def _dashboard_snapshot(self) -> dict[str, Any]:
-        try:
-            return dict(self._dashboard_provider())
-        except Exception as exc:
-            return {
-                "primary_dashboard": {},
-                "dashboard_metrics_error": {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                },
-            }
+        snapshot = dict(self._dashboard_provider())
+        self._record_model_history(snapshot)
+        snapshot["model_history"] = self._model_history_snapshot()
+        return snapshot
 
     def _log_dashboard_metrics(self) -> None:
         if self.log_path is None:
             return
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        # One process run owns one dashboard log. Reusing --root must not append
+        # previous runs indefinitely.
         with self.log_path.open("w", encoding="utf-8", buffering=1) as handle:
             while not self._stop_logging.is_set():
                 timestamp = datetime.now(timezone.utc).isoformat()
-                snapshot = _compact_log_snapshot(self._dashboard_snapshot(), timestamp=timestamp)
+                try:
+                    snapshot = self._dashboard_provider()
+                    self._record_model_history(snapshot)
+                    snapshot = _compact_log_snapshot(snapshot, timestamp=timestamp)
+                except Exception as exc:
+                    # A telemetry read must never terminate the long-lived
+                    # logger. Preserve an auditable failure row and retry at the
+                    # next fixed refresh interval.
+                    snapshot = {
+                        "timestamp_utc": timestamp,
+                        "dashboard_metrics_error": {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    }
                 handle.write(json.dumps(snapshot, sort_keys=True, default=str) + "\n")
-                if self._stop_logging.wait(self.log_refresh_seconds):
+                if self._stop_logging.wait(self.refresh_seconds):
                     break
 
     def start(self) -> None:

@@ -138,6 +138,41 @@ def test_epochs_repeat_sampling_and_training(tmp_path) -> None:
     assert summary["epochs"][1]["performance"]["coordinator_action_requests"] == 0
 
 
+def test_tiny_worker_queues_complete_three_epochs_without_backpressure_deadlock(tmp_path) -> None:
+    root = tmp_path / "tiny-queues"
+    args = build_parser().parse_args([
+        "continuous-run",
+        "--root", str(root),
+        "--games", "synthetic-symbolic",
+        "--steps-per-game", "24",
+        "--epochs", "3",
+        "--actors", "4",
+        "--shards", "1",
+        "--stage-workers", "1",
+        "--ingest-workers", "1",
+        "--derivation-workers", "1",
+        "--stage-ring-capacity", "2",
+        "--shard-ring-capacity", "2",
+        "--ingest-queue-capacity", "1",
+        "--derivation-queue-capacity", "1",
+        "--publication-queue-capacity", "2",
+        "--no-peers",
+        "--no-dashboard",
+        "--no-snapshots",
+    ])
+    assert run_continuous(args) == 0
+    summary = json.loads((root / "v9_run_summary.json").read_text(encoding="utf-8"))
+    assert len(summary["epochs"]) == 3
+    for epoch in summary["epochs"]:
+        performance = epoch["performance"]
+        assert performance["sampled_steps"] == performance["ingested_steps"]
+        assert performance["sampling_backlog"] == 0
+        diagnostics = epoch["metrics"]["telemetry_diagnostics"]
+        assert diagnostics["coordinator_pending_ingest"] == 0
+        assert diagnostics["coordinator_pending_derivation"] == 0
+        assert diagnostics["actors_exited_without_done"] == 0
+
+
 def test_behavioral_success_is_game_independent() -> None:
     from v9.runtime.epoch_runner import _scenario_success
     from v9.runtime.parallel_memory_coordinator import ProcessActorResult

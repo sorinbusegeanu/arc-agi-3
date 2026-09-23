@@ -60,3 +60,55 @@ def test_sampling_prefills_distinct_actor_processes(tmp_path) -> None:
         assert int(diagnostics["actor_policy_snapshot_cache_hits"]) >= 3
     finally:
         runtime.close(normal=False)
+
+
+
+def test_evaluation_only_sampling_does_not_mutate_memory(tmp_path) -> None:
+    runtime = ContinuousMemoryRuntime(
+        RuntimeConfig.from_path(
+            tmp_path / "evaluation",
+            restore=False,
+            enable_snapshots=False,
+            enable_peers=False,
+            shards=2,
+            stage_workers=1,
+        )
+    )
+    runtime.start()
+    spec = resolve_game_specs("step1")[0]
+    before_watermark = runtime.watermark
+    before_memories = runtime.graph.memory_count()
+    try:
+        rows = run_parallel_memory_jobs(
+            runtime,
+            [(1, spec, 12, 1234)],
+            actor_limit=2,
+            stage_workers=1,
+            shards=2,
+            queue_capacity=128,
+            epsilon=0.1,
+            env_root=None,
+            alfred_backend_factory=None,
+            start_method=None,
+            progress_interval_seconds=60.0,
+            ingest_workers=1,
+            derivation_workers=1,
+            ingest_queue_capacity=128,
+            derivation_queue_capacity=64,
+            publication_queue_capacity=128,
+            actor_view_refresh_steps=16,
+            actor_view_refresh_ms=100.0,
+            allow_policy_refresh=False,
+            evaluation_only=True,
+            evidence_branch="heldout_eval",
+        )
+        diagnostics = runtime.unified_telemetry.diagnostic_metrics()
+        assert sum(int(row.steps) for row in rows) == 12
+        assert runtime.watermark == before_watermark
+        assert runtime.graph.memory_count() == before_memories
+        assert int(diagnostics["evaluation_only"]) == 1
+        assert int(diagnostics["evaluation_steps"]) == 12
+        assert int(diagnostics["causally_admitted_steps"]) == 0
+        assert int(diagnostics["ingested_steps"]) == 0
+    finally:
+        runtime.close(normal=False)

@@ -1,51 +1,24 @@
 from __future__ import annotations
 
-import builtins
-import os
-import sys
 import time
 from typing import Any
 
 from . import concurrent_transfer_validation as concurrent
-from . import post_sampling_progress as post_progress
 from .multiprocess import ProcessTopology, ensure_process_server_ready
 from .progress import InlineProgress
 
 
-def _terminal_print(*values: object, sep: str = " ", end: str = "\n", file: Any = None, flush: bool = False) -> None:
-    """Use fd 1 only for an actual interactive terminal; preserve normal capture elsewhere."""
-    target = sys.stdout if file is None else file
-    direct_terminal = False
-    if target in (sys.stdout, sys.__stdout__):
-        try:
-            direct_terminal = bool(target.isatty() and target.fileno() == 1)
-        except (AttributeError, OSError, ValueError):
-            direct_terminal = False
-    if direct_terminal:
-        text = sep.join(str(value) for value in values) + end
-        try:
-            os.write(1, text.encode("utf-8", errors="replace"))
-            return
-        except (BrokenPipeError, OSError, ValueError):
-            pass
-    builtins.print(*values, sep=sep, end=end, file=target, flush=flush)
-
-
-def _install_direct_live_observability() -> None:
-    # Terminal output remains independent from carriage-return progress renderers.
-    # Dashboard live caching is implemented natively by MetricsHTTPServer.
-    post_progress.print = _terminal_print
-
-
 def install() -> None:
     if getattr(concurrent, "_startup_safety_installed", False):
-        _install_direct_live_observability()
         return
     concurrent._startup_safety_installed = True
 
     original_session_start = concurrent.ConcurrentTransferValidationSession.start
 
     def start_after_process_server(self: Any) -> None:
+        # The forkserver must exist before any supervisor/background thread is
+        # created. Starting the server from a multi-threaded parent can stall
+        # the initial actor-process prefill before sampling telemetry begins.
         ensure_process_server_ready(
             getattr(self.runtime.config, "multiprocessing_start_method", None)
         )
@@ -102,4 +75,3 @@ def install() -> None:
                 progress.update(f"{launched}/{self.actors}")
 
     ProcessTopology.start_actor = start_actor_with_prefill_progress
-    _install_direct_live_observability()
