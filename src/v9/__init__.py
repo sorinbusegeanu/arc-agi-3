@@ -82,6 +82,12 @@ _install_runtime_integrity_followup(_runtime_integrity_module, MemoryPipelineSer
 from v9.runtime.inline_lowlevel_publication import install_inline_lowlevel_publication as _install_inline_lowlevel_publication
 _install_inline_lowlevel_publication(ContinuousMemoryRuntime)
 
+if not hasattr(MemoryPipelineService, "shutdown_parallel_pipeline"):
+    def _direct_shutdown_parallel_pipeline(self):
+        return None
+
+    MemoryPipelineService.shutdown_parallel_pipeline = _direct_shutdown_parallel_pipeline
+
 _hgt_package.train_hgt_epoch = _hgt_training.train_hgt_epoch
 from v9.runtime import epoch_runner as _epoch_runner
 _epoch_runner.train_hgt_epoch = _hgt_training.train_hgt_epoch
