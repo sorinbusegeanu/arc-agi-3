@@ -13,7 +13,7 @@ from . import residency as _residency
 
 
 _MISSING = object()
-_EPOCH_COMPACTION_MAX_BATCHES = 16
+_EPOCH_COMPACTION_MAX_BATCHES = 32
 _EPOCH_COMPACTION_MAX_SECONDS = 5.0
 _IDLE_COMPACTION_BACKLOG_MULTIPLIER = 1
 
@@ -281,11 +281,10 @@ def install(pipeline_cls: type) -> None:
     _canonical_derivation.derivation_candidates = _derivation_candidates_with_aggregate_support
     _canonical_commit.derivation_candidates = _derivation_candidates_with_aggregate_support
 
-    # Let the background planner stay farther ahead than the old four-batch cap.
-    # Physical deletion remains single-owner and bounded by the existing 2,048-node
-    # delete batch limit.
+    # Keep enough prepared work to clear a full 50k-class epoch backlog during
+    # the bounded catch-up window without increasing the 2,048-node delete batch.
     _residency._PREPARED_COMPACTION_BATCH_LIMIT = max(
-        int(_residency._PREPARED_COMPACTION_BATCH_LIMIT), 8
+        int(_residency._PREPARED_COMPACTION_BATCH_LIMIT), 16
     )
 
     original_service = pipeline_cls.service
