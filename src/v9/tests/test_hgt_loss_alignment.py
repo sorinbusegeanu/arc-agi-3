@@ -212,7 +212,6 @@ def test_obsolete_raw_transition_value_head_loss_is_removed() -> None:
     assert "policy_score_scale" in source
 
 
-
 def test_policy_feature_source_excludes_post_action_outcomes_without_torch() -> None:
     import inspect
 
@@ -234,7 +233,7 @@ def test_policy_feature_source_excludes_post_action_outcomes_without_torch() -> 
 def test_auxiliary_mask_contract_keeps_non_action_memories_without_torch() -> None:
     import inspect
 
-    source = inspect.getsource(training._loss)
+    source = inspect.getsource(training)
     assert "(~action_mask) | policy_mask" in source
     assert "task_masks[objective][node_type]" in source
 
