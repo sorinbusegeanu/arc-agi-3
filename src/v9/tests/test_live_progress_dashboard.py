@@ -6,13 +6,12 @@ from types import SimpleNamespace
 
 from v9.runtime import post_sampling_progress
 from v9.telemetry.http_server import (
-    DASHBOARD_LIVE_REFRESH_SECONDS,
     DASHBOARD_REFRESH_SECONDS,
     MetricsHTTPServer,
 )
 
 
-def test_live_dashboard_refresh_is_decoupled_from_jsonl_cadence() -> None:
+def test_dashboard_refresh_uses_single_jsonl_cadence() -> None:
     server = MetricsHTTPServer(
         lambda: {"primary_dashboard": {}},
         host="127.0.0.1",
@@ -21,11 +20,10 @@ def test_live_dashboard_refresh_is_decoupled_from_jsonl_cadence() -> None:
     )
     try:
         assert DASHBOARD_REFRESH_SECONDS == 30.0
-        assert DASHBOARD_LIVE_REFRESH_SECONDS == 2.0
         assert server.refresh_seconds == 30.0
         assert server.log_refresh_seconds == 30.0
-        assert server.live_refresh_seconds == 2.0
-        assert server._server.refresh_seconds == 2.0
+        assert not hasattr(server, "live_refresh_seconds")
+        assert not hasattr(server, "_live_thread")
     finally:
         server._server.server_close()
 
