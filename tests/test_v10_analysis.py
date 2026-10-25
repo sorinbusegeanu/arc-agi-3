@@ -1,0 +1,461 @@
+from __future__ import annotations
+
+import io
+import json
+import urllib.error
+from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
+import pytest
+
+from v10.analysis import (
+    DecisionValidationError,
+    build_analysis_input,
+    run_analysis,
+    score_recorded_plan,
+    validate_model_decision,
+)
+from v10.cli import build_parser
+from v10.frames import FrameStore, png_bytes
+from v10.evaluation import run_ablation
+from v10.replay import replay_trace
+from v10.strata_client import StrataClient
+from v10.tools.game import evaluate_prediction
+from v10.tools.history import History
+
+
+@pytest.fixture(autouse=True)
+def _isolated_memory_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("V10_STATE_DIR", str(tmp_path / "state"))
+
+
+def _write_trace(path: Path) -> None:
+    frame = np.zeros((2, 3), dtype=np.int64)
+    with path.open("w", encoding="utf-8") as handle:
+        for index in range(7):
+            if index:
+                frame = frame.copy()
+                frame[0, 0] = index % 2
+            action_id = "RESET" if index == 0 else f"ACTION{1 if index == 6 else (index % 2) + 1}"
+            row = {
+                "timestamp": f"2026-01-01T00:00:{index:02d}Z",
+                "data": {
+                    "game_id": "fixture",
+                    "state": "NOT_FINISHED",
+                    "levels_completed": 0,
+                    "win_levels": 1,
+                    "action_input": {
+                        "id": action_id,
+                        "data": {} if index == 0 else {"game_id": "fixture"},
+                        "reasoning": f"HISTORICAL_REASONING_{index}" + (" FUTURE_ONLY" if index == 5 else ""),
+                    },
+                    "guid": "fixture-guid",
+                    "full_reset": index == 0,
+                    "available_actions": [1, 2],
+                    "frame": frame.tolist(),
+                },
+            }
+            handle.write(json.dumps(row) + "\n")
+
+
+def _valid_decision(action: str = "ACTION2", args: dict | None = None) -> dict:
+    return {
+        "observations": [],
+        "patterns": [],
+        "hypotheses": [],
+        "prediction_audit": [],
+        "goals": [],
+        "priority_question": "Does the next action change the frame?",
+        "decision": {
+            "mode": "explore",
+            "continue_or_reset": "continue",
+            "reset_justification": None,
+            "actions": [{
+                "action": action,
+                "args": args or {},
+                "prediction_id": "PR_NEXT",
+                "expected_observation": "One pixel changes.",
+                "measurable_prediction": {
+                    "all": [{"path": "measurements.changed_pixels", "op": "eq", "value": 1}],
+                },
+                "stop_if": ["unexpected_transition", "level_change"],
+            }],
+        },
+        "memory_patch": [],
+    }
+
+
+class _FakeClient:
+    def __init__(self, outputs: list[str] | None = None, decision: dict | None = None):
+        self.outputs = list(outputs or [])
+        self.decision = decision or _valid_decision()
+        self.calls = []
+
+    def complete(self, system_prompt, user_prompt, image_paths, image_labels):
+        self.calls.append((system_prompt, user_prompt, list(image_paths), list(image_labels)))
+        content = self.outputs.pop(0) if self.outputs else json.dumps(self.decision)
+        return {
+            "content": content,
+            "model": "mock-qwen",
+            "usage": {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17},
+            "latency_seconds": 0.01,
+        }
+
+
+def test_analysis_context_contains_only_prefix_and_selected_images(tmp_path: Path) -> None:
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run_dir = tmp_path / "run"
+    replay_trace(trace, run_dir)
+
+    context = build_analysis_input(run_dir, through_action=4)
+
+    assert len(context["prefix_transitions"]) == 4
+    assert len(context["image_paths"]) == 6
+    assert "replay_records" not in context
+    assert "FUTURE_ONLY" not in context["user_prompt"]
+    assert "HISTORICAL_REASONING" not in context["user_prompt"]
+    assert all("reasoning" not in row for row in context["prefix_transitions"])
+    visible_ids = set(context["visible_evidence_ids"])
+    assert context["initial_state_evidence_id"] in visible_ids
+    assert all(row["evidence_id"] in visible_ids for row in context["prefix_transitions"])
+    assert all(
+        row["prediction_evidence_id"] in visible_ids
+        for row in context["prefix_transitions"] if row.get("prediction_evidence_id")
+    )
+    assert all(frame["frame_id"] not in visible_ids for frame in FrameStore(run_dir).entries())
+    assert set(context["context"]["citable_evidence_ids"]) == visible_ids
+
+
+def test_context_reader_stops_before_malformed_future_evidence(tmp_path: Path) -> None:
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run_dir = tmp_path / "run"
+    replay_trace(trace, run_dir)
+    with (run_dir / "evidence.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write("malformed future evidence\n")
+
+    context = build_analysis_input(run_dir, through_action=4)
+
+    assert len(context["prefix_transitions"]) == 4
+
+
+def test_ablation_profiles_select_expected_memory_and_delta_images(tmp_path: Path) -> None:
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run_dir = tmp_path / "run"
+    replay_trace(trace, run_dir)
+
+    pixels = build_analysis_input(run_dir, conditioning="pixels_actions", horizon=2)
+    with_memory = build_analysis_input(run_dir, conditioning="pixels_actions_memory", horizon=2)
+    memory_delta = build_analysis_input(run_dir, conditioning="memory_delta", horizon=2)
+
+    assert len(pixels["image_paths"]) == len(with_memory["image_paths"]) == 2
+    assert len(memory_delta["image_paths"]) == 4
+    assert pixels["context"]["memory"] is None
+    assert with_memory["context"]["memory"] is not None
+    assert memory_delta["context"]["conditioning"] == "memory_delta"
+
+
+def test_ablation_runs_matched_profiles_without_writing_analysis_decisions(tmp_path: Path) -> None:
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run_dir = tmp_path / "run"
+    replay_trace(trace, run_dir)
+
+    result = run_ablation(run_dir, _FakeClient(), through_action=4, horizon=2)
+
+    assert [arm["conditioning"] for arm in result["arms"]] == [
+        profile for profile in ("pixels_actions", "pixels_actions_memory", "memory_delta")
+        for _ in (False, True)
+    ]
+    assert [arm["include_prior_decisions"] for arm in result["arms"]] == [False, True] * 3
+    assert all(arm["status"] == "ok" for arm in result["arms"])
+    assert not (run_dir / "decisions.jsonl").exists()
+    assert (run_dir / "ablation_runs.jsonl").exists()
+
+
+def test_run_analysis_scores_matching_recorded_action_after_model_call(tmp_path: Path) -> None:
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run_dir = tmp_path / "run"
+    replay_trace(trace, run_dir)
+    client = _FakeClient()
+
+    result = run_analysis(run_dir, client, through_action=4)
+
+    assert result["prediction_audits"] == [{
+        "prediction_id": "PR_NEXT",
+        "plan_index": 0,
+        "verdict": "matched",
+        "compared": [{
+            "path": "measurements.changed_pixels", "op": "eq", "expected": 1,
+            "actual": 1, "matched": True,
+        }],
+        "recorded_evidence_id": "T6",
+        "recorded_action": "ACTION2",
+    }]
+    assert "FUTURE_ONLY" not in client.calls[0][1]
+    assert result["usage"]["total_tokens"] == 17
+    assert (run_dir / "decisions.jsonl").exists()
+
+
+def test_analysis_retries_once_for_invalid_json_and_never_scores_before_validity(tmp_path: Path) -> None:
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run_dir = tmp_path / "run"
+    replay_trace(trace, run_dir)
+    client = _FakeClient(outputs=["not-json", json.dumps(_valid_decision())])
+
+    result = run_analysis(run_dir, client, through_action=4)
+
+    assert result["repair_attempted"] is True
+    assert result["initial_validation_error"].startswith("response is not valid JSON")
+    assert len(client.calls) == 2
+    assert "FUTURE_ONLY" not in client.calls[1][1]
+
+
+def test_model_decision_rejects_future_or_unknown_evidence(tmp_path: Path) -> None:
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run_dir = tmp_path / "run"
+    replay_trace(trace, run_dir)
+    context = build_analysis_input(run_dir, through_action=4)
+    decision = _valid_decision()
+    decision["observations"] = [{"id": "O1", "claim": "future", "evidence_ids": ["T999"]}]
+
+    with pytest.raises(DecisionValidationError, match="unavailable evidence"):
+        validate_model_decision(
+            decision, context["legal_action_specs"], context["visible_evidence_ids"],
+        )
+
+
+def test_model_decision_rejects_frame_handle_as_citation(tmp_path: Path) -> None:
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run_dir = tmp_path / "run"
+    replay_trace(trace, run_dir)
+    context = build_analysis_input(run_dir, through_action=4)
+    decision = _valid_decision()
+    decision["observations"] = [{"id": "O1", "claim": "visible", "evidence_ids": ["F0"]}]
+
+    with pytest.raises(DecisionValidationError, match="frame handle F0"):
+        validate_model_decision(decision, context["legal_action_specs"], context["visible_evidence_ids"])
+
+
+@pytest.mark.parametrize("patch, message", [
+    ({"op": "verdict", "id": "P1", "status": "matched"}, "harness-owned"),
+    ({"op": "upsert", "id": "O1", "type": "observation", "claim": "x", "evidence_ids": ["T1"]}, "entry type"),
+    ({"op": "upsert", "id": "H1", "type": "hypothesis", "claim": "x", "evidence_ids": []}, "non-empty"),
+])
+def test_model_decision_rejects_structurally_invalid_memory_patch(tmp_path: Path, patch: dict, message: str) -> None:
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run_dir = tmp_path / "run"
+    replay_trace(trace, run_dir)
+    context = build_analysis_input(run_dir, through_action=4)
+    decision = _valid_decision()
+    decision["memory_patch"] = [patch]
+
+    with pytest.raises(DecisionValidationError, match=message):
+        validate_model_decision(decision, context["legal_action_specs"], context["visible_evidence_ids"])
+
+
+def test_model_decision_rejects_malformed_enum_types_cleanly(tmp_path: Path) -> None:
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run_dir = tmp_path / "run"
+    replay_trace(trace, run_dir)
+    context = build_analysis_input(run_dir, through_action=4)
+    decision = _valid_decision()
+    decision["decision"]["mode"] = ["explore"]
+
+    with pytest.raises(DecisionValidationError, match="mode must be a string"):
+        validate_model_decision(
+            decision, context["legal_action_specs"], context["visible_evidence_ids"],
+        )
+
+
+def test_scoring_stops_at_first_action_divergence() -> None:
+    decision = _valid_decision(action="ACTION1")
+    plan = decision["decision"]["actions"]
+    plan.append({**plan[0], "prediction_id": "PR_NEXT_2"})
+    future = [{
+        "action": "ACTION2", "args": {}, "evidence_id": "T10",
+        "measurements": {"changed_pixels": 1},
+    }]
+
+    audits = score_recorded_plan(decision, future)
+
+    assert audits[0]["verdict"] == "unscorable"
+    assert audits[1]["verdict"] == "unscorable"
+    assert audits[1]["reason"] == "prior action diverged from recorded trace"
+
+
+def test_scoring_interrupts_plan_after_measurable_prediction_failure() -> None:
+    decision = _valid_decision(action="ACTION2")
+    first = decision["decision"]["actions"][0]
+    second = {**first, "action": "ACTION1", "prediction_id": "PR_NEXT_2"}
+    decision["decision"]["actions"].append(second)
+    future = [
+        {"action": "ACTION2", "args": {}, "evidence_id": "T10", "measurements": {"changed_pixels": 2}},
+        {"action": "ACTION1", "args": {}, "evidence_id": "T11", "measurements": {"changed_pixels": 1}},
+    ]
+
+    audits = score_recorded_plan(decision, future)
+
+    assert audits[0]["verdict"] == "failed"
+    assert audits[0]["interrupt_reason"] == "prediction_mismatch"
+    assert audits[1]["verdict"] == "unscorable"
+
+
+def test_prediction_type_mismatch_is_inconclusive_not_failed() -> None:
+    result = evaluate_prediction(
+        {"changed_pixels": "zero or more"}, {"measurements": {"changed_pixels": 2}},
+    )
+    assert result["verdict"] == "inconclusive"
+    assert result["reason"].startswith("invalid prediction:")
+
+
+def test_measurement_scoring_requires_every_predicted_field() -> None:
+    assert evaluate_prediction(
+        {"changed_pixels": 1, "missing": 2}, {"measurements": {"changed_pixels": 1}},
+    )["verdict"] == "inconclusive"
+    assert evaluate_prediction(
+        {"candidate_displacement": {"best": {"dy": -2}}},
+        {"measurements": {"candidate_displacement": {"best": {"dy": -2, "dx": 0}}}},
+    )["verdict"] == "matched"
+    assert evaluate_prediction(None, {"measurements": {"changed_pixels": 1}}, "unobservable")["verdict"] == "inconclusive"
+
+
+def test_structured_measurement_comparisons_and_game_outcomes() -> None:
+    actual = {
+        "measurements": {"changed_pixels": 3}, "levels_completed": 2, "terminal": False,
+    }
+    assert evaluate_prediction({"all": [
+        {"path": "measurements.changed_pixels", "op": "between", "value": [3, 5]},
+        {"path": "levels_completed", "op": "gte", "value": 2},
+        {"path": "terminal", "op": "eq", "value": False},
+    ]}, actual)["verdict"] == "matched"
+    assert evaluate_prediction({"all": [
+        {"path": "measurements.changed_pixels", "op": "gt", "value": 3},
+    ]}, actual)["verdict"] == "failed"
+    assert evaluate_prediction({"all": [
+        {"path": "measurements.changed_pixels", "op": "eq", "value": 3.0},
+    ]}, actual)["verdict"] == "matched"
+
+
+def test_prediction_wrong_actual_type_is_inconclusive() -> None:
+    result = evaluate_prediction(
+        {"all": [{"path": "measurements.changed_pixels", "op": "gt", "value": 0}]},
+        {"measurements": {"changed_pixels": "many"}},
+    )
+    assert result["verdict"] == "inconclusive"
+    assert result["unavailable_paths"] == ["measurements.changed_pixels"]
+
+
+def test_strata_client_sends_labeled_images_and_parses_usage(tmp_path: Path) -> None:
+    image_path = tmp_path / "frame.png"
+    image_path.write_bytes(png_bytes(np.zeros((1, 1, 3), dtype=np.uint8)))
+    response_body = json.dumps({
+        "model": "qwen-test",
+        "choices": [{"message": {"content": "{}"}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+    }).encode()
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return response_body
+
+    def fake_urlopen(request, timeout):
+        assert request.full_url == "http://strata.example/v1/chat/completions"
+        assert request.get_header("Authorization") == "Bearer test-key"
+        payload = json.loads(request.data)
+        assert payload["reasoning_effort"] == "medium"
+        assert payload["reasoning_budget_tokens"] == 128
+        assert payload["messages"][1]["content"][1]["text"] == "initial frame"
+        assert payload["messages"][1]["content"][2]["image_url"]["url"].startswith("data:image/png;base64,")
+        return FakeResponse()
+
+    client = StrataClient(
+        "http://strata.example", "qwen-test", api_key="test-key", reasoning_budget_tokens=128,
+        log_request=True, log_response=True, log_dir=tmp_path / "run",
+    )
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        result = client.complete("system", "user", [image_path], ["initial frame"])
+    assert result["model"] == "qwen-test"
+    assert result["usage"]["total_tokens"] == 12
+    request_record = json.loads((tmp_path / "run" / "model_requests.jsonl").read_text().splitlines()[0])
+    response_record = json.loads((tmp_path / "run" / "model_responses.jsonl").read_text().splitlines()[0])
+    assert request_record["payload"]["messages"][0]["content"] == "system"
+    assert request_record["payload"]["messages"][1]["content"][0]["text"] == "user"
+    assert "test-key" not in json.dumps(request_record)
+    assert response_record["body"] == response_body.decode()
+
+
+def test_model_logging_cli_flags_default_off_and_enable_independently() -> None:
+    parser = build_parser()
+    defaults = parser.parse_args(["live", "--game-id", "ez01", "--run-dir", "run"])
+    enabled = parser.parse_args([
+        "live", "--game-id", "ez01", "--run-dir", "run", "--log-request", "--log-response",
+    ])
+
+    assert defaults.log_request is False
+    assert defaults.log_response is False
+    assert enabled.log_request is True
+    assert enabled.log_response is True
+
+
+def test_strata_client_falls_back_when_strata_rejects_json_mode_output(tmp_path: Path) -> None:
+    response_body = json.dumps({
+        "model": "qwen-test",
+        "choices": [{"message": {"content": json.dumps(_valid_decision())}}],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 15, "total_tokens": 35},
+    }).encode()
+    failure_body = json.dumps({
+        "error": {"code": "structured_output_failed", "message": "model did not return valid JSON"},
+    }).encode()
+    payloads = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return response_body
+
+    def fake_urlopen(request, timeout):
+        payload = json.loads(request.data)
+        payloads.append(payload)
+        if len(payloads) == 1:
+            raise urllib.error.HTTPError(
+                request.full_url, 502, "Bad Gateway", {}, io.BytesIO(failure_body),
+            )
+        return FakeResponse()
+
+    client = StrataClient(
+        "http://strata.example", "qwen-test", api_key="test-key",
+        log_request=True, log_response=True, log_dir=tmp_path,
+    )
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        result = client.complete("system", "return JSON", (), ())
+
+    assert result["request_attempts"] == 2
+    assert "response_format" in payloads[0]
+    assert "response_format" not in payloads[1]
+    retry_text = "\n".join(block["text"] for block in payloads[1]["messages"][1]["content"])
+    assert "previous generation did not produce valid JSON" in retry_text
+    logged_requests = [json.loads(line) for line in (tmp_path / "model_requests.jsonl").read_text().splitlines()]
+    logged_responses = [json.loads(line) for line in (tmp_path / "model_responses.jsonl").read_text().splitlines()]
+    assert len(logged_requests) == len(logged_responses) == 2
+    assert [row["status"] for row in logged_responses] == [502, 200]

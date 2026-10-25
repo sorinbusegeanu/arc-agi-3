@@ -39,6 +39,11 @@ def write_frame_png(observation: Any, frame_dir: str, frame_index: int) -> str:
 
 
 def _observation_to_image(observation: Any) -> Image.Image:
+    return observation_to_image(observation)
+
+
+def observation_to_image(observation: Any) -> Image.Image:
+    """Render an ARC palette grid or RGB(A) observation as an RGB image."""
     array = np.asarray(observation)
     if array.ndim == 2:
         return Image.fromarray(_palette_rgb(array), mode="RGB")
