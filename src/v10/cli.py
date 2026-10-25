@@ -12,7 +12,13 @@ from .analysis import run_analysis
 from .evaluation import CONDITIONING_PROFILES, run_ablation, run_optimization
 from .live import run_live
 from .replay import replay_trace
-from .tools.memory import DEFAULT_CONTEXT_ENTRIES, default_state_dir
+from .tools.memory import (
+    DEFAULT_CONTEXT_ENTRIES,
+    MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
+    MAX_MEMORY_MARKDOWN_CHARS,
+    default_state_dir,
+    reset_persistent_memory,
+)
 from .strata_client import (
     DEFAULT_REASONING_EFFORT,
     DEFAULT_STRATA_BASE_URL,
@@ -111,8 +117,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     live.add_argument("--state-dir", type=Path, default=default_state_dir(),
                       help="persistent v10 memory root; defaults to the project skills directory")
+    live.add_argument(
+        "--reset-memory", action="store_true",
+        help="delete shared global memory and all game memory/solution stores before starting",
+    )
     live.add_argument("--memory-context-entries", type=int, default=DEFAULT_CONTEXT_ENTRIES,
                       help="maximum persistent memory entries supplied to the model")
+    live.add_argument("--game-memory-max-chars", type=int, default=MAX_MEMORY_MARKDOWN_CHARS,
+                      help="maximum characters accepted for game MEMORY.md")
+    live.add_argument("--global-memory-max-chars", type=int, default=MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
+                      help="maximum characters accepted for global MEMORY.md")
     live.add_argument(
         "--base-url", default=DEFAULT_STRATA_BASE_URL,
         help=f"OpenAI-compatible Strata endpoint base URL (default: {DEFAULT_STRATA_BASE_URL})",
@@ -124,7 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--env-root", default=None, help="optional ARC environment-files root")
     live.add_argument("--seed", type=int, default=0)
     live.add_argument("--max-actions", type=int, default=30)
-    live.add_argument("--max-resets", type=int, default=0)
+    live.add_argument("--max-resets", type=int, default=1,
+                      help="maximum resets, including the startup bootstrap reset (default: 1)")
     live.add_argument("--plan-horizon", type=int, default=4)
     live.add_argument(
         "--review-interval", type=int, default=50,
@@ -200,6 +215,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             from .arcade_env import ArcadeGameEnv
 
+            if args.reset_memory:
+                reset_persistent_memory(args.state_dir)
+                print(f"[v10] cleared persistent memory under {args.state_dir}", file=sys.stderr, flush=True)
+
             client = StrataClient(
                 base_url=args.base_url,
                 model=args.model,
@@ -222,6 +241,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     skill_path=args.skill,
                     state_dir=args.state_dir,
                     memory_context_entries=args.memory_context_entries,
+                    game_memory_max_chars=args.game_memory_max_chars,
+                    global_memory_max_chars=args.global_memory_max_chars,
                 )
             finally:
                 env.close()

@@ -16,6 +16,7 @@ from v10.analysis import (
     score_recorded_plan,
     validate_model_decision,
 )
+from v10 import cli as cli_module
 from v10.cli import build_parser
 from v10.frames import FrameStore, png_bytes
 from v10.evaluation import run_ablation
@@ -392,13 +393,57 @@ def test_model_logging_cli_flags_default_off_and_enable_independently() -> None:
 
     assert defaults.log_request is False
     assert defaults.log_response is False
+    assert defaults.reset_memory is False
     assert defaults.review_interval == 50
     assert enabled.log_request is True
     assert enabled.log_response is True
+    reset = parser.parse_args([
+        "live", "--game-id", "ez01", "--run-dir", "run", "--reset-memory",
+    ])
+    assert reset.reset_memory is True
     configured = parser.parse_args([
         "live", "--game-id", "ez01", "--run-dir", "run", "--review-interval", "12",
     ])
     assert configured.review_interval == 12
+
+
+def test_live_reset_memory_flag_clears_persistent_memory_before_run(tmp_path: Path, monkeypatch) -> None:
+    from v10 import arcade_env
+
+    state_dir = tmp_path / "skills"
+    (state_dir / "games/ez01").mkdir(parents=True)
+    (state_dir / "games/ez01/MEMORY.md").write_text("game knowledge")
+    (state_dir / "global").mkdir()
+    (state_dir / "global/MEMORY.md").write_text("global knowledge")
+    (state_dir / "global/notes.txt").write_text("keep")
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeEnv:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    def fake_run_live(env, run_dir, client, **kwargs):
+        assert not (state_dir / "games").exists()
+        assert not (state_dir / "global/MEMORY.md").exists()
+        assert (state_dir / "global/notes.txt").read_text() == "keep"
+        return {"started": True}
+
+    monkeypatch.setattr(cli_module, "StrataClient", FakeClient)
+    monkeypatch.setattr(cli_module, "run_live", fake_run_live)
+    monkeypatch.setattr(arcade_env, "ArcadeGameEnv", FakeEnv)
+
+    result = cli_module.main([
+        "live", "--game-id", "ez01", "--run-dir", str(tmp_path / "run"),
+        "--state-dir", str(state_dir), "--reset-memory",
+    ])
+
+    assert result == 0
 
 
 def test_strata_client_falls_back_when_strata_rejects_json_mode_output(tmp_path: Path) -> None:

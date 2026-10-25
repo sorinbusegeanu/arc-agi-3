@@ -9,7 +9,8 @@ from v10.frames import FrameStore
 from v10.tools.history import History
 from v10.tools.memory import (
     MAX_GLOBAL_MEMORY_MARKDOWN_CHARS, GameMemory, MemoryValidationError, default_state_dir,
-    game_memory_dir, global_memory_path, read_global_memory, save_global_memory, shared_skill_path,
+    game_memory_dir, global_memory_path, read_global_memory, reset_persistent_memory,
+    save_game_memory, save_global_memory, shared_skill_path,
 )
 
 
@@ -24,33 +25,41 @@ def test_default_persistent_memory_and_shared_skill_are_project_local(monkeypatc
     assert shared_skill_path().is_file()
 
 
-def test_global_memory_is_bounded_markdown_and_replacement_is_atomic(tmp_path) -> None:
-    memory_text = "# Global Memory\n\n- Compare each object before and after an action."
+def test_reset_persistent_memory_removes_all_game_stores_and_only_global_memory(tmp_path) -> None:
+    (tmp_path / "games/ez01").mkdir(parents=True)
+    (tmp_path / "games/ez01/MEMORY.md").write_text("game prose")
+    (tmp_path / "games/ez01/memory.jsonl").write_text("ledger")
+    (tmp_path / "games/ez01/level_solutions.jsonl").write_text("routes")
+    (tmp_path / "games/ez02").mkdir()
+    (tmp_path / "games/ez02/MEMORY.md").write_text("another game")
+    (tmp_path / "global").mkdir()
+    (tmp_path / "global/MEMORY.md").write_text("shared prose")
+    (tmp_path / "global/KEEP.txt").write_text("unrelated global file")
 
+    reset_persistent_memory(tmp_path)
+
+    assert not (tmp_path / "games").exists()
+    assert not (tmp_path / "global/MEMORY.md").exists()
+    assert (tmp_path / "global/KEEP.txt").read_text() == "unrelated global file"
+
+
+def test_global_memory_rejects_oversize_and_preserves_previous_markdown(tmp_path) -> None:
+    memory_text = "# Global Memory\n\n- Compare each object before and after an action."
     assert save_global_memory(tmp_path, memory_text) is True
     path = global_memory_path(tmp_path)
-    assert path.read_text() == memory_text + "\n"
-    assert read_global_memory(tmp_path) == memory_text
+    before = path.read_text()
+
+    with pytest.raises(MemoryValidationError, match="character limit"):
+        save_global_memory(tmp_path, "x" * (MAX_GLOBAL_MEMORY_MARKDOWN_CHARS + 1))
+
+    assert path.read_text() == before
     assert save_global_memory(tmp_path, memory_text) is False
-
-    save_global_memory(tmp_path, "# Global Memory\n\n" + "x" * MAX_GLOBAL_MEMORY_MARKDOWN_CHARS)
-    assert len(path.read_text()) <= MAX_GLOBAL_MEMORY_MARKDOWN_CHARS
-    assert path.read_text().startswith("# Global Memory")
-
-    path.write_text("# Global Memory\n\n" + "x" * MAX_GLOBAL_MEMORY_MARKDOWN_CHARS)
     assert len(read_global_memory(tmp_path)) <= MAX_GLOBAL_MEMORY_MARKDOWN_CHARS
-    assert "truncated for prompt budget" in read_global_memory(tmp_path)
 
-
-def test_global_memory_deduplicates_repeated_lessons(tmp_path) -> None:
-    save_global_memory(
-        tmp_path,
-        "# Global Memory\n\n- Compare objects before and after each action.\n"
-        "- Compare objects before and after each action.",
-    )
-    rendered = global_memory_path(tmp_path).read_text()
-    assert rendered.count("Compare objects") == 1
-
+def test_markdown_save_preserves_model_authored_text_without_rewriting_duplicates(tmp_path) -> None:
+    content = "# Global Memory\n\n- Compare objects before and after each action.\n- Compare objects before and after each action."
+    save_global_memory(tmp_path, content)
+    assert global_memory_path(tmp_path).read_text() == content + "\n"
 
 def test_model_cannot_author_prediction_verdict_or_evidence_metadata(tmp_path) -> None:
     memory = GameMemory(tmp_path)
@@ -109,42 +118,32 @@ def test_pattern_updates_do_not_store_prediction_evidence(tmp_path) -> None:
     assert "verified_by" not in result["accepted"][0]
 
 
-def test_memory_renders_state_scoped_strategies_failures_and_experiments_without_empty_sections(tmp_path) -> None:
-    memory = GameMemory(tmp_path, store_dir=tmp_path / "persistent", run_id="r1", game_id="fixture")
-    memory.apply_review_changes([
-        {
-            "operation": "upsert", "pattern_type": "strategy", "status": "confirmed",
-            "claim": "A demonstrated route works.", "applicability_conditions": ["Start at level zero."],
-            "state_selector": {"level": 0, "levels_completed": 0}, "goal": "Complete level zero.",
-            "preconditions": ["Recorded start frame matches."], "action_policy": "Repeat up twice.",
-            "success_conditions": ["Progress advances."],
-        },
-        {
-            "operation": "upsert", "pattern_type": "hypothesis", "status": "candidate",
-            "claim": "A left action may reveal the target response.",
-            "applicability_conditions": ["When repeated up no longer changes the level."],
-            "state_selector": {"levels_completed": 0}, "action_policy": "Try left once and compare frames.",
-        },
-        {
-            "operation": "upsert", "pattern_type": "failure", "status": "confirmed",
-            "claim": "Repeating right from the same blocked state made no progress.",
-            "applicability_conditions": ["At the recorded blocked state."],
-            "state_selector": {"level": 0}, "action_policy": "Do not repeat right without a state change.",
-        },
-    ], game_id="fixture", current_step=2, covered_event_count=3)
-    text = memory.write_view().read_text()
+def test_structured_ledger_updates_do_not_generate_or_overwrite_markdown(tmp_path) -> None:
+    store_dir = tmp_path / "persistent"
+    memory = GameMemory(tmp_path, store_dir=store_dir, run_id="r1", game_id="fixture")
+    memory.apply_review_changes([{
+        "operation": "upsert", "pattern_type": "strategy", "status": "confirmed",
+        "claim": "A demonstrated route works.", "goal": "Complete level zero.",
+        "preconditions": ["Start state matches."], "action_policy": "Repeat up.",
+        "success_conditions": ["Progress advances."],
+    }], game_id="fixture", current_step=2, covered_event_count=3)
+    assert not memory.view_path.exists()
 
-    assert "## 3. Successful Strategies" in text
-    assert "State: level=0, levels_completed=0" in text
-    assert "## 5. Active Hypotheses" in text
-    assert "## 6. Failed Approaches" in text
-    assert "## 7. Next Actions" in text
-    assert "none" not in text
-    assert "Legacy review retained" not in text
+    saved = "# Game Memory\n\n- Model-authored strategy scoped to level zero."
+    save_game_memory(store_dir, saved)
+    memory.record_run_state("fixture", {
+        "level": 4, "levels_completed": 3, "win_levels": 5,
+        "game_state": "NOT_FINISHED", "terminal": False,
+    }, step=20)
+    memory.apply_review_changes([{
+        "operation": "upsert", "pattern_type": "hypothesis", "status": "candidate",
+        "claim": "A new tentative observation.",
+    }], game_id="fixture", current_step=21, covered_event_count=4)
+    assert memory.view_path.read_text() == saved + "\n"
 
-
-def test_review_revision_replaces_conflicting_claim_instead_of_accumulating_it(tmp_path) -> None:
+def test_conflicting_legacy_pattern_revision_does_not_replace_markdown(tmp_path) -> None:
     memory = GameMemory(tmp_path, run_id="r1", game_id="fixture")
+    save_game_memory(memory.store_dir, "# Game Memory\n\n- Current model-authored explanation.")
     memory.apply_review_changes([{
         "operation": "upsert", "pattern_type": "mechanic", "status": "confirmed",
         "claim": "The target cannot move.", "applicability_conditions": [], "state_selector": {},
@@ -152,28 +151,25 @@ def test_review_revision_replaces_conflicting_claim_instead_of_accumulating_it(t
     old = memory.patterns("fixture")[0]
     memory.apply_review_changes([{
         "operation": "upsert", "pattern_id": old["id"], "pattern_type": "mechanic",
-        "status": "candidate", "claim": "The target remained still in the observed frame sequence.",
-        "applicability_conditions": ["Only in the recorded level-zero states."],
+        "status": "candidate", "claim": "The target stayed still in these frames.",
+        "applicability_conditions": ["Only the observed level-zero states."],
         "state_selector": {"level": 0},
     }], game_id="fixture", current_step=4, covered_event_count=2)
+    assert memory.patterns("fixture")[0]["pattern_revision"] == 2
+    assert memory.view_path.read_text() == "# Game Memory\n\n- Current model-authored explanation.\n"
 
-    patterns = memory.patterns("fixture")
-    assert len(patterns) == 1
-    assert patterns[0]["id"] == old["id"]
-    assert patterns[0]["pattern_revision"] == 2
-    assert "cannot move" not in memory.write_view().read_text()
-
-
-def test_rendered_current_state_does_not_leak_from_another_run(tmp_path) -> None:
-    prior = GameMemory(tmp_path, store_dir=tmp_path / "persistent", run_id="prior", game_id="fixture")
+def test_run_state_is_not_rendered_into_durable_markdown(tmp_path) -> None:
+    state_dir = tmp_path / "persistent"
+    prior = GameMemory(tmp_path / "prior", store_dir=state_dir, run_id="prior", game_id="fixture")
+    saved = "# Game Memory\n\n- A persistent mechanic."
+    save_game_memory(state_dir, saved)
     prior.record_run_state("fixture", {
         "level": 4, "levels_completed": 3, "win_levels": 5,
         "game_state": "NOT_FINISHED", "terminal": False,
     }, step=20)
-    next_run = GameMemory(tmp_path, store_dir=tmp_path / "persistent", run_id="next", game_id="fixture")
-
-    assert "Current State" not in next_run.write_view().read_text()
-
+    next_run = GameMemory(tmp_path / "next", store_dir=state_dir, run_id="next", game_id="fixture")
+    assert next_run.view_path.read_text() == saved + "\n"
+    assert "level 4" not in next_run.view_path.read_text()
 
 def test_step_bounded_read_does_not_reveal_future_revision_or_entries(tmp_path) -> None:
     memory = GameMemory(tmp_path)
@@ -198,86 +194,63 @@ def test_frame_store_round_trips_values_without_int16_truncation(tmp_path) -> No
     assert np.array_equal(store.get(frame_id), frame)
 
 
-def test_memory_persists_between_runs_but_isolated_by_game(tmp_path) -> None:
+def test_ledger_persists_between_runs_without_creating_model_memory(tmp_path) -> None:
     state_dir = tmp_path / "state"
     game_a = game_memory_dir(state_dir, "game/a")
     first = GameMemory(tmp_path / "run-one", store_dir=game_a, run_id="run-one")
-    first.propose_update([
-        {
-            "op": "upsert", "id": "H1", "type": "hypothesis",
-            "claim": "A persistent fact. (evidence: T1)",
-        },
-    ], current_step=1)
-
+    first.propose_update([{
+        "op": "upsert", "id": "H1", "type": "hypothesis",
+        "claim": "A persistent fact. (evidence: T1)",
+    }], current_step=1)
     next_run = GameMemory(tmp_path / "run-two", store_dir=game_a, run_id="run-two")
     other_game = GameMemory(tmp_path / "other", store_dir=game_memory_dir(state_dir, "game-b"), run_id="run-three")
-
-    assert next_run.read()["entries"][0]["id"] == "run-one:H1"
-    assert "evidence_ids" not in next_run.read()["entries"][0]
     assert next_run.read()["entries"][0]["claim"] == "A persistent fact."
-    assert "evidence:" not in (game_a / "MEMORY.md").read_text().casefold()
-    assert "evidence_ids" not in next_run.compact()["entries"][0]
     assert other_game.read()["entries"] == []
-    assert (game_a / "MEMORY.md").exists()
+    assert not (game_a / "MEMORY.md").exists()
 
-
-def test_review_summary_replaces_view_and_is_the_only_compacted_memory(tmp_path) -> None:
+def test_legacy_review_summary_stays_in_ledger_and_does_not_write_markdown(tmp_path) -> None:
     store_dir = game_memory_dir(tmp_path / "state", "ez01")
     first = GameMemory(tmp_path / "run-one", store_dir=store_dir, run_id="run-one")
-    first.propose_update([
-        {"op": "upsert", "id": "P1", "type": "pattern", "claim": "Prior observation."},
-    ], current_step=1)
-    markdown = "## Patterns\nA recurring effect. (evidence: T1)\n\n## Uncertain ideas\n- none"
-    clean_markdown = "## Patterns\nA recurring effect.\n\n## Uncertain ideas\n- none"
-
-    saved = first.save_review_summary(markdown, current_step=2)
-
-    assert saved["id"] == "review:latest"
-    assert saved["revision"] == 2
-    assert first.view_path.read_text() == clean_markdown + "\n"
-    compact = first.compact(max_entries=5, through_step=2)
-    assert len(compact["entries"]) == 1
-    assert compact["entries"][0]["type"] == "review"
-    assert compact["entries"][0]["claim"] == clean_markdown
-    assert "evidence_ids" not in compact["entries"][0]
-    assert compact["entries"][0]["id"] == "review:latest"
-    assert "evidence_ids" not in first.read()["entries"][-1]
-
+    saved = "# Game Memory\n\n- Existing exact prose."
+    save_game_memory(store_dir, saved)
+    row = first.save_review_summary("## Patterns\nA recurring effect.", current_step=2)
+    assert row["id"] == "review:latest"
+    assert (store_dir / "memory.jsonl").is_file()
+    assert first.view_path.read_text() == saved + "\n"
     next_run = GameMemory(tmp_path / "run-two", store_dir=store_dir, run_id="run-two")
-    assert next_run.compact(max_entries=5, through_step=0)["entries"][0]["claim"] == clean_markdown
+    assert next_run.view_path.read_text() == saved + "\n"
 
-
-def test_empty_review_preserves_existing_memory_and_review_entries_are_harness_owned(tmp_path) -> None:
-    memory = GameMemory(tmp_path)
-    memory.propose_update([
-        {"op": "upsert", "id": "P1", "type": "pattern", "claim": "Prior observation."},
-    ], current_step=1)
+def test_empty_legacy_review_does_not_change_markdown_or_ledger(tmp_path) -> None:
+    memory = GameMemory(tmp_path, run_id="run-one")
+    save_game_memory(memory.store_dir, "# Game Memory\n\n- Existing strategy.")
     before_view = memory.view_path.read_text()
-    before_ledger = memory.path.read_text()
-
+    before_ledger = memory.path.read_text() if memory.path.exists() else ""
     with pytest.raises(MemoryValidationError, match="non-empty"):
         memory.save_review_summary("  \n", current_step=2)
-    result = memory.propose_update([
-        {"op": "upsert", "id": "R1", "type": "review", "claim": "Model-authored review"},
-    ], current_step=2)
-
+    result = memory.propose_update([{
+        "op": "upsert", "id": "R1", "type": "review", "claim": "Model-authored review",
+    }], current_step=2)
     assert memory.view_path.read_text() == before_view
-    assert memory.path.read_text() == before_ledger
+    assert (memory.path.read_text() if memory.path.exists() else "") == before_ledger
     assert result["rejected"][0]["reason"] == "review_entries_are_harness_owned"
 
+def test_failed_atomic_markdown_save_preserves_previous_file(tmp_path, monkeypatch) -> None:
+    import v10.tools.memory as memory_module
+    store_dir = tmp_path / "game"
+    save_game_memory(store_dir, "# Game Memory\n\n- Previous strategy.")
+    path = store_dir / "MEMORY.md"
+    before = path.read_text()
+    global_before = "# Global Memory\n\n- Previous reusable method."
+    save_global_memory(tmp_path / "state", global_before)
+    global_path = global_memory_path(tmp_path / "state")
+    monkeypatch.setattr(memory_module, "_atomic_write_text", lambda *_: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(OSError, match="disk full"):
+        save_game_memory(store_dir, "# Game Memory\n\n- Replacement strategy.")
+    assert path.read_text() == before
 
-def test_failed_review_view_save_rolls_back_latest_summary(tmp_path, monkeypatch) -> None:
-    memory = GameMemory(tmp_path, run_id="run-one")
-    memory.save_review_summary("## Patterns\nPrevious summary.", current_step=1)
-    before_view = memory.view_path.read_text()
-    monkeypatch.setattr(memory, "write_view", lambda: (_ for _ in ()).throw(OSError("view is read-only")))
-
-    with pytest.raises(OSError, match="view is read-only"):
-        memory.save_review_summary("## Patterns\nReplacement summary.", current_step=2)
-
-    assert memory.view_path.read_text() == before_view
-    assert memory.compact()["entries"][0]["claim"] == "## Patterns\nPrevious summary."
-
+    with pytest.raises(OSError, match="disk full"):
+        save_global_memory(tmp_path / "state", "# Global Memory\n\n- Replacement method.")
+    assert global_path.read_text() == global_before + "\n"
 
 def test_pattern_updates_are_independent_incremental_and_idempotent(tmp_path) -> None:
     state_dir = game_memory_dir(tmp_path / "state", "ez01")
@@ -313,10 +286,7 @@ def test_pattern_updates_are_independent_incremental_and_idempotent(tmp_path) ->
     assert "supporting_evidence" not in mechanic
     assert strategy["pattern_type"] == "strategy"
     assert strategy["goal"] == "Complete the current level."
-    view_text = memory.view_path.read_text()
-    assert "Refs:" not in view_text
-    assert "confidence" not in view_text
-    assert "T2" not in view_text
+    assert not memory.view_path.exists()
 
     prior_strategy = dict(strategy)
     row_count = len(memory.ledger())
@@ -365,8 +335,7 @@ def test_run_state_is_owned_by_its_run_and_second_run_reuses_patterns(tmp_path) 
     assert [entry["pattern_type"] for entry in prompt_memory["entries"]] == ["mechanic"]
     assert prompt_memory["entries"][0]["id"] == first.patterns("ez01")[0]["id"]
     assert all(entry.get("run_id") != "run-one" for entry in prompt_memory["entries"] if entry.get("type") == "state")
-    assert "level 0" in second.view_path.read_text()
-    assert "From run" not in second.view_path.read_text()
+    assert not second.view_path.exists()
 
 
 def test_legacy_run_ledger_migrates_before_run_dir_reuse(tmp_path) -> None:

@@ -29,11 +29,14 @@ from .tools.game import ActionError, BudgetExceeded, GameTools, evaluate_predict
 from .tools.history import History
 from .tools.memory import (
     DEFAULT_CONTEXT_ENTRIES,
+    MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
+    MAX_MEMORY_MARKDOWN_CHARS,
     GameMemory,
     default_state_dir,
     game_memory_dir,
     global_memory_path,
     read_global_memory,
+    save_game_memory,
     save_global_memory,
     shared_skill_path,
 )
@@ -179,49 +182,47 @@ def _random_legal_action(legal_actions: Any, rng: random.Random) -> dict[str, An
     return rng.choice(candidates) if candidates else None
 
 
-_REVIEW_SYSTEM_PROMPT = """# V10 incremental memory review
+_REVIEW_SYSTEM_PROMPT = """# V10 memory consolidation
 
-Review this game's new ordered observations against existing game patterns and shared global memory. Answer two questions: what was learned about this specific game, and what meaningful reusable technique could help solve other games? You do not control the game and must not request actions or resets. Return only a JSON object with a `changes` array, boolean `legacy_memory_migrated`, and complete `global_memory_markdown` text for the shared file. Keep that Markdown under 3000 characters. If no useful global lesson was learned, return the existing global memory unchanged. Do not add global entries for game-specific mechanics.
+Review existing game MEMORY.md and shared global MEMORY.md, new ordered observations, and verified successful routes. Return only one JSON object with exactly two non-empty Markdown strings: `game_memory_markdown` and `global_memory_markdown`.
 
-Each change is one of:
-- An upsert with `operation`, optional existing `pattern_id`, `pattern_type` (`mechanic`, `strategy`, `exception`, `hypothesis`, or `failure`), `status` (`candidate`, `confirmed`, or `contradicted`), a concise `claim`, `applicability_conditions` as a list of strings, and `state_selector` as an object. Put conditions expressible as current state fields into `state_selector` so the harness can match them; reserve prose conditions for visible states and context.
-- A retirement with `operation: "retire"` and an existing `pattern_id`.
+Write very concise, decision-useful guidance. Merge repetition, qualify uncertainty, correct contradictions, and preserve demonstrated strategies with level or observed-state scope. Use short prose bullets under brief headings; game memory should contain only a few bullets. Do not include any digits, tables, timelines, raw observation narration, coordinates, pixel distances, displacement values, per-level action counts, or action sequences. Do not copy route details into memory; the exact-state route store handles precise route lengths and replay.
 
-When revising an existing pattern, reuse its ID. Use distinct conditional variants when different conditions explain different outcomes; retire or supersede a broad pattern only when justified. Choose status from the observations: use `confirmed` for a directly established rule, `candidate` when uncertain, and `contradicted` when the observations disprove the claim.
+Routes are supplied only when the environment recorded level completion or WIN. Treat their outcome as fixed facts. You may merge equivalent routes into one high-level strategy while retaining scope in words (such as “on matching level start states”), but never derive or reproduce route lengths, exact actions, counts, or arguments. Game memory may contain lasting mechanics, useful approaches, repeated failures, and unresolved experiments. Describe a tested approach qualitatively (for example: “When the goal is above the player, move upward toward it; use the verified route when the starting state matches.”).
 
-For successful action sequences, use `pattern_type: "strategy"` and provide `goal`, `preconditions` (string list), `action_policy`, and `success_conditions` (string list). Add `expected_observations` only when a specific measurable outcome is directly supported; numeric predictions are optional. Do not produce successful solutions that are not supported by a successful transition. A useful exploration tactic may be a candidate `hypothesis` with an `action_policy`; distinguish it clearly from a solved strategy. Use `pattern_type: "failure"` for repeated ineffective approaches and include a useful alternative in `action_policy` when the evidence supports one.
+Global memory is at most a few bullets and contains only methods that transfer to unrelated games. Do not mention this game's colors, objects, directions, levels, pixel values, or specific rule. Generalize a reusable method (for example: “Compare each object's position before and after one action to infer action effects.”); if no transferable lesson was learned, retain only prior reusable guidance. Remove game-specific details from existing global memory rather than carrying them forward.
 
-Distinguish observations from explanations. A repeated unchanged frame means only that the action had no visible effect in that observed state; it does not establish a wall, obstacle, or total reachability. Do not infer completion rules from proximity. Treat positions and layouts as state-specific, not lasting mechanics. Revise a conflicting claim in place or retire it; do not accumulate incompatible confirmed claims. Describe one useful next experiment after unsuccessful exploration. Global lessons must be broadly reusable and actionable; merge equivalents and keep the shared Markdown short and deduplicated. Global Markdown has no evidence references, scores, or per-pattern records. Return the existing global Markdown unchanged when there is no meaningful update. Return `{"changes": [], "legacy_memory_migrated": true, "global_memory_markdown": "# Global Memory\\n"}` when no useful prior game memory or global lesson exists."""
+Separate observations from explanations. Unchanged pixels show only that an action had no visible effect in that state; do not infer walls, total reachability, or completion rules from proximity. Distinguish lasting mechanics from historical positions. Follow current observations when they conflict with prior memory. Do not put current run state in durable memory. Return complete replacement Markdown, retaining only concise findings that can change a future decision."""
 
 
-def _validate_review_payload(value: Any) -> tuple[list[dict[str, Any]], bool, str | None]:
-    if not isinstance(value, Mapping) or set(value) - {
-        "changes", "legacy_memory_migrated", "global_memory_markdown",
-    } or "changes" not in value:
-        raise ValueError("review response must be a JSON object containing changes")
-    legacy_migrated = value.get("legacy_memory_migrated", False)
-    if not isinstance(legacy_migrated, bool):
-        raise ValueError("legacy_memory_migrated must be a boolean")
-    changes = value["changes"]
-    if not isinstance(changes, list):
-        raise ValueError("review changes must be a list")
-    if any(not isinstance(change, Mapping) for change in changes):
-        raise ValueError("each review change must be an object")
+def _validate_review_payload(
+    value: Any,
+    *,
+    game_memory_max_chars: int = MAX_MEMORY_MARKDOWN_CHARS,
+    global_memory_max_chars: int = MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
+) -> tuple[str, str]:
+    expected = {"game_memory_markdown", "global_memory_markdown"}
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ValueError("review response must contain exactly game_memory_markdown and global_memory_markdown")
+    game_memory = value.get("game_memory_markdown")
     global_memory = value.get("global_memory_markdown")
-    if global_memory is not None and not isinstance(global_memory, str):
-        raise ValueError("global_memory_markdown must be text or null")
-    return [dict(change) for change in changes], legacy_migrated, global_memory
+    for name, markdown, limit in (
+        ("game_memory_markdown", game_memory, game_memory_max_chars),
+        ("global_memory_markdown", global_memory, global_memory_max_chars),
+    ):
+        if not isinstance(markdown, str) or not markdown.strip():
+            raise ValueError(f"{name} must be non-empty Markdown text")
+        if len(markdown.strip()) > int(limit):
+            raise ValueError(f"{name} exceeds the {int(limit)} character limit")
+    return game_memory.strip(), global_memory.strip()
 
 
 def _review_repair_prompt(base_prompt: str, errors: Any) -> str:
-    """Ask for only malformed review changes to be corrected in the same contract."""
+    """Ask for both complete Markdown fields after validation fails."""
     return (
         base_prompt
-        + "\n\nYour prior response had review validation errors. Correct only the rejected changes; "
-        "do not repeat changes that were accepted. Return the corrected JSON review object. "
-        "Use `applicability_conditions` as a string list, `state_selector` as an object, and each "
-        "expected observation's `measurable_prediction` as an all-of predicate object, never prose. "
-        "Return only fields supported by the review schema.\n"
+        + "\n\nYour prior review response was invalid. Return both complete replacement Markdown fields "
+        "with concise content within the specified limits. Return only the required JSON object.\n"
         "Validation errors:\n" + json.dumps(errors, ensure_ascii=False, separators=(",", ":"))
     )
 
@@ -363,49 +364,21 @@ def _repeated_outcome_summary(
     }
 
 
-def _persist_successful_strategy(
-    memory: GameMemory, game_id: str, solution: Mapping[str, Any], *, run_id: str, step: int,
-) -> None:
-    """Persist a concise, state-scoped strategy for an already verified route."""
-    try:
-        start_key = json.loads(str(solution.get("level_key", "{}")))
-    except (TypeError, json.JSONDecodeError):
-        start_key = {}
-    actions = [str(model_action_name(item.get("action"))) for item in solution.get("steps", [])]
-    if not actions:
-        return
-    level, completed = start_key.get("level", "?"), start_key.get("levels_completed", "?")
-    sequence = " → ".join(actions)
-    claim = f"On level {level} ({completed} completed), this observed route succeeded: {sequence}."
-    conditions = [
-        f"Current level is {level} with {completed} levels completed.",
-        "Use only from the recorded visible start state; cached replay verifies the full frame.",
-    ]
-    existing = next((
-        item for item in memory.patterns(game_id)
-        if item.get("pattern_type") == "strategy" and item.get("claim") == claim
-    ), None)
-    change = {
-        "operation": "upsert", "pattern_id": existing.get("id") if existing else None,
-        "pattern_type": "strategy", "status": "confirmed", "claim": claim,
-        "applicability_conditions": conditions,
-        "state_selector": {key: start_key[key] for key in ("level", "levels_completed") if key in start_key},
-        "goal": f"Complete level {level}.", "preconditions": conditions,
-        "action_policy": (
-            f"Use the saved exact-state route ({sequence}) only when the visible start state matches; "
-            "stop when progress changes or WIN appears."
-        ),
-        "success_conditions": ["levels_completed increases, or game_state becomes WIN."],
-    }
-    if existing and all(existing.get(field) == change.get(field) for field in (
-        "status", "claim", "applicability_conditions", "state_selector", "goal",
-        "preconditions", "action_policy", "success_conditions",
-    )):
-        return
-    memory.apply_review_changes(
-        [change], game_id=game_id, current_step=step,
-        covered_event_count=0, checkpoint=False,
-    )
+def _verified_route_summaries(solution_store: LevelSolutionStore) -> list[dict[str, Any]]:
+    """Provide success facts for prose consolidation; the store retains exact routes."""
+    summaries: list[dict[str, Any]] = []
+    for route in solution_store.solutions():
+        try:
+            scope = json.loads(str(route.get("level_key", "{}")))
+        except (TypeError, json.JSONDecodeError):
+            scope = {"level_key": route.get("level_key")}
+        summaries.append({
+            "scope": scope,
+            "environment_recorded_success": route.get("success"),
+            "actions": [model_action_name(step.get("action")) for step in route.get("steps", [])],
+            "step_count": len(route.get("steps", [])),
+        })
+    return summaries
 
 
 def _perform_review(
@@ -416,90 +389,80 @@ def _perform_review(
     run_id: str,
     memory_store_dir: Path,
     trigger_reasons: Sequence[str],
+    game_memory_max_chars: int = MAX_MEMORY_MARKDOWN_CHARS,
+    global_memory_max_chars: int = MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
 ) -> dict[str, Any]:
-    """Review the frozen run prefix and persist a consolidated Markdown summary."""
+    """Consolidate observations into model-authored game and global Markdown."""
     transition_count = 0
     image_labels: list[str] = []
     usage: dict[str, Any] = {}
     latency = 0.0
     attempts = 0
     repair_history: list[dict[str, Any]] = []
-    applied: dict[str, Any] = {"rejected": [], "committed": False, "checkpointed": False}
+    memory_saved = False
+    global_saved = False
+    memory = GameMemory(tools.run_dir, store_dir=memory_store_dir, run_id=run_id, game_id=game_id)
     try:
         records = tools.history.records()
         transitions = [row for row in records if row.get("type") == "transition"]
         transition_count = len(transitions)
-        memory = GameMemory(tools.run_dir, store_dir=memory_store_dir, run_id=run_id, game_id=game_id)
-        memory_text = memory.write_view().read_text(encoding="utf-8")
         state_root = memory_store_dir.parent.parent
-        shared_memory = read_global_memory(state_root)
+        view_path = memory_store_dir / "MEMORY.md"
+        existing_memory = view_path.read_text(encoding="utf-8").strip() if view_path.is_file() else ""
         legacy_review = memory.get("review:latest")
-        legacy_review_text = str(legacy_review.get("claim", "")) if legacy_review else ""
+        if not existing_memory and legacy_review:
+            existing_memory = str(legacy_review.get("claim", "")).strip()
+        shared_memory = read_global_memory(state_root)
         events = _review_events(records)
         covered_event_count = len(events)
         if memory.has_review_coverage(game_id, covered_event_count):
             row = {
-                "schema": "v10.live_review/2", "status": "skipped_duplicate_review",
+                "schema": "v10.live_review/3", "status": "skipped_duplicate_review",
                 "trigger_reasons": list(trigger_reasons), "through_action": tools.action_count,
-                "covered_transition_count": transition_count,
-                "selected_image_labels": [], "request_attempts": 0, "usage": {},
-                "latency_seconds": 0.0, "duplicate_review": True,
+                "covered_transition_count": transition_count, "selected_image_labels": [],
+                "request_attempts": 0, "usage": {}, "latency_seconds": 0.0,
+                "duplicate_review": True,
             }
             append_jsonl(tools.run_dir / "reviews.jsonl", row)
             return {"row": row, "attempts": 0, "usage": {}, "latency_seconds": 0.0}
+
         prior_event_count = min(memory.reviewed_event_count(game_id), len(events))
         new_events = events[prior_event_count:]
         frames = FrameStore(tools.run_dir)
         previous_transition_count = sum(event.get("type") == "transition" for event in events[:prior_event_count])
-        new_transitions = transitions[previous_transition_count:]
         if previous_transition_count:
             initial_completed = transitions[previous_transition_count - 1].get("levels_completed")
         else:
             initial_state = next((row for row in records if row.get("type") == "state"), {})
             initial_completed = initial_state.get("levels_completed", 0)
+        new_transitions = transitions[previous_transition_count:]
         image_paths, image_labels = _review_frame_selection(
             new_transitions, frames,
             initial_completed=int(initial_completed) if initial_completed is not None else None,
         )
-        legacy_review_text = legacy_review_text[:4_000]
-        patterns = [
-            {
-                "pattern_id": entry["id"], "pattern_type": entry.get("pattern_type"),
-                "claim": entry.get("claim"), "applicability_conditions": entry.get("applicability_conditions", []),
-                "state_selector": entry.get("state_selector", {}), "status": entry.get("status"),
-                **{
-                    key: entry[key] for key in (
-                        "goal", "preconditions", "action_policy", "expected_observations", "success_conditions",
-                    ) if key in entry
-                },
-            }
-            for entry in memory.patterns(game_id, include_retired=True)
-        ]
+        solution_store = LevelSolutionStore(memory_store_dir / "level_solutions.jsonl", game_id)
+        verified_routes = _verified_route_summaries(solution_store)
         user_prompt = (
-            f"Review all recorded experience for game {game_id} through action {tools.action_count}. "
-            f"This review was triggered by: {', '.join(trigger_reasons)}. "
-        "Update only patterns affected by observations since their last review. Separate measured observations from explanations. "
-            "When observations conflict, consider whether applicability conditions distinguish them; refine or split patterns if supported. "
-            "Use the supplied observations directly. Identify repeated effects, successful approaches, repeated failures, contradictions, and one useful next experiment. "
-            "Keep an exploration tactic separate from a demonstrated solution.\n\n"
-            "Existing patterns (authoritative ledger projection):\n"
-            + json.dumps(patterns, ensure_ascii=False, separators=(",", ":")) + "\n\n"
-            "Existing MEMORY.md view (legacy content may be migrated into patterns):\n"
-            + memory_text + "\n\n"
-            "Current shared global/MEMORY.md (reusable cross-game techniques only):\n"
-            + (shared_memory or "(no global lessons stored yet)") + "\n\n"
-            "Prior unstructured review, if any (bounded to 4000 characters):\n" + legacy_review_text + "\n\n"
-            "New ordered run observations since the last review checkpoint:\n"
+            f"Consolidate memory for game {game_id} after action {tools.action_count}. "
+            f"Review trigger: {', '.join(trigger_reasons)}. Current progress belongs only in observation context, not either memory file. "
+            "Preserve level/state scope when summarizing successful approaches. Existing game MEMORY.md:\n"
+            + (existing_memory or "(none)")
+            + "\n\nExisting shared global MEMORY.md:\n"
+            + (shared_memory or "(none)")
+            + "\n\nNew ordered observations since the last successful review checkpoint:\n"
             + json.dumps(new_events, ensure_ascii=False, separators=(",", ":"))
-            + "\n\nRepeated states and ineffective state/action pairs (compact recent summary):\n"
+            + "\n\nRepeated states and ineffective state/action summary:\n"
             + json.dumps(_repeated_outcome_summary(transitions, tools.frames), ensure_ascii=False, separators=(",", ":"))
+            + "\n\nVerified successful routes (outcomes and scope are environment facts; summarize strategies without copying routes):\n"
+            + json.dumps(verified_routes, ensure_ascii=False, separators=(",", ":"))
+            + f"\n\nLength limits: game Markdown at most {int(game_memory_max_chars)} characters; "
+            + f"global Markdown at most {int(global_memory_max_chars)} characters. Keep game memory to a few concise bullets "
+            "and global memory to only broadly reusable bullets."
         )
         responses: list[dict[str, Any]] = []
-        applied_totals = {"added": 0, "updated": 0, "retired": 0, "unchanged": 0}
-        changes: list[dict[str, Any]] = []
-        legacy_migrated = False
-        global_memory_markdown: str | None = None
         review_prompt = user_prompt
+        game_markdown = ""
+        global_markdown = ""
         for repair_index in range(2):
             attempts += 1
             try:
@@ -514,13 +477,15 @@ def _perform_review(
             attempts += max(0, int(response.get("request_attempts", 1)) - 1)
             latency += float(response.get("latency_seconds", 0.0))
             usage = _sum_usage(responses)
-            content = response.get("content")
             try:
                 if response.get("finish_reason") == "length":
                     raise ValueError("review response was truncated at the output-token limit")
-                changes, legacy_migrated, global_memory_markdown = _validate_review_payload(
-                    _parse_content(content)
+                game_markdown, global_markdown = _validate_review_payload(
+                    _parse_content(response.get("content")),
+                    game_memory_max_chars=game_memory_max_chars,
+                    global_memory_max_chars=global_memory_max_chars,
                 )
+                break
             except (DecisionValidationError, ValueError) as exc:
                 repair_history.append({"attempt": repair_index + 1, "error": str(exc)})
                 if repair_index == 0:
@@ -528,84 +493,54 @@ def _perform_review(
                     continue
                 raise
 
-            applied = memory.apply_review_changes(
-                changes, game_id=game_id, current_step=tools.action_count,
-                covered_event_count=covered_event_count,
-            )
-            for key in applied_totals:
-                applied_totals[key] += int(applied.get(key, 0))
-            if applied.get("rejected") and repair_index == 0:
-                repair_history.append({"attempt": repair_index + 1, "rejected": applied["rejected"]})
-                review_prompt = _review_repair_prompt(
-                    user_prompt,
-                    applied["rejected"],
-                )
-                continue
-            break
-
-        if not applied_totals["added"] and not applied_totals["updated"] and not applied_totals["retired"] and not applied.get("checkpointed") and not applied.get("rejected"):
-            raise ValueError("review did not produce a completed change set")
-        if not applied.get("rejected") and not applied.get("checkpointed"):
-            raise ValueError("review changes were not checkpointed")
-        legacy_review_retired = (
-            memory.retire_legacy_review(current_step=tools.action_count)
-            if legacy_migrated and applied.get("checkpointed") else False
+        # Each destination is atomically replaced only after both outputs validate.
+        memory_saved = save_game_memory(
+            memory_store_dir, game_markdown, max_characters=game_memory_max_chars,
         )
-        global_memory_updated = False
-        global_memory_error = None
-        if global_memory_markdown is not None:
-            try:
-                global_memory_updated = save_global_memory(state_root, global_memory_markdown)
-            except (OSError, ValueError) as exc:
-                global_memory_error = f"{type(exc).__name__}: {exc}"
-        canonical = json.dumps(changes, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        final_usage = _sum_usage(responses)
+        global_saved = save_global_memory(
+            state_root, global_markdown, max_characters=global_memory_max_chars,
+        )
+        memory.record_review_checkpoint(
+            game_id=game_id, current_step=tools.action_count,
+            covered_event_count=covered_event_count,
+        )
+        digest = hashlib.sha256(
+            (game_markdown + "\0" + global_markdown).encode("utf-8")
+        ).hexdigest()
         row = {
-            "schema": "v10.live_review/2",
-            "status": (
-                "saved_with_global_memory_error" if global_memory_error else
-                "saved_with_rejections" if applied["rejected"] else "saved"
-            ),
-            "trigger_reasons": list(trigger_reasons),
-            "through_action": tools.action_count,
+            "schema": "v10.live_review/3", "status": "saved",
+            "trigger_reasons": list(trigger_reasons), "through_action": tools.action_count,
             "covered_transition_count": transition_count,
             "selected_image_labels": image_labels,
             "model": response.get("model", getattr(client, "model", None)),
-            "request_attempts": attempts, "usage": final_usage,
+            "request_attempts": attempts, "usage": _sum_usage(responses),
             "latency_seconds": round(latency, 6),
-            "memory_revision": memory.revision(), "memory_path": str(memory.view_path),
-            "patterns_added": applied_totals["added"], "patterns_updated": applied_totals["updated"],
-            "patterns_retired": applied_totals["retired"], "unchanged_patterns": applied_totals["unchanged"],
-            "rejected_changes": applied["rejected"], "duplicate_review": applied["duplicate_review"],
-            "review_checkpoint_saved": bool(applied.get("checkpointed")),
-            "repair_history": repair_history,
-            "legacy_memory_migrated": legacy_migrated, "legacy_review_retired": legacy_review_retired,
+            "game_memory_path": str(view_path), "game_memory_updated": memory_saved,
+            "game_memory_characters": len(game_markdown),
             "global_memory_path": str(global_memory_path(state_root)),
-            "global_memory_updated": global_memory_updated,
-            "global_memory_characters": len(global_memory_markdown or shared_memory),
-            "result_characters": len(canonical),
-            "result_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "global_memory_updated": global_saved,
+            "global_memory_characters": len(global_markdown),
+            "verified_routes_supplied": len(verified_routes),
+            "review_checkpoint_saved": True, "repair_history": repair_history,
+            "result_sha256": digest,
         }
-        if global_memory_error:
-            row["global_memory_error"] = global_memory_error
     except Exception as exc:
         attempts = max(attempts, int(getattr(exc, "request_attempts", 0)))
         if getattr(exc, "latency_seconds", None) is not None:
             latency = max(latency, float(exc.latency_seconds))
         row = {
-            "schema": "v10.live_review/2", "status": "failed", "trigger_reasons": list(trigger_reasons),
-            "through_action": tools.action_count,
+            "schema": "v10.live_review/3", "status": "failed",
+            "trigger_reasons": list(trigger_reasons), "through_action": tools.action_count,
             "covered_transition_count": transition_count,
             "selected_image_labels": image_labels,
             "request_attempts": attempts, "usage": usage,
             "latency_seconds": round(latency, 6),
-            "review_checkpoint_saved": bool(applied.get("checkpointed")),
-            "repair_history": repair_history,
+            "game_memory_saved": memory_saved, "global_memory_saved": global_saved,
+            "review_checkpoint_saved": False, "repair_history": repair_history,
             "error": f"{type(exc).__name__}: {exc}",
         }
     append_jsonl(tools.run_dir / "reviews.jsonl", row)
     return {"row": row, "attempts": attempts, "usage": usage, "latency_seconds": latency}
-
 
 def _live_context(
     tools: GameTools,
@@ -616,6 +551,9 @@ def _live_context(
     memory_store_dir: Path,
     run_id: str,
     memory_context_entries: int,
+    *,
+    starting_routine: bool = False,
+    bootstrap_observations: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     records = tools.history.records()
     transitions = [
@@ -635,25 +573,10 @@ def _live_context(
         })
     visible_step = int(current.get("step", max((int(row.get("step", 0)) for row in records), default=0)))
     memory_store = GameMemory(tools.run_dir, store_dir=memory_store_dir, run_id=run_id, game_id=game_id)
-    # MEMORY.md is the generated, model-facing memory contract for action
-    # selection. Keep the JSONL ledger internal to review and rendering; do
-    # not bypass the generated view by sending raw legacy review claims.
-    memory_store.write_view()
-    memory = memory_store.view_path.read_text(encoding="utf-8")
+    # The saved model-authored Markdown is authoritative; never render ledger
+    # records into action guidance here.
+    memory = memory_store.view_path.read_text(encoding="utf-8") if memory_store.view_path.is_file() else ""
     global_memory = read_global_memory(memory_store_dir.parent.parent)
-    current_memory = GameMemory(
-        tools.run_dir, store_dir=memory_store_dir, run_id=run_id, game_id=game_id,
-    )
-    applicable_strategies = [
-        {
-            "claim": entry.get("claim"), "conditions": entry.get("applicability_conditions", []),
-            "state": entry.get("state_selector", {}), "goal": entry.get("goal"),
-            "preconditions": entry.get("preconditions", []), "action_policy": entry.get("action_policy"),
-            "success_conditions": entry.get("success_conditions", []),
-        }
-        for entry in current_memory.applicable_patterns(game_id, current, include_hypotheses=False)
-        if entry.get("pattern_type") == "strategy" and entry.get("status") == "confirmed"
-    ]
     context = {
         "game_id": game_id,
         "current_state": {
@@ -672,7 +595,6 @@ def _live_context(
             for row in transitions
         ],
         "memory": memory,
-        "applicable_successful_strategies": applicable_strategies,
         "repeated_outcomes": _repeated_outcome_summary(transitions, FrameStore(tools.run_dir)),
         "global_memory": global_memory,
         "budgets": {
@@ -681,6 +603,17 @@ def _live_context(
             "plan_horizon": horizon,
         },
     }
+    if starting_routine:
+        context["bootstrap_observations"] = [
+            {
+                "action": model_action_name(row.get("action")),
+                "measurements": _compact_transition_measurements(row.get("measurements")),
+                "level": row.get("level"),
+                "levels_completed": row.get("levels_completed"),
+                "game_state": row.get("game_state"),
+            }
+            for row in bootstrap_observations
+        ]
     image_ids: list[tuple[str, str]] = []
     current_image_id = current.get("frame_image_id")
     previous_image_id = transitions[-1].get("pre_frame_image_id") if transitions else None
@@ -688,6 +621,13 @@ def _live_context(
         image_ids.append(("Previous actual game frame", str(previous_image_id)))
     if current_image_id:
         image_ids.append(("Current actual game frame", str(current_image_id)))
+    if starting_routine and bootstrap_observations:
+        bootstrap_frames: list[tuple[str, str]] = []
+        if bootstrap_observations[0].get("pre_frame_image_id"):
+            bootstrap_frames.append(("Bootstrap initial frame before reset", str(bootstrap_observations[0]["pre_frame_image_id"])))
+        if bootstrap_observations[-1].get("post_frame_image_id"):
+            bootstrap_frames.append(("Bootstrap final frame before reset", str(bootstrap_observations[-1]["post_frame_image_id"])))
+        image_ids = bootstrap_frames + image_ids
     frames = FrameStore(tools.run_dir)
     entries = {entry["frame_id"]: entry for entry in frames.entries()}
     image_paths: list[Path] = []
@@ -707,8 +647,16 @@ def _live_context(
         {**row, "action": model_action_name(row.get("action"))}
         for row in context["recent_transitions"]
     ]
+    start_instruction = (
+        "The listed bootstrap observations came from a short exploratory sequence, and the game was then reset. "
+        "The current image and current_state are the initial screen after that reset. Use the bootstrap observations and memory to choose "
+        "a useful sequence that must start from this initial screen; do not continue from the bootstrap's final screen. "
+        f"Return up to {horizon} legal lowercase directional actions. Do not reset. This instruction applies only to this one startup decision.\n\n"
+        if starting_routine else ""
+    )
     prompt = (
-        f"Choose up to {horizon} legal actions from the current state, recent outcomes, and read-only memory. "
+        start_instruction
+        + f"Choose up to {horizon} legal actions from the current state, recent outcomes, and read-only memory. "
         "Use game memory first for this game's established mechanics and strategies. Use global memory only as reusable exploration guidance; it must not override game-specific observations. "
         "Prefer applicable demonstrated strategies, but follow the current image and outcomes if memory conflicts. Distinguish lasting mechanics from historical positions. "
         "Avoid repeating actions that had no visible effect in the same observed state and avoid cycles. Use one action for an uncertain experiment; use a longer plan only for understood behavior. "
@@ -716,9 +664,6 @@ def _live_context(
         "Return only an actions list. Each action must contain only action and args. "
         "Do not include analysis, memory updates, predictions, goals, or narrative. "
         "If RESET is listed, use it alone and include args.justification.\n\n"
-        "Applicable demonstrated strategies (consider these first when their conditions match):\n"
-        + json.dumps(applicable_strategies, ensure_ascii=False, separators=(",", ":"))
-        + "\n\n"
         "Required response shape:\n" + json.dumps(_decision_contract_description(), ensure_ascii=False, separators=(",", ":"))
         + "\n\nVisible context:\n" + json.dumps(model_context, ensure_ascii=False, separators=(",", ":"))
     )
@@ -728,6 +673,38 @@ def _live_context(
         "legal_action_specs": legal_actions, "visible_step": visible_step,
         "skill_sha256": hashlib.sha256(skill_path.read_bytes()).hexdigest(),
     }
+
+
+def _standard_start_routine(legal_action_specs: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Return the fixed up/left/down/right opening, limited to currently legal moves."""
+    directions = ("up", "left", "down", "right")
+    legal_directions = {
+        str(model_action_name(spec.get("id"))) for spec in legal_action_specs
+    }
+    candidate = {
+        "actions": [
+            {"action": direction, "args": {}}
+            for direction in directions if direction in legal_directions
+        ]
+    }
+    if not candidate["actions"]:
+        return []
+    try:
+        return validate_model_decision(candidate, legal_action_specs, max_actions=4)["actions"]
+    except (DecisionValidationError, ActionError):
+        # An unusual movement schema may require arguments; avoid fabricating them.
+        accepted = []
+        for direction in directions:
+            if direction not in legal_directions:
+                continue
+            try:
+                accepted.extend(validate_model_decision(
+                    {"actions": [{"action": direction, "args": {}}]},
+                    legal_action_specs, max_actions=1,
+                )["actions"])
+            except (DecisionValidationError, ActionError):
+                continue
+        return accepted
 
 
 def _compact_transition_measurements(value: Any) -> dict[str, Any]:
@@ -757,12 +734,15 @@ def run_live(
     game_id: str,
     seed: int = 0,
     max_actions: int = 30,
-    max_resets: int = 0,
+    max_resets: int = 1,
     plan_horizon: int = 4,
     review_interval: int = 50,
     skill_path: str | Path | None = None,
     state_dir: str | Path | None = None,
     memory_context_entries: int = DEFAULT_CONTEXT_ENTRIES,
+    starting_routine: bool = True,
+    game_memory_max_chars: int = MAX_MEMORY_MARKDOWN_CHARS,
+    global_memory_max_chars: int = MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
 ) -> dict[str, Any]:
     """Run a bounded live episode, persisting evidence before and after actions."""
     if not 1 <= int(plan_horizon) <= 4:
@@ -773,6 +753,8 @@ def run_live(
         raise ValueError("action budget must be positive and reset budget non-negative")
     if not 0 <= int(memory_context_entries) <= 5:
         raise ValueError("memory_context_entries must be between 0 and 5")
+    if int(game_memory_max_chars) < 1 or int(global_memory_max_chars) < 1:
+        raise ValueError("memory Markdown limits must be positive")
     destination = Path(run_dir)
     source_skill = Path(skill_path) if skill_path is not None else shared_skill_path()
     run_id = uuid.uuid4().hex
@@ -782,7 +764,6 @@ def run_live(
     GameMemory.migrate_run_ledger(destination, memory_store_dir, game_id)
     _prepare_live_run_directory(destination)
     memory = GameMemory(destination, store_dir=memory_store_dir, run_id=run_id, game_id=game_id)
-    memory.write_view()
     skill_sha256 = hashlib.sha256(source_skill.read_bytes()).hexdigest()
     write_json(destination / "run_manifest.json", {
         "schema": "v10.live_run/1", "run_id": run_id, "game_id": game_id,
@@ -797,11 +778,13 @@ def run_live(
     solution_store = LevelSolutionStore(memory_store_dir / "level_solutions.jsonl", game_id)
     historical_run = Path(__file__).resolve().parents[2] / "runs" / "v10" / "ez01_20"
     if game_id == "ez01" and (historical_run / "evidence.jsonl").is_file():
-        imported_solutions = solution_store.import_successful_run(historical_run)
-        for solution in imported_solutions:
-            _persist_successful_strategy(
-                memory, game_id, solution, run_id=run_id, step=tools.action_count,
-            )
+        solution_store.import_successful_run(historical_run)
+    initial_routine_pending = bool(starting_routine and tools.max_resets > 0)
+    bootstrap_probe_active = bool(starting_routine and tools.max_resets > 0)
+    bootstrap_plan_pending = False
+    bootstrap_observations: list[dict[str, Any]] = []
+    starter_queue: list[dict[str, Any]] = []
+    starter_queue_source = "standard_start_routine"
     level_start_observation: Mapping[str, Any] = dict(current)
     level_path_edges: list[dict[str, Any]] = []
     cached_solution_plans = 0
@@ -884,6 +867,8 @@ def run_live(
         result = _perform_review(
             tools, client, game_id=game_id, run_id=run_id,
             memory_store_dir=memory_store_dir, trigger_reasons=reasons,
+            game_memory_max_chars=game_memory_max_chars,
+            global_memory_max_chars=global_memory_max_chars,
         )
         actions_since_review = 0
         fresh_actions_since_review = 0
@@ -910,6 +895,8 @@ def run_live(
             before, str(action["action"]), action.get("args", {}), after,
             run_id=run_id,
         )
+        if bootstrap_probe_active:
+            return edge
         level_path_edges.append(edge)
         previous_completed = before.get("levels_completed")
         current_completed = after.get("levels_completed")
@@ -919,14 +906,10 @@ def run_live(
         )
         won = str(after.get("game_state", "")).upper() == "WIN"
         if completed or won:
-            saved = solution_store.record_successful_trajectory(
+            solution_store.record_successful_trajectory(
                 level_start_observation, level_path_edges, run_id=run_id,
                 success="win" if won else "level_completed",
             )
-            if saved is not None:
-                _persist_successful_strategy(
-                    memory, game_id, saved, run_id=run_id, step=tools.action_count,
-                )
             level_start_observation = dict(after)
             level_path_edges = []
         elif level_key(before) != level_key(after):
@@ -939,13 +922,97 @@ def run_live(
     progress(f"started game={game_id}")
     try:
         while tools.action_count < tools.max_actions and not current.get("terminal"):
-            known_path = solution_store.shortest_known_solution(current)
-            solution_edges = known_path[:plan_horizon] if known_path else []
             responses: list[dict[str, Any]] = []
             validation_error: str | None = None
             cached_path_error: str | None = None
             decision: dict[str, Any] | None = None
-            if solution_edges:
+            decision_source = "model"
+            solution_edges: list[dict[str, Any]] = []
+            starter_chunk = False
+
+            if starter_queue:
+                decision_source = starter_queue_source
+                decision = {"actions": starter_queue[:int(plan_horizon)]}
+                starter_chunk = True
+                inputs = {
+                    "skill_sha256": skill_sha256,
+                    "image_labels": [],
+                    "legal_action_specs": _public_actions(current.get("legal_actions", [])),
+                }
+            elif initial_routine_pending:
+                initial_routine_pending = False
+                inputs = {"skill_sha256": skill_sha256, "image_labels": [],
+                          "legal_action_specs": _public_actions(current.get("legal_actions", []))}
+                starter_queue = _standard_start_routine(inputs["legal_action_specs"])
+                starter_queue_source = "bootstrap_probe"
+                if starter_queue:
+                    decision_source = starter_queue_source
+                    decision = {"actions": starter_queue[:int(plan_horizon)]}
+                    starter_chunk = True
+            elif bootstrap_plan_pending:
+                bootstrap_plan_pending = False
+                inputs = _live_context(
+                    tools, current, game_id, int(plan_horizon), source_skill,
+                    memory_store_dir, run_id, int(memory_context_entries),
+                    starting_routine=True, bootstrap_observations=bootstrap_observations,
+                )
+                for attempt in range(2):
+                    model_calls += 1
+                    try:
+                        response = client.complete(
+                            inputs["system_prompt"], inputs["user_prompt"],
+                            inputs["image_paths"], inputs["image_labels"],
+                        )
+                    except StrataRequestError as exc:
+                        model_calls += max(0, int(getattr(exc, "request_attempts", 1)) - 1)
+                        total_latency += float(getattr(exc, "latency_seconds", 0.0))
+                        validation_error = f"bootstrap planning request failed: {exc}"
+                        break
+                    model_calls += max(0, int(response.get("request_attempts", 1)) - 1)
+                    responses.append(response)
+                    for key in total_usage:
+                        value = response.get("usage", {}).get(key)
+                        if value is not None:
+                            total_usage[key] += int(value)
+                            action_usage[key] += int(value)
+                    total_latency += float(response.get("latency_seconds", 0.0))
+                    try:
+                        candidate = validate_model_decision(
+                            _parse_content(response.get("content")),
+                            inputs["legal_action_specs"], max_actions=plan_horizon,
+                        )
+                        directions = {"up", "left", "down", "right"}
+                        if not candidate["actions"] or any(
+                            str(model_action_name(item["action"])) not in directions
+                            for item in candidate["actions"]
+                        ):
+                            raise DecisionValidationError(
+                                "bootstrap plan must contain legal lowercase directional actions"
+                            )
+                        decision = candidate
+                        starter_queue_source = "bootstrap_model_start"
+                        break
+                    except (DecisionValidationError, ActionError) as exc:
+                        decision = None
+                        validation_error = str(exc)
+                        if attempt == 0:
+                            inputs["user_prompt"] = _decision_repair_prompt(
+                                inputs["user_prompt"], validation_error,
+                            )
+                if decision is not None:
+                    starter_queue = list(decision["actions"])
+                else:
+                    starter_queue = _standard_start_routine(inputs["legal_action_specs"])
+                    starter_queue_source = "bootstrap_start_fallback"
+                if starter_queue:
+                    decision_source = starter_queue_source
+                    decision = {"actions": starter_queue[:int(plan_horizon)]}
+                    starter_chunk = True
+
+            if decision is None:
+                known_path = solution_store.shortest_known_solution(current)
+                solution_edges = known_path[:plan_horizon] if known_path else []
+            if decision is None and solution_edges:
                 inputs = {
                     "skill_sha256": skill_sha256,
                     "image_labels": [],
@@ -959,11 +1026,12 @@ def run_live(
                     decision = validate_model_decision(
                         cached_decision, inputs["legal_action_specs"], max_actions=plan_horizon,
                     )
+                    decision_source = "verified_level_path"
                 except (DecisionValidationError, ActionError) as exc:
                     # A stored edge may no longer be legal; ask the model from the current state.
                     cached_path_error = f"cached path is no longer valid: {exc}"
                     solution_edges = []
-            if not solution_edges:
+            if decision is None and not solution_edges:
                 validation_error = None
                 inputs = _live_context(
                     tools, current, game_id, int(plan_horizon), source_skill,
@@ -1002,6 +1070,8 @@ def run_live(
                             inputs["user_prompt"] = _decision_repair_prompt(
                                 inputs["user_prompt"], validation_error,
                             )
+            if starter_chunk:
+                progress(f"using {decision_source} ({len(starter_queue)} starter actions queued)")
             if decision is None:
                 append_jsonl(decisions_path, {
                     "schema": "v10.live_decision/2", "status": "rejected",
@@ -1075,7 +1145,7 @@ def run_live(
                     fallback_reasons.append("stagnation")
                 if actions_since_review >= int(review_interval):
                     fallback_reasons.append("action_interval")
-                if fallback_reasons:
+                if fallback_reasons and not bootstrap_probe_active:
                     perform_triggered_review(fallback_reasons)
                 update_metrics()
                 continue
@@ -1092,7 +1162,7 @@ def run_live(
                 "game_id": game_id, "decision_schema": DECISION_SCHEMA,
                 "prompt_version": "v10.live_prompt/3", "skill_sha256": inputs["skill_sha256"],
                 "model": responses[-1].get("model") if responses else None,
-                "source": "verified_level_path" if solution_edges else "model",
+                "source": "verified_level_path" if solution_edges else decision_source,
                 "cached_path_edge_ids": [edge["id"] for edge in solution_edges],
                 "cached_path_error": cached_path_error,
                 "input_image_labels": inputs["image_labels"], "decision": logged_decision,
@@ -1120,11 +1190,14 @@ def run_live(
                     append_jsonl(decisions_path, {"schema": "v10.live_plan_result/2", "status": stop_reason})
                     break
                 current = reset_result["observation"]
+                starter_queue.clear()
                 level_start_observation = dict(current)
                 level_path_edges = []
                 no_progress_actions = 0
                 consecutive_unchanged_actions = 0
                 recent_state_actions.clear()
+                actions_since_review = 0
+                fresh_actions_since_review = 0
                 progress("reset executed")
                 interrupted_plans += 1
                 append_jsonl(decisions_path, {
@@ -1153,6 +1226,8 @@ def run_live(
                 legal_now = {item.get("id") for item in _public_actions(current.get("legal_actions", []))}
                 if action["action"] not in legal_now:
                     interruption = "planned_action_no_longer_legal"
+                    if starter_chunk:
+                        starter_queue.clear()
                     break
                 previous_level = current.get("level")
                 previous_levels_completed = current.get("levels_completed")
@@ -1170,6 +1245,8 @@ def run_live(
                     )
                 except (ActionError, BudgetExceeded) as exc:
                     interruption = "action_error" if isinstance(exc, ActionError) else "action_budget_exhausted"
+                    if starter_chunk:
+                        starter_queue.clear()
                     append_jsonl(decisions_path, {
                         "schema": "v10.live_plan_result/2", "status": "action_error",
                         "error": f"{type(exc).__name__}: {exc}",
@@ -1177,6 +1254,8 @@ def run_live(
                     break
                 current = result["observation"]
                 observed_edge = learn_transition(before_observation, action, result)
+                if starter_chunk and starter_queue:
+                    starter_queue.pop(0)
                 if expected_cached_edge:
                     cached_solution_actions += 1
                     if observed_edge["target_state"] != expected_cached_edge["target_state"]:
@@ -1276,7 +1355,7 @@ def run_live(
                     trigger_reasons.append("stagnation")
                 if actions_since_review >= int(review_interval):
                     trigger_reasons.append("action_interval")
-                if trigger_reasons:
+                if trigger_reasons and not bootstrap_probe_active:
                     perform_triggered_review(trigger_reasons)
                 if current.get("terminal"):
                     interruption = "terminal_state"
@@ -1284,6 +1363,11 @@ def run_live(
                     interruption = "level_change"
                 elif trigger_reasons:
                     interruption = "review"
+                if starter_chunk and interruption in {
+                    "terminal_state", "level_change", "planned_action_no_longer_legal",
+                    "action_error", "solution_diverged",
+                }:
+                    starter_queue.clear()
                 if interruption == "solution_diverged":
                     break
                 if interruption:
@@ -1294,6 +1378,41 @@ def run_live(
                 "schema": "v10.live_plan_result/2", "status": "interrupted" if interruption else "completed",
                 "executed": executed, "interrupt_reason": interruption,
             })
+            if bootstrap_probe_active and (not starter_queue or interruption is not None):
+                bootstrap_generation = tools.reset_generation
+                bootstrap_observations = [
+                    dict(row) for row in tools.history.records()
+                    if row.get("type") == "transition"
+                    and int(row.get("reset_generation", -1)) == int(bootstrap_generation)
+                ]
+                try:
+                    reset_result = tools.reset(
+                        "Return to the initial screen after collecting startup bootstrap observations."
+                    )
+                except BudgetExceeded:
+                    stop_reason = "bootstrap_reset_budget_exhausted"
+                    append_jsonl(decisions_path, {
+                        "schema": "v10.live_bootstrap_reset/1", "status": stop_reason,
+                        "required_reset_budget": 1,
+                    })
+                    update_metrics()
+                    break
+                current = reset_result["observation"]
+                bootstrap_probe_active = False
+                bootstrap_plan_pending = True
+                starter_queue.clear()
+                level_start_observation = dict(current)
+                level_path_edges = []
+                no_progress_actions = 0
+                consecutive_unchanged_actions = 0
+                recent_state_actions.clear()
+                append_jsonl(decisions_path, {
+                    "schema": "v10.live_bootstrap_reset/1", "status": "reset",
+                    "bootstrap_transitions": [row.get("evidence_id") for row in bootstrap_observations],
+                    "reset_evidence_id": reset_result["evidence"]["evidence_id"],
+                    "reset_generation": tools.reset_generation,
+                })
+                progress("bootstrap observations captured; reset to initial screen")
             update_metrics()
             if interruption == "action_budget_exhausted":
                 stop_reason = interruption

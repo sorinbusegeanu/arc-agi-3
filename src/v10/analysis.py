@@ -190,11 +190,8 @@ def build_analysis_input(
         run_path, store_dir=game_memory_dir(state_dir or default_state_dir(), str(game_id)),
         run_id=str(run_id),
     )
-    # Replay decisions consume the same generated game memory as live runs.
-    # Keep the JSONL ledger behind the renderer instead of exposing legacy
-    # review claims directly to the model.
-    memory_store.write_view()
-    memory = memory_store.view_path.read_text(encoding="utf-8")
+    # Replay decisions consume the same model-authored Markdown as live runs.
+    memory = memory_store.view_path.read_text(encoding="utf-8") if memory_store.view_path.is_file() else ""
     if conditioning == "pixels_actions":
         memory = ""
     context = {

@@ -1,84 +1,53 @@
 # V10 — Replay, Live Play, and Incremental Game Memory
 
-**Design v0.5 · 25 October 2026**
+**Design v0.6 · 25 October 2026**
 **Status:** Implemented in `src/v10`.
 
 ## 1. Purpose and boundaries
 
-V10 records reproducible game transitions, asks the configured model for a bounded action plan, validates each action in the harness, and reviews recorded experience to improve later decisions. Action selection remains action-only: the model returns legal action names and arguments. Review is a separate JSON call and cannot execute game actions.
+V10 records reproducible game transitions, asks the configured model for bounded action plans, validates each action in Python, and reviews recorded experience to improve later decisions. Action selection remains action-only: the model returns legal action names and arguments. Review is a separate JSON call and cannot execute game actions.
 
-Game knowledge is persistent and game-scoped. Run state and observations remain associated with their originating run. Existing append-only `memory.jsonl` files remain readable as internal review records; generated `MEMORY.md` is the model-facing game memory.
+Game and global `MEMORY.md` files contain model-authored Markdown and are authoritative for durable action guidance. Python owns validation, atomic persistence, event checkpoints, and exact successful-route replay. Existing append-only `memory.jsonl` files remain readable as historical records and retain run state and review checkpoints; structured ledger entries are not rendered into or duplicated in action prompts.
 
 ## 2. Live action loop
 
-The runner observes the game, supplies images, legal actions, recent outcomes, and compact applicable memory, then requests up to the configured plan horizon. The harness validates and executes each action. Level changes, terminal states, errors, budget exhaustion, and invalid next actions interrupt the remainder of a plan. Review also interrupts a remaining plan so the next model request sees the updated memory.
+At startup, the runner executes the standard legal directional bootstrap (`up`, `left`, `down`, `right`) and records its transitions as exploration, not as a successful route. It then performs one budgeted reset. A single model call receives the bootstrap observations and images, saved memory, and the current initial-screen image. That call is explicitly told that the game has reset and its proposed action sequence must start from the initial screen, not continue from the bootstrap's last screen. Invalid output falls back to the standard directional routine. This special instruction is used only for that startup call; all later action prompts follow the normal flow. The default reset budget is one to cover the startup reset; `--max-resets 0` disables reset-based startup.
 
-The model-facing movement names are `up`, `down`, `left`, and `right`; the harness maps them to environment action IDs. The action prompt receives memory as read-only context. The action response does not contain memory patches, predictions, or explanations.
+The model-facing movement names are lowercase `up`, `down`, `left`, and `right`; Python maps them to environment action IDs. The action prompt reads the saved game and global Markdown directly, alongside the current observation and bounded recent transitions. It does not receive raw JSONL or a duplicate structured-strategy payload. Current progress belongs in observation context, not durable memory. The action response contains no memory patches, predictions, or explanations.
 
-## 3. Review lifecycle
+The harness validates each action and stops a plan on a level change, terminal state, action error, budget exhaustion, or illegal next action. Review interrupts a remaining plan so a later action request sees the newly saved Markdown.
 
-Review runs after level completion, a `WIN`, an unexpected prediction, the configured action interval (default 50 executed actions), or stagnation. Stagnation requires at least three actions without level progress plus repeated visible states or repeated state/action pairs; at least three fresh actions must occur before it can trigger again. Simultaneous triggers are combined into one review, and a failed review can retry after fresh experience. Review does not advance or reset the game. It receives the current persistent game patterns, game `MEMORY.md`, shared global `MEMORY.md`, ordered new observations, a compact summary of repeated states and ineffective actions, and varied frames covering movement, blocked actions, interactions, and progress.
+## 3. Review and Markdown persistence
 
-The reviewer identifies repeated effects, successful approaches, repeated failures, contradictions, and a useful next experiment. It separates observations from explanations: unchanged pixels alone do not establish walls or total reachability, and proximity alone does not establish a completion rule. Exploration tactics may be recorded as tentative hypotheses before a level is solved and are kept distinct from demonstrated solutions. It also identifies meaningful, reusable problem-solving techniques for global memory. Memory patterns do not store evidence references, evidence counts, or numeric confidence. Global Markdown is deduplicated and bounded deterministically on save.
+Review runs after level completion, `WIN`, an unexpected legacy pattern prediction, the configured action interval (default 50 executed actions), or stagnation. Stagnation requires at least three actions without level progress plus repeated visible states or repeated state/action pairs; at least three fresh actions must occur before it can trigger again. Simultaneous triggers are coalesced. Review does not advance or reset the game.
 
-Each call receives only run observations not covered by its latest checkpoint, alongside the existing patterns; coverage is stored as an ordered event count so repeated identical reviews are recognizable without copying observation IDs into memory. Existing pattern IDs are reused for revisions. A new conditional variant has its own stable ID. Review changes only records it touches; other patterns are not rewritten. Observation IDs remain in run history and are omitted from reviewer event text and memory records.
+Each review receives the existing game and global Markdown, new ordered observations since the last successful review checkpoint, a compact summary of repeated states and ineffective actions, selected review images, and verified successful routes from `level_solutions.jsonl`. Routes are included with environment-recorded outcome and level scope. The reviewer may summarize equivalent routes into one strategy while preserving their level/state conditions. Exact route execution remains Python-owned.
 
-Review coverage checkpoints make an identical review idempotent. A checkpoint records the run and number of ordered review events covered. Retrying a review with the same coverage does not append another pattern revision. Review failures retain the prior ledger and view, are logged in `reviews.jsonl`, and do not stop live play.
+The review response is JSON containing exactly two non-empty strings: `game_memory_markdown` and `global_memory_markdown`. Game memory should contain a few concise mechanics, demonstrated and useful approaches, failures, and unresolved experiments. Global memory should contain only reusable problem-solving methods. The reviewer is instructed to consolidate repetition, qualify uncertainty, resolve contradictions, preserve proven strategies and scope, and omit exact action sequences, action counts, pixel statistics, state fingerprints, evidence IDs, internal schemas, and run-specific progress from the Markdown.
 
-The harness gives the reviewer one repair attempt when the response is malformed or a proposed pattern fails schema validation. Valid changes from a mixed accepted/rejected response are persisted, but the coverage checkpoint is withheld until a later review accepts the rejected changes or otherwise completes the set. This prevents failed proposals from hiding observations from the next review. Repair calls are included in request, token, and latency totals.
+Python checks both outputs against configurable character limits (defaults: 2,000 for game memory and 1,000 for global memory). Oversized, empty, malformed, or truncated output gets one repair request. It is rejected if still invalid; prose is never truncated to fit. Each valid file is atomically replaced. Invalid output or a failed save leaves that file's previous contents intact. A successful pair of saves is followed by an append-only review checkpoint, making repeat reviews of the same event idempotent. Failures are logged in `reviews.jsonl` and do not stop live play.
 
-Legacy whole-document review entries are retained until the reviewer reports that all useful findings have been migrated into structured records. Old rows are never rewritten; migration and retirement append ledger revisions.
+The existing Markdown files are supplied to later reviews for consolidation. Existing ledger rows and saved successful routes remain available as migration input; historical JSONL is retained and is not rewritten into a competing Markdown view.
 
-## 4. Pattern ledger
+## 4. Successful route storage and replay
 
-Each structured pattern is independently revised in the append-only JSONL ledger and contains:
+The game directory contains append-only `level_solutions.jsonl`. It stores observed state/action/next-state edges and complete trajectories only when level completion or `WIN` was observed. Successful routes are persisted immediately at the completion transition, independently of review success. The historical `runs/v10/ez01_20` trajectory is imported after validating its evidence chain, frames, legal actions, progress boundaries, terminal win, and metrics; import is idempotent and invents no transitions.
 
-- Stable `P-...` ID, `game_id`, type (`mechanic`, `strategy`, `exception`, or `hypothesis`), and concise claim.
-- Applicability conditions and an optional state selector over `game_state`, `level`, `levels_completed`, `win_levels`, and `terminal`.
-- Qualitative status (`candidate`, `confirmed`, `contradicted`, or `retired`) and pattern revision number.
-- Strategy-specific goal, preconditions, action policy, expected observations, and success conditions where applicable.
+State fingerprints include the visible grid, level/progress fields, game/terminal state, and legal action names. At each decision point, the runner searches only for a route starting at the exact current fingerprint and matching level key. Cached actions are converted to the lowercase direction contract before validation. Each action is checked against the expected source and resulting state; divergence or illegality stops replay and returns control to model selection. Routes count against the normal action budget and are never replaced by reviewer prose.
 
-IDs are derived deterministically from the game, type, normalized claim, and initial applicability conditions. Revising a record preserves its ID and increments its pattern revision. IDs are internal to the ledger and review prompt so the reviewer can update a specific pattern; they are omitted from the game-facing Markdown. Explicit retirements append a revision; no historical row is deleted. Conditional variants remain separate records with their own applicability conditions.
+## 5. Persistent storage and prompt loading
 
-The reviewer assigns qualitative status from the ordered observations. The harness validates the status value and preserves revisions; it does not calculate confidence from observation counts.
+Persistent files default to `skills/games/<game-id>/` and `skills/global/MEMORY.md`. Shared action instructions live in `skills/SKILL.md`. `V10_STATE_DIR` or `--state-dir` changes the persistent root; `--skill` overrides shared action instructions. `--reset-memory` on the live CLI removes the complete `games/` memory and solution subtree plus `global/MEMORY.md` before a run, while preserving `SKILL.md` and unrelated global files. `--game-memory-max-chars` and `--global-memory-max-chars` configure accepted review-output limits.
 
-## 5. Strategy and prediction handling
+Before each action request, the harness reads the saved game `MEMORY.md` and shared global `MEMORY.md` as Markdown. Game guidance takes priority for game rules; global guidance is limited to reusable exploration methods. The exact saved Markdown is preserved across restarts and is not regenerated during startup, state recording, action execution, replay analysis, or prompt construction.
 
-A strategy describes a goal, preconditions, a reusable action policy, and success conditions. Expected measurable observations are optional. Strategies are game-scoped and can include conditions keyed to observed state. A review may store a strategy only when its action sequence is supported by successful recorded experience. Verified route completions and wins immediately append a state-scoped strategy to game memory, so it is available to the next session. Applicable successful strategies are called out before the rest of the action context.
+`memory.jsonl` remains append-only for historical knowledge revisions, run-specific progress, legacy review prose, and review checkpoints. It is not the authoritative action-memory document and is not sent to action prompts. `level_solutions.jsonl` is the authoritative store for exact route edges, starting-state compatibility, and verified success.
 
-When a confirmed mechanic or strategy supplies one unambiguous measurable expectation for the selected action and current state, the harness evaluates that expectation against the resulting transition. It appends a prediction audit with expected and actual observations and a matched, failed, or inconclusive verdict to run history. A failed prediction marks the affected pattern contradicted; a matched prediction leaves it unchanged. An unexpected transition triggers an incremental review. Prediction audits are not copied into game memory.
+## 6. Run history and interruption
 
-Prediction expectations use the existing measurable-prediction validator and evaluator. Conflicting confirmed expectations are not arbitrarily selected; the harness skips prediction when applicable patterns disagree.
+Recent transition context is bounded independently from plan horizon. Run-specific observations and progress stay associated with their originating run. On interruption, completed transitions and verified successes remain saved, metrics record `stop_reason=interrupted`, and shutdown does not launch a review or mark an unfinished route successful.
 
-## 6. Cross-run memory and retrieval
-
-Persistent files are stored under `skills/games/<game-id>/` by default. Shared cross-game guidance is stored in `skills/global/MEMORY.md`; shared action instructions are `skills/SKILL.md`. `V10_STATE_DIR` or `--state-dir` overrides the persistent root, including both `games/` and `global/`; `--skill` overrides the shared action instructions. Game `MEMORY.md` is regenerated from internal review records after changes and is capped at 12,000 characters. The JSONL ledger supports review, validation, and rendering; it is not sent to action or replay prompts. Global memory is a single simple Markdown file, atomically replaced only when its contents change, and is capped at 3,000 characters both on write and in action prompts. Older unstructured game entries remain compatible until migrated or retired.
-
-Each run stores progress under a run-qualified state record. A new run can retrieve prior game patterns and strategies but does not receive another run's current progress as its own. Evidence references also include run IDs so local transition identifiers do not collide.
-
-The game directory also contains append-only `level_solutions.jsonl`. It stores observed state/action/next-state edges and complete action trajectories only when a level completion or `WIN` was observed. The recorded successful `runs/v10/ez01_20` history is imported after validating its contiguous evidence and frame chain, legal action order and arguments, progress boundaries, terminal win, and run metrics. Import is idempotent and writes no inferred transitions. State fingerprints include the visible grid, level/progress fields, game/terminal state, and legal action names. At each decision point, the runner searches only for routes starting at the exact current fingerprint and matching level key. Cached internal action IDs are translated to the established lowercase direction contract before validation. A verified path is replayed without an action-model call, up to the configured plan horizon, and every action still counts against the action budget. Each step is checked against the expected source and resulting state; if it diverges or is no longer legal, replay stops and normal model selection resumes from the observed state. These records do not enter model prompts.
-
-Recent transition context is bounded independently from plan horizon. On interruption, completed transitions and verified successes remain saved, metrics record `stop_reason=interrupted`, and shutdown does not start a review or mark an incomplete route successful.
-
-Before each action request, the harness includes the generated game `MEMORY.md` and shared global `MEMORY.md` as Markdown text. The game view presents active game knowledge; global memory guides exploration and does not override game-specific observations. The action prompt does not receive raw JSONL entries or the unrendered legacy review claim. Game Markdown is capped at 12,000 characters and global Markdown at 3,000 characters.
-
-## 7. Generated `MEMORY.md`
-
-The renderer deterministically produces these sections:
-
-1. Current State
-2. Confirmed Mechanics
-3. Successful Strategies
-4. Known Exceptions
-5. Active Hypotheses
-6. Failed Approaches
-7. Next Actions
-
-Pattern entries contain the claim, applicability conditions, qualitative status, and useful strategy details. They omit internal pattern IDs, confidence values, and observation references. Detailed observations and every historical revision remain in JSONL, with observation identifiers confined to run history.
-
-## 8. Backward compatibility and validation
-
-The reducer continues reading prior v10 ledger rows and preserves their revision history while omitting legacy evidence references and confidence fields from memory views. New metadata is appended without changing existing run interfaces. Legacy review prose is available to the migration review and remains in the generated view until successfully migrated. The ez01 regression fixture distinguishes gap-closing transitions, intermediate level completion, and the final `WIN` transition.
+## 7. Validation
 
 Focused regression suite:
 

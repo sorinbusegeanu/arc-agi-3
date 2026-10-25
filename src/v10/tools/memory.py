@@ -1,7 +1,7 @@
-"""Internal knowledge ledger and generated Markdown memory view.
+"""Internal append-only review ledger and model-authored Markdown memory.
 
-The ledger supports review, validation, and rendering. Action and replay
-prompts consume the generated `MEMORY.md` view, not raw ledger entries.
+The ledger preserves review history and run state. Action and replay prompts
+consume the saved `MEMORY.md` files, not rendered ledger entries.
 Patches are applied only after harness checks.
 """
 
@@ -11,6 +11,7 @@ import os
 import hashlib
 import json
 import re
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -25,8 +26,8 @@ LEDGER_NAME = "memory.jsonl"
 REVIEW_SUMMARY_ID = "review:latest"
 DEFAULT_MAX_ENTRIES = 60
 DEFAULT_CONTEXT_ENTRIES = 5
-MAX_MEMORY_MARKDOWN_CHARS = 12_000
-MAX_GLOBAL_MEMORY_MARKDOWN_CHARS = 3_000
+MAX_MEMORY_MARKDOWN_CHARS = 2_000
+MAX_GLOBAL_MEMORY_MARKDOWN_CHARS = 1_000
 PATTERN_TYPES: tuple[str, ...] = ("mechanic", "strategy", "exception", "hypothesis", "failure")
 PATTERN_STATUSES: tuple[str, ...] = ("candidate", "confirmed", "contradicted", "retired")
 STATE_SELECTOR_FIELDS = frozenset({"game_state", "level", "levels_completed", "win_levels", "terminal"})
@@ -69,28 +70,55 @@ def global_memory_path(state_dir: Path | str) -> Path:
     return Path(state_dir) / "global" / MEMORY_VIEW_NAME
 
 
+def reset_persistent_memory(state_dir: Path | str) -> None:
+    """Remove all game-scoped memory and shared Markdown memory under state_dir."""
+    root = Path(state_dir).expanduser()
+    games = root / "games"
+    global_dir = root / "global"
+    global_memory = global_memory_path(root)
+    if games.is_symlink():
+        raise ValueError(f"refusing to reset game memory through symlink: {games}")
+    if global_dir.is_symlink():
+        raise ValueError(f"refusing to reset global memory through symlink: {global_dir}")
+    if games.exists():
+        if not games.is_dir():
+            raise ValueError(f"game memory path is not a directory: {games}")
+        shutil.rmtree(games)
+    if global_memory.is_symlink():
+        global_memory.unlink()
+    elif global_memory.exists():
+        if not global_memory.is_file():
+            raise ValueError(f"global memory path is not a file: {global_memory}")
+        global_memory.unlink()
+
+
 def read_global_memory(state_dir: Path | str) -> str:
-    """Read bounded shared guidance for a model prompt; absent memory is empty."""
+    """Read the authoritative shared Markdown verbatim; absent memory is empty."""
     path = global_memory_path(state_dir)
     if not path.is_file():
         return ""
-    content = path.read_text(encoding="utf-8").strip()
-    if len(content) <= MAX_GLOBAL_MEMORY_MARKDOWN_CHARS:
-        return content
-    marker = "\n[Global memory truncated for prompt budget.]"
-    bounded = content[:MAX_GLOBAL_MEMORY_MARKDOWN_CHARS - len(marker)]
-    return bounded.rsplit("\n", 1)[0].rstrip() + marker
+    return path.read_text(encoding="utf-8").strip()
 
 
-def save_global_memory(state_dir: Path | str, markdown: str) -> bool:
-    """Atomically save a deduplicated, deterministically bounded global Markdown view."""
-    content = _deduplicate_global_markdown(str(markdown).strip())
-    if not content:
-        return False
-    if not content.startswith("# Global Memory"):
-        content = "# Global Memory\n\n" + content
-    content = _bound_global_markdown(content, MAX_GLOBAL_MEMORY_MARKDOWN_CHARS - 1)
-    rendered = content.rstrip() + "\n"
+def _validated_markdown(markdown: str, maximum: int, label: str) -> str:
+    if not isinstance(markdown, str) or not markdown.strip():
+        raise MemoryValidationError(f"{label} Markdown must be non-empty text")
+    content = markdown.strip()
+    if len(content) > int(maximum):
+        raise MemoryValidationError(
+            f"{label} Markdown exceeds the {int(maximum)} character limit ({len(content)} characters)"
+        )
+    return content + "\n"
+
+
+def save_global_memory(
+    state_dir: Path | str,
+    markdown: str,
+    *,
+    max_characters: int = MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
+) -> bool:
+    """Atomically save model-authored global Markdown without rewriting prose."""
+    rendered = _validated_markdown(markdown, max_characters, "global memory")
     path = global_memory_path(state_dir)
     if path.is_file() and path.read_text(encoding="utf-8") == rendered:
         return False
@@ -98,43 +126,19 @@ def save_global_memory(state_dir: Path | str, markdown: str) -> bool:
     return True
 
 
-def _bound_global_markdown(markdown: str, maximum: int) -> str:
-    """Keep complete early lessons and truncate only the final oversized line."""
-    if len(markdown) <= maximum:
-        return markdown.strip()
-    lines = markdown.splitlines()
-    result: list[str] = []
-    for line in lines:
-        candidate = "\n".join([*result, line]).rstrip()
-        if len(candidate) <= maximum:
-            result.append(line)
-            continue
-        remaining = maximum - len("\n".join(result)) - (1 if result else 0)
-        if remaining > 0:
-            shortened = line[:remaining].rsplit(" ", 1)[0].rstrip()
-            if shortened:
-                result.append(shortened)
-        break
-    return "\n".join(result).strip()
-
-
-def _deduplicate_global_markdown(markdown: str) -> str:
-    """Remove duplicate non-heading lines while preserving the first concise lesson."""
-    lines: list[str] = []
-    seen: set[str] = set()
-    for line in markdown.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            if lines and lines[-1] != "":
-                lines.append("")
-            continue
-        key = " ".join(stripped.lstrip("-* ").split()).casefold()
-        if not stripped.startswith("#") and key in seen:
-            continue
-        if not stripped.startswith("#"):
-            seen.add(key)
-        lines.append(stripped)
-    return "\n".join(lines).strip()
+def save_game_memory(
+    store_dir: Path | str,
+    markdown: str,
+    *,
+    max_characters: int = MAX_MEMORY_MARKDOWN_CHARS,
+) -> bool:
+    """Atomically save model-authored game Markdown without regenerating it."""
+    rendered = _validated_markdown(markdown, max_characters, "game memory")
+    path = Path(store_dir) / MEMORY_VIEW_NAME
+    if path.is_file() and path.read_text(encoding="utf-8") == rendered:
+        return False
+    _atomic_write_text(path, rendered)
+    return True
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -206,29 +210,6 @@ ENTRY_FIELDS = tuple(sorted(PATCH_FIELDS - {"op", "reason"}))
 MODEL_PATCH_OPS: tuple[str, ...] = ("upsert", "retire")
 MODEL_PATCH_FIELDS = frozenset(PATCH_FIELDS - {"reason", "step", "run_id"})
 
-# Render order follows DESIGN.md section 8.2.
-VIEW_SECTIONS: tuple[tuple[str, str], ...] = (
-    ("1. Current state", "state"),
-    ("2. Supported mechanics", "mechanic"),
-    ("3. Open hypotheses", "hypothesis"),
-    ("4. Patterns", "pattern"),
-    ("5. Goal candidates", "goal"),
-    ("6. Current strategy", "strategy"),
-    ("7. Prediction register", "prediction"),
-    ("8. Known failures/contradictions", "failure"),
-)
-
-_EMPTY_SECTION = "- none"
-
-PATTERN_VIEW_SECTIONS = (
-    ("2. Confirmed Mechanics", "mechanic", "confirmed"),
-    ("3. Successful Strategies", "strategy", "confirmed"),
-    ("4. Known Exceptions", "exception", None),
-    ("5. Active Hypotheses", "hypothesis", None),
-    ("6. Failed Approaches", "failure", None),
-)
-
-
 class MemoryValidationError(Exception):
     """Raised only for structurally unusable proposals, never for policy rejections."""
 
@@ -295,14 +276,6 @@ def stable_pattern_id(
     }
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
     return f"P-{digest}"
-
-
-def _bound_markdown(lines: Sequence[str], maximum: int) -> str:
-    text = "\n".join(lines).rstrip() + "\n"
-    if len(text) <= maximum:
-        return text
-    suffix = "\n[Memory view truncated at configured size limit.]\n"
-    return text[: max(0, maximum - len(suffix))].rsplit("\n", 1)[0].rstrip() + suffix
 
 
 def _pattern_context(entry: Mapping[str, Any]) -> dict[str, Any]:
@@ -551,7 +524,6 @@ class GameMemory:
         row = {"op": "upsert", **updated, "revision": revision}
         append_many(self.path, [row])
         self._rows.append(row)
-        self.write_view()
         return dict(row)
 
     def record_run_state(self, game_id: str, state: Mapping[str, Any], *, step: int) -> dict[str, Any] | None:
@@ -573,7 +545,6 @@ class GameMemory:
         }
         append_many(self.path, [row])
         self._rows.append(row)
-        self.write_view()
         return dict(row)
 
     @staticmethod
@@ -586,6 +557,32 @@ class GameMemory:
             return False
         coverage = self.review_coverage_id(game_id, self.run_id, covered_event_count)
         return any(row.get("op") == "checkpoint" and row.get("id") == coverage for row in self._rows)
+
+    def record_review_checkpoint(
+        self,
+        *,
+        game_id: str,
+        current_step: int,
+        covered_event_count: int,
+    ) -> bool:
+        """Record a completed Markdown review without writing pattern records."""
+        if not self.run_id:
+            raise MemoryValidationError("review checkpoint requires a run_id")
+        if int(current_step) < 0 or int(covered_event_count) < 0:
+            raise MemoryValidationError("review checkpoint values must be non-negative")
+        if self.has_review_coverage(game_id, covered_event_count):
+            return False
+        revision = self.revision() + 1
+        row = {
+            "op": "checkpoint",
+            "id": self.review_coverage_id(game_id, self.run_id, covered_event_count),
+            "type": "review_checkpoint", "game_id": str(game_id),
+            "run_id": self.run_id, "covered_event_count": int(covered_event_count),
+            "step": int(current_step), "revision": revision,
+        }
+        append_many(self.path, [row])
+        self._rows.append(row)
+        return True
 
     def reviewed_event_count(self, game_id: str) -> int:
         """Number of ordered review events covered by the latest checkpoint."""
@@ -610,7 +607,6 @@ class GameMemory:
         }
         append_many(self.path, [row])
         self._rows.append(row)
-        self.write_view()
         return True
 
     def apply_review_changes(
@@ -788,7 +784,6 @@ class GameMemory:
             if rows:
                 append_many(self.path, rows)
                 self._rows.extend(rows)
-                self.write_view()
             return {
                 "added": added, "updated": updated_count, "retired": retired,
                 "unchanged": unchanged, "rejected": rejected,
@@ -812,7 +807,6 @@ class GameMemory:
             }
         append_many(self.path, rows)
         self._rows.extend(rows)
-        self.write_view()
         return {
             "added": added, "updated": updated_count, "retired": retired,
             "unchanged": unchanged, "rejected": rejected, "duplicate_review": False,
@@ -979,7 +973,6 @@ class GameMemory:
                 rows.append(row)
             append_many(self.path, rows)
             self._rows.extend(rows)
-            self.write_view()
 
         return {"accepted": accepted, "rejected": rejected, "revision": revision}
 
@@ -1090,7 +1083,6 @@ class GameMemory:
             row["run_id"] = self.run_id
         append_many(self.path, [row])
         self._rows.append(row)
-        self.write_view()
         return dict(row)
 
     def _apply(
@@ -1120,199 +1112,27 @@ class GameMemory:
             order.append(entry_id)
         entries[entry_id] = entry
 
-    # ------------------------------------------------------------------ view
-
-    def render(self, through_step: int | None = None) -> str:
-        view = self.read(through_step=through_step)
-        structured = [
-            entry for entry in view["entries"]
-            if entry.get("pattern_type") in PATTERN_TYPES and entry.get("status") != "retired"
-        ]
-        if structured or any(entry.get("type") == "state" for entry in view["entries"]):
-            return self._render_structured_view(view, structured)
-        review = next((entry for entry in reversed(view["entries"]) if entry.get("type") == "review"), None)
-        if review is not None:
-            return _without_evidence_citations(str(review.get("claim", ""))) + "\n"
-        lines = [
-            "# Game memory (generated view)",
-            "",
-            f"Revision {view['revision']} · {view['count']} active entries.",
-            "",
-        ]
-        by_type: dict[str, list[dict[str, Any]]] = {}
-        for entry in view["entries"]:
-            by_type.setdefault(str(entry.get("type")), []).append(entry)
-        for title, entry_type in VIEW_SECTIONS:
-            lines.append(f"## {title}")
-            section = by_type.get(entry_type, [])
-            if not section:
-                lines.append(_EMPTY_SECTION)
-                lines.append("")
-                continue
-            for entry in section:
-                lines.append(self._render_entry(entry))
-            lines.append("")
-        return "\n".join(lines).rstrip() + "\n"
-
-    def _render_structured_view(
-        self,
-        view: Mapping[str, Any],
-        patterns: Sequence[Mapping[str, Any]],
-    ) -> str:
-        lines = ["# Game Memory"]
-        states = [
-            entry for entry in view["entries"]
-            if entry.get("type") == "state"
-            and self.run_id is not None and entry.get("run_id") == self.run_id
-        ]
-        latest_state = max(states, key=lambda entry: int(entry.get("ledger_revision", 0)), default=None)
-        if latest_state:
-            lines.extend(["", "## 1. Current State"])
-            values = [
-                f"level {latest_state.get('level', '?')}",
-                f"{latest_state.get('levels_completed', '?')}/{latest_state.get('win_levels', '?')} completed",
-                f"state {latest_state.get('game_state', '?')}",
-            ]
-            if latest_state.get("terminal"):
-                values.append("terminal")
-            lines.append("- " + "; ".join(values) + ".")
-
-        legacy = view["entries"]
-        for title, pattern_type, status in PATTERN_VIEW_SECTIONS:
-            if pattern_type == "failure":
-                selected = [entry for entry in legacy if entry.get("type") == "failure"]
-                selected.extend(
-                    entry for entry in patterns
-                    if entry.get("pattern_type") == "failure"
-                )
-            elif pattern_type == "hypothesis":
-                selected = [
-                    entry for entry in patterns
-                    if entry.get("pattern_type") == "hypothesis" and entry.get("status") == "candidate"
-                    or (entry.get("pattern_type") == "mechanic" and entry.get("status") == "candidate")
-                ]
-                selected.extend(
-                    entry for entry in legacy
-                    if entry.get("type") in {"hypothesis", "pattern"} and not entry.get("pattern_type")
-                )
-            else:
-                selected = [
-                    entry for entry in patterns
-                    if entry.get("pattern_type") == pattern_type
-                    and entry.get("status") not in {"contradicted", "retired"}
-                    and (status is None or entry.get("status") == status)
-                ]
-                legacy_type = "strategy" if pattern_type == "strategy" else "mechanic"
-                selected.extend(
-                    entry for entry in legacy
-                    if entry.get("type") == legacy_type
-                    and entry.get("status") in {"supported", "mechanic", "confirmed"}
-                )
-            if not selected:
-                continue
-            else:
-                lines.extend(["", f"## {title}"])
-                for entry in sorted(selected, key=lambda value: str(value.get("id", ""))):
-                    lines.append(self._render_pattern(entry))
-        next_actions = [
-            str(entry.get("action_policy", "")).strip()
-            for entry in patterns
-            if entry.get("pattern_type") in {"hypothesis", "failure"}
-            and entry.get("status") not in {"contradicted", "retired"}
-            and entry.get("action_policy")
-        ]
-        if next_actions:
-            lines.extend(["", "## 7. Next Actions"])
-            lines.extend(f"- {action}" for action in dict.fromkeys(next_actions))
-        return _bound_markdown(lines, MAX_MEMORY_MARKDOWN_CHARS)
-
-    def _render_pattern(self, entry: Mapping[str, Any]) -> str:
-        pattern_type = entry.get("pattern_type")
-        status = entry.get("status", "candidate")
-        parts = [
-            f"- {status}: "
-            f"{_without_evidence_citations(str(entry.get('claim', '')))}"
-        ]
-        conditions = entry.get("applicability_conditions", [])
-        if conditions:
-            parts.append("  Applies: " + "; ".join(map(str, conditions)))
-        selector = entry.get("state_selector")
-        if isinstance(selector, Mapping) and selector:
-            parts.append("  State: " + ", ".join(f"{key}={value}" for key, value in sorted(selector.items())))
-        if pattern_type == "strategy":
-            for label, field in (
-                ("Goal", "goal"), ("Preconditions", "preconditions"),
-                ("Policy", "action_policy"), ("Expected observations", "expected_observations"),
-                ("Success", "success_conditions"),
-            ):
-                value = entry.get(field)
-                if value:
-                    rendered = json.dumps(value, ensure_ascii=False, sort_keys=True) if isinstance(value, (dict, list)) else str(value)
-                    parts.append(f"  {label}: {rendered}")
-        return "\n".join(parts)
-
-    def _render_entry(self, entry: dict[str, Any]) -> str:
-        parts = [f"- `{entry['id']}`"]
-        if entry.get("status"):
-            parts.append(f"[{entry['status']}]")
-        parts.append(str(entry.get("claim", "")).strip())
-        detail = " ".join(parts)
-        if entry.get("prediction"):
-            detail += f"\n  - predicts: {entry['prediction']}"
-        if entry.get("falsification"):
-            detail += f"\n  - falsified by: {entry['falsification']}"
-        if entry.get("exceptions"):
-            detail += f"\n  - exceptions: {', '.join(str(value) for value in _as_list(entry['exceptions']))}"
-        if entry.get("notes"):
-            detail += f"\n  - notes: {entry['notes']}"
-        return detail
-
-    def write_view(self, through_step: int | None = None) -> Path:
-        rendered = self.render(through_step=through_step)
-        _atomic_write_text(self.view_path, rendered)
-        return self.view_path
-
     def save_review_summary(
         self,
         markdown: str,
         *,
         current_step: int,
     ) -> dict[str, Any]:
-        """Append the latest consolidated review to the authoritative game ledger."""
+        """Append legacy review prose to JSONL without changing authoritative Markdown."""
         if not isinstance(markdown, str) or not markdown.strip():
             raise MemoryValidationError("review Markdown must be non-empty text")
         if int(current_step) < 0:
             raise MemoryValidationError("review step must be non-negative")
-        previous_review = self.get(REVIEW_SUMMARY_ID)
-        revision = self.revision()
+        revision = self.revision() + 1
         row = {
             "op": "upsert", "id": REVIEW_SUMMARY_ID, "type": "review",
             "claim": _without_evidence_citations(markdown),
-            "step": int(current_step), "revision": revision + 1,
+            "step": int(current_step), "revision": revision,
         }
         if self.run_id:
             row["run_id"] = self.run_id
         append_many(self.path, [row])
         self._rows.append(row)
-        try:
-            self.write_view()
-        except Exception:
-            # The JSONL ledger is authoritative. Append a compensating record
-            # so a failed view save cannot replace the previously usable summary.
-            rollback = (
-                {"op": "upsert", **{
-                    field: value for field, value in previous_review.items()
-                    if field in ENTRY_FIELDS
-                }}
-                if previous_review is not None
-                else {"op": "retire", "id": REVIEW_SUMMARY_ID}
-            )
-            rollback.update({"step": int(current_step), "revision": revision + 2})
-            if self.run_id:
-                rollback["run_id"] = self.run_id
-            append_many(self.path, [rollback])
-            self._rows.append(rollback)
-            raise
         return dict(row)
 
     @staticmethod
@@ -1349,7 +1169,6 @@ class GameMemory:
         append_many(destination, migrated)
         memory = GameMemory(source_dir, store_dir=store_dir)
         memory._rows = read_jsonl(destination)
-        memory.write_view()
         return len(migrated)
 
 
@@ -1363,6 +1182,7 @@ __all__ = [
     "default_state_dir",
     "game_memory_dir",
     "global_memory_path",
+    "reset_persistent_memory",
     "read_global_memory",
     "save_global_memory",
     "MAX_GLOBAL_MEMORY_MARKDOWN_CHARS",
@@ -1374,7 +1194,7 @@ __all__ = [
     "MEMORY_VIEW_NAME",
     "PATCH_FIELDS",
     "PREDICTION_VERDICTS",
-    "PROMOTION_STATUSES",
-    "VIEW_SECTIONS",
+    "MAX_MEMORY_MARKDOWN_CHARS",
+    "save_game_memory",
     "MemoryValidationError",
 ]

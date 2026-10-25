@@ -6,7 +6,14 @@ from pathlib import Path
 import numpy as np
 
 from v10.live import run_live
+from v10.tools.memory import save_game_memory
 from v10.tools.solutions import LevelSolutionStore, state_fingerprint
+
+
+def _run_live_without_starting_routine(*args, **kwargs):
+    """Keep route tests focused on route reuse, independently of startup selection."""
+    kwargs["starting_routine"] = False
+    return run_live(*args, **kwargs)
 
 
 def _observation(frame: int, *, level: int = 0, completed: int = 0) -> dict:
@@ -118,8 +125,11 @@ class _Client:
 
     def complete(self, system_prompt, user_prompt, image_paths, image_labels, response_format="json_object"):
         self.calls.append(system_prompt)
-        if system_prompt.startswith("# V10 incremental memory review"):
-            content = '{"changes": [], "global_memory_markdown": "# Global Memory\\n"}'
+        if system_prompt.startswith("# V10 memory consolidation"):
+            content = json.dumps({
+                "game_memory_markdown": "# Game Memory\n\n- The verified route completes level zero.",
+                "global_memory_markdown": "# Global Memory\n\n- Compare objects before and after actions.",
+            })
         else:
             content = '{"actions":[{"action":"up","args":{}}]}'
         return {
@@ -134,13 +144,13 @@ def test_new_run_replays_successful_level_path_without_action_model_call(tmp_pat
     monkeypatch.setenv("V10_STATE_DIR", str(state_dir))
     first_env = _CompletingEnv()
     first_client = _Client()
-    first = run_live(first_env, tmp_path / "first", first_client, game_id="fixture", max_actions=1)
+    first = _run_live_without_starting_routine(first_env, tmp_path / "first", first_client, game_id="fixture", max_actions=1)
     assert first["actions"] == 1
     assert first["available_level_solutions"] == 1
 
     second_env = _CompletingEnv()
     second_client = _Client()
-    second = run_live(second_env, tmp_path / "second", second_client, game_id="fixture", max_actions=1)
+    second = _run_live_without_starting_routine(second_env, tmp_path / "second", second_client, game_id="fixture", max_actions=1)
 
     rows = [json.loads(line) for line in (tmp_path / "second/decisions.jsonl").read_text().splitlines()]
     plan = next(row for row in rows if row.get("schema") == "v10.live_decision/2")
@@ -150,11 +160,7 @@ def test_new_run_replays_successful_level_path_without_action_model_call(tmp_pat
     assert plan["source"] == "verified_level_path"
     assert len(second_client.calls) == 1  # completion review only
     assert plan["decision"]["actions"] == [{"action": "up", "args": {}}]
-    from v10.tools.memory import GameMemory
-    patterns = GameMemory(
-        tmp_path / "second", store_dir=state_dir / "games/fixture", game_id="fixture",
-    ).patterns("fixture")
-    assert any(pattern.get("pattern_type") == "strategy" for pattern in patterns)
+    assert "verified route" in (state_dir / "games/fixture/MEMORY.md").read_text()
 
 
 def test_cached_route_stops_on_divergence_then_asks_model(tmp_path: Path, monkeypatch) -> None:
@@ -170,7 +176,7 @@ def test_cached_route_stops_on_divergence_then_asks_model(tmp_path: Path, monkey
     store = LevelSolutionStore(game_memory_dir(state_dir, "fixture") / "level_solutions.jsonl", "fixture")
     edge = store.record_transition(start, "ACTION1", {}, wrong_target, run_id="seed")
     store.record_successful_trajectory(start, [edge], run_id="seed", success="level_completed")
-    metrics = run_live(
+    metrics = _run_live_without_starting_routine(
         _CompletingEnv(), tmp_path / "diverging", _Client(),
         game_id="fixture", max_actions=2, state_dir=state_dir,
     )
@@ -193,7 +199,7 @@ def test_illegal_cached_action_is_rejected_and_model_is_queried(tmp_path: Path, 
     edge = store.record_transition(start, "ACTION2", {}, illegal_target, run_id="seed")
     store.record_successful_trajectory(start, [edge], run_id="seed", success="level_completed")
 
-    run_live(
+    _run_live_without_starting_routine(
         _CompletingEnv(), tmp_path / "illegal", _Client(),
         game_id="fixture", max_actions=1, state_dir=state_dir,
     )
@@ -201,3 +207,95 @@ def test_illegal_cached_action_is_rejected_and_model_is_queried(tmp_path: Path, 
     plan = next(row for row in rows if row.get("schema") == "v10.live_decision/2")
     assert plan["source"] == "model"
     assert "cached path is no longer valid" in plan["cached_path_error"]
+
+
+def test_bootstrap_model_startup_uses_memory_before_normal_route_reuse(tmp_path: Path, monkeypatch) -> None:
+    from v10.tools.memory import GameMemory, game_memory_dir
+
+    class TwoStepWinEnv:
+        def __init__(self):
+            self.frame = np.zeros((2, 2), dtype=np.int64)
+            self.actions = []
+
+        def observe(self):
+            completed = 1 if self.actions else 0
+            won = len(self.actions) >= 2
+            return {
+                "frame": self.frame.copy(),
+                "legal_actions": [{"id": "ACTION1", "parameters": {
+                    "type": "object", "properties": {}, "required": [], "additionalProperties": False,
+                }}],
+                "game_state": "WIN" if won else "NOT_FINISHED", "level": completed,
+                "levels_completed": completed, "win_levels": 1,
+                "terminal": won,
+            }
+
+        def act(self, action, args):
+            self.actions.append(action)
+            self.frame[0, 0] += 1
+            return {}
+
+        def reset(self):
+            self.frame[:] = 0
+            self.actions.clear()
+            return self.observe()
+
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("V10_STATE_DIR", str(state_dir))
+    save_game_memory(
+        game_memory_dir(state_dir, "fixture"),
+        "# Game Memory\n\n- This game has a previously observed mechanic.",
+    )
+    route_env = TwoStepWinEnv()
+    route_env.act("ACTION1", {})
+    route_start = route_env.observe()
+    route_env.act("ACTION1", {})
+    win = route_env.observe()
+    store = LevelSolutionStore(game_memory_dir(state_dir, "fixture") / "level_solutions.jsonl", "fixture")
+    edge = store.record_transition(route_start, "ACTION1", {}, win, run_id="seed")
+    store.record_successful_trajectory(route_start, [edge], run_id="seed", success="win")
+
+    env = TwoStepWinEnv()
+    metrics = run_live(
+        env, tmp_path / "run", _Client(), game_id="fixture", max_actions=2,
+        state_dir=state_dir,
+    )
+    rows = [json.loads(line) for line in (tmp_path / "run/decisions.jsonl").read_text().splitlines()]
+    plans = [row for row in rows if row.get("schema") == "v10.live_decision/2"]
+
+    assert [row["source"] for row in plans] == ["bootstrap_probe", "bootstrap_model_start"]
+    assert metrics["cached_solution_actions"] == 0
+    assert metrics["actions"] == 2
+    assert metrics["resets"] == 1
+
+
+def test_successful_route_is_saved_and_replayed_even_when_review_fails(tmp_path: Path, monkeypatch) -> None:
+    from v10.tools.memory import game_memory_dir
+
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("V10_STATE_DIR", str(state_dir))
+
+    class InvalidReviewClient(_Client):
+        def complete(self, system_prompt, user_prompt, image_paths, image_labels, response_format="json_object"):
+            if system_prompt.startswith("# V10 memory consolidation"):
+                self.calls.append(system_prompt)
+                return {"content": "not JSON", "model": self.model, "usage": {},
+                        "latency_seconds": 0.0, "request_attempts": 1, "finish_reason": "stop"}
+            return super().complete(system_prompt, user_prompt, image_paths, image_labels, response_format)
+
+    failed = _run_live_without_starting_routine(
+        _CompletingEnv(), tmp_path / "failed-review", InvalidReviewClient(),
+        game_id="fixture", max_actions=1, state_dir=state_dir,
+    )
+    store = LevelSolutionStore(game_memory_dir(state_dir, "fixture") / "level_solutions.jsonl", "fixture")
+    assert failed["available_level_solutions"] == 1
+    assert store.solutions()[0]["success"] == "level_completed"
+    assert failed["stop_reason"] == "action_budget_exhausted"
+
+    env = _CompletingEnv()
+    replayed = _run_live_without_starting_routine(
+        env, tmp_path / "replayed", _Client(), game_id="fixture", max_actions=1,
+        state_dir=state_dir,
+    )
+    assert env.actions == ["ACTION1"]
+    assert replayed["cached_solution_actions"] == 1
