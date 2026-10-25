@@ -1,0 +1,63 @@
+[
+  {
+    "schema": "v10.evidence/1",
+    "evidence_id": "T2",
+    "type": "transition",
+    "action": "ACTION1",
+    "level": 0,
+    "levels_completed": 0,
+    "game_state": "NOT_FINISHED",
+    "terminal": false,
+    "measurements": {
+      "changed_pixels": 128,
+      "candidate_displacement": {"best": {"dx": 0, "dy": -8, "score": 1.0}, "margin": 0.125}
+    }
+  },
+  {
+    "schema": "v10.evidence/1",
+    "evidence_id": "T3",
+    "type": "transition",
+    "action": "ACTION1",
+    "level": 1,
+    "levels_completed": 1,
+    "game_state": "NOT_FINISHED",
+    "terminal": false,
+    "measurements": {
+      "changed_pixels": 258,
+      "candidate_displacement": {"best": {"dx": 8, "dy": 8, "score": 0.5}, "margin": 0.0}
+    }
+  },
+  {
+    "schema": "v10.evidence/1",
+    "evidence_id": "T25",
+    "type": "transition",
+    "action": "ACTION1",
+    "level": 4,
+    "levels_completed": 4,
+    "game_state": "NOT_FINISHED",
+    "terminal": false,
+    "measurements": {
+      "changed_pixels": 128,
+      "candidate_displacement": {"best": {"dx": 0, "dy": -8, "score": 1.0}, "margin": 0.125}
+    }
+  },
+  {
+    "schema": "v10.evidence/1",
+    "evidence_id": "T26",
+    "type": "transition",
+    "action": "ACTION1",
+    "level": 5,
+    "levels_completed": 5,
+    "game_state": "WIN",
+    "terminal": true,
+    "measurements": {
+      "changed_pixels": 145,
+      "color_transitions": [
+        {"from": 9, "pixels": 64, "to": 5},
+        {"from": 11, "pixels": 64, "to": 9},
+        {"from": 5, "pixels": 16, "to": 14}
+      ],
+      "candidate_displacement": {"best": {"dx": 0, "dy": -2, "score": 0.015385}, "margin": 0.0}
+    }
+  }
+]

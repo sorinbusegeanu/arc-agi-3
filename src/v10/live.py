@@ -24,7 +24,7 @@ from .analysis import (
 from .frames import DELTA_KIND, IMAGE_KIND, FrameStore
 from .runlog import append_jsonl, write_json
 from .strata_client import StrataRequestError
-from .tools.game import ActionError, BudgetExceeded, GameTools
+from .tools.game import ActionError, BudgetExceeded, GameTools, evaluate_prediction
 from .tools.history import History
 from .tools.memory import (
     DEFAULT_CONTEXT_ENTRIES,
@@ -175,7 +175,7 @@ def _random_legal_action(legal_actions: Any, rng: random.Random) -> dict[str, An
 
 _REVIEW_SYSTEM_PROMPT = """# ez01 incremental memory review
 
-Review this run's ordered observations against the existing structured patterns. You do not control the game and must not request actions or resets. Return only a JSON object with a `changes` array. Do not rewrite the whole memory.
+Review this run's ordered observations against the existing structured patterns. You do not control the game and must not request actions or resets. Return only a JSON object with a `changes` array and boolean `legacy_memory_migrated`. Set the latter true only when all useful legacy MEMORY.md findings have been converted to structured patterns or strategies; otherwise keep the legacy note active. Do not rewrite the whole memory.
 
 Each change is one of:
 - An upsert with `operation`, optional existing `pattern_id`, `pattern_type` (`mechanic`, `strategy`, `exception`, or `hypothesis`), a concise `claim`, optional `applicability_conditions`, optional `state_selector`, and only newly observed `supporting_evidence` / `contradicting_evidence` IDs from this review's events.
@@ -185,18 +185,21 @@ When revising an existing pattern, reuse its ID. Use distinct conditional varian
 
 For useful successful action sequences, use `pattern_type: "strategy"` and provide `goal`, `preconditions` (string list), `action_policy`, `expected_observations`, and `success_conditions` (string list). Each expected observation has `action`, optional `state_selector` over game_state/level/levels_completed/terminal, and a measurable prediction in the supported all-of predicate format. Do not produce strategies that are not supported by a successful transition.
 
-Distinguish direct observations from explanations. Direction words name commands; infer movement from frames and measurements. Keep claims game-specific and concise. Return `{"changes": []}` when this review adds no information."""
+Distinguish direct observations from explanations. Direction words name commands; infer movement from frames and measurements. Keep claims game-specific and concise. Return `{"changes": [], "legacy_memory_migrated": true}` when no useful legacy content remains."""
 
 
-def _validate_review_payload(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, Mapping) or set(value) != {"changes"}:
-        raise ValueError("review response must be a JSON object containing only changes")
+def _validate_review_payload(value: Any) -> tuple[list[dict[str, Any]], bool]:
+    if not isinstance(value, Mapping) or set(value) - {"changes", "legacy_memory_migrated"} or "changes" not in value:
+        raise ValueError("review response must be a JSON object containing changes")
+    legacy_migrated = value.get("legacy_memory_migrated", False)
+    if not isinstance(legacy_migrated, bool):
+        raise ValueError("legacy_memory_migrated must be a boolean")
     changes = value["changes"]
     if not isinstance(changes, list):
         raise ValueError("review changes must be a list")
     if any(not isinstance(change, Mapping) for change in changes):
         raise ValueError("each review change must be an object")
-    return [dict(change) for change in changes]
+    return [dict(change) for change in changes], legacy_migrated
 
 
 def _review_events(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -217,11 +220,20 @@ def _review_events(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
                 "justification": row.get("justification"),
             })
         elif kind == "audit":
-            events.append({
-                "type": "action_error", "evidence_id": row.get("evidence_id"),
-                "kind": row.get("kind"), "action": model_action_name(row.get("action")),
-                "error": row.get("error"), "reset_generation": row.get("reset_generation"),
-            })
+            if row.get("kind") == "pattern_prediction":
+                events.append({
+                    "type": "pattern_prediction", "evidence_id": row.get("evidence_id"),
+                    "pattern_id": row.get("pattern_id"), "transition_id": row.get("transition_id"),
+                    "verdict": row.get("verdict"), "action": model_action_name(row.get("action")),
+                    "expected": row.get("expected"), "actual": row.get("actual"),
+                    "reason": row.get("reason"), "reset_generation": row.get("reset_generation"),
+                })
+            else:
+                events.append({
+                    "type": "action_error", "evidence_id": row.get("evidence_id"),
+                    "kind": row.get("kind"), "action": model_action_name(row.get("action")),
+                    "error": row.get("error"), "reset_generation": row.get("reset_generation"),
+                })
         elif kind == "transition":
             events.append({
                 "type": "transition", "evidence_id": row.get("evidence_id"),
@@ -318,6 +330,8 @@ def _perform_review(
         last_id = transition_ids[-1] if transition_ids else None
         memory = GameMemory(tools.run_dir, store_dir=memory_store_dir, run_id=run_id, game_id=game_id)
         memory_text = memory.write_view().read_text(encoding="utf-8")
+        legacy_review = memory.get("review:latest")
+        legacy_review_text = str(legacy_review.get("claim", "")) if legacy_review else ""
         if memory.has_review_coverage(game_id, transition_ids):
             row = {
                 "schema": "v10.live_review/2", "status": "skipped_duplicate_evidence",
@@ -357,6 +371,7 @@ def _perform_review(
             + json.dumps(patterns, ensure_ascii=False, separators=(",", ":")) + "\n\n"
             "Existing MEMORY.md view (legacy content may be migrated into patterns):\n"
             + memory_text + "\n\n"
+            "Prior unstructured review, if any:\n" + legacy_review_text + "\n\n"
             "New ordered run observations (evidence IDs are valid only in the evidence arrays):\n"
             + json.dumps(events, ensure_ascii=False, separators=(",", ":"))
         )
@@ -371,13 +386,14 @@ def _perform_review(
         content = response.get("content")
         if response.get("finish_reason") == "length":
             raise ValueError("review response was truncated at the output-token limit")
-        changes = _validate_review_payload(_parse_content(content))
+        changes, legacy_migrated = _validate_review_payload(_parse_content(content))
         applied = memory.apply_review_changes(
             changes, game_id=game_id, evidence_ids=transition_ids,
             current_step=tools.action_count,
         )
         if not applied.get("committed", True):
             raise ValueError(f"review contained no valid changes: {applied['rejected']}")
+        legacy_review_retired = memory.retire_legacy_review(current_step=tools.action_count) if legacy_migrated else False
         canonical = json.dumps(changes, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         row = {
             "schema": "v10.live_review/2",
@@ -393,6 +409,7 @@ def _perform_review(
             "patterns_added": applied["added"], "patterns_updated": applied["updated"],
             "patterns_retired": applied["retired"], "unchanged_patterns": applied["unchanged"],
             "rejected_changes": applied["rejected"], "duplicate_review": applied["duplicate_review"],
+            "legacy_memory_migrated": legacy_migrated, "legacy_review_retired": legacy_review_retired,
             "result_characters": len(canonical),
             "result_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
         }
@@ -568,6 +585,10 @@ def run_live(
     review_latency = 0.0
     review_model_calls = 0
     review_count = 0
+    pattern_predictions = 0
+    pattern_prediction_matches = 0
+    pattern_prediction_contradictions = 0
+    pattern_prediction_inconclusive = 0
     actions_since_review = 0
     interrupted_plans = 0
     stop_reason = "running"
@@ -587,6 +608,10 @@ def run_live(
             "model_calls": model_calls, "usage": dict(total_usage),
             "action_usage": dict(action_usage), "review_usage": dict(review_usage),
             "review_model_calls": review_model_calls, "review_count": review_count,
+            "pattern_predictions": pattern_predictions,
+            "pattern_prediction_matches": pattern_prediction_matches,
+            "pattern_prediction_contradictions": pattern_prediction_contradictions,
+            "pattern_prediction_inconclusive": pattern_prediction_inconclusive,
             "review_latency_seconds": round(review_latency, 6),
             "review_interval": int(review_interval),
             "latency_seconds": round(total_latency, 6), "elapsed_seconds": elapsed,
@@ -751,6 +776,10 @@ def run_live(
                     break
                 previous_level = current.get("level")
                 previous_levels_completed = current.get("levels_completed")
+                prediction_memory = GameMemory(
+                    destination, store_dir=memory_store_dir, run_id=run_id, game_id=game_id,
+                )
+                expected_pattern = prediction_memory.expected_observation(game_id, current, action["action"])
                 try:
                     next_number = tools.action_count + 1
                     progress(f"taking action {next_number}: {action['action']}")
@@ -765,15 +794,55 @@ def run_live(
                     })
                     break
                 current = result["observation"]
+                memory = GameMemory(
+                    destination, store_dir=memory_store_dir, run_id=run_id, game_id=game_id,
+                )
+                memory.record_run_state(game_id, current, step=tools.action_count)
                 progress(
                     f"action {tools.action_count}: {action['action']} -> "
                     f"{current.get('game_state', '?')}"
                 )
-                executed.append({
-                    "evidence_id": result["evidence"]["evidence_id"],
-                })
+                executed_action = {"evidence_id": result["evidence"]["evidence_id"]}
+                prediction_failed = False
+                if expected_pattern is not None:
+                    actual = {
+                        "measurements": result.get("measurements", {}),
+                        "game_state": current.get("game_state"), "level": current.get("level"),
+                        "levels_completed": current.get("levels_completed"),
+                        "win_levels": current.get("win_levels"), "terminal": current.get("terminal", False),
+                    }
+                    verdict_row = evaluate_prediction(expected_pattern["measurable_prediction"], actual)
+                    verdict = str(verdict_row.get("verdict", "inconclusive"))
+                    audit = tools.history.append({
+                        "type": "audit", "kind": "pattern_prediction",
+                        "pattern_id": expected_pattern["pattern_id"],
+                        "transition_id": result["evidence"]["evidence_id"],
+                        "action": action["action"], "expected": expected_pattern["expected_observation"],
+                        "actual": actual, "verdict": verdict, "reason": verdict_row.get("reason"),
+                        "reset_generation": tools.reset_generation,
+                    })
+                    memory.record_pattern_prediction(
+                        expected_pattern["pattern_id"], result["evidence"]["evidence_id"], verdict,
+                        audit["evidence_id"], step=tools.action_count,
+                    )
+                    pattern_predictions += 1
+                    if verdict == "matched":
+                        pattern_prediction_matches += 1
+                    elif verdict == "failed":
+                        pattern_prediction_contradictions += 1
+                        prediction_failed = True
+                    else:
+                        pattern_prediction_inconclusive += 1
+                    executed_action["pattern_prediction"] = {
+                        "pattern_id": expected_pattern["pattern_id"],
+                        "audit_id": audit["evidence_id"], "verdict": verdict,
+                    }
+                    progress(f"pattern prediction {verdict}: {expected_pattern['pattern_id']}")
+                executed.append(executed_action)
                 actions_since_review += 1
                 trigger_reasons = []
+                if prediction_failed:
+                    trigger_reasons.append("unexpected_transition")
                 level_completed = (
                     previous_levels_completed is not None
                     and current.get("levels_completed") is not None

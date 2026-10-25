@@ -261,6 +261,29 @@ def _bound_markdown(lines: Sequence[str], maximum: int) -> str:
     return text[: max(0, maximum - len(suffix))].rsplit("\n", 1)[0].rstrip() + suffix
 
 
+def _pattern_context(entry: Mapping[str, Any]) -> dict[str, Any]:
+    context = {
+        key: entry[key] for key in (
+            "id", "game_id", "pattern_type", "status", "confidence", "state_selector",
+        ) if key in entry
+    }
+    context["claim"] = _without_evidence_citations(str(entry.get("claim", "")))[:500]
+    context["applicability_conditions"] = [
+        str(value)[:180] for value in entry.get("applicability_conditions", [])[:4]
+    ]
+    context["supporting_evidence_count"] = len(entry.get("supporting_evidence", []))
+    context["contradicting_evidence_count"] = len(entry.get("contradicting_evidence", []))
+    for field in ("goal", "action_policy"):
+        if entry.get(field):
+            context[field] = str(entry[field])[:500]
+    for field in ("preconditions", "success_conditions"):
+        if entry.get(field):
+            context[field] = [str(value)[:180] for value in entry[field][:4]]
+    if entry.get("expected_observations"):
+        context["expected_observations"] = list(entry["expected_observations"][:2])
+    return context
+
+
 def _as_list(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -548,6 +571,20 @@ class GameMemory:
         coverage = self.review_coverage_id(game_id, self.run_id, evidence_ids)
         return any(row.get("op") == "checkpoint" and row.get("id") == coverage for row in self._rows)
 
+    def retire_legacy_review(self, *, current_step: int) -> bool:
+        """Retire the old whole-document review after its findings are structured."""
+        if self.get(REVIEW_SUMMARY_ID) is None:
+            return False
+        revision = self.revision() + 1
+        row = {
+            "op": "retire", "id": REVIEW_SUMMARY_ID, "step": int(current_step),
+            "revision": revision, "run_id": self.run_id,
+        }
+        append_many(self.path, [row])
+        self._rows.append(row)
+        self.write_view()
+        return True
+
     def apply_review_changes(
         self,
         changes: Any,
@@ -572,6 +609,7 @@ class GameMemory:
         current_patterns = {entry["id"]: entry for entry in self.patterns(game_id, include_retired=True)}
         planned: dict[str, dict[str, Any]] = {}
         rejected: list[dict[str, Any]] = []
+        unchanged = 0
         for index, raw in enumerate(changes):
             if not isinstance(raw, Mapping):
                 rejected.append({"index": index, "reason": "change_must_be_object"})
@@ -629,6 +667,9 @@ class GameMemory:
             stable_id = str(existing["id"]) if existing else stable_pattern_id(
                 game_id, str(pattern_type), claim, conditions,
             )
+            if stable_id in planned:
+                rejected.append({"index": index, "pattern_id": stable_id, "reason": "duplicate_pattern_change"})
+                continue
             base = dict(existing or {})
             prior_support = list(base.get("supporting_evidence", []))
             prior_contra = list(base.get("contradicting_evidence", []))
@@ -698,7 +739,7 @@ class GameMemory:
 
         rows: list[dict[str, Any]] = []
         revision = self.revision()
-        added = updated_count = retired = unchanged = 0
+        added = updated_count = retired = 0
         for pattern_id, record in planned.items():
             existing = current_patterns.get(pattern_id)
             compare_record = {key: value for key, value in record.items() if key not in {"step", "run_id", "pattern_revision"}}
@@ -756,12 +797,27 @@ class GameMemory:
                 self.run_id is not None and entry.get("run_id") == self.run_id
             )
         ]
-        patterns = self.applicable_patterns(game_id or self.game_id or "", current_state)
+        patterns = self.applicable_patterns(
+            game_id or self.game_id or "", current_state, include_hypotheses=False,
+        )
+        if not any(
+            entry.get("pattern_type") in {"mechanic", "strategy"} and entry.get("status") == "confirmed"
+            for entry in patterns
+        ):
+            hypotheses = self.applicable_patterns(
+                game_id or self.game_id or "", current_state, include_hypotheses=True,
+            )
+            patterns.extend(entry for entry in hypotheses if entry.get("pattern_type") == "hypothesis")
+            patterns.sort(key=lambda entry: (
+                {"mechanic": 0, "strategy": 1, "exception": 2, "hypothesis": 3}.get(str(entry.get("pattern_type")), 9),
+                0 if entry.get("status") == "confirmed" else 1,
+                -float(entry.get("confidence", 0.0)), str(entry.get("id", "")),
+            ))
         if patterns:
-            selected = [dict(entry) for entry in patterns[:max_entries]]
+            selected = [_pattern_context(entry) for entry in patterns[:max_entries]]
             for entry in selected:
-                entry["supporting_evidence_count"] = len(entry.get("supporting_evidence", []))
-                entry["contradicting_evidence_count"] = len(entry.get("contradicting_evidence", []))
+                entry.setdefault("supporting_evidence_count", len(entry.get("supporting_evidence", [])))
+                entry.setdefault("contradicting_evidence_count", len(entry.get("contradicting_evidence", [])))
                 entry.pop("supporting_evidence", None)
                 entry.pop("contradicting_evidence", None)
                 entry.pop("evidence_ids", None)
@@ -1120,7 +1176,7 @@ class GameMemory:
             elif pattern_type == "hypothesis":
                 selected = [
                     entry for entry in patterns
-                    if entry.get("pattern_type") == "hypothesis"
+                    if entry.get("pattern_type") == "hypothesis" and entry.get("status") == "candidate"
                     or (entry.get("pattern_type") == "mechanic" and entry.get("status") == "candidate")
                 ]
                 selected.extend(
@@ -1131,7 +1187,8 @@ class GameMemory:
                 selected = [
                     entry for entry in patterns
                     if entry.get("pattern_type") == pattern_type
-                    and (status is None or entry.get("status") == status)
+                    and entry.get("status") not in {"contradicted", "retired"}
+                    and (status is None or entry.get("status") == status or pattern_type == "strategy")
                 ]
                 legacy_type = "strategy" if pattern_type == "strategy" else "mechanic"
                 selected.extend(

@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from v10.arcade_env import ArcadeGameEnv
-from v10.live import run_live
+from v10.live import _perform_review, run_live
 from v10.tools.game import GameTools
 from v10.tools.game import ActionError
 from v10.tools.history import History
@@ -173,6 +173,52 @@ def test_live_action_only_responses_create_no_prediction_audits(tmp_path: Path) 
         if row.get("type") == "audit" and row.get("kind") == "prediction"
     ]
     assert prediction_rows == []
+
+
+def test_confirmed_pattern_prediction_is_audited_and_triggers_review_on_conflict(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    prior = GameMemory(
+        tmp_path / "prior", store_dir=state_dir / "games/fixture",
+        run_id="prior-run", game_id="fixture",
+    )
+    prior.apply_review_changes([{
+        "operation": "upsert", "pattern_type": "mechanic", "claim": "Up changes 999 pixels.",
+        "applicability_conditions": ["Any level."],
+        "supporting_evidence": ["T1", "T2"], "contradicting_evidence": [],
+        "state_selector": {},
+        "expected_observations": [{
+            "action": "up", "state_selector": {},
+            "measurable_prediction": {"all": [
+                {"path": "measurements.changed_pixels", "op": "eq", "value": 999},
+            ]},
+        }],
+    }], game_id="fixture", evidence_ids=["T1", "T2"], current_step=2)
+    pattern_id = prior.patterns("fixture")[0]["id"]
+    client = _FakeClient(
+        [_decision([_action()])], review_responses=['{"changes": []}'],
+    )
+
+    metrics = run_live(
+        _FakeEnv(), tmp_path / "run", client, game_id="fixture", max_actions=1,
+        state_dir=state_dir,
+    )
+
+    audits = [
+        row for row in History(tmp_path / "run").records()
+        if row.get("kind") == "pattern_prediction"
+    ]
+    assert len(audits) == 1
+    assert audits[0]["pattern_id"] == pattern_id
+    assert audits[0]["verdict"] == "failed"
+    assert metrics["pattern_predictions"] == 1
+    assert metrics["pattern_prediction_contradictions"] == 1
+    assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["unexpected_transition"]
+    updated = GameMemory(
+        tmp_path / "run", store_dir=state_dir / "games/fixture",
+        run_id=json.loads((tmp_path / "run/run_manifest.json").read_text())["run_id"], game_id="fixture",
+    ).patterns("fixture")[0]
+    assert updated["contradicting_evidence"][-1].endswith(":T2")
+    assert updated["status"] == "candidate"
 
 
 def test_live_repairs_response_that_includes_prediction_fields(tmp_path: Path) -> None:
@@ -420,6 +466,82 @@ def test_review_runs_on_level_completion_and_next_action_receives_pattern(tmp_pa
     assert review_row["status"] == "saved"
     assert review_row["trigger_reasons"] == ["level_completed"]
     assert review_row["covered_transitions"] == {"count": 1, "first": "T2", "last": "T2"}
+
+
+def test_ez01_fixture_keeps_gap_intermediate_and_final_win_patterns_distinct(tmp_path: Path) -> None:
+    fixture = json.loads((Path(__file__).parent / "fixtures/v10/ez01_memory_history.json").read_text())
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    history = History(run_dir)
+    for row in fixture:
+        history.append(row)
+    tools = GameTools(_FakeEnv(), run_dir)
+    game_id = "ez01"
+    run_id = "ez01-fixture-run"
+    memory = GameMemory(run_dir, store_dir=tmp_path / "state/games/ez01", run_id=run_id, game_id=game_id)
+    memory.record_run_state(game_id, {
+        "level": 5, "levels_completed": 5, "win_levels": 5, "game_state": "WIN", "terminal": True,
+    }, step=tools.action_count)
+    changes = [
+        {
+            "operation": "upsert", "pattern_type": "mechanic",
+            "claim": "Pressing up closes a vertical gap by moving blue upward eight pixels.",
+            "applicability_conditions": ["The squares are vertically separated."],
+            "supporting_evidence": ["T2", "T25"], "contradicting_evidence": [],
+            "state_selector": {"level": 0},
+            "expected_observations": [{
+                "action": "up", "state_selector": {"level": 0},
+                "measurable_prediction": {"all": [
+                    {"path": "measurements.changed_pixels", "op": "eq", "value": 128},
+                ]},
+            }],
+        },
+        {
+            "operation": "upsert", "pattern_type": "exception",
+            "claim": "Separating a stacked pair completes an intermediate level without winning the game.",
+            "applicability_conditions": ["The current level is not the final level."],
+            "supporting_evidence": ["T3"], "contradicting_evidence": [], "state_selector": {},
+        },
+        {
+            "operation": "upsert", "pattern_type": "strategy",
+            "claim": "On the final level, close the gap with six up presses, then press up once to win.",
+            "applicability_conditions": ["The current level is the last level."],
+            "supporting_evidence": ["T26"], "contradicting_evidence": [],
+            "goal": "Win ez01.", "preconditions": ["The final level is active."],
+            "action_policy": "Close the gap with up, then press up once more and verify WIN.",
+            "success_conditions": ["game_state is WIN."],
+            "state_selector": {},
+            "expected_observations": [{
+                "action": "up", "state_selector": {"level": 4},
+                "measurable_prediction": {"all": [
+                    {"path": "game_state", "op": "eq", "value": "WIN"},
+                ]},
+            }],
+        },
+    ]
+    client = _FakeClient([], review_responses=[json.dumps({"changes": changes})])
+
+    result = _perform_review(
+        tools, client, game_id=game_id, run_id=run_id,
+        memory_store_dir=tmp_path / "state/games/ez01", trigger_reasons=["level_completed"],
+    )
+
+    assert result["row"]["status"] == "saved"
+    memory = GameMemory(run_dir, store_dir=tmp_path / "state/games/ez01", run_id=run_id, game_id=game_id)
+    patterns = memory.patterns(game_id)
+    assert {entry["pattern_type"] for entry in patterns} == {"mechanic", "exception", "strategy"}
+    mechanic = next(entry for entry in patterns if entry["pattern_type"] == "mechanic")
+    exception = next(entry for entry in patterns if entry["pattern_type"] == "exception")
+    strategy = next(entry for entry in patterns if entry["pattern_type"] == "strategy")
+    assert mechanic["status"] == "confirmed"
+    assert mechanic["confidence"] == 0.75
+    assert exception["supporting_evidence"] == [f"{run_id}:T3"]
+    assert strategy["supporting_evidence"] == [f"{run_id}:T26"]
+    assert "145" not in mechanic["claim"]
+    assert "T26" not in mechanic["supporting_evidence"]
+    assert "## 2. Confirmed Mechanics" in memory.view_path.read_text()
+    assert "## 3. Successful Strategies" in memory.view_path.read_text()
+    assert f"{run_id[:8]}:T26" in memory.view_path.read_text()
 
 
 def test_review_interval_defaults_to_50_and_runs_after_fiftieth_action(tmp_path: Path) -> None:
