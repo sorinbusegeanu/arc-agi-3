@@ -26,7 +26,7 @@ def _decision(actions=None, *, reset: bool = False) -> dict:
     return {"actions": list(actions or [])}
 
 
-def _action(action="ACTION1"):
+def _action(action="up"):
     return {"action": action, "args": {}}
 
 
@@ -80,7 +80,7 @@ class _FakeEnv:
 
 def test_live_executes_action_plan_without_prediction_interrupts(tmp_path: Path) -> None:
     env = _FakeEnv()
-    first = _decision([_action(), _action("ACTION2")])
+    first = _decision([_action(), _action("down")])
     second = _decision([])
     client = _FakeClient([first, second])
 
@@ -135,7 +135,7 @@ def test_live_metrics_include_strata_json_recovery_attempt(tmp_path: Path) -> No
 
 
 def test_live_action_only_responses_create_no_prediction_audits(tmp_path: Path) -> None:
-    client = _FakeClient([_decision([_action(), _action("ACTION2")]), _decision([])])
+    client = _FakeClient([_decision([_action(), _action("down")]), _decision([])])
     env = _FakeEnv()
 
     metrics = run_live(
@@ -207,14 +207,14 @@ def test_live_executes_random_fallback_after_invalid_decision_and_repair(tmp_pat
     assert "prediction_verdict" not in fallback
 
 
-@pytest.mark.parametrize("repair_action", ["ACTION1", "NOT_LEGAL"])
+@pytest.mark.parametrize("repair_action", ["up", "NOT_LEGAL"])
 def test_live_rejected_duplicate_candidate_cannot_execute_when_repair_fails(
     tmp_path: Path, repair_action: str,
 ) -> None:
-    duplicate = _decision([_action("ACTION1"), _action("ACTION2")])
+    duplicate = _decision([_action("up"), _action("down")])
     duplicate["actions"][1]["prediction_id"] = duplicate["actions"][0]["prediction_id"] = "P_DUP"
-    repair = _decision([_action(repair_action), _action("ACTION2")])
-    if repair_action == "ACTION1":
+    repair = _decision([_action(repair_action), _action("down")])
+    if repair_action == "up":
         repair["actions"][1]["prediction_id"] = repair["actions"][0]["prediction_id"] = "P_DUP"
     env = _FakeEnv()
     metrics = run_live(
@@ -341,5 +341,39 @@ def test_live_context_has_no_future_records_and_includes_current_images(tmp_path
     assert "measurable_prediction" not in prompt
     assert "memory_patch" not in prompt
     assert "up to 4 legal actions" in prompt
+    assert '"id":"up"' in prompt
+    assert '"id":"down"' in prompt
+    assert "ACTION1" not in prompt
     assert len(image_paths) == 1
     assert labels == ["Current actual game frame"]
+
+
+def test_live_direction_words_are_converted_to_environment_action_ids(tmp_path: Path) -> None:
+    class FourActionEnv(_FakeEnv):
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"] += [
+                {"id": "ACTION3", "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}},
+                {"id": "ACTION4", "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}},
+            ]
+            return result
+
+    env = FourActionEnv()
+    directions = _decision([_action("right"), _action("left"), _action("down"), _action("up")])
+    client = _FakeClient([directions])
+
+    metrics = run_live(env, tmp_path / "run", client, game_id="fixture", max_actions=4)
+
+    assert env.actions == [
+        ("ACTION4", {}), ("ACTION3", {}), ("ACTION2", {}), ("ACTION1", {}),
+    ]
+    prompt = client.calls[0][0]
+    for direction in ("up", "down", "left", "right"):
+        assert f'"id":"{direction}"' in prompt
+    assert "ACTION1" not in prompt and "ACTION2" not in prompt
+    rows = [json.loads(line) for line in (tmp_path / "run" / "decisions.jsonl").read_text().splitlines()]
+    accepted = next(row for row in rows if row.get("status") == "accepted")
+    assert [item["action"] for item in accepted["decision"]["actions"]] == [
+        "ACTION4", "ACTION3", "ACTION2", "ACTION1",
+    ]
+    assert metrics["actions"] == 4

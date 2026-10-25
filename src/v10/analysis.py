@@ -17,6 +17,69 @@ from .tools.memory import (
 
 
 DECISION_SCHEMA = "v10.action_set/2"
+
+_DIRECTION_BY_ACTION = {
+    "ACTION1": "up",
+    "ACTION2": "down",
+    "ACTION3": "left",
+    "ACTION4": "right",
+}
+
+
+def model_action_aliases(legal_action_specs: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    """Map model-facing direction names to the canonical ARC action IDs."""
+    legal_ids = {str(spec.get("id")) for spec in legal_action_specs}
+    return {
+        direction: action_id
+        for action_id, direction in _DIRECTION_BY_ACTION.items()
+        if action_id in legal_ids
+    }
+
+
+def model_action_name(action_id: Any) -> Any:
+    """Return a direction label for the four canonical ARC movement actions."""
+    return _DIRECTION_BY_ACTION.get(str(action_id), action_id)
+
+
+def model_facing_action_specs(
+    legal_action_specs: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Expose directional names in prompts while retaining each action schema."""
+    directions_by_action = {action_id: direction for action_id, direction in _DIRECTION_BY_ACTION.items()}
+    result = []
+    for spec in legal_action_specs:
+        item = dict(spec)
+        action_id = str(item.get("id", ""))
+        if action_id in directions_by_action:
+            item["id"] = directions_by_action[action_id]
+        result.append(item)
+    return result
+
+
+def _canonicalize_model_actions(payload: Any, legal_action_specs: Sequence[Mapping[str, Any]]) -> Any:
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("actions"), list):
+        return payload
+    aliases = model_action_aliases(legal_action_specs)
+    if not aliases:
+        return payload
+    canonical_ids = set(aliases.values())
+    normalized = dict(payload)
+    normalized_actions = []
+    for index, action in enumerate(payload["actions"]):
+        if isinstance(action, Mapping):
+            action_name = action.get("action")
+            if isinstance(action_name, str) and action_name in aliases:
+                action = {**action, "action": aliases[action_name]}
+            elif isinstance(action_name, str) and action_name in canonical_ids:
+                direction = _DIRECTION_BY_ACTION[action_name]
+                raise ActionError(
+                    f"actions[{index}] must use directional name {direction!r} instead of {action_name}"
+                )
+        normalized_actions.append(action)
+    normalized["actions"] = normalized_actions
+    return normalized
+
+
 class DecisionValidationError(ValueError):
     """Model output failed the v10 decision contract."""
 
@@ -28,7 +91,10 @@ def validate_model_decision(
 ) -> dict[str, Any]:
     """Validate the model's action-only plan against current legal action schemas."""
     try:
-        return validate_decision(payload, legal_action_specs, max_actions=max_actions)
+        return validate_decision(
+            _canonicalize_model_actions(payload, legal_action_specs),
+            legal_action_specs, max_actions=max_actions,
+        )
     except ActionError as exc:
         raise DecisionValidationError(str(exc)) from exc
 
@@ -134,11 +200,11 @@ def build_analysis_input(
             "level": last.get("levels_completed"),
             "win_levels": last.get("win_levels"),
             "game_state": last.get("game_state"),
-            "legal_actions": last.get("legal_actions", []),
+            "legal_actions": model_facing_action_specs(_action_specs(prefix, last)),
         },
         "recent_transitions": [
             {
-                "action": row["action"],
+                "action": model_action_name(row["action"]),
                 "args": row.get("args", {}),
                 "measurements": row.get("measurements"),
                 "game_state": row.get("game_state"),
@@ -198,7 +264,7 @@ def build_analysis_input(
 def _decision_contract_description() -> dict[str, Any]:
     return {
         "actions": [{
-            "action": "LEGAL_ACTION_ID",
+            "action": "up | down | left | right | RESET",
             "args": {},
         }],
     }

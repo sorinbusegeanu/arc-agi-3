@@ -17,6 +17,8 @@ from .analysis import (
     DecisionValidationError,
     _decision_repair_prompt,
     _decision_contract_description,
+    model_action_name,
+    model_facing_action_specs,
     validate_model_decision,
 )
 from .frames import DELTA_KIND, IMAGE_KIND, FrameStore
@@ -248,13 +250,21 @@ def _live_context(
         image_paths.append(frames.path_of(frame_id))
         image_labels.append(label)
     system_prompt = skill_path.read_text(encoding="utf-8")
+    model_context = dict(context)
+    model_current_state = dict(context["current_state"])
+    model_current_state["legal_actions"] = model_facing_action_specs(legal_actions)
+    model_context["current_state"] = model_current_state
+    model_context["recent_transitions"] = [
+        {**row, "action": model_action_name(row.get("action"))}
+        for row in context["recent_transitions"]
+    ]
     prompt = (
         f"Choose up to {horizon} legal actions from the current state, recent outcomes, and read-only memory. "
         "Return only an actions list. Each action must contain only action and args. "
         "Do not include analysis, memory updates, predictions, goals, or narrative. "
         "If RESET is listed, use it alone and include args.justification.\n\n"
         "Required response shape:\n" + json.dumps(_decision_contract_description(), ensure_ascii=False, separators=(",", ":"))
-        + "\n\nVisible context:\n" + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+        + "\n\nVisible context:\n" + json.dumps(model_context, ensure_ascii=False, separators=(",", ":"))
     )
     return {
         "system_prompt": system_prompt, "user_prompt": prompt, "context": context,
@@ -432,7 +442,7 @@ def run_live(
             decision_row = {
                 "schema": "v10.live_decision/2", "status": "accepted",
                 "game_id": game_id, "decision_schema": DECISION_SCHEMA,
-                "prompt_version": "v10.live_prompt/2", "skill_sha256": inputs["skill_sha256"],
+                "prompt_version": "v10.live_prompt/3", "skill_sha256": inputs["skill_sha256"],
                 "model": responses[-1].get("model"),
                 "visible_evidence_ids": sorted(inputs["visible_evidence_ids"]),
                 "input_image_labels": inputs["image_labels"], "decision": decision,

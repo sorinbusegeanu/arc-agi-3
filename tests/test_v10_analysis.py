@@ -59,7 +59,7 @@ def _write_trace(path: Path) -> None:
             handle.write(json.dumps(row) + "\n")
 
 
-def _valid_decision(action: str = "ACTION2", args: dict | None = None) -> dict:
+def _valid_decision(action: str = "down", args: dict | None = None) -> dict:
     return {"actions": [{"action": action, "args": args or {}}]}
 
 
@@ -207,12 +207,17 @@ def test_action_response_needs_only_action_and_args(tmp_path: Path) -> None:
     context = build_analysis_input(run_dir, through_action=4)
 
     normalized = validate_model_decision(
-        {"actions": [{"action": "ACTION2", "args": {}}]},
+        {"actions": [{"action": "down", "args": {}}]},
         context["legal_action_specs"],
     )
 
     assert normalized["actions"][0]["action"] == "ACTION2"
     assert normalized == {"actions": [{"action": "ACTION2", "args": {}}]}
+    with pytest.raises(DecisionValidationError, match="directional name 'down'"):
+        validate_model_decision(
+            {"actions": [{"action": "ACTION2", "args": {}}]},
+            context["legal_action_specs"],
+        )
 
 
 def test_action_response_respects_requested_plan_horizon(tmp_path: Path) -> None:
@@ -224,7 +229,7 @@ def test_action_response_respects_requested_plan_horizon(tmp_path: Path) -> None
 
     with pytest.raises(DecisionValidationError, match="0 to 1 actions"):
         validate_model_decision(
-            {"actions": [{"action": "ACTION1", "args": {}}, {"action": "ACTION2", "args": {}}]},
+            {"actions": [{"action": "up", "args": {}}, {"action": "down", "args": {}}]},
             context["legal_action_specs"], max_actions=1,
         )
 
