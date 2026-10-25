@@ -190,11 +190,13 @@ def build_analysis_input(
         run_path, store_dir=game_memory_dir(state_dir or default_state_dir(), str(game_id)),
         run_id=str(run_id),
     )
-    memory = memory_store.compact(max_entries=memory_context_entries, through_step=visible_step)
+    # Replay decisions consume the same generated game memory as live runs.
+    # Keep the JSONL ledger behind the renderer instead of exposing legacy
+    # review claims directly to the model.
+    memory_store.write_view()
+    memory = memory_store.view_path.read_text(encoding="utf-8")
     if conditioning == "pixels_actions":
-        memory = {**memory, "entries": [], "count": 0, "compacted": False}
-    for entry in memory["entries"]:
-        visible_ids.update(str(value) for value in entry.get("evidence_ids", []))
+        memory = ""
     context = {
         "current_state": {
             "level": last.get("levels_completed"),

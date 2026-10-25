@@ -510,13 +510,12 @@ def _live_context(
         })
     visible_step = int(current.get("step", max((int(row.get("step", 0)) for row in records), default=0)))
     memory_store = GameMemory(tools.run_dir, store_dir=memory_store_dir, run_id=run_id, game_id=game_id)
-    memory = memory_store.compact(
-        max_entries=memory_context_entries, through_step=visible_step,
-        game_id=game_id, current_state=current,
-    )
+    # MEMORY.md is the generated, model-facing memory contract for action
+    # selection. Keep the JSONL ledger internal to review and rendering; do
+    # not bypass the generated view by sending raw legacy review claims.
+    memory_store.write_view()
+    memory = memory_store.view_path.read_text(encoding="utf-8")
     global_memory = read_global_memory(memory_store_dir.parent.parent)
-    for entry in memory["entries"]:
-        visible_ids.update(str(value) for value in entry.get("evidence_ids", []))
     context = {
         "game_id": game_id,
         "current_state": {

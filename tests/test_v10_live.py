@@ -457,6 +457,7 @@ def test_review_runs_on_level_completion_and_next_action_receives_pattern(tmp_pa
     assert metrics["review_count"] == 1
     assert client.response_formats == ["json_object", "json_object", "json_object"]
     assert "A cue is visible." in client.calls[2][0]
+    assert '"memory":"# Game Memory\\n' in client.calls[2][0]
     assert "evidence_ids" not in client.calls[2][0]
     view = (tmp_path / "state/games/fixture/MEMORY.md").read_text()
     assert "## 2. Confirmed Mechanics" in view

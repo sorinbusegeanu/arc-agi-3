@@ -7,7 +7,7 @@
 
 V10 records reproducible game transitions, asks the configured model for a bounded action plan, validates each action in the harness, and reviews recorded experience to improve later decisions. Action selection remains action-only: the model returns legal action names and arguments. Review is a separate JSON call and cannot execute game actions.
 
-Game knowledge is persistent and game-scoped. Run state and observations remain associated with their originating run. Existing append-only `memory.jsonl` files remain readable; `MEMORY.md` is a deterministic generated view, not an independent source of truth.
+Game knowledge is persistent and game-scoped. Run state and observations remain associated with their originating run. Existing append-only `memory.jsonl` files remain readable as internal review records; generated `MEMORY.md` is the model-facing game memory.
 
 ## 2. Live action loop
 
@@ -55,11 +55,11 @@ Prediction expectations use the existing measurable-prediction validator and eva
 
 ## 6. Cross-run memory and retrieval
 
-Persistent files are stored under `skills/games/<game-id>/` by default. Shared cross-game guidance is stored in `skills/global/MEMORY.md`; shared action instructions are `skills/SKILL.md`. `V10_STATE_DIR` or `--state-dir` overrides the persistent root, including both `games/` and `global/`; `--skill` overrides the shared action instructions. The game append-only `memory.jsonl` ledger is authoritative. Game `MEMORY.md` is regenerated from active records after changes and is capped at 12,000 characters. Global memory is a single simple Markdown file, atomically replaced only when its contents change, and is capped at 3,000 characters both on write and in action prompts. Older unstructured game entries remain compatible until migrated or retired.
+Persistent files are stored under `skills/games/<game-id>/` by default. Shared cross-game guidance is stored in `skills/global/MEMORY.md`; shared action instructions are `skills/SKILL.md`. `V10_STATE_DIR` or `--state-dir` overrides the persistent root, including both `games/` and `global/`; `--skill` overrides the shared action instructions. Game `MEMORY.md` is regenerated from internal review records after changes and is capped at 12,000 characters. The JSONL ledger supports review, validation, and rendering; it is not sent to action or replay prompts. Global memory is a single simple Markdown file, atomically replaced only when its contents change, and is capped at 3,000 characters both on write and in action prompts. Older unstructured game entries remain compatible until migrated or retired.
 
 Each run stores progress under a run-qualified state record. A new run can retrieve prior game patterns and strategies but does not receive another run's current progress as its own. Evidence references also include run IDs so local transition identifiers do not collide.
 
-Before each action request, retrieval loads both global Markdown and game patterns. Confirmed game mechanics and strategies rank first, then applicable exceptions; global techniques guide exploration and do not override game observations. Hypotheses are included only when no confirmed mechanic or strategy is available. Contradicted and retired patterns are excluded from action context. The existing game context-entry limit remains in force, and global Markdown is limited to 3,000 characters.
+Before each action request, the harness includes the generated game `MEMORY.md` and shared global `MEMORY.md` as Markdown text. The game view presents active game knowledge; global memory guides exploration and does not override game-specific observations. The action prompt does not receive raw JSONL entries or the unrendered legacy review claim. Game Markdown is capped at 12,000 characters and global Markdown at 3,000 characters.
 
 ## 7. Generated `MEMORY.md`
 

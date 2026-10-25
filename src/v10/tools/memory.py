@@ -1,8 +1,8 @@
-"""Append-only knowledge ledger with a regenerated compact view (DESIGN.md section 8).
+"""Internal knowledge ledger and generated Markdown memory view.
 
-The ledger (`memory.jsonl`) is authoritative; `MEMORY.md` is a rendered view.
-Patches are only applied when they pass the harness checks, so a proposal can
-never silently delete contradictory evidence or promote itself to a mechanic.
+The ledger supports review, validation, and rendering. Action and replay
+prompts consume the generated `MEMORY.md` view, not raw ledger entries.
+Patches are applied only after harness checks.
 """
 
 from __future__ import annotations
@@ -1208,7 +1208,7 @@ class GameMemory:
         lines = [
             "# Game memory (generated view)",
             "",
-            f"Revision {view['revision']} · {view['count']} active entries · ledger `memory.jsonl` is authoritative.",
+            f"Revision {view['revision']} · {view['count']} active entries.",
             "",
         ]
         by_type: dict[str, list[dict[str, Any]]] = {}
