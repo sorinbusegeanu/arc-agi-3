@@ -40,6 +40,70 @@ def test_solution_store_finds_shortest_unambiguous_success_path(tmp_path: Path) 
     assert state_fingerprint(start) == store.edges()[0]["source_state"]
 
 
+def test_exact_start_replays_shortest_successful_trajectory_only(tmp_path: Path) -> None:
+    store = LevelSolutionStore(tmp_path / "solutions.jsonl", "fixture")
+    start = {**_observation(0), "legal_actions": ["left", "right", "up"]}
+    first = _observation(1)
+    second = _observation(2)
+    third = _observation(3)
+    goal = {**_observation(9, level=1, completed=1), "game_state": "WIN", "terminal": True}
+
+    long_edges = [
+        store.record_transition(start, "left", {}, first, run_id="long"),
+        store.record_transition(first, "right", {}, second, run_id="long"),
+        store.record_transition(second, "left", {}, goal, run_id="long"),
+    ]
+    store.record_successful_trajectory(start, long_edges, run_id="long", success="win")
+    short_edges = [
+        store.record_transition(start, "right", {}, third, run_id="short"),
+        store.record_transition(third, "left", {}, goal, run_id="short"),
+    ]
+    store.record_successful_trajectory(start, short_edges, run_id="short", success="win")
+    # An observed completion edge is not itself a saved successful trajectory.
+    store.record_transition(start, "up", {}, goal, run_id="edge-only")
+    overlong_path = [
+        store.record_transition(start, "up", {}, _observation(4), run_id="longer-again"),
+        store.record_transition(_observation(4), "right", {}, _observation(5), run_id="longer-again"),
+        store.record_transition(_observation(5), "left", {}, _observation(6), run_id="longer-again"),
+        store.record_transition(_observation(6), "right", {}, goal, run_id="longer-again"),
+    ]
+    retained = store.record_successful_trajectory(
+        start, overlong_path, run_id="longer-again", success="win",
+    )
+
+    selected = store.shortest_known_solution(start)
+    assert selected is not None
+    assert [edge["action"] for edge in selected] == ["right", "left"]
+    assert retained is not None and len(retained["steps"]) == 2
+    assert len(store.solutions()) == 1
+    assert len(store.solutions()[0]["steps"]) == 2
+    assert sum(
+        json.loads(line).get("kind") == "solution"
+        for line in store.path.read_text().splitlines()
+    ) == 2
+
+
+def test_successful_run_logs_are_discovered_and_imported_idempotently(tmp_path: Path) -> None:
+    from shutil import copytree
+    from v10.live import _import_prior_winning_runs
+
+    source = Path(__file__).resolve().parents[1] / "runs/v10/ez01_20"
+    runs_root = tmp_path / "runs"
+    copytree(source, runs_root / "ez01_legacy")
+    store = LevelSolutionStore(tmp_path / "skills/games/ez01/level_solutions.jsonl", "ez01")
+
+    first_imports = _import_prior_winning_runs(
+        store, "ez01", tmp_path / "new-run", runs_root=runs_root,
+    )
+    second_imports = _import_prior_winning_runs(
+        store, "ez01", tmp_path / "new-run", runs_root=runs_root,
+    )
+
+    assert first_imports == 5
+    assert second_imports == 0
+    assert len(store.solutions()) == 5
+
+
 def test_solution_store_ignores_ambiguous_action_edges_and_deduplicates(tmp_path: Path) -> None:
     store = LevelSolutionStore(tmp_path / "solutions.jsonl", "fixture")
     start, first_target, other_target = _observation(0), _observation(1), _observation(2)
@@ -173,8 +237,9 @@ def test_startup_skips_bootstrap_when_exact_route_exists_for_current_level(tmp_p
     assert first["available_level_solutions"] == 1
 
     env = _CompletingEnv()
+    client = _Client()
     metrics = run_live(
-        env, tmp_path / "replay", _Client(), game_id="fixture",
+        env, tmp_path / "replay", client, game_id="fixture",
         max_actions=1, state_dir=state_dir,
     )
 
@@ -184,7 +249,88 @@ def test_startup_skips_bootstrap_when_exact_route_exists_for_current_level(tmp_p
     assert env.actions == ["ACTION1"]
     assert metrics["cached_solution_actions"] == 1
     assert metrics["resets"] == 0
+    assert len(client.calls) == 1  # completion review only, no model action plan
+    assert client.calls[0].startswith("# V10 memory consolidation")
     assert not any(row.get("schema") == "v10.live_bootstrap_reset/1" for row in rows)
+
+
+def test_level_route_with_different_start_skips_bootstrap_and_guides_model(tmp_path: Path, monkeypatch) -> None:
+    from v10.tools.memory import game_memory_dir
+
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("V10_STATE_DIR", str(state_dir))
+    saved_start = {
+        **_observation(0, level=2, completed=2), "game_id": "fixture",
+        "legal_actions": ["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+    }
+    saved_end = {
+        **_observation(1, level=3, completed=3), "game_id": "fixture",
+        "legal_actions": ["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+    }
+    store = LevelSolutionStore(game_memory_dir(state_dir, "fixture") / "level_solutions.jsonl", "fixture")
+    edge = store.record_transition(saved_start, "ACTION1", {}, saved_end, run_id="seed")
+    store.record_successful_trajectory(saved_start, [edge], run_id="seed", success="level_completed")
+
+    class DifferentStartEnv:
+        def __init__(self):
+            self.frame = np.full((2, 2), 77, dtype=np.int64)
+            self.actions = []
+            self.resets = 0
+
+        def observe(self):
+            return {
+                "frame": self.frame.copy(),
+                "legal_actions": [{"id": f"ACTION{i}", "parameters": {
+                    "type": "object", "properties": {}, "required": [], "additionalProperties": False,
+                }} for i in range(1, 5)],
+                "game_state": "NOT_FINISHED", "level": 2, "levels_completed": 2,
+                "win_levels": 5, "terminal": False,
+            }
+
+        def act(self, action, args):
+            self.actions.append(action)
+            self.frame[0, 0] += 1
+            return {}
+
+        def reset(self):
+            self.resets += 1
+            self.frame[:] = 0
+            return self.observe()
+
+    class DownClient(_Client):
+        def __init__(self):
+            super().__init__()
+            self.user_prompts = []
+
+        def complete(self, system_prompt, user_prompt, image_paths, image_labels, response_format="json_object"):
+            self.user_prompts.append(user_prompt)
+            if system_prompt.startswith("# V10 memory consolidation"):
+                return super().complete(system_prompt, user_prompt, image_paths, image_labels, response_format)
+            return {
+                "content": '{"actions":[{"action":"down","args":{}}]}',
+                "model": self.model, "usage": {}, "latency_seconds": 0,
+                "request_attempts": 1, "finish_reason": "stop",
+            }
+
+    env = DifferentStartEnv()
+    client = DownClient()
+    metrics = run_live(
+        env, tmp_path / "different-start", client, game_id="fixture",
+        max_actions=1, state_dir=state_dir,
+    )
+
+    rows = [json.loads(line) for line in (tmp_path / "different-start/decisions.jsonl").read_text().splitlines()]
+    plan = next(row for row in rows if row.get("schema") == "v10.live_decision/2")
+    prompt_context = json.loads(client.user_prompts[0].split("Visible context:\n", 1)[1])
+    guidance = prompt_context["saved_route_guidance"][0]
+    assert env.resets == 0
+    assert env.actions == ["ACTION2"]
+    assert plan["source"] == "model"
+    assert metrics["cached_solution_actions"] == 0
+    assert guidance["actions"] == ["up"]
+    assert guidance["applies_to_current_starting_screen"] is False
+    assert "starting screen differs" in guidance["guidance"]
+    assert not any(row.get("source") == "bootstrap_probe" for row in rows)
 
 
 def test_cached_route_stops_on_divergence_then_asks_model(tmp_path: Path, monkeypatch) -> None:

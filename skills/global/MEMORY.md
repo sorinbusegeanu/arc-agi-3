@@ -1,0 +1,6 @@
+- Compare before/after frames to identify which object responds to input; roles may change between levels.
+- When an action produces no pixel change, treat it as blocked for that state and try a different direction immediately.
+- If the direct path is blocked, explore perpendicular axes rather than oscillating.
+- When two objects are adjacent but overlap isn't achieved, try moving along a perpendicular axis.
+- After one failed action in a state, avoid repeating it; diversify attempts to escape stagnation.
+- When a new level's first action produces an unexpected large displacement of multiple objects, treat the level as having different mechanics and re-derive movement rules from scratch.

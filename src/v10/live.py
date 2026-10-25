@@ -435,6 +435,72 @@ def _verified_route_summaries(solution_store: LevelSolutionStore) -> list[dict[s
     return summaries
 
 
+def _saved_route_guidance(
+    solution_store: LevelSolutionStore, current: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Summarize one successful route for this level without implying state compatibility."""
+    wanted_level = level_key(current)
+    current_state = state_fingerprint(current)
+    candidates = [
+        route for route in solution_store.solutions()
+        if route.get("game_id") == solution_store.game_id
+        and route.get("level_key") == wanted_level
+        and route.get("success") in {"level_completed", "win"}
+        and isinstance(route.get("steps"), list) and route.get("steps")
+    ]
+    if not candidates:
+        return []
+    candidates.sort(key=lambda route: (len(route["steps"]), str(route.get("id", ""))))
+    route = candidates[0]
+    return [{
+        "success": route.get("success"),
+        "actions": [model_action_name(step.get("action")) for step in route["steps"]],
+        "applies_to_current_starting_screen": route.get("start_state") == current_state,
+        "guidance": (
+            "This is a verified route for the current level, but its recorded starting screen differs. "
+            "Use its action sequence as guidance; choose actions for the current screen."
+            if route.get("start_state") != current_state
+            else "This verified route starts from the current screen."
+        ),
+    }]
+
+
+def _import_prior_winning_runs(
+    solution_store: LevelSolutionStore,
+    game_id: str,
+    current_run_dir: Path,
+    *,
+    runs_root: Path | None = None,
+) -> int:
+    """Import only complete winning run logs before the live run directory is cleared."""
+    candidates: set[Path] = set()
+    if current_run_dir.is_dir():
+        candidates.add(current_run_dir)
+    runs_root = runs_root or (Path(__file__).resolve().parents[2] / "runs" / "v10")
+    if runs_root.is_dir():
+        candidates.update(
+            path for path in runs_root.iterdir()
+            if path.is_dir() and (
+                path.name == game_id or path.name.startswith(f"{game_id}_")
+            )
+        )
+    imported_count = 0
+    for path in sorted(candidates, key=lambda item: str(item)):
+        try:
+            manifest = json.loads((path / "run_manifest.json").read_text(encoding="utf-8"))
+            metrics = json.loads((path / "metrics.json").read_text(encoding="utf-8"))
+            if (
+                not isinstance(manifest, Mapping) or not isinstance(metrics, Mapping)
+                or manifest.get("game_id") != game_id or metrics.get("won") is not True
+            ):
+                continue
+            imported_count += len(solution_store.import_successful_run(path))
+        except (OSError, ValueError, TypeError, KeyError):
+            # Incomplete, malformed, or non-winning logs are not route evidence.
+            continue
+    return imported_count
+
+
 def _perform_review(
     tools: GameTools,
     client: Any,
@@ -496,10 +562,17 @@ def _perform_review(
         )
         solution_store = LevelSolutionStore(memory_store_dir / "level_solutions.jsonl", game_id)
         verified_routes = _verified_route_summaries(solution_store)
+        success_triggered = any(reason in {"level_completed", "win"} for reason in trigger_reasons)
+        success_instruction = (
+            "An environment-confirmed level completion or WIN triggered this review. Add concise strategy guidance only when it is supported by the corresponding verified route and its scope; exact actions stay in the route store. "
+            if success_triggered else
+            "No level completion or WIN triggered this review. Do not present the current exploration as a successful strategy; retain prior verified strategy guidance only when still useful. "
+        )
         user_prompt = (
             f"Consolidate memory for game {game_id} after action {tools.action_count}. "
             f"Review trigger: {', '.join(trigger_reasons)}. Current progress belongs only in observation context, not either memory file. "
-            "Preserve level/state scope when summarizing successful approaches. Existing game MEMORY.md:\n"
+            + success_instruction
+            + "Preserve level/state scope when summarizing successful approaches. Existing game MEMORY.md:\n"
             + (existing_memory or "(none)")
             + "\n\nExisting shared global MEMORY.md:\n"
             + (shared_memory or "(none)")
@@ -608,6 +681,7 @@ def _live_context(
     *,
     starting_routine: bool = False,
     bootstrap_observations: Sequence[Mapping[str, Any]] = (),
+    saved_route_guidance: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     records = tools.history.records()
     transitions = [
@@ -669,6 +743,8 @@ def _live_context(
             }
             for row in bootstrap_observations
         ]
+    if saved_route_guidance:
+        context["saved_route_guidance"] = [dict(route) for route in saved_route_guidance]
     frames = FrameStore(tools.run_dir)
     if starting_routine and bootstrap_observations:
         action_images, image_labels, screen_sequence = _action_screen_sequence(
@@ -704,6 +780,7 @@ def _live_context(
         + f"Choose up to {horizon} legal actions from the current state, recent outcomes, and read-only memory. "
         "The supplied screen images are in chronological order. Labels identify the action before/after which each screen was observed; include every intermediate screen in that order. "
         "Use game memory first for this game's established mechanics and strategies. Use global memory only as reusable exploration guidance; it must not override game-specific observations. "
+        "Use saved_route_guidance as a demonstrated sequence for this level, but check whether its starting screen matches and adapt it to the current image instead of blindly replaying a mismatched route. "
         "Prefer applicable demonstrated strategies, but follow the current image and outcomes if memory conflicts. Distinguish lasting mechanics from historical positions. "
         "Avoid repeating actions that had no visible effect in the same observed state and avoid cycles. Use one action for an uncertain experiment; use a longer plan only for understood behavior. "
         "Keep reasoning internal. "
@@ -806,6 +883,8 @@ def run_live(
     run_id = uuid.uuid4().hex
     state_root = Path(state_dir) if state_dir is not None else default_state_dir()
     memory_store_dir = game_memory_dir(state_root, game_id)
+    solution_store = LevelSolutionStore(memory_store_dir / "level_solutions.jsonl", game_id)
+    _import_prior_winning_runs(solution_store, game_id, destination)
     # Old versions kept the only copy of knowledge inside the disposable run directory.
     GameMemory.migrate_run_ledger(destination, memory_store_dir, game_id)
     _prepare_live_run_directory(destination)
@@ -821,10 +900,6 @@ def run_live(
     tools = GameTools(env, destination, max_actions=max_actions, max_resets=max_resets)
     current = tools.observe()
     memory.record_run_state(game_id, current, step=tools.action_count)
-    solution_store = LevelSolutionStore(memory_store_dir / "level_solutions.jsonl", game_id)
-    historical_run = Path(__file__).resolve().parents[2] / "runs" / "v10" / "ez01_20"
-    if game_id == "ez01" and (historical_run / "evidence.jsonl").is_file():
-        solution_store.import_successful_run(historical_run)
     initial_routine_pending = bool(starting_routine and tools.max_resets > 0)
     bootstrap_probe_active = bool(starting_routine and tools.max_resets > 0)
     bootstrap_plan_pending = False
@@ -985,26 +1060,30 @@ def run_live(
                     "image_labels": [],
                     "legal_action_specs": _public_actions(current.get("legal_actions", [])),
                 }
-            elif initial_routine_pending and solution_store.shortest_known_solution(current):
-                # Exact, level-scoped success is better startup evidence than a probe.
-                initial_routine_pending = False
-                bootstrap_probe_active = False
             elif initial_routine_pending:
                 initial_routine_pending = False
-                inputs = {"skill_sha256": skill_sha256, "image_labels": [],
-                          "legal_action_specs": _public_actions(current.get("legal_actions", []))}
-                starter_queue = _standard_start_routine(inputs["legal_action_specs"])
-                starter_queue_source = "bootstrap_probe"
-                if starter_queue:
-                    decision_source = starter_queue_source
-                    decision = {"actions": starter_queue[:int(plan_horizon)]}
-                    starter_chunk = True
+                startup_path = solution_store.shortest_known_solution(current)
+                if startup_path is not None or solution_store.has_verified_route_for_level(current):
+                    # Exact paths are replayed below; other routes guide model selection without probing.
+                    bootstrap_probe_active = False
+                    if startup_path is not None:
+                        solution_edges = startup_path[:plan_horizon]
+                else:
+                    inputs = {"skill_sha256": skill_sha256, "image_labels": [],
+                              "legal_action_specs": _public_actions(current.get("legal_actions", []))}
+                    starter_queue = _standard_start_routine(inputs["legal_action_specs"])
+                    starter_queue_source = "bootstrap_probe"
+                    if starter_queue:
+                        decision_source = starter_queue_source
+                        decision = {"actions": starter_queue[:int(plan_horizon)]}
+                        starter_chunk = True
             elif bootstrap_plan_pending:
                 bootstrap_plan_pending = False
                 inputs = _live_context(
                     tools, current, game_id, int(plan_horizon), source_skill,
                     memory_store_dir, run_id, int(memory_context_entries),
                     starting_routine=True, bootstrap_observations=bootstrap_observations,
+                    saved_route_guidance=_saved_route_guidance(solution_store, current),
                 )
                 for attempt in range(2):
                     model_calls += 1
@@ -1086,6 +1165,7 @@ def run_live(
                 inputs = _live_context(
                     tools, current, game_id, int(plan_horizon), source_skill,
                     memory_store_dir, run_id, int(memory_context_entries),
+                    saved_route_guidance=_saved_route_guidance(solution_store, current),
                 )
                 for attempt in range(2):
                     model_calls += 1

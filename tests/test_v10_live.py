@@ -816,6 +816,7 @@ def test_ez01_fixture_review_writes_model_markdown_without_state_or_evidence_noi
     assert saved == memory_text + "\n"
     assert "T26" not in saved and "confidence" not in saved
     assert "Current progress belongs only in observation context" in client.calls[0][0]
+    assert "An environment-confirmed level completion or WIN triggered this review" in client.calls[0][0]
     assert "145" in client.calls[0][0]  # raw evidence is review input, not saved prose
 
 
@@ -890,6 +891,7 @@ def test_incremental_review_prompt_contains_only_uncovered_observations(tmp_path
     assert second["row"]["status"] == "saved"
     assert '"changed_pixels":2' in client.calls[1][0]
     assert '"changed_pixels":1' not in client.calls[1][0]
+    assert "No level completion or WIN triggered this review" in client.calls[1][0]
 
 
 def test_review_repairs_empty_markdown_then_checkpoints(tmp_path: Path) -> None:

@@ -85,7 +85,36 @@ class LevelSolutionStore:
         return [dict(row) for row in self._rows if row.get("kind") == "edge"]
 
     def solutions(self) -> list[dict[str, Any]]:
-        return [dict(row) for row in self._rows if row.get("kind") == "solution"]
+        """Return the shortest verified trajectory for each level/start pair."""
+        best: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in self._rows:
+            if (
+                row.get("kind") != "solution" or row.get("game_id") != self.game_id
+                or row.get("success") not in {"level_completed", "win"}
+                or not isinstance(row.get("steps"), list) or not row["steps"]
+            ):
+                continue
+            key = (str(row.get("level_key")), str(row.get("start_state")))
+            previous = best.get(key)
+            rank = (len(row["steps"]), 0 if row.get("success") == "win" else 1, str(row.get("id", "")))
+            previous_rank = (
+                len(previous["steps"]), 0 if previous.get("success") == "win" else 1,
+                str(previous.get("id", "")),
+            ) if previous else None
+            if previous_rank is None or rank < previous_rank:
+                best[key] = row
+        return [dict(row) for _key, row in sorted(best.items())]
+
+    def has_verified_route_for_level(self, observation: Mapping[str, Any]) -> bool:
+        """Return whether this game has any recorded successful route for the level."""
+        wanted_level = level_key(observation)
+        return any(
+            row.get("game_id") == self.game_id
+            and row.get("level_key") == wanted_level
+            and row.get("success") in {"level_completed", "win"}
+            and isinstance(row.get("steps"), list) and bool(row["steps"])
+            for row in self.solutions()
+        )
 
     def import_successful_run(self, run_dir: Path | str, *, run_id: str | None = None) -> list[dict[str, Any]]:
         """Import fully evidenced completed routes from a recorded successful run.
@@ -172,6 +201,7 @@ class LevelSolutionStore:
         # Do not mutate the append-only store until the whole history has validated.
         route_edges: list[dict[str, Any]] = []
         imported: list[dict[str, Any]] = []
+        known_solution_ids = set(self._solution_ids)
         for before, action, args, after, row in validated:
             edge = self.record_transition(before, action, args, after, run_id=run_identity)
             route_edges.append(edge)
@@ -187,8 +217,9 @@ class LevelSolutionStore:
                     route_start, route_edges, run_id=run_identity,
                     success="win" if won else "level_completed",
                 )
-                if saved is not None:
+                if saved is not None and saved.get("id") not in known_solution_ids:
                     imported.append(saved)
+                    known_solution_ids.add(str(saved["id"]))
                 route_start = after
                 route_edges = []
         return imported
@@ -260,6 +291,27 @@ class LevelSolutionStore:
             "end_state": steps[-1]["target_state"], "steps": steps,
             "success": success, "run_id": str(run_id),
         }
+        prior = [
+            row for row in self._rows
+            if row.get("kind") == "solution"
+            and row.get("level_key") == body["level_key"]
+            and row.get("start_state") == body["start_state"]
+            and isinstance(row.get("steps"), list)
+        ]
+        if prior:
+            best_prior = min(
+                prior,
+                key=lambda row: (
+                    len(row["steps"]), 0 if row.get("success") == "win" else 1,
+                    str(row.get("id", "")),
+                ),
+            )
+            prior_rank = (
+                len(best_prior["steps"]), 0 if best_prior.get("success") == "win" else 1,
+            )
+            candidate_rank = (len(steps), 0 if success == "win" else 1)
+            if candidate_rank >= prior_rank:
+                return dict(best_prior)
         identity = {key: value for key, value in body.items() if key != "run_id"}
         solution_id = hashlib.sha256(dumps(identity).encode("utf-8")).hexdigest()[:24]
         row = {"id": solution_id, **body}
@@ -270,9 +322,28 @@ class LevelSolutionStore:
         return row
 
     def shortest_known_solution(self, observation: Mapping[str, Any]) -> list[dict[str, Any]] | None:
-        """Return the shortest unambiguous observed path to a completion edge."""
+        """Prefer a saved successful trajectory for this exact start, then search observed edges."""
         start_state = state_fingerprint(observation)
         wanted_level = level_key(observation)
+        exact_routes = [
+            route for route in self.solutions()
+            if route.get("level_key") == wanted_level and route.get("start_state") == start_state
+        ]
+        if exact_routes:
+            route = min(
+                exact_routes,
+                key=lambda row: (
+                    len(row["steps"]), 0 if row.get("success") == "win" else 1,
+                    str(row.get("id", "")),
+                ),
+            )
+            return [{
+                "id": f"{route['id']}:{index}", "route_id": route["id"],
+                "game_id": route.get("game_id"), "level_key": route["level_key"],
+                "source_state": step["source_state"], "target_state": step["target_state"],
+                "action": step["action"], "args": dict(step.get("args", {})),
+                "verified_success": route.get("success"),
+            } for index, step in enumerate(route["steps"], start=1)]
         candidates = [row for row in self.edges() if row.get("level_key") == wanted_level]
         by_action: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         for edge in candidates:
