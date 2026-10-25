@@ -544,6 +544,36 @@ def test_ez01_fixture_keeps_gap_intermediate_and_final_win_patterns_distinct(tmp
     assert f"{run_id[:8]}:T26" in memory.view_path.read_text()
 
 
+def test_incremental_review_prompt_contains_only_uncovered_observations(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    tools = GameTools(_FakeEnv(), run_dir)
+    tools.history.append({
+        "type": "transition", "action": "ACTION1", "args": {}, "measurements": {"changed_pixels": 1},
+        "level": 0, "levels_completed": 0, "game_state": "NOT_FINISHED", "terminal": False,
+    })
+    client = _FakeClient([], review_responses=['{"changes": []}', '{"changes": []}'])
+    store_dir = tmp_path / "state/games/fixture"
+
+    first = _perform_review(
+        tools, client, game_id="fixture", run_id="run-one", memory_store_dir=store_dir,
+        trigger_reasons=["action_interval"],
+    )
+    assert first["row"]["status"] == "saved"
+    tools.history.append({
+        "type": "transition", "action": "ACTION2", "args": {}, "measurements": {"changed_pixels": 2},
+        "level": 0, "levels_completed": 0, "game_state": "NOT_FINISHED", "terminal": False,
+    })
+
+    second = _perform_review(
+        tools, client, game_id="fixture", run_id="run-one", memory_store_dir=store_dir,
+        trigger_reasons=["action_interval"],
+    )
+
+    assert second["row"]["status"] == "saved"
+    assert '"evidence_id":"T2"' in client.calls[1][0]
+    assert '"evidence_id":"T1"' not in client.calls[1][0]
+
+
 def test_review_interval_defaults_to_50_and_runs_after_fiftieth_action(tmp_path: Path) -> None:
     client = _FakeClient(
         [], default_decision=_decision([_action()] * 4),

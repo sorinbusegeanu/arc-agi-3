@@ -1,11 +1,25 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from v10.frames import FrameStore
 from v10.tools.history import History
-from v10.tools.memory import GameMemory, MemoryValidationError, game_memory_dir
+from v10.tools.memory import (
+    GameMemory, MemoryValidationError, default_state_dir, game_memory_dir, shared_skill_path,
+)
+
+
+def test_default_persistent_memory_and_shared_skill_are_project_local(monkeypatch) -> None:
+    monkeypatch.delenv("V10_STATE_DIR", raising=False)
+    project_skills = Path(__file__).resolve().parents[1] / "skills"
+
+    assert default_state_dir() == project_skills
+    assert game_memory_dir(default_state_dir(), "ez01") == project_skills / "games/ez01"
+    assert shared_skill_path() == project_skills / "SKILL.md"
+    assert shared_skill_path().is_file()
 
 
 def test_model_cannot_author_prediction_verdict_or_self_promote(tmp_path) -> None:
@@ -315,3 +329,17 @@ def test_retirement_is_a_revision_and_does_not_erase_history(tmp_path) -> None:
     assert revisions[-1]["status"] == "retired"
     assert memory.patterns("ez01") == []
     assert memory.patterns("ez01", include_retired=True)[0]["claim"] == "The cue indicates a reset."
+
+
+def test_review_checkpoints_track_cumulative_coverage_while_changes_use_only_new_evidence(tmp_path) -> None:
+    memory = GameMemory(tmp_path / "run", store_dir=tmp_path / "state", run_id="run-a", game_id="ez01")
+    memory.apply_review_changes([], game_id="ez01", evidence_ids=["T1"], current_step=1)
+
+    result = memory.apply_review_changes([{
+        "operation": "upsert", "pattern_type": "hypothesis", "claim": "A later cue may signal a reset.",
+        "supporting_evidence": ["T2"], "contradicting_evidence": [],
+    }], game_id="ez01", evidence_ids=["T2"], current_step=2, coverage_evidence_ids=["T1", "T2"])
+
+    assert result["added"] == 1
+    assert memory.reviewed_evidence_ids("ez01") == {"T1", "T2"}
+    assert memory.has_review_coverage("ez01", ["T1", "T2"])

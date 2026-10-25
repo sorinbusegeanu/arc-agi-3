@@ -19,9 +19,9 @@ The model-facing movement names are `up`, `down`, `left`, and `right`; the harne
 
 Review runs after a level completion or the configured action interval (default 50 executed actions). Simultaneous triggers are combined. Review does not advance or reset the game. It receives the current persistent patterns, generated memory view, ordered observations and relevant frames from the run, plus prediction audits. It returns JSON changes, not a replacement Markdown document.
 
-The reviewer identifies new patterns, new supporting or contradicting evidence, condition refinements, conditional variants, retirements, and successful strategies. Existing pattern IDs are reused for revisions. A new conditional variant has its own stable ID. Review changes only records it touches; other patterns are not rewritten. Evidence references must identify observations in the supplied history. The harness qualifies them with the originating run ID and deduplicates them.
+The reviewer identifies new patterns, new supporting or contradicting evidence, condition refinements, conditional variants, retirements, and successful strategies. Each call receives only run observations not covered by its latest checkpoint, alongside the existing patterns; coverage remains cumulative so repeated identical reviews are recognizable. Existing pattern IDs are reused for revisions. A new conditional variant has its own stable ID. Review changes only records it touches; other patterns are not rewritten. Evidence references must identify observations in the supplied new history. The harness qualifies them with the originating run ID and deduplicates them.
 
-Review coverage checkpoints make an identical review idempotent. A checkpoint records the run and evidence IDs covered. Retrying a review with the same coverage does not append another pattern revision or duplicate evidence. Review failures retain the prior ledger and view, are logged in `reviews.jsonl`, and do not stop live play.
+Review coverage checkpoints make an identical review idempotent. A checkpoint records the run and cumulative evidence IDs covered. Retrying a review with the same coverage does not append another pattern revision or duplicate evidence. Review failures retain the prior ledger and view, are logged in `reviews.jsonl`, and do not stop live play.
 
 Legacy whole-document review entries are retained until the reviewer reports that all useful findings have been migrated into structured records. Old rows are never rewritten; migration and retirement append ledger revisions.
 
@@ -53,7 +53,7 @@ Prediction expectations use the existing measurable-prediction validator and eva
 
 ## 6. Cross-run memory and retrieval
 
-Persistent files are stored under `$V10_STATE_DIR/games/<game-id>/` (default `~/.local/state/arc-agi-v10/games/<game-id>/`). The append-only `memory.jsonl` ledger is authoritative. `MEMORY.md` is regenerated from active records after changes and is capped at 12,000 characters. Older unstructured entries are rendered compatibly until migrated or retired.
+Persistent files are stored under `skills/games/<game-id>/` by default. The shared/global action instructions are `skills/SKILL.md`. `V10_STATE_DIR` or `--state-dir` can override the game-memory root; the shared skill remains in the project skills directory unless `--skill` overrides it. The append-only `memory.jsonl` ledger is authoritative. `MEMORY.md` is regenerated from active records after changes and is capped at 12,000 characters. Older unstructured entries are rendered compatibly until migrated or retired.
 
 Each run stores progress under a run-qualified state record. A new run can retrieve prior game patterns and strategies but does not receive another run's current progress as its own. Evidence references also include run IDs so local transition identifiers do not collide.
 

@@ -7,7 +7,7 @@
 
 - `src/v10/tools/memory.py` remains the owner of ledger reduction, stable pattern identities, append-only revisions, evidence qualification/deduplication, deterministic confidence/status, applicability filtering, and bounded `MEMORY.md` rendering.
 - `src/v10/live.py` owns review prompting and persistence, run-state snapshots, applicable memory in action context, and harness-authored validation of pattern expectations.
-- Existing `memory.jsonl` rows are still readable. Structured changes append independent revisions. A review checkpoint prevents repeat processing of the same run evidence. Legacy review content remains available until marked migrated.
+- Existing `memory.jsonl` rows are still readable. Structured changes append independent revisions. Each review receives only evidence since its prior checkpoint, while the checkpoint tracks cumulative run evidence for idempotence. Legacy review content remains available until marked migrated.
 - Review evidence may reference transition, state, reset, or prediction-audit records supplied in the review events. Prompt selectors are restricted to observable state fields.
 - The action response remains action-only. Separate review calls produce structured changes, and prediction audits are based on harness measurements rather than model-authored verdicts.
 

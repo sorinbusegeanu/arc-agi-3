@@ -16,6 +16,7 @@ from vlm_v2.frame_writer import observation_to_image
 from .frames import DELTA_KIND, IMAGE_KIND, FrameStore, to_frame_array
 from .runlog import read_jsonl, write_json
 from .tools.history import History
+from .tools.memory import shared_skill_path
 from .tools.vision import candidate_displacement, delta_image, pixel_diff
 
 
@@ -121,7 +122,7 @@ def replay_trace(
     if destination.exists() and any(destination.iterdir()):
         raise FileExistsError(f"run directory is not empty: {destination}")
     destination.mkdir(parents=True, exist_ok=True)
-    skill_source = Path(__file__).with_name("SKILL.md")
+    skill_source = shared_skill_path()
 
     frames = FrameStore(destination)
     history = History(destination)

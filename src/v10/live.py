@@ -31,6 +31,7 @@ from .tools.memory import (
     GameMemory,
     default_state_dir,
     game_memory_dir,
+    shared_skill_path,
 )
 
 
@@ -347,8 +348,22 @@ def _perform_review(
             }
             append_jsonl(tools.run_dir / "reviews.jsonl", row)
             return {"row": row, "attempts": 0, "usage": {}, "latency_seconds": 0.0}
+        prior_coverage = memory.reviewed_evidence_ids(game_id)
+        new_events = [
+            event for event in events
+            if not event.get("evidence_id") or str(event["evidence_id"]) not in prior_coverage
+        ]
+        new_evidence_ids = list(dict.fromkeys(
+            str(event["evidence_id"]) for event in new_events
+            if event.get("evidence_id")
+        ))
         frames = FrameStore(tools.run_dir)
-        image_paths, image_labels = _review_frame_selection(transitions, frames)
+        new_transition_ids = set(new_evidence_ids)
+        new_transitions = [
+            transition for transition in transitions
+            if str(transition.get("evidence_id", "")) in new_transition_ids
+        ]
+        image_paths, image_labels = _review_frame_selection(new_transitions, frames)
         legacy_review_text = legacy_review_text[:4_000]
         patterns = [
             {
@@ -377,8 +392,8 @@ def _perform_review(
             "Existing MEMORY.md view (legacy content may be migrated into patterns):\n"
             + memory_text + "\n\n"
             "Prior unstructured review, if any (bounded to 4000 characters):\n" + legacy_review_text + "\n\n"
-            "New ordered run observations (evidence IDs are valid only in the evidence arrays):\n"
-            + json.dumps(events, ensure_ascii=False, separators=(",", ":"))
+            "New ordered run observations since the last review checkpoint (evidence IDs are valid only in the evidence arrays):\n"
+            + json.dumps(new_events, ensure_ascii=False, separators=(",", ":"))
         )
         attempts = 1
         response = client.complete(
@@ -393,8 +408,8 @@ def _perform_review(
             raise ValueError("review response was truncated at the output-token limit")
         changes, legacy_migrated = _validate_review_payload(_parse_content(content))
         applied = memory.apply_review_changes(
-            changes, game_id=game_id, evidence_ids=review_evidence_ids,
-            current_step=tools.action_count,
+            changes, game_id=game_id, evidence_ids=new_evidence_ids,
+            current_step=tools.action_count, coverage_evidence_ids=review_evidence_ids,
         )
         if not applied.get("committed", True):
             raise ValueError(f"review contained no valid changes: {applied['rejected']}")
@@ -565,7 +580,7 @@ def run_live(
     if not 0 <= int(memory_context_entries) <= 5:
         raise ValueError("memory_context_entries must be between 0 and 5")
     destination = Path(run_dir)
-    source_skill = Path(skill_path) if skill_path is not None else Path(__file__).with_name("SKILL.md")
+    source_skill = Path(skill_path) if skill_path is not None else shared_skill_path()
     run_id = uuid.uuid4().hex
     memory_store_dir = game_memory_dir(state_dir or default_state_dir(), game_id)
     # Old versions kept the only copy of knowledge inside the disposable run directory.

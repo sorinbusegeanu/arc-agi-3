@@ -40,13 +40,21 @@ def _without_evidence_citations(text: str) -> str:
 
 
 def default_state_dir() -> Path:
-    """Durable v10 state root, independent of disposable run directories."""
+    """Project-local durable state, so learned knowledge can be reviewed and committed."""
     configured = os.environ.get("V10_STATE_DIR")
     if configured:
         return Path(configured).expanduser()
-    xdg_state = os.environ.get("XDG_STATE_HOME")
-    base = Path(xdg_state).expanduser() if xdg_state else Path.home() / ".local" / "state"
-    return base / "arc-agi-v10"
+    return project_skills_dir()
+
+
+def project_skills_dir() -> Path:
+    """Repository-owned directory for shared instructions and committed memories."""
+    return Path(__file__).resolve().parents[3] / "skills"
+
+
+def shared_skill_path() -> Path:
+    """Canonical global v10 instruction file stored with project skills."""
+    return project_skills_dir() / "SKILL.md"
 
 
 def game_memory_dir(state_dir: Path | str, game_id: str) -> Path:
@@ -572,6 +580,18 @@ class GameMemory:
         coverage = self.review_coverage_id(game_id, self.run_id, evidence_ids)
         return any(row.get("op") == "checkpoint" and row.get("id") == coverage for row in self._rows)
 
+    def reviewed_evidence_ids(self, game_id: str) -> set[str]:
+        """Evidence covered by the latest checkpoint for this game and run."""
+        checkpoints = [
+            row for row in self._rows
+            if row.get("op") == "checkpoint" and row.get("game_id") == str(game_id)
+            and row.get("run_id") == self.run_id
+        ]
+        if not checkpoints:
+            return set()
+        latest = max(checkpoints, key=lambda row: int(row.get("revision", 0)))
+        return set(map(str, latest.get("review_coverage", [])))
+
     def retire_legacy_review(self, *, current_step: int) -> bool:
         """Retire the old whole-document review after its findings are structured."""
         if self.get(REVIEW_SUMMARY_ID) is None:
@@ -593,6 +613,7 @@ class GameMemory:
         game_id: str,
         evidence_ids: Sequence[str],
         current_step: int,
+        coverage_evidence_ids: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         """Append independent pattern revisions and a successful review checkpoint."""
         if not isinstance(changes, list):
@@ -603,8 +624,9 @@ class GameMemory:
             raise MemoryValidationError("pattern review requires a run_id")
         game_id = str(game_id)
         current_ids = {str(value) for value in evidence_ids}
-        coverage_id = self.review_coverage_id(game_id, self.run_id, list(evidence_ids))
-        if self.has_review_coverage(game_id, evidence_ids):
+        full_coverage = list(coverage_evidence_ids if coverage_evidence_ids is not None else evidence_ids)
+        coverage_id = self.review_coverage_id(game_id, self.run_id, full_coverage)
+        if self.has_review_coverage(game_id, full_coverage):
             return {"added": 0, "updated": 0, "retired": 0, "unchanged": len(changes), "rejected": [], "duplicate_review": True, "committed": True}
 
         current_patterns = {entry["id"]: entry for entry in self.patterns(game_id, include_retired=True)}
@@ -772,7 +794,7 @@ class GameMemory:
         checkpoint = {
             "op": "checkpoint", "id": coverage_id, "type": "review_checkpoint",
             "game_id": game_id, "run_id": self.run_id,
-            "review_coverage": list(evidence_ids), "step": int(current_step), "revision": revision,
+            "review_coverage": full_coverage, "step": int(current_step), "revision": revision,
         }
         rows.append(checkpoint)
         append_many(self.path, rows)
@@ -1390,6 +1412,8 @@ __all__ = [
     "GameMemory",
     "default_state_dir",
     "game_memory_dir",
+    "project_skills_dir",
+    "shared_skill_path",
     "LEDGER_NAME",
     "MEMORY_SCHEMA",
     "validate_model_patches",

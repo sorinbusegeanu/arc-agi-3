@@ -12,7 +12,7 @@ from .runlog import append_jsonl, read_json
 from .tools.game import ActionError, validate_decision
 from .tools.history import History
 from .tools.memory import (
-    DEFAULT_CONTEXT_ENTRIES, GameMemory, default_state_dir, game_memory_dir,
+    DEFAULT_CONTEXT_ENTRIES, GameMemory, default_state_dir, game_memory_dir, shared_skill_path,
 )
 
 
@@ -229,7 +229,7 @@ def build_analysis_input(
         context["prior_decision_summaries"] = prior[-4:]
     default_skill = run_path / "SKILL.md"
     if not default_skill.exists():
-        default_skill = Path(__file__).with_name("SKILL.md")
+        default_skill = shared_skill_path()
     skill_file = Path(skill_path) if skill_path is not None else default_skill
     system_prompt = skill_file.read_text(encoding="utf-8")
     skill_digest = hashlib.sha256(skill_file.read_bytes()).hexdigest()

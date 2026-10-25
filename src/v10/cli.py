@@ -110,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="run output directory; existing contents are erased before the run",
     )
     live.add_argument("--state-dir", type=Path, default=default_state_dir(),
-                      help="persistent v10 memory root; defaults to the user state directory")
+                      help="persistent v10 memory root; defaults to the project skills directory")
     live.add_argument("--memory-context-entries", type=int, default=DEFAULT_CONTEXT_ENTRIES,
                       help="maximum persistent memory entries supplied to the model")
     live.add_argument(
