@@ -92,7 +92,11 @@ def test_memory_persists_between_runs_but_isolated_by_game(tmp_path) -> None:
     game_a = game_memory_dir(state_dir, "game/a")
     first = GameMemory(tmp_path / "run-one", store_dir=game_a, run_id="run-one")
     first.propose_update([
-        {"op": "upsert", "id": "H1", "type": "hypothesis", "claim": "A persistent fact"},
+        {
+            "op": "upsert", "id": "H1", "type": "hypothesis",
+            "claim": "A persistent fact. (evidence: T1)",
+            "evidence_ids": ["T1"],
+        },
     ], known_evidence_ids={"T1"}, current_step=1)
 
     next_run = GameMemory(tmp_path / "run-two", store_dir=game_a, run_id="run-two")
@@ -100,8 +104,69 @@ def test_memory_persists_between_runs_but_isolated_by_game(tmp_path) -> None:
 
     assert next_run.read()["entries"][0]["id"] == "run-one:H1"
     assert next_run.read()["entries"][0]["evidence_ids"] == ["run-one:T1"]
+    assert next_run.read()["entries"][0]["claim"] == "A persistent fact."
+    assert "evidence:" not in (game_a / "MEMORY.md").read_text().casefold()
+    assert "evidence_ids" not in next_run.compact()["entries"][0]
     assert other_game.read()["entries"] == []
     assert (game_a / "MEMORY.md").exists()
+
+
+def test_review_summary_replaces_view_and_is_the_only_compacted_memory(tmp_path) -> None:
+    store_dir = game_memory_dir(tmp_path / "state", "ez01")
+    first = GameMemory(tmp_path / "run-one", store_dir=store_dir, run_id="run-one")
+    first.propose_update([
+        {"op": "upsert", "id": "P1", "type": "pattern", "claim": "Prior observation."},
+    ], current_step=1)
+    markdown = "## Patterns\nA recurring effect. (evidence: T1)\n\n## Uncertain ideas\n- none"
+    clean_markdown = "## Patterns\nA recurring effect.\n\n## Uncertain ideas\n- none"
+
+    saved = first.save_review_summary(markdown, evidence_ids=["T1"], current_step=2)
+
+    assert saved["id"] == "review:latest"
+    assert saved["revision"] == 2
+    assert first.view_path.read_text() == clean_markdown + "\n"
+    compact = first.compact(max_entries=5, through_step=2)
+    assert len(compact["entries"]) == 1
+    assert compact["entries"][0]["type"] == "review"
+    assert compact["entries"][0]["claim"] == clean_markdown
+    assert "evidence_ids" not in compact["entries"][0]
+    assert compact["entries"][0]["id"] == "review:latest"
+    assert first.read()["entries"][-1]["evidence_ids"] == ["run-one:T1"]
+
+    next_run = GameMemory(tmp_path / "run-two", store_dir=store_dir, run_id="run-two")
+    assert next_run.compact(max_entries=5, through_step=0)["entries"][0]["claim"] == clean_markdown
+
+
+def test_empty_review_preserves_existing_memory_and_review_entries_are_harness_owned(tmp_path) -> None:
+    memory = GameMemory(tmp_path)
+    memory.propose_update([
+        {"op": "upsert", "id": "P1", "type": "pattern", "claim": "Prior observation."},
+    ], current_step=1)
+    before_view = memory.view_path.read_text()
+    before_ledger = memory.path.read_text()
+
+    with pytest.raises(MemoryValidationError, match="non-empty"):
+        memory.save_review_summary("  \n", evidence_ids=[], current_step=2)
+    result = memory.propose_update([
+        {"op": "upsert", "id": "R1", "type": "review", "claim": "Model-authored review"},
+    ], current_step=2)
+
+    assert memory.view_path.read_text() == before_view
+    assert memory.path.read_text() == before_ledger
+    assert result["rejected"][0]["reason"] == "review_entries_are_harness_owned"
+
+
+def test_failed_review_view_save_rolls_back_latest_summary(tmp_path, monkeypatch) -> None:
+    memory = GameMemory(tmp_path, run_id="run-one")
+    memory.save_review_summary("## Patterns\nPrevious summary.", evidence_ids=["T1"], current_step=1)
+    before_view = memory.view_path.read_text()
+    monkeypatch.setattr(memory, "write_view", lambda: (_ for _ in ()).throw(OSError("view is read-only")))
+
+    with pytest.raises(OSError, match="view is read-only"):
+        memory.save_review_summary("## Patterns\nReplacement summary.", evidence_ids=["T2"], current_step=2)
+
+    assert memory.view_path.read_text() == before_view
+    assert memory.compact()["entries"][0]["claim"] == "## Patterns\nPrevious summary."
 
 
 def test_legacy_run_ledger_migrates_before_run_dir_reuse(tmp_path) -> None:

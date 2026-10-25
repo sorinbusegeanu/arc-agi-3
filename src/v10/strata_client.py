@@ -87,6 +87,7 @@ class StrataClient:
         user_prompt: str,
         image_paths: Sequence[Path] = (),
         image_labels: Sequence[str] = (),
+        response_format: str | None = "json_object",
     ) -> dict[str, Any]:
         content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
         for index, path in enumerate(image_paths):
@@ -102,9 +103,10 @@ class StrataClient:
             ],
             "max_tokens": self.max_output_tokens,
             "temperature": 0,
-            "response_format": {"type": "json_object"},
             "reasoning_effort": self.reasoning_effort,
         }
+        if response_format is not None:
+            payload["response_format"] = {"type": str(response_format)}
         if self.reasoning_budget_tokens is not None:
             payload["reasoning_budget_tokens"] = self.reasoning_budget_tokens
         request_attempts = 1

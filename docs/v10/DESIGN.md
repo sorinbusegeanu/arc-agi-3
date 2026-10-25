@@ -1,7 +1,7 @@
 # V10 — Add a Review Session to the Working ez01 Agent
 
 **Design v0.4 · 25 October 2026**  
-**Status:** Proposed addition. Supersedes the larger v0.3 proposal.  
+**Status:** Implemented. Supersedes the larger v0.3 proposal.
 **Plan:** [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)
 
 ## 1. Purpose
@@ -34,7 +34,7 @@ Use the same configured model in a separate call with a review-specific prompt. 
 
 Use existing logs and frame selection helpers. The reviewer should consider the complete recorded action history; it need not receive every screenshot.
 
-Ask it to identify recurring action effects, conditions, exceptions, successful approaches, and repeated failures. It should distinguish supported observations from tentative explanations, cite transition IDs, and say when evidence is insufficient. Direction names describe commands; actual movement must be inferred from observations.
+Ask it to identify recurring action effects, conditions, exceptions, successful approaches, and repeated failures. It should distinguish supported observations from tentative explanations and say when observations are insufficient. Do not put transition IDs or citations in memory text; the harness retains run-qualified provenance in the ledger. Direction names describe commands; actual movement must be inferred from observations.
 
 The review call returns Markdown using a review-specific response format; the action call keeps its existing JSON format. Reuse the existing client with a small per-call format option if needed.
 
@@ -61,4 +61,4 @@ Keep the existing directional mapping, action-only response, game controls, acti
 
 Implementation consists of a trigger, a review call, memory persistence, and supplying that memory to subsequent decisions. Small changes to existing helpers needed for this integration are allowed; unrelated baseline repairs are not prerequisites. No new planner, prediction framework, knowledge-status system, cross-game library, or unrelated baseline refactor is part of this change.
 
-Verify both triggers, combined-trigger handling, failure recovery, and memory visibility in the next decision. Then run ez01 with review enabled and inspect whether later decisions use useful patterns. Compare with the current three-of-five result under the same game/model/action settings; report review overhead and actual outcomes without assuming improvement.
+The implementation verifies both triggers, combined-trigger handling, failure recovery, terminal handling, and memory visibility in the next decision. A 50-action ez01 run with the baseline model settings completed one level and saved one review after action 2; it used 4,362 review tokens and 23.95 seconds of review latency. The run completed 1/5 levels versus the prior 3/5 result, so it provides no evidence of an improvement. That run exposed a review-format compliance issue; validation now rejects malformed output and preserves prior memory. A 2-action live check then saved the required four-section review (3,662 tokens; 15.96 seconds). See the implementation plan for the test command and artifact paths.

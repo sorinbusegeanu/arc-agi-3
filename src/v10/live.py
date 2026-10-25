@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import shutil
 import sys
 import time
@@ -173,6 +174,210 @@ def _random_legal_action(legal_actions: Any, rng: random.Random) -> dict[str, An
     return rng.choice(candidates) if candidates else None
 
 
+_REVIEW_SYSTEM_PROMPT = """# ez01 experience review
+
+Review recorded game experience and consolidate useful, game-specific memory. You do not control the game and must not request actions or resets.
+
+Rewrite the findings under exactly these four headings, in this order: `## Patterns`, `## Useful approaches`, `## Failures and exceptions`, and `## Uncertain ideas`. Do not copy the previous MEMORY.md layout or repeat its content verbatim; use it as source material and consolidate it with this run's observations. Include all four headings even when a section only says that evidence is insufficient.
+
+Distinguish directly observed effects from tentative explanations. Do not include evidence IDs, source citations, or parenthetical transition references; the harness stores provenance separately. Direction words name commands; infer actual movement only from the recorded frames and measurements. Preserve earlier findings that remain useful, qualify or remove claims contradicted by observations, and do not invent game rules or outcomes.
+
+Return only compact Markdown with those four headings. This Markdown replaces the previous memory view."""
+
+_REVIEW_HEADINGS = (
+    "patterns", "useful approaches", "failures and exceptions", "uncertain ideas",
+)
+
+
+def _validate_review_markdown(content: str) -> str:
+    """Reject reviews that did not follow the compact memory format."""
+    headings = [
+        re.sub(r"\s+#+\s*$", "", match.group(1)).strip().casefold()
+        for match in re.finditer(r"(?m)^#{1,6}\s+(.+?)\s*$", content)
+    ]
+    if tuple(headings) != _REVIEW_HEADINGS:
+        raise ValueError("review response must contain exactly the four required headings in order")
+    return content.strip()
+
+
+def _review_events(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for row in records:
+        kind = row.get("type")
+        if kind == "state":
+            events.append({
+                "type": "initial_state", "evidence_id": row.get("evidence_id"),
+                "level": row.get("level"), "levels_completed": row.get("levels_completed"),
+                "reset_generation": row.get("reset_generation"), "game_state": row.get("game_state"),
+            })
+        elif kind == "reset":
+            events.append({
+                "type": "reset_boundary", "evidence_id": row.get("evidence_id"),
+                "level": row.get("level"), "levels_completed": row.get("levels_completed"),
+                "reset_generation": row.get("reset_generation"),
+                "justification": row.get("justification"),
+            })
+        elif kind == "audit":
+            events.append({
+                "type": "action_error", "evidence_id": row.get("evidence_id"),
+                "kind": row.get("kind"), "action": model_action_name(row.get("action")),
+                "error": row.get("error"), "reset_generation": row.get("reset_generation"),
+            })
+        elif kind == "transition":
+            events.append({
+                "type": "transition", "evidence_id": row.get("evidence_id"),
+                "action": model_action_name(row.get("action")), "args": row.get("args", {}),
+                "measurements": row.get("measurements"), "result": row.get("result"),
+                "level": row.get("level"), "levels_completed": row.get("levels_completed"),
+                "game_state": row.get("game_state"), "terminal": row.get("terminal"),
+                "reset_generation": row.get("reset_generation"),
+            })
+    return events
+
+
+def _review_frame_selection(
+    transitions: Sequence[Mapping[str, Any]],
+    frames: FrameStore,
+    *,
+    max_images: int = 8,
+) -> tuple[list[Path], list[str]]:
+    """Choose at most four informative before/after pairs in chronological order."""
+    if max_images < 2 or not transitions:
+        return [], []
+    frame_entries = {entry["frame_id"]: entry for entry in frames.entries()}
+    pair_limit = max_images // 2
+    scores: list[tuple[int, int]] = []
+    previous_completed: int | None = 0
+    for index, row in enumerate(transitions):
+        score = 0
+        completed = row.get("levels_completed")
+        if completed is not None:
+            completed = int(completed)
+            if previous_completed is not None and completed > previous_completed:
+                score += 10
+            previous_completed = completed
+        if row.get("terminal"):
+            score += 9
+        measurements = row.get("measurements")
+        if isinstance(measurements, Mapping) and measurements.get("changed_pixels") == 0:
+            score += 4
+        if index in {0, len(transitions) - 1}:
+            score += 2
+        scores.append((score, index))
+    ranked = [index for _, index in sorted(scores, key=lambda item: (-item[0], item[1]))]
+    selected = ranked[:pair_limit]
+    if len(selected) < pair_limit:
+        remaining = [index for index in range(len(transitions)) if index not in selected]
+        while remaining and len(selected) < pair_limit:
+            target = round((len(selected) + 1) * (len(transitions) - 1) / (pair_limit + 1))
+            index = min(remaining, key=lambda item: (abs(item - target), item))
+            selected.append(index)
+            remaining.remove(index)
+    selected.sort()
+
+    image_paths: list[Path] = []
+    image_labels: list[str] = []
+    for index in selected:
+        row = transitions[index]
+        evidence_id = str(row.get("evidence_id", f"transition-{index + 1}"))
+        pair = []
+        for field, label in (("pre_frame_image_id", "before"), ("post_frame_image_id", "after")):
+            image_id = row.get(field)
+            entry = frame_entries.get(str(image_id)) if image_id else None
+            if entry is None or entry.get("kind") != IMAGE_KIND:
+                pair = []
+                break
+            pair.append((frames.path_of(str(image_id)), f"{label.title()} frame for {evidence_id}"))
+        for path, label in pair:
+            image_paths.append(path)
+            image_labels.append(label)
+    return image_paths[:max_images], image_labels[:max_images]
+
+
+def _perform_review(
+    tools: GameTools,
+    client: Any,
+    *,
+    game_id: str,
+    run_id: str,
+    memory_store_dir: Path,
+    trigger_reasons: Sequence[str],
+) -> dict[str, Any]:
+    """Review the frozen run prefix and persist a consolidated Markdown summary."""
+    transition_ids: list[str] = []
+    first_id: str | None = None
+    last_id: str | None = None
+    image_labels: list[str] = []
+    usage: dict[str, Any] = {}
+    latency = 0.0
+    attempts = 0
+    try:
+        records = tools.history.records()
+        transitions = [row for row in records if row.get("type") == "transition"]
+        transition_ids = [str(row["evidence_id"]) for row in transitions if row.get("evidence_id")]
+        first_id = transition_ids[0] if transition_ids else None
+        last_id = transition_ids[-1] if transition_ids else None
+        memory = GameMemory(tools.run_dir, store_dir=memory_store_dir, run_id=run_id)
+        memory_text = memory.write_view().read_text(encoding="utf-8")
+        frames = FrameStore(tools.run_dir)
+        image_paths, image_labels = _review_frame_selection(transitions, frames)
+        events = _review_events(records)
+        user_prompt = (
+            f"Review all recorded experience for game {game_id} through action {tools.action_count}. "
+            f"This review was triggered by: {', '.join(trigger_reasons)}. "
+            "Use the complete ordered transition summaries and the selected actual frames. Do not write transition IDs or citations in the memory text; the harness records provenance separately. "
+            "Return a concise consolidated replacement for the prior memory.\n\n"
+            "Previous MEMORY.md:\n" + memory_text + "\n\n"
+            "Recorded experience (ordered; no events after this review boundary):\n"
+            + json.dumps(events, ensure_ascii=False, separators=(",", ":"))
+        )
+        attempts = 1
+        response = client.complete(
+            _REVIEW_SYSTEM_PROMPT, user_prompt, image_paths, image_labels,
+            response_format=None,
+        )
+        usage = dict(response.get("usage", {}))
+        latency = float(response.get("latency_seconds", 0.0))
+        attempts = max(1, int(response.get("request_attempts", 1)))
+        content = response.get("content")
+        if response.get("finish_reason") == "length":
+            raise ValueError("review response was truncated at the output-token limit")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("review response must be non-empty Markdown text")
+        content = _validate_review_markdown(content)
+        saved = memory.save_review_summary(
+            content, evidence_ids=transition_ids, current_step=tools.action_count,
+        )
+        content = str(saved["claim"])
+        row = {
+            "schema": "v10.live_review/1", "status": "saved", "trigger_reasons": list(trigger_reasons),
+            "through_action": tools.action_count,
+            "covered_transitions": {"count": len(transition_ids), "first": first_id, "last": last_id},
+            "selected_image_labels": image_labels,
+            "model": response.get("model", getattr(client, "model", None)),
+            "request_attempts": attempts, "usage": usage,
+            "latency_seconds": round(latency, 6),
+            "memory_revision": saved["revision"], "memory_path": str(memory.view_path),
+            "result_characters": len(content),
+            "result_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        }
+    except Exception as exc:
+        attempts = max(attempts, int(getattr(exc, "request_attempts", 0)))
+        if getattr(exc, "latency_seconds", None) is not None:
+            latency = max(latency, float(exc.latency_seconds))
+        row = {
+            "schema": "v10.live_review/1", "status": "failed", "trigger_reasons": list(trigger_reasons),
+            "through_action": tools.action_count,
+            "covered_transitions": {"count": len(transition_ids), "first": first_id, "last": last_id},
+            "selected_image_labels": image_labels,
+            "request_attempts": attempts, "usage": usage,
+            "latency_seconds": round(latency, 6),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    append_jsonl(tools.run_dir / "reviews.jsonl", row)
+    return {"row": row, "attempts": attempts, "usage": usage, "latency_seconds": latency}
+
+
 def _live_context(
     tools: GameTools,
     current: Mapping[str, Any],
@@ -285,6 +490,7 @@ def run_live(
     max_actions: int = 30,
     max_resets: int = 0,
     plan_horizon: int = 4,
+    review_interval: int = 50,
     skill_path: str | Path | None = None,
     state_dir: str | Path | None = None,
     memory_context_entries: int = DEFAULT_CONTEXT_ENTRIES,
@@ -292,6 +498,8 @@ def run_live(
     """Run a bounded live episode, persisting evidence before and after actions."""
     if not 1 <= int(plan_horizon) <= 4:
         raise ValueError("plan_horizon must be between 1 and 4")
+    if int(review_interval) < 1:
+        raise ValueError("review_interval must be positive")
     if int(max_actions) < 1 or int(max_resets) < 0:
         raise ValueError("action budget must be positive and reset budget non-negative")
     if not 0 <= int(memory_context_entries) <= 5:
@@ -316,7 +524,13 @@ def run_live(
     current = tools.observe()
     model_calls = 0
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    action_usage = dict(total_usage)
+    review_usage = dict(total_usage)
     total_latency = 0.0
+    review_latency = 0.0
+    review_model_calls = 0
+    review_count = 0
+    actions_since_review = 0
     interrupted_plans = 0
     stop_reason = "running"
     decisions_path = destination / "decisions.jsonl"
@@ -333,6 +547,10 @@ def run_live(
             "actions": tools.action_count, "action_budget": tools.max_actions,
             "resets": tools.reset_count, "reset_budget": tools.max_resets,
             "model_calls": model_calls, "usage": dict(total_usage),
+            "action_usage": dict(action_usage), "review_usage": dict(review_usage),
+            "review_model_calls": review_model_calls, "review_count": review_count,
+            "review_latency_seconds": round(review_latency, 6),
+            "review_interval": int(review_interval),
             "latency_seconds": round(total_latency, 6), "elapsed_seconds": elapsed,
             "levels_completed": current.get("levels_completed"), "win_levels": current.get("win_levels"),
             "game_state": state, "terminal": terminal, "won": state == "WIN",
@@ -386,6 +604,7 @@ def run_live(
                     value = response.get("usage", {}).get(key)
                     if value is not None:
                         total_usage[key] += int(value)
+                        action_usage[key] += int(value)
                 total_latency += float(response.get("latency_seconds", 0.0))
                 try:
                     decision = validate_model_decision(
@@ -514,10 +733,45 @@ def run_live(
                 executed.append({
                     "evidence_id": result["evidence"]["evidence_id"],
                 })
+                actions_since_review += 1
+                trigger_reasons = []
+                level_completed = (
+                    previous_levels_completed is not None
+                    and current.get("levels_completed") is not None
+                    and int(current["levels_completed"]) > int(previous_levels_completed)
+                )
+                if level_completed:
+                    trigger_reasons.append("level_completed")
+                if actions_since_review >= int(review_interval):
+                    trigger_reasons.append("action_interval")
+                if trigger_reasons:
+                    review_count += 1
+                    progress(f"review starting; triggers={trigger_reasons}")
+                    review_result = _perform_review(
+                        tools, client, game_id=game_id, run_id=run_id,
+                        memory_store_dir=memory_store_dir,
+                        trigger_reasons=trigger_reasons,
+                    )
+                    # One attempt, successful or not, starts the next interval.
+                    actions_since_review = 0
+                    attempts = int(review_result["attempts"])
+                    review_model_calls += attempts
+                    model_calls += attempts
+                    elapsed = float(review_result["latency_seconds"])
+                    review_latency += elapsed
+                    total_latency += elapsed
+                    for key in total_usage:
+                        value = review_result["usage"].get(key)
+                        if value is not None:
+                            total_usage[key] += int(value)
+                            review_usage[key] += int(value)
+                    progress(f"review {review_result['row']['status']}")
                 if current.get("terminal"):
                     interruption = "terminal_state"
                 elif current.get("level") != previous_level or current.get("levels_completed") != previous_levels_completed:
                     interruption = "level_change"
+                elif trigger_reasons:
+                    interruption = "review"
                 if interruption:
                     break
             if interruption:

@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import os
 import hashlib
+import json
+import re
+import tempfile
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote
 
 from ..runlog import append_many, read_json, read_jsonl
@@ -19,8 +22,20 @@ from .history import History
 MEMORY_SCHEMA = "v10.memory/1"
 MEMORY_VIEW_NAME = "MEMORY.md"
 LEDGER_NAME = "memory.jsonl"
+REVIEW_SUMMARY_ID = "review:latest"
 DEFAULT_MAX_ENTRIES = 60
 DEFAULT_CONTEXT_ENTRIES = 5
+MAX_MEMORY_MARKDOWN_CHARS = 12_000
+PATTERN_TYPES: tuple[str, ...] = ("mechanic", "strategy", "exception", "hypothesis")
+PATTERN_STATUSES: tuple[str, ...] = ("candidate", "confirmed", "contradicted", "retired")
+CONFIDENCE_PRIOR = 1
+CONFIDENCE_CONFIRMED_THRESHOLD = 0.75
+
+
+def _without_evidence_citations(text: str) -> str:
+    """Remove audit-only evidence labels from model-facing memory text."""
+    text = re.sub(r"\s*\(?\s*evidence\s*:\s*[^)\n]*(?:\)|$)", "", str(text), flags=re.IGNORECASE | re.MULTILINE)
+    return "\n".join(line.rstrip() for line in text.splitlines()).strip()
 
 
 def default_state_dir() -> Path:
@@ -49,7 +64,9 @@ ENTRY_TYPES: tuple[str, ...] = (
     "goal",
     "prediction",
     "failure",
+    "review",
 )
+MODEL_ENTRY_TYPES: tuple[str, ...] = tuple(kind for kind in ENTRY_TYPES if kind != "review")
 PATCH_OPS: tuple[str, ...] = ("upsert", "retire", "verdict")
 PREDICTION_VERDICTS: tuple[str, ...] = ("pending", "matched", "failed", "inconclusive")
 PROMOTION_STATUSES: tuple[str, ...] = ("supported", "mechanic")
@@ -72,6 +89,26 @@ PATCH_FIELDS = frozenset(
         "reason",
         "step",
         "related_to",
+        "game_id",
+        "pattern_type",
+        "applicability_conditions",
+        "supporting_evidence",
+        "contradicting_evidence",
+        "confidence",
+        "pattern_revision",
+        "state_selector",
+        "goal",
+        "preconditions",
+        "action_policy",
+        "expected_observations",
+        "success_conditions",
+        "supersedes",
+        "level",
+        "levels_completed",
+        "win_levels",
+        "terminal",
+        "game_state",
+        "review_coverage",
     }
 )
 
@@ -92,6 +129,14 @@ VIEW_SECTIONS: tuple[tuple[str, str], ...] = (
 )
 
 _EMPTY_SECTION = "- none"
+
+PATTERN_VIEW_SECTIONS = (
+    ("2. Confirmed Mechanics", "mechanic", "confirmed"),
+    ("3. Successful Strategies", "strategy", "confirmed"),
+    ("4. Known Exceptions", "exception", None),
+    ("5. Active Hypotheses", "hypothesis", None),
+    ("6. Failed Approaches", "failure", None),
+)
 
 
 class MemoryValidationError(Exception):
@@ -126,9 +171,9 @@ def validate_model_patches(
             continue
 
         entry_type = patch.get("type")
-        if entry_type not in ENTRY_TYPES:
+        if entry_type not in MODEL_ENTRY_TYPES:
             raise MemoryValidationError(
-                f"{name}.type must be one of {', '.join(ENTRY_TYPES)}; observations belong in decision.observations"
+                f"{name}.type must be one of {', '.join(MODEL_ENTRY_TYPES)}; observations belong in decision.observations"
             )
         if not isinstance(patch.get("claim"), str) or not patch["claim"].strip():
             raise MemoryValidationError(f"{name}.claim must be a non-empty string")
@@ -156,6 +201,57 @@ def _normalise_claim(claim: Any) -> str:
     return " ".join(str(claim).casefold().split())
 
 
+def stable_pattern_id(
+    game_id: str,
+    pattern_type: str,
+    claim: str,
+    applicability_conditions: Sequence[str] = (),
+) -> str:
+    identity = {
+        "game_id": str(game_id), "pattern_type": str(pattern_type),
+        "claim": _normalise_claim(claim),
+        "applicability_conditions": sorted(_normalise_claim(value) for value in applicability_conditions),
+    }
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+    return f"P-{digest}"
+
+
+def pattern_confidence(supporting: Sequence[Any], contradicting: Sequence[Any]) -> float:
+    """Deterministic Laplace-smoothed support ratio: (support+1)/(support+contradiction+2)."""
+    support_count = len(set(map(str, supporting)))
+    contradiction_count = len(set(map(str, contradicting)))
+    return round((support_count + CONFIDENCE_PRIOR) / (
+        support_count + contradiction_count + 2 * CONFIDENCE_PRIOR
+    ), 4)
+
+
+def pattern_status(supporting: Sequence[Any], contradicting: Sequence[Any], *, retired: bool = False) -> str:
+    if retired:
+        return "retired"
+    support_count = len(set(map(str, supporting)))
+    contradiction_count = len(set(map(str, contradicting)))
+    confidence = pattern_confidence(supporting, contradicting)
+    if contradiction_count and contradiction_count >= support_count:
+        return "contradicted"
+    if support_count >= 2 and confidence >= CONFIDENCE_CONFIRMED_THRESHOLD:
+        return "confirmed"
+    return "candidate"
+
+
+def _short_evidence_refs(values: Sequence[Any], limit: int = 3) -> str:
+    refs = []
+    for value in dict.fromkeys(map(str, values)):
+        if ":" in value:
+            run_id, evidence_id = value.rsplit(":", 1)
+            display = f"{run_id[:8]}:{evidence_id}"
+        else:
+            display = value
+        refs.append(display)
+    visible = refs[-limit:]
+    suffix = f", +{len(refs) - limit}" if len(refs) > limit else ""
+    return ", ".join(visible) + suffix
+
+
 def _as_list(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -164,6 +260,21 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, Sequence) or isinstance(value, Iterable):
         return list(value)
     return [value]
+
+
+def _qualify_pattern_refs(values: Sequence[Any], run_id: str) -> list[str]:
+    result = []
+    for value in values:
+        ref = str(value)
+        if ":" not in ref:
+            ref = f"{run_id}:{ref}"
+        if ref not in result:
+            result.append(ref)
+    return result
+
+
+def _entry_equal(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    return all(left.get(key) == right.get(key) for key in set(left) | set(right))
 
 
 class GameMemory:
@@ -178,6 +289,7 @@ class GameMemory:
         *,
         store_dir: Path | str | None = None,
         run_id: str | None = None,
+        game_id: str | None = None,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.store_dir = Path(store_dir) if store_dir is not None else self.run_dir
@@ -185,6 +297,7 @@ class GameMemory:
         self.view_path = self.store_dir / view_name
         self.max_entries = int(max_entries)
         self.run_id = str(run_id) if run_id else None
+        self.game_id = str(game_id) if game_id else None
         self._rows = read_jsonl(self.path)
 
     # ------------------------------------------------------------------ ledger
@@ -214,6 +327,8 @@ class GameMemory:
             if not entry_id:
                 continue
             op = row.get("op", "upsert")
+            if op == "checkpoint":
+                continue
             if op == "retire":
                 if entries.pop(entry_id, None) is not None and entry_id in order:
                     order.remove(entry_id)
@@ -271,6 +386,220 @@ class GameMemory:
                 return entry
         return None
 
+    def patterns(self, game_id: str | None = None, *, include_retired: bool = False) -> list[dict[str, Any]]:
+        wanted_game = str(game_id or self.game_id or "")
+        return [
+            entry for entry in self.read()["entries"]
+            if entry.get("pattern_type") in PATTERN_TYPES
+            and (not wanted_game or entry.get("game_id") == wanted_game)
+            and (include_retired or entry.get("status") != "retired")
+        ]
+
+    def applicable_patterns(
+        self,
+        game_id: str,
+        state: Mapping[str, Any] | None = None,
+        *,
+        include_hypotheses: bool = True,
+    ) -> list[dict[str, Any]]:
+        state_values = dict(state or {})
+        selected = []
+        for entry in self.patterns(game_id):
+            selector = entry.get("state_selector") or {}
+            if not isinstance(selector, Mapping):
+                continue
+            if any(state_values.get(key) != value for key, value in selector.items()):
+                continue
+            if entry.get("status") == "contradicted":
+                continue
+            if entry.get("pattern_type") == "hypothesis" and not include_hypotheses:
+                continue
+            selected.append(entry)
+        priority = {"mechanic": 0, "strategy": 1, "exception": 2, "hypothesis": 3}
+        selected.sort(key=lambda entry: (
+            priority.get(str(entry.get("pattern_type")), 9),
+            0 if entry.get("status") == "confirmed" else 1,
+            -float(entry.get("confidence", 0.0)),
+            str(entry.get("id", "")),
+        ))
+        return selected
+
+    def record_run_state(self, game_id: str, state: Mapping[str, Any], *, step: int) -> dict[str, Any] | None:
+        """Keep the latest progress snapshot under its originating run ID."""
+        if not self.run_id:
+            raise MemoryValidationError("run state requires a run_id")
+        state_fields = {
+            key: state.get(key) for key in ("level", "levels_completed", "win_levels", "game_state", "terminal")
+            if key in state
+        }
+        entry_id = f"state:{self.run_id}"
+        existing = self.get(entry_id)
+        if existing and all(existing.get(key) == value for key, value in state_fields.items()):
+            return None
+        revision = self.revision() + 1
+        row = {
+            "op": "upsert", "id": entry_id, "type": "state", "game_id": str(game_id),
+            "run_id": self.run_id, **state_fields, "step": int(step), "revision": revision,
+        }
+        append_many(self.path, [row])
+        self._rows.append(row)
+        self.write_view()
+        return dict(row)
+
+    @staticmethod
+    def review_coverage_id(game_id: str, run_id: str, evidence_ids: Sequence[str]) -> str:
+        material = json.dumps([str(game_id), str(run_id), list(map(str, evidence_ids))], separators=(",", ":"))
+        return "review-checkpoint:" + hashlib.sha256(material.encode()).hexdigest()[:20]
+
+    def has_review_coverage(self, game_id: str, evidence_ids: Sequence[str]) -> bool:
+        if not self.run_id:
+            return False
+        coverage = self.review_coverage_id(game_id, self.run_id, evidence_ids)
+        return any(row.get("op") == "checkpoint" and row.get("id") == coverage for row in self._rows)
+
+    def apply_review_changes(
+        self,
+        changes: Any,
+        *,
+        game_id: str,
+        evidence_ids: Sequence[str],
+        current_step: int,
+    ) -> dict[str, Any]:
+        """Append independent pattern revisions and a successful review checkpoint."""
+        if not isinstance(changes, list):
+            raise MemoryValidationError("review changes must be a list")
+        if int(current_step) < 0:
+            raise MemoryValidationError("review step must be non-negative")
+        if self.run_id is None:
+            raise MemoryValidationError("pattern review requires a run_id")
+        game_id = str(game_id)
+        current_ids = {str(value) for value in evidence_ids}
+        coverage_id = self.review_coverage_id(game_id, self.run_id, list(evidence_ids))
+        if self.has_review_coverage(game_id, evidence_ids):
+            return {"added": 0, "updated": 0, "retired": 0, "unchanged": len(changes), "rejected": [], "duplicate_review": True}
+
+        current_patterns = {entry["id"]: entry for entry in self.patterns(game_id, include_retired=True)}
+        planned: dict[str, dict[str, Any]] = {}
+        rejected: list[dict[str, Any]] = []
+        for index, raw in enumerate(changes):
+            if not isinstance(raw, Mapping):
+                rejected.append({"index": index, "reason": "change_must_be_object"})
+                continue
+            operation = raw.get("operation", "upsert")
+            pattern_id = raw.get("pattern_id")
+            if operation == "retire":
+                existing = current_patterns.get(str(pattern_id))
+                if existing is None:
+                    rejected.append({"index": index, "pattern_id": pattern_id, "reason": "unknown_pattern"})
+                    continue
+                updated = dict(existing)
+                updated["status"] = "retired"
+                updated["pattern_revision"] = int(existing.get("pattern_revision", 1)) + 1
+                updated["step"] = int(current_step)
+                updated["run_id"] = self.run_id
+                if _entry_equal(existing, updated):
+                    continue
+                planned[str(pattern_id)] = updated
+                continue
+            if operation != "upsert":
+                rejected.append({"index": index, "pattern_id": pattern_id, "reason": "unknown_operation"})
+                continue
+            pattern_type = raw.get("pattern_type")
+            claim = _without_evidence_citations(str(raw.get("claim", ""))).strip()
+            if pattern_type not in PATTERN_TYPES or not claim:
+                rejected.append({"index": index, "pattern_id": pattern_id, "reason": "invalid_type_or_claim"})
+                continue
+            conditions = raw.get("applicability_conditions", [])
+            if not isinstance(conditions, list) or any(not isinstance(value, str) for value in conditions):
+                rejected.append({"index": index, "pattern_id": pattern_id, "reason": "invalid_applicability_conditions"})
+                continue
+            selector = raw.get("state_selector", {})
+            if not isinstance(selector, Mapping) or any(not isinstance(key, str) for key in selector):
+                rejected.append({"index": index, "pattern_id": pattern_id, "reason": "invalid_state_selector"})
+                continue
+            new_support = raw.get("supporting_evidence", [])
+            new_contra = raw.get("contradicting_evidence", [])
+            if not isinstance(new_support, list) or not isinstance(new_contra, list):
+                rejected.append({"index": index, "pattern_id": pattern_id, "reason": "evidence_refs_must_be_lists"})
+                continue
+            if any(not isinstance(value, str) or value not in current_ids for value in [*new_support, *new_contra]):
+                rejected.append({"index": index, "pattern_id": pattern_id, "reason": "unknown_review_evidence"})
+                continue
+            existing = current_patterns.get(str(pattern_id)) if pattern_id else None
+            if pattern_id and existing is None:
+                rejected.append({"index": index, "pattern_id": pattern_id, "reason": "unknown_pattern_id"})
+                continue
+            if existing and existing.get("game_id") != game_id:
+                rejected.append({"index": index, "pattern_id": pattern_id, "reason": "game_id_mismatch"})
+                continue
+            stable_id = str(existing["id"]) if existing else stable_pattern_id(
+                game_id, str(pattern_type), claim, conditions,
+            )
+            base = dict(existing or {})
+            prior_support = list(base.get("supporting_evidence", []))
+            prior_contra = list(base.get("contradicting_evidence", []))
+            support = _qualify_pattern_refs([*prior_support, *new_support], self.run_id)
+            contra = _qualify_pattern_refs([*prior_contra, *new_contra], self.run_id)
+            if existing and "applicability_conditions" not in raw:
+                conditions = list(existing.get("applicability_conditions", []))
+            if existing and "state_selector" not in raw:
+                selector = existing.get("state_selector", {})
+            confidence = pattern_confidence(support, contra)
+            status = pattern_status(support, contra)
+            record = {
+                **base, "id": stable_id, "type": "pattern", "game_id": game_id,
+                "pattern_type": str(pattern_type), "claim": claim,
+                "applicability_conditions": list(dict.fromkeys(conditions)),
+                "state_selector": dict(selector),
+                "supporting_evidence": support, "contradicting_evidence": contra,
+                "evidence_ids": list(dict.fromkeys([*support, *contra])),
+                "confidence": confidence, "status": status,
+                "pattern_revision": int(base.get("pattern_revision", 0)) + 1,
+                "step": int(current_step), "run_id": self.run_id,
+            }
+            for field in (
+                "goal", "preconditions", "action_policy", "expected_observations", "success_conditions", "supersedes",
+            ):
+                if field in raw:
+                    record[field] = raw[field]
+            # Preserve strategy details on an update that omits them.
+            planned[stable_id] = record
+
+        rows: list[dict[str, Any]] = []
+        revision = self.revision()
+        added = updated_count = retired = unchanged = 0
+        for pattern_id, record in planned.items():
+            existing = current_patterns.get(pattern_id)
+            compare_record = {key: value for key, value in record.items() if key not in {"step", "run_id", "pattern_revision"}}
+            compare_existing = {key: value for key, value in (existing or {}).items() if key not in {"step", "run_id", "pattern_revision"}}
+            if existing and compare_record == compare_existing:
+                unchanged += 1
+                continue
+            revision += 1
+            row = {"op": "upsert", **record, "revision": revision}
+            rows.append(row)
+            if record.get("status") == "retired":
+                retired += 1
+            elif existing:
+                updated_count += 1
+            else:
+                added += 1
+
+        revision += 1
+        checkpoint = {
+            "op": "checkpoint", "id": coverage_id, "type": "review_checkpoint",
+            "game_id": game_id, "run_id": self.run_id,
+            "review_coverage": list(evidence_ids), "step": int(current_step), "revision": revision,
+        }
+        rows.append(checkpoint)
+        append_many(self.path, rows)
+        self._rows.extend(rows)
+        self.write_view()
+        return {
+            "added": added, "updated": updated_count, "retired": retired,
+            "unchanged": unchanged, "rejected": rejected, "duplicate_review": False,
+        }
+
     def compact(self, max_entries: int = DEFAULT_CONTEXT_ENTRIES, through_step: int | None = None) -> dict[str, Any]:
         """Select a compact prompt view without deleting or rewriting ledger entries."""
         max_entries = int(max_entries)
@@ -278,6 +607,20 @@ class GameMemory:
             raise ValueError("max_entries must be non-negative")
         view = self.read(through_step=through_step)
         all_entries = view["entries"]
+        review = next((entry for entry in reversed(all_entries) if entry.get("type") == "review"), None)
+        if review is not None:
+            selected = [dict(review)] if max_entries else []
+            if selected:
+                selected[0]["claim"] = _without_evidence_citations(selected[0].get("claim", ""))
+                selected[0].pop("evidence_ids", None)
+            return {
+                **view,
+                "count": len(selected),
+                "total_count": len(all_entries),
+                "context_limit": max_entries,
+                "compacted": len(selected) < len(all_entries),
+                "entries": selected,
+            }
         type_priority = {
             "mechanic": 0, "goal": 1, "strategy": 2, "failure": 3,
             "state": 4, "hypothesis": 5, "pattern": 6, "prediction": 7,
@@ -293,6 +636,10 @@ class GameMemory:
         )
         chosen_indices = {index for index, _ in ranked[:max_entries]}
         selected = [entry for index, entry in enumerate(all_entries) if index in chosen_indices]
+        selected = [dict(entry) for entry in selected]
+        for entry in selected:
+            entry["claim"] = _without_evidence_citations(entry.get("claim", ""))
+            entry.pop("evidence_ids", None)
         return {
             **view,
             "count": len(selected),
@@ -379,6 +726,8 @@ class GameMemory:
     ) -> dict[str, Any]:
         """Qualify evidence by run so persistent references cannot collide across runs."""
         stored = dict(patch)
+        if isinstance(stored.get("claim"), str):
+            stored["claim"] = _without_evidence_citations(stored["claim"])
         if not self.run_id:
             return stored
         prior_refs = _as_list(existing.get("evidence_ids")) if existing else []
@@ -433,6 +782,8 @@ class GameMemory:
             return "missing_field: type"
         if entry_type not in ENTRY_TYPES:
             return f"unknown_type: {entry_type}"
+        if entry_type == "review":
+            return "review_entries_are_harness_owned"
         claim = patch.get("claim")
         if not isinstance(claim, str) or not claim.strip():
             return "missing_field: claim"
@@ -539,6 +890,9 @@ class GameMemory:
 
     def render(self, through_step: int | None = None) -> str:
         view = self.read(through_step=through_step)
+        review = next((entry for entry in reversed(view["entries"]) if entry.get("type") == "review"), None)
+        if review is not None:
+            return _without_evidence_citations(str(review.get("claim", ""))) + "\n"
         lines = [
             "# Game memory (generated view)",
             "",
@@ -566,8 +920,6 @@ class GameMemory:
             parts.append(f"[{entry['status']}]")
         parts.append(str(entry.get("claim", "")).strip())
         detail = " ".join(parts)
-        if entry.get("evidence_ids"):
-            detail += f" (evidence: {', '.join(str(value) for value in _as_list(entry['evidence_ids']))})"
         if entry.get("prediction"):
             detail += f"\n  - predicts: {entry['prediction']}"
         if entry.get("falsification"):
@@ -582,8 +934,73 @@ class GameMemory:
 
     def write_view(self, through_step: int | None = None) -> Path:
         self.view_path.parent.mkdir(parents=True, exist_ok=True)
-        self.view_path.write_text(self.render(through_step=through_step), encoding="utf-8")
+        rendered = self.render(through_step=through_step)
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=self.view_path.parent, delete=False,
+            ) as handle:
+                handle.write(rendered)
+                handle.flush()
+                os.fsync(handle.fileno())
+                temp_path = Path(handle.name)
+            os.replace(temp_path, self.view_path)
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink()
         return self.view_path
+
+    def save_review_summary(
+        self,
+        markdown: str,
+        *,
+        evidence_ids: Sequence[str],
+        current_step: int,
+    ) -> dict[str, Any]:
+        """Append the latest consolidated review to the authoritative game ledger."""
+        if not isinstance(markdown, str) or not markdown.strip():
+            raise MemoryValidationError("review Markdown must be non-empty text")
+        if int(current_step) < 0:
+            raise MemoryValidationError("review step must be non-negative")
+        if isinstance(evidence_ids, (str, bytes)) or not isinstance(evidence_ids, Sequence):
+            raise MemoryValidationError("review evidence_ids must be a sequence of strings")
+        if any(not isinstance(value, str) or not value for value in evidence_ids):
+            raise MemoryValidationError("review evidence_ids must contain non-empty strings")
+        qualified_ids = [
+            value if not self.run_id or ":" in value else f"{self.run_id}:{value}"
+            for value in dict.fromkeys(evidence_ids)
+        ]
+        previous_review = self.get(REVIEW_SUMMARY_ID)
+        revision = self.revision()
+        row = {
+            "op": "upsert", "id": REVIEW_SUMMARY_ID, "type": "review",
+            "claim": _without_evidence_citations(markdown), "evidence_ids": qualified_ids,
+            "step": int(current_step), "revision": revision + 1,
+        }
+        if self.run_id:
+            row["run_id"] = self.run_id
+        append_many(self.path, [row])
+        self._rows.append(row)
+        try:
+            self.write_view()
+        except Exception:
+            # The JSONL ledger is authoritative. Append a compensating record
+            # so a failed view save cannot replace the previously usable summary.
+            rollback = (
+                {"op": "upsert", **{
+                    field: value for field, value in previous_review.items()
+                    if field in ENTRY_FIELDS
+                }}
+                if previous_review is not None
+                else {"op": "retire", "id": REVIEW_SUMMARY_ID}
+            )
+            rollback.update({"step": int(current_step), "revision": revision + 2})
+            if self.run_id:
+                rollback["run_id"] = self.run_id
+            append_many(self.path, [rollback])
+            self._rows.append(rollback)
+            raise
+        return dict(row)
 
     @staticmethod
     def migrate_run_ledger(run_dir: Path | str, store_dir: Path | str, game_id: str) -> int:

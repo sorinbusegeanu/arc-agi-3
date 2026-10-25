@@ -1,7 +1,7 @@
 # V10 Implementation Plan — Small Review Addition
 
 **25 October 2026 · Implements DESIGN.md v0.4**  
-**Status:** Planned. Replace the previous broad implementation plan with these three changes.
+**Status:** Implemented. Replaces the previous broad implementation plan with these three changes.
 
 ## 1. Add review triggers to the existing loop
 
@@ -21,7 +21,7 @@
 
 - Build a review prompt from existing MEMORY.md, recorded actions and transformations so far, relevant frames, transition IDs, level/reset boundaries, and outcome feedback.
 - Ask the same model for compact consolidated Markdown covering patterns, useful approaches, failures/exceptions, and uncertain ideas. Use a review-specific response format through the existing client; add only a small per-call format option if necessary. Keep action-call JSON handling unchanged.
-- Require evidence references and distinguish observations from guesses in the prompt.
+- Distinguish observations from guesses in the prompt. Keep evidence references in ledger metadata; exclude them from memory prose and action context.
 - Save a non-empty Markdown result using the existing memory path; preserve previous memory if the call or save fails. No new review schema or promotion rules are needed.
 - Log trigger, covered transitions, result/error, and available usage/latency.
 - Reuse existing persistence and logging utilities. Do not introduce another ledger or a new knowledge framework.
@@ -41,6 +41,13 @@
 
 Limit helper changes to what is needed to connect review, persistence, and action context. Existing unrelated issues do not become prerequisites.
 
-The addition is done when review runs at the requested boundaries, useful findings are saved to MEMORY.md, the next decision receives them, and review failures leave the working agent able to continue.
+The addition is implemented: reviews run at the requested boundaries, validated findings are saved to MEMORY.md, the next decision receives them, and review failures leave the working agent able to continue.
+
+## Verification record
+
+- Focused suite: `PYTHONPATH=src /home/zodrak/cuda_python14_t/bin/python -m pytest -q tests/test_v10_replay.py tests/test_v10_analysis.py tests/test_v10_memory_integrity.py tests/test_v10_live.py` — 69 passed.
+- 50-action run: `runs/v10/ez01_review_v04_50_20261025`. It completed 1/5 levels, triggered a review on level completion after action 2, then used the remaining action budget. Review usage was 4,362 tokens and 23.95 seconds. The model returned the prior legacy memory layout; the code initially accepted it. That malformed review was retired from the authoritative ledger, restoring the previous memory view.
+- Follow-up format check: `runs/v10/ez01_review_format_check_20261025`. Two actions completed one level and triggered a review. The model returned all four required sections; status was saved, with 3,662 tokens and 15.96 seconds review latency.
+- The 50-action result is below the prior 3/5 baseline and does not demonstrate an improvement. The short follow-up validates review formatting and persistence, not game-solving performance.
 
 Do not include unrelated fixes, control changes, mandatory predictions, memory promotion policies, cross-game transfer, new evaluation infrastructure, or architectural refactoring in this task.

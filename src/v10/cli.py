@@ -126,6 +126,10 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--max-actions", type=int, default=30)
     live.add_argument("--max-resets", type=int, default=0)
     live.add_argument("--plan-horizon", type=int, default=4)
+    live.add_argument(
+        "--review-interval", type=int, default=50,
+        help="review experience after this many actions without another review (default: 50)",
+    )
     live.add_argument("--timeout-seconds", type=float, default=300.0)
     live.add_argument("--max-output-tokens", type=int, default=4096)
     live.add_argument(
@@ -214,7 +218,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     env, args.run_dir, client, game_id=args.game_id,
                     seed=args.seed,
                     max_actions=args.max_actions, max_resets=args.max_resets,
-                    plan_horizon=args.plan_horizon, skill_path=args.skill,
+                    plan_horizon=args.plan_horizon, review_interval=args.review_interval,
+                    skill_path=args.skill,
                     state_dir=args.state_dir,
                     memory_context_entries=args.memory_context_entries,
                 )

@@ -346,6 +346,8 @@ def test_strata_client_sends_labeled_images_and_parses_usage(tmp_path: Path) -> 
     }).encode()
 
     class FakeResponse:
+        status = 200
+
         def __enter__(self):
             return self
 
@@ -390,8 +392,13 @@ def test_model_logging_cli_flags_default_off_and_enable_independently() -> None:
 
     assert defaults.log_request is False
     assert defaults.log_response is False
+    assert defaults.review_interval == 50
     assert enabled.log_request is True
     assert enabled.log_response is True
+    configured = parser.parse_args([
+        "live", "--game-id", "ez01", "--run-dir", "run", "--review-interval", "12",
+    ])
+    assert configured.review_interval == 12
 
 
 def test_strata_client_falls_back_when_strata_rejects_json_mode_output(tmp_path: Path) -> None:
@@ -406,6 +413,8 @@ def test_strata_client_falls_back_when_strata_rejects_json_mode_output(tmp_path:
     payloads = []
 
     class FakeResponse:
+        status = 200
+
         def __enter__(self):
             return self
 
@@ -440,6 +449,29 @@ def test_strata_client_falls_back_when_strata_rejects_json_mode_output(tmp_path:
     logged_responses = [json.loads(line) for line in (tmp_path / "model_responses.jsonl").read_text().splitlines()]
     assert len(logged_requests) == len(logged_responses) == 2
     assert [row["status"] for row in logged_responses] == [502, 200]
+
+
+def test_strata_client_can_omit_json_response_format_for_review_markdown(monkeypatch) -> None:
+    payloads = []
+
+    class FakeResponse:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "## Patterns\\nObserved."}}]}).encode()
+
+    def fake_urlopen(request, **kwargs):
+        payloads.append(json.loads(request.data))
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    client = StrataClient("http://strata.example", "qwen-test")
+
+    response = client.complete("review", "return Markdown", response_format=None)
+
+    assert "response_format" not in payloads[0]
+    assert response["content"] == "## Patterns\\nObserved."
 
 
 @pytest.mark.parametrize("body", [
