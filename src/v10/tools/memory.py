@@ -30,8 +30,6 @@ MAX_GLOBAL_MEMORY_MARKDOWN_CHARS = 3_000
 PATTERN_TYPES: tuple[str, ...] = ("mechanic", "strategy", "exception", "hypothesis")
 PATTERN_STATUSES: tuple[str, ...] = ("candidate", "confirmed", "contradicted", "retired")
 STATE_SELECTOR_FIELDS = frozenset({"game_state", "level", "levels_completed", "win_levels", "terminal"})
-CONFIDENCE_PRIOR = 1
-CONFIDENCE_CONFIRMED_THRESHOLD = 0.75
 
 
 def _without_evidence_citations(text: str) -> str:
@@ -135,8 +133,6 @@ ENTRY_TYPES: tuple[str, ...] = (
 MODEL_ENTRY_TYPES: tuple[str, ...] = tuple(kind for kind in ENTRY_TYPES if kind != "review")
 PATCH_OPS: tuple[str, ...] = ("upsert", "retire", "verdict")
 PREDICTION_VERDICTS: tuple[str, ...] = ("pending", "matched", "failed", "inconclusive")
-PROMOTION_STATUSES: tuple[str, ...] = ("supported", "mechanic")
-
 PATCH_FIELDS = frozenset(
     {
         "op",
@@ -144,8 +140,6 @@ PATCH_FIELDS = frozenset(
         "type",
         "claim",
         "status",
-        "evidence_ids",
-        "verified_by",
         "alternatives",
         "prediction",
         "falsification",
@@ -158,9 +152,6 @@ PATCH_FIELDS = frozenset(
         "game_id",
         "pattern_type",
         "applicability_conditions",
-        "supporting_evidence",
-        "contradicting_evidence",
-        "confidence",
         "pattern_revision",
         "state_selector",
         "goal",
@@ -174,7 +165,7 @@ PATCH_FIELDS = frozenset(
         "win_levels",
         "terminal",
         "game_state",
-        "review_coverage",
+        "covered_event_count",
         "run_id",
     }
 )
@@ -212,12 +203,10 @@ class MemoryValidationError(Exception):
 
 def validate_model_patches(
     patches: Any,
-    known_evidence_ids: Iterable[str],
 ) -> None:
     """Validate model patch structure before a decision can be accepted."""
     if not isinstance(patches, list):
         raise MemoryValidationError("memory_patch must be a list")
-    known = {str(value) for value in known_evidence_ids}
     upsert_fields = MODEL_PATCH_FIELDS
     for index, patch in enumerate(patches):
         name = f"memory_patch[{index}]"
@@ -244,14 +233,7 @@ def validate_model_patches(
             )
         if not isinstance(patch.get("claim"), str) or not patch["claim"].strip():
             raise MemoryValidationError(f"{name}.claim must be a non-empty string")
-        if not isinstance(patch.get("evidence_ids"), list) or not patch["evidence_ids"]:
-            raise MemoryValidationError(f"{name}.evidence_ids must be a non-empty list of visible evidence IDs")
-        for evidence_id in patch["evidence_ids"]:
-            if not isinstance(evidence_id, str):
-                raise MemoryValidationError(f"{name}.evidence_ids must contain strings")
-            if evidence_id not in known:
-                raise MemoryValidationError(f"{name}.evidence_ids references unavailable evidence: {evidence_id}")
-        for field in ("alternatives", "exceptions", "verified_by", "related_to"):
+        for field in ("alternatives", "exceptions", "related_to"):
             if field in patch and (
                 not isinstance(patch[field], list)
                 or any(not isinstance(value, str) for value in patch[field])
@@ -283,42 +265,6 @@ def stable_pattern_id(
     return f"P-{digest}"
 
 
-def pattern_confidence(supporting: Sequence[Any], contradicting: Sequence[Any]) -> float:
-    """Deterministic Laplace-smoothed support ratio: (support+1)/(support+contradiction+2)."""
-    support_count = len(set(map(str, supporting)))
-    contradiction_count = len(set(map(str, contradicting)))
-    return round((support_count + CONFIDENCE_PRIOR) / (
-        support_count + contradiction_count + 2 * CONFIDENCE_PRIOR
-    ), 4)
-
-
-def pattern_status(supporting: Sequence[Any], contradicting: Sequence[Any], *, retired: bool = False) -> str:
-    if retired:
-        return "retired"
-    support_count = len(set(map(str, supporting)))
-    contradiction_count = len(set(map(str, contradicting)))
-    confidence = pattern_confidence(supporting, contradicting)
-    if contradiction_count and contradiction_count >= support_count:
-        return "contradicted"
-    if support_count >= 2 and confidence >= CONFIDENCE_CONFIRMED_THRESHOLD:
-        return "confirmed"
-    return "candidate"
-
-
-def _short_evidence_refs(values: Sequence[Any], limit: int = 3) -> str:
-    refs = []
-    for value in dict.fromkeys(map(str, values)):
-        if ":" in value:
-            run_id, evidence_id = value.rsplit(":", 1)
-            display = f"{run_id[:8]}:{evidence_id}"
-        else:
-            display = value
-        refs.append(display)
-    visible = refs[-limit:]
-    suffix = f", +{len(refs) - limit}" if len(refs) > limit else ""
-    return ", ".join(visible) + suffix
-
-
 def _bound_markdown(lines: Sequence[str], maximum: int) -> str:
     text = "\n".join(lines).rstrip() + "\n"
     if len(text) <= maximum:
@@ -330,15 +276,13 @@ def _bound_markdown(lines: Sequence[str], maximum: int) -> str:
 def _pattern_context(entry: Mapping[str, Any]) -> dict[str, Any]:
     context = {
         key: entry[key] for key in (
-            "id", "game_id", "pattern_type", "status", "confidence", "state_selector",
+            "id", "game_id", "pattern_type", "status", "state_selector",
         ) if key in entry
     }
     context["claim"] = _without_evidence_citations(str(entry.get("claim", "")))[:500]
     context["applicability_conditions"] = [
         str(value)[:180] for value in entry.get("applicability_conditions", [])[:4]
     ]
-    context["supporting_evidence_count"] = len(entry.get("supporting_evidence", []))
-    context["contradicting_evidence_count"] = len(entry.get("contradicting_evidence", []))
     for field in ("goal", "action_policy"):
         if entry.get(field):
             context[field] = str(entry[field])[:500]
@@ -358,17 +302,6 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, Sequence) or isinstance(value, Iterable):
         return list(value)
     return [value]
-
-
-def _qualify_pattern_refs(values: Sequence[Any], run_id: str) -> list[str]:
-    result = []
-    for value in values:
-        ref = str(value)
-        if ":" not in ref:
-            ref = f"{run_id}:{ref}"
-        if ref not in result:
-            result.append(ref)
-    return result
 
 
 def _entry_equal(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
@@ -401,8 +334,12 @@ class GameMemory:
     # ------------------------------------------------------------------ ledger
 
     def ledger(self) -> list[dict[str, Any]]:
-        """Every accepted patch ever applied, in apply order (retirements included)."""
-        return [dict(row) for row in self._rows]
+        """Memory revisions in apply order, without legacy evidence metadata."""
+        excluded = {
+            "evidence_ids", "supporting_evidence", "contradicting_evidence",
+            "confidence", "verified_by", "review_coverage",
+        }
+        return [{key: value for key, value in row.items() if key not in excluded} for row in self._rows]
 
     def revision(self) -> int:
         return max((int(row.get("revision", 0)) for row in self._rows), default=0)
@@ -435,16 +372,14 @@ class GameMemory:
                 entry = entries.get(entry_id)
                 if entry is not None:
                     entry["status"] = row.get("status")
-                    if row.get("verified_by"):
-                        entry["verified_by"] = row["verified_by"]
-                    if row.get("evidence_ids"):
-                        prior = _as_list(entry.get("evidence_ids"))
-                        entry["evidence_ids"] = list(dict.fromkeys([*prior, *_as_list(row["evidence_ids"])]))
                 continue
             existing = entries.get(entry_id)
             entry = dict(existing) if existing else {}
             for field in ENTRY_FIELDS:
-                if field in row:
+                if field in row and field not in {
+                    "evidence_ids", "supporting_evidence", "contradicting_evidence",
+                    "confidence", "verified_by",
+                }:
                     entry[field] = row[field]
             entry["id"] = entry_id
             entry["ledger_revision"] = int(row.get("revision", revision))
@@ -518,7 +453,6 @@ class GameMemory:
         selected.sort(key=lambda entry: (
             priority.get(str(entry.get("pattern_type")), 9),
             0 if entry.get("status") == "confirmed" else 1,
-            -float(entry.get("confidence", 0.0)),
             str(entry.get("id", "")),
         ))
         return selected
@@ -552,9 +486,7 @@ class GameMemory:
         }
         if len(signatures) > 1:
             return None
-        pattern, expected = max(matches, key=lambda pair: (
-            float(pair[0].get("confidence", 0.0)), str(pair[0].get("id", "")),
-        ))
+        pattern, expected = min(matches, key=lambda pair: str(pair[0].get("id", "")))
         return {
             "pattern_id": pattern["id"],
             "measurable_prediction": expected["measurable_prediction"],
@@ -564,9 +496,7 @@ class GameMemory:
     def record_pattern_prediction(
         self,
         pattern_id: str,
-        transition_id: str,
         verdict: str,
-        audit_id: str,
         *,
         step: int,
     ) -> dict[str, Any] | None:
@@ -575,26 +505,14 @@ class GameMemory:
         pattern = next((entry for entry in self.patterns(include_retired=True) if entry["id"] == pattern_id), None)
         if pattern is None:
             raise MemoryValidationError(f"unknown pattern: {pattern_id}")
-        if verdict == "inconclusive":
+        if verdict != "failed":
             return None
-        support = list(pattern.get("supporting_evidence", []))
-        contra = list(pattern.get("contradicting_evidence", []))
-        evidence = _qualify_pattern_refs([transition_id], self.run_id or "")
-        target = support if verdict == "matched" else contra
-        if evidence[0] in target:
+        if pattern.get("status") == "contradicted":
             return None
-        target.extend(evidence)
-        support = list(dict.fromkeys(support))
-        contra = list(dict.fromkeys(contra))
         updated = {
             **pattern,
-            "supporting_evidence": support,
-            "contradicting_evidence": contra,
-            "evidence_ids": list(dict.fromkeys([*support, *contra])),
-            "confidence": pattern_confidence(support, contra),
-            "status": pattern_status(support, contra),
+            "status": "contradicted",
             "pattern_revision": int(pattern.get("pattern_revision", 1)) + 1,
-            "verified_by": list(dict.fromkeys([*_as_list(pattern.get("verified_by")), audit_id])),
             "step": int(step), "run_id": self.run_id,
         }
         revision = self.revision() + 1
@@ -627,27 +545,27 @@ class GameMemory:
         return dict(row)
 
     @staticmethod
-    def review_coverage_id(game_id: str, run_id: str, evidence_ids: Sequence[str]) -> str:
-        material = json.dumps([str(game_id), str(run_id), list(map(str, evidence_ids))], separators=(",", ":"))
+    def review_coverage_id(game_id: str, run_id: str, covered_event_count: int) -> str:
+        material = json.dumps([str(game_id), str(run_id), int(covered_event_count)], separators=(",", ":"))
         return "review-checkpoint:" + hashlib.sha256(material.encode()).hexdigest()[:20]
 
-    def has_review_coverage(self, game_id: str, evidence_ids: Sequence[str]) -> bool:
+    def has_review_coverage(self, game_id: str, covered_event_count: int) -> bool:
         if not self.run_id:
             return False
-        coverage = self.review_coverage_id(game_id, self.run_id, evidence_ids)
+        coverage = self.review_coverage_id(game_id, self.run_id, covered_event_count)
         return any(row.get("op") == "checkpoint" and row.get("id") == coverage for row in self._rows)
 
-    def reviewed_evidence_ids(self, game_id: str) -> set[str]:
-        """Evidence covered by the latest checkpoint for this game and run."""
+    def reviewed_event_count(self, game_id: str) -> int:
+        """Number of ordered review events covered by the latest checkpoint."""
         checkpoints = [
             row for row in self._rows
             if row.get("op") == "checkpoint" and row.get("game_id") == str(game_id)
             and row.get("run_id") == self.run_id
         ]
         if not checkpoints:
-            return set()
+            return 0
         latest = max(checkpoints, key=lambda row: int(row.get("revision", 0)))
-        return set(map(str, latest.get("review_coverage", [])))
+        return int(latest.get("covered_event_count", 0))
 
     def retire_legacy_review(self, *, current_step: int) -> bool:
         """Retire the old whole-document review after its findings are structured."""
@@ -668,9 +586,8 @@ class GameMemory:
         changes: Any,
         *,
         game_id: str,
-        evidence_ids: Sequence[str],
         current_step: int,
-        coverage_evidence_ids: Sequence[str] | None = None,
+        covered_event_count: int,
     ) -> dict[str, Any]:
         """Append independent pattern revisions and a successful review checkpoint."""
         if not isinstance(changes, list):
@@ -680,11 +597,16 @@ class GameMemory:
         if self.run_id is None:
             raise MemoryValidationError("pattern review requires a run_id")
         game_id = str(game_id)
-        current_ids = {str(value) for value in evidence_ids}
-        full_coverage = list(coverage_evidence_ids if coverage_evidence_ids is not None else evidence_ids)
-        coverage_id = self.review_coverage_id(game_id, self.run_id, full_coverage)
-        if self.has_review_coverage(game_id, full_coverage):
-            return {"added": 0, "updated": 0, "retired": 0, "unchanged": len(changes), "rejected": [], "duplicate_review": True, "committed": True}
+        covered_event_count = int(covered_event_count)
+        if covered_event_count < 0:
+            raise MemoryValidationError("covered_event_count must be non-negative")
+        coverage_id = self.review_coverage_id(game_id, self.run_id, covered_event_count)
+        if self.has_review_coverage(game_id, covered_event_count):
+            return {
+                "added": 0, "updated": 0, "retired": 0, "unchanged": len(changes),
+                "rejected": [], "duplicate_review": True, "committed": True,
+                "checkpointed": True,
+            }
 
         current_patterns = {entry["id"]: entry for entry in self.patterns(game_id, include_retired=True)}
         planned: dict[str, dict[str, Any]] = {}
@@ -735,14 +657,6 @@ class GameMemory:
             ):
                 rejected.append({"index": index, "pattern_id": pattern_id, "reason": "invalid_state_selector"})
                 continue
-            new_support = raw.get("supporting_evidence", [])
-            new_contra = raw.get("contradicting_evidence", [])
-            if not isinstance(new_support, list) or not isinstance(new_contra, list):
-                rejected.append({"index": index, "pattern_id": pattern_id, "reason": "evidence_refs_must_be_lists"})
-                continue
-            if any(not isinstance(value, str) or value not in current_ids for value in [*new_support, *new_contra]):
-                rejected.append({"index": index, "pattern_id": pattern_id, "reason": "unknown_review_evidence"})
-                continue
             if existing and existing.get("game_id") != game_id:
                 rejected.append({"index": index, "pattern_id": pattern_id, "reason": "game_id_mismatch"})
                 continue
@@ -753,24 +667,20 @@ class GameMemory:
                 rejected.append({"index": index, "pattern_id": stable_id, "reason": "duplicate_pattern_change"})
                 continue
             base = dict(existing or {})
-            prior_support = list(base.get("supporting_evidence", []))
-            prior_contra = list(base.get("contradicting_evidence", []))
-            support = _qualify_pattern_refs([*prior_support, *new_support], self.run_id)
-            contra = _qualify_pattern_refs([*prior_contra, *new_contra], self.run_id)
             if existing and "applicability_conditions" not in raw:
                 conditions = list(existing.get("applicability_conditions", []))
             if existing and "state_selector" not in raw:
                 selector = existing.get("state_selector", {})
-            confidence = pattern_confidence(support, contra)
-            status = pattern_status(support, contra)
+            status = raw.get("status", base.get("status", "candidate"))
+            if status not in {"candidate", "confirmed", "contradicted"}:
+                rejected.append({"index": index, "pattern_id": pattern_id, "reason": "invalid_status"})
+                continue
             record = {
                 **base, "id": stable_id, "type": "pattern", "game_id": game_id,
                 "pattern_type": str(pattern_type), "claim": claim,
                 "applicability_conditions": list(dict.fromkeys(conditions)),
                 "state_selector": dict(selector),
-                "supporting_evidence": support, "contradicting_evidence": contra,
-                "evidence_ids": list(dict.fromkeys([*support, *contra])),
-                "confidence": confidence, "status": status,
+                "status": status,
                 "pattern_revision": int(base.get("pattern_revision", 0)) + 1,
                 "step": int(current_step), "run_id": self.run_id,
             }
@@ -841,17 +751,23 @@ class GameMemory:
             else:
                 added += 1
 
-        if rejected and not rows:
+        if rejected:
+            if rows:
+                append_many(self.path, rows)
+                self._rows.extend(rows)
+                self.write_view()
             return {
-                "added": 0, "updated": 0, "retired": 0, "unchanged": unchanged,
-                "rejected": rejected, "duplicate_review": False, "committed": False,
+                "added": added, "updated": updated_count, "retired": retired,
+                "unchanged": unchanged, "rejected": rejected,
+                "duplicate_review": False, "committed": bool(rows), "checkpointed": False,
             }
 
         revision += 1
         checkpoint = {
             "op": "checkpoint", "id": coverage_id, "type": "review_checkpoint",
             "game_id": game_id, "run_id": self.run_id,
-            "review_coverage": full_coverage, "step": int(current_step), "revision": revision,
+            "covered_event_count": covered_event_count,
+            "step": int(current_step), "revision": revision,
         }
         rows.append(checkpoint)
         append_many(self.path, rows)
@@ -859,7 +775,8 @@ class GameMemory:
         self.write_view()
         return {
             "added": added, "updated": updated_count, "retired": retired,
-            "unchanged": unchanged, "rejected": rejected, "duplicate_review": False, "committed": True,
+            "unchanged": unchanged, "rejected": rejected, "duplicate_review": False,
+            "committed": True, "checkpointed": True,
         }
 
     def compact(
@@ -895,16 +812,16 @@ class GameMemory:
             patterns.sort(key=lambda entry: (
                 {"mechanic": 0, "strategy": 1, "exception": 2, "hypothesis": 3}.get(str(entry.get("pattern_type")), 9),
                 0 if entry.get("status") == "confirmed" else 1,
-                -float(entry.get("confidence", 0.0)), str(entry.get("id", "")),
+                str(entry.get("id", "")),
             ))
         if patterns:
             selected = [_pattern_context(entry) for entry in patterns[:max_entries]]
             for entry in selected:
-                entry.setdefault("supporting_evidence_count", len(entry.get("supporting_evidence", [])))
-                entry.setdefault("contradicting_evidence_count", len(entry.get("contradicting_evidence", [])))
                 entry.pop("supporting_evidence", None)
                 entry.pop("contradicting_evidence", None)
                 entry.pop("evidence_ids", None)
+                entry.pop("confidence", None)
+                entry.pop("verified_by", None)
             return {
                 **view,
                 "count": len(selected),
@@ -919,6 +836,8 @@ class GameMemory:
             if selected:
                 selected[0]["claim"] = _without_evidence_citations(selected[0].get("claim", ""))
                 selected[0].pop("evidence_ids", None)
+                selected[0].pop("verified_by", None)
+                selected[0].pop("confidence", None)
             return {
                 **view,
                 "count": len(selected),
@@ -946,6 +865,8 @@ class GameMemory:
         for entry in selected:
             entry["claim"] = _without_evidence_citations(entry.get("claim", ""))
             entry.pop("evidence_ids", None)
+            entry.pop("verified_by", None)
+            entry.pop("confidence", None)
         return {
             **view,
             "count": len(selected),
@@ -960,19 +881,17 @@ class GameMemory:
     def propose_update(
         self,
         patches: Any,
-        known_evidence_ids: Iterable[str] | None = None,
         current_step: int | None = None,
     ) -> dict[str, Any]:
         """Apply every patch that passes policy checks; report the rest with reasons.
 
-        Promotion to `supported`/`mechanic` requires a matched prediction, so the
-        harness - not the model - controls what counts as a mechanic.
+        Old evidence metadata is not accepted or stored. Prediction audits remain
+        in the run history, separate from reusable game memory.
         """
         if patches is None or isinstance(patches, (str, bytes)) or not isinstance(patches, list):
             raise MemoryValidationError("memory_patch must be a list of patch objects")
         if current_step is not None and int(current_step) < 0:
             raise MemoryValidationError("current_step must be non-negative")
-        known = None if known_evidence_ids is None else {str(value) for value in known_evidence_ids}
         if current_step is None:
             history = History(self.run_dir)
             current_step = history.steps()[-1] if history.count() else 0
@@ -995,19 +914,19 @@ class GameMemory:
             proposed.pop("step", None)
             if self.run_id and isinstance(proposed.get("id"), str):
                 proposed["id"] = id_map.get(proposed["id"], proposed["id"])
-                for field in ("verified_by", "related_to"):
+                for field in ("related_to",):
                     if field in proposed:
                         values = _as_list(proposed[field])
                         mapped = [id_map.get(str(value), str(value)) for value in values]
                         proposed[field] = mapped if isinstance(proposed[field], list) else (mapped[0] if mapped else None)
             if current_step is not None:
                 proposed["step"] = int(current_step)
-            reason = self._reject_reason(proposed, entries, known)
+            reason = self._reject_reason(proposed, entries)
             if reason is not None:
                 rejected.append({"index": index, "id": proposed.get("id"), "reason": reason})
                 continue
             existing = entries.get(proposed["id"])
-            stored = self._stored_patch(proposed, existing, known)
+            stored = self._stored_patch(proposed)
             self._apply(stored, entries, order)
             accepted.append(stored)
 
@@ -1027,34 +946,21 @@ class GameMemory:
     def _stored_patch(
         self,
         patch: dict[str, Any],
-        existing: dict[str, Any] | None,
-        known: set[str] | None,
     ) -> dict[str, Any]:
-        """Qualify evidence by run so persistent references cannot collide across runs."""
+        """Store a clean memory patch with only run metadata."""
         stored = dict(patch)
+        for field in ("evidence_ids", "supporting_evidence", "contradicting_evidence", "confidence", "verified_by"):
+            stored.pop(field, None)
         if isinstance(stored.get("claim"), str):
             stored["claim"] = _without_evidence_citations(stored["claim"])
-        if not self.run_id:
-            return stored
-        prior_refs = _as_list(existing.get("evidence_ids")) if existing else []
-        current_refs = _as_list(stored.get("evidence_ids"))
-        qualified: list[str] = []
-        for evidence_id in [*prior_refs, *current_refs]:
-            ref = str(evidence_id)
-            if known is not None and ref in known and ":" not in ref:
-                ref = f"{self.run_id}:{ref}"
-            if ref not in qualified:
-                qualified.append(ref)
-        if "evidence_ids" in stored or qualified:
-            stored["evidence_ids"] = qualified
-        stored["run_id"] = self.run_id
+        if self.run_id:
+            stored["run_id"] = self.run_id
         return stored
 
     def _reject_reason(
         self,
         patch: dict[str, Any],
         entries: dict[str, dict[str, Any]],
-        known: set[str] | None,
     ) -> str | None:
         op = patch.get("op")
         if op not in PATCH_OPS:
@@ -1066,12 +972,6 @@ class GameMemory:
         entry_id = patch.get("id")
         if not isinstance(entry_id, str) or not entry_id.strip():
             return "missing_field: id"
-
-        evidence_ids = patch.get("evidence_ids")
-        if evidence_ids is not None and known is not None:
-            for evidence_id in _as_list(evidence_ids):
-                if str(evidence_id) not in known:
-                    return f"unknown_evidence_id: {evidence_id}"
 
         if op == "retire":
             if entry_id not in entries:
@@ -1110,16 +1010,6 @@ class GameMemory:
                 return f"duplicate_claim: {other_id}"
 
         status = patch.get("status")
-        if entry_type == "mechanic" or status in PROMOTION_STATUSES:
-            verified_by = _as_list(patch.get("verified_by"))
-            if not verified_by:
-                return "promotion_without_matched_prediction"
-            for prediction_id in verified_by:
-                referenced = entries.get(str(prediction_id))
-                if referenced is None:
-                    return f"unknown_prediction: {prediction_id}"
-                if referenced.get("type") != "prediction" or referenced.get("status") != "matched":
-                    return f"promotion_without_matched_prediction: {prediction_id}"
         return None
 
     def record_prediction_verdict(
@@ -1154,8 +1044,6 @@ class GameMemory:
             raise MemoryValidationError("prediction verdict step cannot precede its audit")
         row = {
             "op": "verdict", "id": stored_prediction_id, "status": verdict,
-            "verified_by": f"{self.run_id}:{audit_evidence_id}" if self.run_id else audit_evidence_id,
-            "evidence_ids": [f"{self.run_id}:{audit_evidence_id}" if self.run_id else audit_evidence_id],
             "revision": revision + 1, "step": recorded_step,
         }
         if self.run_id:
@@ -1236,7 +1124,6 @@ class GameMemory:
         latest_state = max(states, key=lambda entry: int(entry.get("ledger_revision", 0)), default=None)
         lines.append("## 1. Current State")
         if latest_state:
-            run = str(latest_state.get("run_id", "unknown"))[:8]
             values = [
                 f"level {latest_state.get('level', '?')}",
                 f"{latest_state.get('levels_completed', '?')}/{latest_state.get('win_levels', '?')} completed",
@@ -1244,7 +1131,7 @@ class GameMemory:
             ]
             if latest_state.get("terminal"):
                 values.append("terminal")
-            lines.append(f"- From run {run}: " + "; ".join(values) + ".")
+            lines.append("- " + "; ".join(values) + ".")
         else:
             lines.append(_EMPTY_SECTION)
 
@@ -1302,9 +1189,8 @@ class GameMemory:
     def _render_pattern(self, entry: Mapping[str, Any]) -> str:
         pattern_type = entry.get("pattern_type")
         status = entry.get("status", "candidate")
-        confidence = float(entry.get("confidence", 0.5))
         parts = [
-            f"- [{entry.get('id', '?')}] {status}, confidence {confidence:.2f}: "
+            f"- {status}: "
             f"{_without_evidence_citations(str(entry.get('claim', '')))}"
         ]
         conditions = entry.get("applicability_conditions", [])
@@ -1320,15 +1206,6 @@ class GameMemory:
                 if value:
                     rendered = json.dumps(value, ensure_ascii=False, sort_keys=True) if isinstance(value, (dict, list)) else str(value)
                     parts.append(f"  {label}: {rendered}")
-        supporting = _short_evidence_refs(entry.get("supporting_evidence", entry.get("evidence_ids", [])))
-        contradicting = _short_evidence_refs(entry.get("contradicting_evidence", []))
-        refs = []
-        if supporting:
-            refs.append(f"+ {supporting}")
-        if contradicting:
-            refs.append(f"- {contradicting}")
-        if refs:
-            parts.append("  Refs: " + "; ".join(refs))
         return "\n".join(parts)
 
     def _render_entry(self, entry: dict[str, Any]) -> str:
@@ -1341,8 +1218,6 @@ class GameMemory:
             detail += f"\n  - predicts: {entry['prediction']}"
         if entry.get("falsification"):
             detail += f"\n  - falsified by: {entry['falsification']}"
-        if entry.get("verified_by"):
-            detail += f"\n  - verified by: {', '.join(str(value) for value in _as_list(entry['verified_by']))}"
         if entry.get("exceptions"):
             detail += f"\n  - exceptions: {', '.join(str(value) for value in _as_list(entry['exceptions']))}"
         if entry.get("notes"):
@@ -1358,7 +1233,6 @@ class GameMemory:
         self,
         markdown: str,
         *,
-        evidence_ids: Sequence[str],
         current_step: int,
     ) -> dict[str, Any]:
         """Append the latest consolidated review to the authoritative game ledger."""
@@ -1366,19 +1240,11 @@ class GameMemory:
             raise MemoryValidationError("review Markdown must be non-empty text")
         if int(current_step) < 0:
             raise MemoryValidationError("review step must be non-negative")
-        if isinstance(evidence_ids, (str, bytes)) or not isinstance(evidence_ids, Sequence):
-            raise MemoryValidationError("review evidence_ids must be a sequence of strings")
-        if any(not isinstance(value, str) or not value for value in evidence_ids):
-            raise MemoryValidationError("review evidence_ids must contain non-empty strings")
-        qualified_ids = [
-            value if not self.run_id or ":" in value else f"{self.run_id}:{value}"
-            for value in dict.fromkeys(evidence_ids)
-        ]
         previous_review = self.get(REVIEW_SUMMARY_ID)
         revision = self.revision()
         row = {
             "op": "upsert", "id": REVIEW_SUMMARY_ID, "type": "review",
-            "claim": _without_evidence_citations(markdown), "evidence_ids": qualified_ids,
+            "claim": _without_evidence_citations(markdown),
             "step": int(current_step), "revision": revision + 1,
         }
         if self.run_id:
@@ -1428,16 +1294,13 @@ class GameMemory:
             row = dict(original)
             if row.get("id"):
                 row["id"] = f"{legacy_run_id}:{row['id']}"
-            for field in ("verified_by", "related_to"):
+            for field in ("related_to",):
                 if field in row:
                     values = _as_list(row[field])
                     values = [f"{legacy_run_id}:{value}" if str(value) in ids else value for value in values]
                     row[field] = values if isinstance(row[field], list) else (values[0] if values else None)
-            if "evidence_ids" in row:
-                row["evidence_ids"] = [
-                    f"{legacy_run_id}:{value}" if ":" not in str(value) else value
-                    for value in _as_list(row["evidence_ids"])
-                ]
+            for field in ("evidence_ids", "supporting_evidence", "contradicting_evidence", "confidence", "verified_by"):
+                row.pop(field, None)
             row["run_id"] = legacy_run_id
             migrated.append(row)
         append_many(destination, migrated)

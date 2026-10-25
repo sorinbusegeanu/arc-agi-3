@@ -36,6 +36,7 @@ from .tools.memory import (
     save_global_memory,
     shared_skill_path,
 )
+from .tools.solutions import LevelSolutionStore, level_key, state_fingerprint
 
 
 def _parse_content(content: Any) -> Any:
@@ -182,12 +183,12 @@ _REVIEW_SYSTEM_PROMPT = """# V10 incremental memory review
 Review this game's new ordered observations against existing game patterns and shared global memory. Answer two questions: what was learned about this specific game, and what meaningful reusable technique could help solve other games? You do not control the game and must not request actions or resets. Return only a JSON object with a `changes` array, boolean `legacy_memory_migrated`, and complete `global_memory_markdown` text for the shared file. Keep that Markdown under 3000 characters. If no useful global lesson was learned, return the existing global memory unchanged. Do not add global entries for game-specific mechanics.
 
 Each change is one of:
-- An upsert with `operation`, optional existing `pattern_id`, `pattern_type` (`mechanic`, `strategy`, `exception`, or `hypothesis`), a concise `claim`, optional `applicability_conditions`, optional `state_selector`, and only newly observed `supporting_evidence` / `contradicting_evidence` IDs from this review's events.
+- An upsert with `operation`, optional existing `pattern_id`, `pattern_type` (`mechanic`, `strategy`, `exception`, or `hypothesis`), `status` (`candidate`, `confirmed`, or `contradicted`), a concise `claim`, `applicability_conditions` as a list of strings, and `state_selector` as an object.
 - A retirement with `operation: "retire"` and an existing `pattern_id`.
 
-When revising an existing pattern, reuse its ID. Use distinct conditional variants when different conditions explain different outcomes; retire or supersede a broad pattern only when justified. Include evidence references only in the structured evidence arrays, never in prose. Do not invent facts or confidence/status values; the harness computes confidence and status deterministically.
+When revising an existing pattern, reuse its ID. Use distinct conditional variants when different conditions explain different outcomes; retire or supersede a broad pattern only when justified. Choose status from the observations: use `confirmed` for a directly established rule, `candidate` when uncertain, and `contradicted` when the observations disprove the claim.
 
-For useful successful action sequences, use `pattern_type: "strategy"` and provide `goal`, `preconditions` (string list), `action_policy`, `expected_observations`, and `success_conditions` (string list). Each expected observation has `action`, optional `state_selector` over game_state/level/levels_completed/terminal, and a measurable prediction in the supported all-of predicate format. Do not produce strategies that are not supported by a successful transition.
+For useful successful action sequences, use `pattern_type: "strategy"` and provide `goal`, `preconditions` (string list), `action_policy`, `expected_observations`, and `success_conditions` (string list). Each expected observation has `action`, optional object-valued `state_selector` over game_state/level/levels_completed/terminal, and `measurable_prediction` in this exact format: `{"all":[{"path":"measurements.changed_pixels","op":"gt","value":0}]}`. Each predicate has exactly `path`, `op`, and `value`; use only supported paths and operators. Do not use a prose `prediction` field. Do not produce strategies that are not supported by a successful transition.
 
 Distinguish direct observations from explanations. Direction words name commands; infer movement from frames and measurements. Keep game claims specific and concise. Global lessons must be broadly reusable and actionable, such as tracking objects separately when they move together, testing action effects systematically, reading progress indicators, comparing frames, exploring efficiently, or accounting for tool limitations. Merge equivalent lessons, refine or correct contradictions using the new experience, and omit unsupported or trivial lessons. Global Markdown has no evidence references, scores, or per-pattern records. Return the existing global Markdown unchanged when there is no meaningful update. Return `{"changes": [], "legacy_memory_migrated": true, "global_memory_markdown": "# Global Memory\\n"}` when no useful prior game memory or global lesson exists."""
 
@@ -211,19 +212,32 @@ def _validate_review_payload(value: Any) -> tuple[list[dict[str, Any]], bool, st
     return [dict(change) for change in changes], legacy_migrated, global_memory
 
 
+def _review_repair_prompt(base_prompt: str, errors: Any) -> str:
+    """Ask for only malformed review changes to be corrected in the same contract."""
+    return (
+        base_prompt
+        + "\n\nYour prior response had review validation errors. Correct only the rejected changes; "
+        "do not repeat changes that were accepted. Return the corrected JSON review object. "
+        "Use `applicability_conditions` as a string list, `state_selector` as an object, and each "
+        "expected observation's `measurable_prediction` as an all-of predicate object, never prose. "
+        "Return only fields supported by the review schema.\n"
+        "Validation errors:\n" + json.dumps(errors, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
 def _review_events(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for row in records:
         kind = row.get("type")
         if kind == "state":
             events.append({
-                "type": "initial_state", "evidence_id": row.get("evidence_id"),
+                "type": "initial_state",
                 "level": row.get("level"), "levels_completed": row.get("levels_completed"),
                 "reset_generation": row.get("reset_generation"), "game_state": row.get("game_state"),
             })
         elif kind == "reset":
             events.append({
-                "type": "reset_boundary", "evidence_id": row.get("evidence_id"),
+                "type": "reset_boundary",
                 "level": row.get("level"), "levels_completed": row.get("levels_completed"),
                 "reset_generation": row.get("reset_generation"),
                 "justification": row.get("justification"),
@@ -231,21 +245,21 @@ def _review_events(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
         elif kind == "audit":
             if row.get("kind") == "pattern_prediction":
                 events.append({
-                    "type": "pattern_prediction", "evidence_id": row.get("evidence_id"),
-                    "pattern_id": row.get("pattern_id"), "transition_id": row.get("transition_id"),
+                    "type": "pattern_prediction",
+                    "pattern_id": row.get("pattern_id"),
                     "verdict": row.get("verdict"), "action": model_action_name(row.get("action")),
                     "expected": row.get("expected"), "actual": row.get("actual"),
                     "reason": row.get("reason"), "reset_generation": row.get("reset_generation"),
                 })
             else:
                 events.append({
-                    "type": "action_error", "evidence_id": row.get("evidence_id"),
+                    "type": "action_error",
                     "kind": row.get("kind"), "action": model_action_name(row.get("action")),
                     "error": row.get("error"), "reset_generation": row.get("reset_generation"),
                 })
         elif kind == "transition":
             events.append({
-                "type": "transition", "evidence_id": row.get("evidence_id"),
+                "type": "transition",
                 "action": model_action_name(row.get("action")), "args": row.get("args", {}),
                 "measurements": row.get("measurements"), "result": row.get("result"),
                 "level": row.get("level"), "levels_completed": row.get("levels_completed"),
@@ -299,7 +313,6 @@ def _review_frame_selection(
     image_labels: list[str] = []
     for index in selected:
         row = transitions[index]
-        evidence_id = str(row.get("evidence_id", f"transition-{index + 1}"))
         pair = []
         for field, label in (("pre_frame_image_id", "before"), ("post_frame_image_id", "after")):
             image_id = row.get(field)
@@ -307,7 +320,7 @@ def _review_frame_selection(
             if entry is None or entry.get("kind") != IMAGE_KIND:
                 pair = []
                 break
-            pair.append((frames.path_of(str(image_id)), f"{label.title()} frame for {evidence_id}"))
+            pair.append((frames.path_of(str(image_id)), f"{label.title()} frame for transition {index + 1}"))
         for path, label in pair:
             image_paths.append(path)
             image_labels.append(label)
@@ -324,19 +337,17 @@ def _perform_review(
     trigger_reasons: Sequence[str],
 ) -> dict[str, Any]:
     """Review the frozen run prefix and persist a consolidated Markdown summary."""
-    transition_ids: list[str] = []
-    first_id: str | None = None
-    last_id: str | None = None
+    transition_count = 0
     image_labels: list[str] = []
     usage: dict[str, Any] = {}
     latency = 0.0
     attempts = 0
+    repair_history: list[dict[str, Any]] = []
+    applied: dict[str, Any] = {"rejected": [], "committed": False, "checkpointed": False}
     try:
         records = tools.history.records()
         transitions = [row for row in records if row.get("type") == "transition"]
-        transition_ids = [str(row["evidence_id"]) for row in transitions if row.get("evidence_id")]
-        first_id = transition_ids[0] if transition_ids else None
-        last_id = transition_ids[-1] if transition_ids else None
+        transition_count = len(transitions)
         memory = GameMemory(tools.run_dir, store_dir=memory_store_dir, run_id=run_id, game_id=game_id)
         memory_text = memory.write_view().read_text(encoding="utf-8")
         state_root = memory_store_dir.parent.parent
@@ -344,35 +355,22 @@ def _perform_review(
         legacy_review = memory.get("review:latest")
         legacy_review_text = str(legacy_review.get("claim", "")) if legacy_review else ""
         events = _review_events(records)
-        review_evidence_ids = list(dict.fromkeys(
-            str(event["evidence_id"]) for event in events
-            if event.get("evidence_id")
-        ))
-        if memory.has_review_coverage(game_id, review_evidence_ids):
+        covered_event_count = len(events)
+        if memory.has_review_coverage(game_id, covered_event_count):
             row = {
-                "schema": "v10.live_review/2", "status": "skipped_duplicate_evidence",
+                "schema": "v10.live_review/2", "status": "skipped_duplicate_review",
                 "trigger_reasons": list(trigger_reasons), "through_action": tools.action_count,
-                "covered_transitions": {"count": len(transition_ids), "first": first_id, "last": last_id},
+                "covered_transition_count": transition_count,
                 "selected_image_labels": [], "request_attempts": 0, "usage": {},
                 "latency_seconds": 0.0, "duplicate_review": True,
             }
             append_jsonl(tools.run_dir / "reviews.jsonl", row)
             return {"row": row, "attempts": 0, "usage": {}, "latency_seconds": 0.0}
-        prior_coverage = memory.reviewed_evidence_ids(game_id)
-        new_events = [
-            event for event in events
-            if not event.get("evidence_id") or str(event["evidence_id"]) not in prior_coverage
-        ]
-        new_evidence_ids = list(dict.fromkeys(
-            str(event["evidence_id"]) for event in new_events
-            if event.get("evidence_id")
-        ))
+        prior_event_count = min(memory.reviewed_event_count(game_id), len(events))
+        new_events = events[prior_event_count:]
         frames = FrameStore(tools.run_dir)
-        new_transition_ids = set(new_evidence_ids)
-        new_transitions = [
-            transition for transition in transitions
-            if str(transition.get("evidence_id", "")) in new_transition_ids
-        ]
+        previous_transition_count = sum(event.get("type") == "transition" for event in events[:prior_event_count])
+        new_transitions = transitions[previous_transition_count:]
         image_paths, image_labels = _review_frame_selection(new_transitions, frames)
         legacy_review_text = legacy_review_text[:4_000]
         patterns = [
@@ -380,9 +378,6 @@ def _perform_review(
                 "pattern_id": entry["id"], "pattern_type": entry.get("pattern_type"),
                 "claim": entry.get("claim"), "applicability_conditions": entry.get("applicability_conditions", []),
                 "state_selector": entry.get("state_selector", {}), "status": entry.get("status"),
-                "confidence": entry.get("confidence"),
-                "support_count": len(entry.get("supporting_evidence", [])),
-                "contradiction_count": len(entry.get("contradicting_evidence", [])),
                 **{
                     key: entry[key] for key in (
                         "goal", "preconditions", "action_policy", "expected_observations", "success_conditions",
@@ -394,9 +389,9 @@ def _perform_review(
         user_prompt = (
             f"Review all recorded experience for game {game_id} through action {tools.action_count}. "
             f"This review was triggered by: {', '.join(trigger_reasons)}. "
-            "Update only patterns affected by observations since their last review. Add only new evidence IDs; never repeat an ID already attached to a pattern. "
-            "When evidence conflicts, consider whether applicability conditions distinguish the observations; refine or split patterns if supported. "
-            "Keep evidence IDs in the structured evidence arrays only.\n\n"
+            "Update only patterns affected by observations since their last review. "
+            "When observations conflict, consider whether applicability conditions distinguish them; refine or split patterns if supported. "
+            "Use the supplied observations directly.\n\n"
             "Existing patterns (authoritative ledger projection):\n"
             + json.dumps(patterns, ensure_ascii=False, separators=(",", ":")) + "\n\n"
             "Existing MEMORY.md view (legacy content may be migrated into patterns):\n"
@@ -404,28 +399,66 @@ def _perform_review(
             "Current shared global/MEMORY.md (reusable cross-game techniques only):\n"
             + (shared_memory or "(no global lessons stored yet)") + "\n\n"
             "Prior unstructured review, if any (bounded to 4000 characters):\n" + legacy_review_text + "\n\n"
-            "New ordered run observations since the last review checkpoint (evidence IDs are valid only in the evidence arrays):\n"
+            "New ordered run observations since the last review checkpoint:\n"
             + json.dumps(new_events, ensure_ascii=False, separators=(",", ":"))
         )
-        attempts = 1
-        response = client.complete(
-            _REVIEW_SYSTEM_PROMPT, user_prompt, image_paths, image_labels,
-            response_format="json_object",
+        responses: list[dict[str, Any]] = []
+        applied_totals = {"added": 0, "updated": 0, "retired": 0, "unchanged": 0}
+        changes: list[dict[str, Any]] = []
+        legacy_migrated = False
+        global_memory_markdown: str | None = None
+        review_prompt = user_prompt
+        for repair_index in range(2):
+            attempts += 1
+            try:
+                response = client.complete(
+                    _REVIEW_SYSTEM_PROMPT, review_prompt, image_paths, image_labels,
+                    response_format="json_object",
+                )
+            except StrataRequestError as exc:
+                attempts += max(0, int(getattr(exc, "request_attempts", 1)) - 1)
+                raise
+            responses.append(response)
+            attempts += max(0, int(response.get("request_attempts", 1)) - 1)
+            latency += float(response.get("latency_seconds", 0.0))
+            usage = _sum_usage(responses)
+            content = response.get("content")
+            try:
+                if response.get("finish_reason") == "length":
+                    raise ValueError("review response was truncated at the output-token limit")
+                changes, legacy_migrated, global_memory_markdown = _validate_review_payload(
+                    _parse_content(content)
+                )
+            except (DecisionValidationError, ValueError) as exc:
+                repair_history.append({"attempt": repair_index + 1, "error": str(exc)})
+                if repair_index == 0:
+                    review_prompt = _review_repair_prompt(user_prompt, str(exc))
+                    continue
+                raise
+
+            applied = memory.apply_review_changes(
+                changes, game_id=game_id, current_step=tools.action_count,
+                covered_event_count=covered_event_count,
+            )
+            for key in applied_totals:
+                applied_totals[key] += int(applied.get(key, 0))
+            if applied.get("rejected") and repair_index == 0:
+                repair_history.append({"attempt": repair_index + 1, "rejected": applied["rejected"]})
+                review_prompt = _review_repair_prompt(
+                    user_prompt,
+                    applied["rejected"],
+                )
+                continue
+            break
+
+        if not applied_totals["added"] and not applied_totals["updated"] and not applied_totals["retired"] and not applied.get("checkpointed") and not applied.get("rejected"):
+            raise ValueError("review did not produce a completed change set")
+        if not applied.get("rejected") and not applied.get("checkpointed"):
+            raise ValueError("review changes were not checkpointed")
+        legacy_review_retired = (
+            memory.retire_legacy_review(current_step=tools.action_count)
+            if legacy_migrated and applied.get("checkpointed") else False
         )
-        usage = dict(response.get("usage", {}))
-        latency = float(response.get("latency_seconds", 0.0))
-        attempts = max(1, int(response.get("request_attempts", 1)))
-        content = response.get("content")
-        if response.get("finish_reason") == "length":
-            raise ValueError("review response was truncated at the output-token limit")
-        changes, legacy_migrated, global_memory_markdown = _validate_review_payload(_parse_content(content))
-        applied = memory.apply_review_changes(
-            changes, game_id=game_id, evidence_ids=new_evidence_ids,
-            current_step=tools.action_count, coverage_evidence_ids=review_evidence_ids,
-        )
-        if not applied.get("committed", True):
-            raise ValueError(f"review contained no valid changes: {applied['rejected']}")
-        legacy_review_retired = memory.retire_legacy_review(current_step=tools.action_count) if legacy_migrated else False
         global_memory_updated = False
         global_memory_error = None
         if global_memory_markdown is not None:
@@ -434,6 +467,7 @@ def _perform_review(
             except (OSError, ValueError) as exc:
                 global_memory_error = f"{type(exc).__name__}: {exc}"
         canonical = json.dumps(changes, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        final_usage = _sum_usage(responses)
         row = {
             "schema": "v10.live_review/2",
             "status": (
@@ -442,15 +476,17 @@ def _perform_review(
             ),
             "trigger_reasons": list(trigger_reasons),
             "through_action": tools.action_count,
-            "covered_transitions": {"count": len(transition_ids), "first": first_id, "last": last_id},
+            "covered_transition_count": transition_count,
             "selected_image_labels": image_labels,
             "model": response.get("model", getattr(client, "model", None)),
-            "request_attempts": attempts, "usage": usage,
+            "request_attempts": attempts, "usage": final_usage,
             "latency_seconds": round(latency, 6),
             "memory_revision": memory.revision(), "memory_path": str(memory.view_path),
-            "patterns_added": applied["added"], "patterns_updated": applied["updated"],
-            "patterns_retired": applied["retired"], "unchanged_patterns": applied["unchanged"],
+            "patterns_added": applied_totals["added"], "patterns_updated": applied_totals["updated"],
+            "patterns_retired": applied_totals["retired"], "unchanged_patterns": applied_totals["unchanged"],
             "rejected_changes": applied["rejected"], "duplicate_review": applied["duplicate_review"],
+            "review_checkpoint_saved": bool(applied.get("checkpointed")),
+            "repair_history": repair_history,
             "legacy_memory_migrated": legacy_migrated, "legacy_review_retired": legacy_review_retired,
             "global_memory_path": str(global_memory_path(state_root)),
             "global_memory_updated": global_memory_updated,
@@ -467,10 +503,12 @@ def _perform_review(
         row = {
             "schema": "v10.live_review/2", "status": "failed", "trigger_reasons": list(trigger_reasons),
             "through_action": tools.action_count,
-            "covered_transitions": {"count": len(transition_ids), "first": first_id, "last": last_id},
+            "covered_transition_count": transition_count,
             "selected_image_labels": image_labels,
             "request_attempts": attempts, "usage": usage,
             "latency_seconds": round(latency, 6),
+            "review_checkpoint_saved": bool(applied.get("checkpointed")),
+            "repair_history": repair_history,
             "error": f"{type(exc).__name__}: {exc}",
         }
     append_jsonl(tools.run_dir / "reviews.jsonl", row)
@@ -493,11 +531,6 @@ def _live_context(
         if row.get("type") == "transition"
         and int(row.get("reset_generation", 0)) == int(tools.reset_generation)
     ][-horizon:]
-    first = next((row for row in records if row.get("type") == "state"), None)
-    visible_ids = {str(current["evidence_id"])} if current.get("evidence_id") else set()
-    if first and first.get("evidence_id"):
-        visible_ids.add(str(first["evidence_id"]))
-    visible_ids.update(str(row["evidence_id"]) for row in transitions if row.get("evidence_id"))
     legal_actions = _public_actions(current.get("legal_actions", []))
     if tools.reset_count < tools.max_resets:
         legal_actions.append({
@@ -578,7 +611,6 @@ def _live_context(
     return {
         "system_prompt": system_prompt, "user_prompt": prompt, "context": context,
         "image_paths": image_paths, "image_labels": image_labels,
-        "visible_evidence_ids": visible_ids,
         "legal_action_specs": legal_actions, "visible_step": visible_step,
         "skill_sha256": hashlib.sha256(skill_path.read_bytes()).hexdigest(),
     }
@@ -624,10 +656,16 @@ def run_live(
         "seed": int(seed), "skill_sha256": skill_sha256,
         "persistent_memory_dir": str(memory_store_dir),
         "global_memory_path": str(global_memory_path(state_root)),
+        "level_solutions_path": str(memory_store_dir / "level_solutions.jsonl"),
     })
     tools = GameTools(env, destination, max_actions=max_actions, max_resets=max_resets)
     current = tools.observe()
     memory.record_run_state(game_id, current, step=tools.action_count)
+    solution_store = LevelSolutionStore(memory_store_dir / "level_solutions.jsonl", game_id)
+    level_start_observation: Mapping[str, Any] = dict(current)
+    level_path_edges: list[dict[str, Any]] = []
+    cached_solution_plans = 0
+    cached_solution_actions = 0
     model_calls = 0
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     action_usage = dict(total_usage)
@@ -670,6 +708,9 @@ def run_live(
             "levels_completed": current.get("levels_completed"), "win_levels": current.get("win_levels"),
             "game_state": state, "terminal": terminal, "won": state == "WIN",
             "interrupted_plans": interrupted_plans, "stop_reason": stop_reason,
+            "cached_solution_plans": cached_solution_plans,
+            "cached_solution_actions": cached_solution_actions,
+            "available_level_solutions": len(solution_store.solutions()),
             "memory_entries": GameMemory(
                 destination, store_dir=memory_store_dir, run_id=run_id, game_id=game_id,
             ).read().get("count", 0),
@@ -691,54 +732,107 @@ def run_live(
             file=sys.stderr, flush=True,
         )
 
+    def learn_transition(
+        before: Mapping[str, Any], action: Mapping[str, Any], result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        nonlocal level_start_observation, level_path_edges
+        after = result["observation"]
+        edge = solution_store.record_transition(
+            before, str(action["action"]), action.get("args", {}), after,
+            run_id=run_id,
+        )
+        level_path_edges.append(edge)
+        previous_completed = before.get("levels_completed")
+        current_completed = after.get("levels_completed")
+        completed = (
+            previous_completed is not None and current_completed is not None
+            and int(current_completed) > int(previous_completed)
+        )
+        won = str(after.get("game_state", "")).upper() == "WIN"
+        if completed or won:
+            solution_store.record_successful_trajectory(
+                level_start_observation, level_path_edges, run_id=run_id,
+                success="win" if won else "level_completed",
+            )
+            level_start_observation = dict(after)
+            level_path_edges = []
+        elif level_key(before) != level_key(after):
+            # A nonterminal level discontinuity is not a completed route.
+            level_start_observation = dict(after)
+            level_path_edges = []
+        return edge
+
     update_metrics()
     progress(f"started game={game_id}")
     try:
         while tools.action_count < tools.max_actions and not current.get("terminal"):
-            inputs = _live_context(
-                tools, current, game_id, int(plan_horizon), source_skill,
-                memory_store_dir, run_id, int(memory_context_entries),
-            )
+            known_path = solution_store.shortest_known_solution(current)
+            solution_edges = known_path[:plan_horizon] if known_path else []
             responses: list[dict[str, Any]] = []
             validation_error: str | None = None
+            cached_path_error: str | None = None
             decision: dict[str, Any] | None = None
-            for attempt in range(2):
-                model_calls += 1
-                try:
-                    response = client.complete(
-                        inputs["system_prompt"], inputs["user_prompt"],
-                        inputs["image_paths"], inputs["image_labels"],
-                    )
-                except StrataRequestError as exc:
-                    model_calls += max(0, int(getattr(exc, "request_attempts", 1)) - 1)
-                    total_latency += float(getattr(exc, "latency_seconds", 0.0))
-                    raise
-                model_calls += max(0, int(response.get("request_attempts", 1)) - 1)
-                responses.append(response)
-                for key in total_usage:
-                    value = response.get("usage", {}).get(key)
-                    if value is not None:
-                        total_usage[key] += int(value)
-                        action_usage[key] += int(value)
-                total_latency += float(response.get("latency_seconds", 0.0))
+            if solution_edges:
+                inputs = {
+                    "skill_sha256": skill_sha256,
+                    "image_labels": [],
+                    "legal_action_specs": current.get("legal_actions", []),
+                }
+                cached_decision = {"actions": [
+                    {"action": edge["action"], "args": edge.get("args", {})}
+                    for edge in solution_edges
+                ]}
                 try:
                     decision = validate_model_decision(
-                        _parse_content(response.get("content")), inputs["legal_action_specs"],
-                        max_actions=plan_horizon,
+                        cached_decision, inputs["legal_action_specs"], max_actions=plan_horizon,
                     )
-                    break
                 except (DecisionValidationError, ActionError) as exc:
-                    # Never retain a partially accepted candidate across repair.
-                    decision = None
-                    validation_error = str(exc)
-                    if attempt == 0:
-                        inputs["user_prompt"] = _decision_repair_prompt(
-                            inputs["user_prompt"], validation_error,
+                    # A stored edge may no longer be legal; ask the model from the current state.
+                    cached_path_error = f"cached path is no longer valid: {exc}"
+                    solution_edges = []
+            if not solution_edges:
+                validation_error = None
+                inputs = _live_context(
+                    tools, current, game_id, int(plan_horizon), source_skill,
+                    memory_store_dir, run_id, int(memory_context_entries),
+                )
+                for attempt in range(2):
+                    model_calls += 1
+                    try:
+                        response = client.complete(
+                            inputs["system_prompt"], inputs["user_prompt"],
+                            inputs["image_paths"], inputs["image_labels"],
                         )
+                    except StrataRequestError as exc:
+                        model_calls += max(0, int(getattr(exc, "request_attempts", 1)) - 1)
+                        total_latency += float(getattr(exc, "latency_seconds", 0.0))
+                        raise
+                    model_calls += max(0, int(response.get("request_attempts", 1)) - 1)
+                    responses.append(response)
+                    for key in total_usage:
+                        value = response.get("usage", {}).get(key)
+                        if value is not None:
+                            total_usage[key] += int(value)
+                            action_usage[key] += int(value)
+                    total_latency += float(response.get("latency_seconds", 0.0))
+                    try:
+                        decision = validate_model_decision(
+                            _parse_content(response.get("content")), inputs["legal_action_specs"],
+                            max_actions=plan_horizon,
+                        )
+                        break
+                    except (DecisionValidationError, ActionError) as exc:
+                        # Never retain a partially accepted candidate across repair.
+                        decision = None
+                        validation_error = str(exc)
+                        if attempt == 0:
+                            inputs["user_prompt"] = _decision_repair_prompt(
+                                inputs["user_prompt"], validation_error,
+                            )
             if decision is None:
                 append_jsonl(decisions_path, {
                     "schema": "v10.live_decision/2", "status": "rejected",
-                    "game_id": game_id, "visible_evidence_ids": sorted(inputs["visible_evidence_ids"]),
+                    "game_id": game_id,
                     "validation_error": validation_error, "repair_attempted": len(responses) > 1,
                     "model": responses[-1].get("model"), "usage": _sum_usage(responses),
                     "request_attempts": sum(int(item.get("request_attempts", 1)) for item in responses),
@@ -754,44 +848,61 @@ def run_live(
                     })
                     break
                 action_number = tools.action_count + 1
+                fallback_name = model_action_name(fallback["action"])
                 progress(
                     f"decision invalid after repair; taking random legal fallback action "
-                    f"{action_number}: {fallback['action']}"
+                    f"{action_number}: {fallback_name}"
                 )
-                result = tools.act(fallback["action"], fallback["args"])
+                before_observation = current
+                result = tools.act(
+                    fallback["action"], fallback["args"], action_name=fallback_name,
+                )
                 current = result["observation"]
+                learn_transition(before_observation, fallback, result)
                 memory.record_run_state(game_id, current, step=tools.action_count)
                 append_jsonl(decisions_path, {
                     "schema": "v10.live_fallback/2", "status": "executed",
                     "cause": "invalid_decision", "validation_error": validation_error,
-                    "action": fallback["action"], "args": fallback["args"],
+                    "action": fallback_name, "args": fallback["args"],
                     "evidence_id": result["evidence"]["evidence_id"],
                 })
                 progress(
-                    f"fallback action {tools.action_count}: {fallback['action']} -> "
+                    f"fallback action {tools.action_count}: {fallback_name} -> "
                     f"{current.get('game_state', '?')}; observation captured"
                 )
                 update_metrics()
                 continue
 
+            logged_decision = {
+                **decision,
+                "actions": [
+                    {**item, "action": model_action_name(item["action"])}
+                    for item in decision["actions"]
+                ],
+            }
             decision_row = {
                 "schema": "v10.live_decision/2", "status": "accepted",
                 "game_id": game_id, "decision_schema": DECISION_SCHEMA,
                 "prompt_version": "v10.live_prompt/3", "skill_sha256": inputs["skill_sha256"],
-                "model": responses[-1].get("model"),
-                "visible_evidence_ids": sorted(inputs["visible_evidence_ids"]),
-                "input_image_labels": inputs["image_labels"], "decision": decision,
+                "model": responses[-1].get("model") if responses else None,
+                "source": "verified_level_path" if solution_edges else "model",
+                "cached_path_edge_ids": [edge["id"] for edge in solution_edges],
+                "cached_path_error": cached_path_error,
+                "input_image_labels": inputs["image_labels"], "decision": logged_decision,
                 "repair_attempted": len(responses) > 1,
                 "initial_validation_error": validation_error, "usage": _sum_usage(responses),
                 "request_attempts": sum(int(item.get("request_attempts", 1)) for item in responses),
                 "latency_seconds": round(sum(float(item.get("latency_seconds", 0.0)) for item in responses), 6),
             }
+            if solution_edges:
+                cached_solution_plans += 1
+                progress(f"replaying verified known path ({len(solution_edges)} actions in this plan)")
             append_jsonl(decisions_path, decision_row)
 
             plan = decision
             progress(
                 f"decision ready in {decision_row['latency_seconds']:.1f}s; "
-                f"planned={[item['action'] for item in plan['actions']]}"
+                f"planned={[model_action_name(item['action']) for item in plan['actions']]}"
             )
             reset_action = next((item for item in plan["actions"] if item["action"] == "RESET"), None)
             if reset_action is not None:
@@ -802,6 +913,8 @@ def run_live(
                     append_jsonl(decisions_path, {"schema": "v10.live_plan_result/2", "status": stop_reason})
                     break
                 current = reset_result["observation"]
+                level_start_observation = dict(current)
+                level_path_edges = []
                 progress("reset executed")
                 interrupted_plans += 1
                 append_jsonl(decisions_path, {
@@ -818,9 +931,14 @@ def run_live(
 
             executed: list[dict[str, Any]] = []
             interruption: str | None = None
-            for action in actions[:plan_horizon]:
+            for action_index, action in enumerate(actions[:plan_horizon]):
                 if tools.action_count >= tools.max_actions:
                     interruption = "action_budget_exhausted"
+                    break
+                expected_cached_edge = solution_edges[action_index] if solution_edges else None
+                if expected_cached_edge and state_fingerprint(current) != expected_cached_edge["source_state"]:
+                    interruption = "solution_diverged"
+                    progress("cached path state mismatch; returning to model decisions")
                     break
                 legal_now = {item.get("id") for item in _public_actions(current.get("legal_actions", []))}
                 if action["action"] not in legal_now:
@@ -832,11 +950,13 @@ def run_live(
                     destination, store_dir=memory_store_dir, run_id=run_id, game_id=game_id,
                 )
                 expected_pattern = prediction_memory.expected_observation(game_id, current, action["action"])
+                before_observation = current
                 try:
                     next_number = tools.action_count + 1
-                    progress(f"taking action {next_number}: {action['action']}")
+                    action_name = model_action_name(action["action"])
+                    progress(f"taking action {next_number}: {action_name}")
                     result = tools.act(
-                        action["action"], action.get("args", {}),
+                        action["action"], action.get("args", {}), action_name=action_name,
                     )
                 except (ActionError, BudgetExceeded) as exc:
                     interruption = "action_error" if isinstance(exc, ActionError) else "action_budget_exhausted"
@@ -846,6 +966,12 @@ def run_live(
                     })
                     break
                 current = result["observation"]
+                observed_edge = learn_transition(before_observation, action, result)
+                if expected_cached_edge:
+                    cached_solution_actions += 1
+                    if observed_edge["target_state"] != expected_cached_edge["target_state"]:
+                        interruption = "solution_diverged"
+                        progress("cached path observation differed; returning to model decisions")
                 changed_pixels = (result.get("measurements") or {}).get("changed_pixels")
                 if changed_pixels == 0:
                     consecutive_unchanged_actions += 1
@@ -856,10 +982,13 @@ def run_live(
                 )
                 memory.record_run_state(game_id, current, step=tools.action_count)
                 progress(
-                    f"action {tools.action_count}: {action['action']} -> "
+                    f"action {tools.action_count}: {model_action_name(action['action'])} -> "
                     f"{current.get('game_state', '?')}"
                 )
-                executed_action = {"evidence_id": result["evidence"]["evidence_id"]}
+                executed_action = {
+                    "action": model_action_name(action["action"]),
+                    "evidence_id": result["evidence"]["evidence_id"],
+                }
                 prediction_failed = False
                 if expected_pattern is not None:
                     actual = {
@@ -874,13 +1003,13 @@ def run_live(
                         "type": "audit", "kind": "pattern_prediction",
                         "pattern_id": expected_pattern["pattern_id"],
                         "transition_id": result["evidence"]["evidence_id"],
-                        "action": action["action"], "expected": expected_pattern["expected_observation"],
+                        "action": action_name,
+                        "expected": expected_pattern["expected_observation"],
                         "actual": actual, "verdict": verdict, "reason": verdict_row.get("reason"),
                         "reset_generation": tools.reset_generation,
                     })
                     memory.record_pattern_prediction(
-                        expected_pattern["pattern_id"], result["evidence"]["evidence_id"], verdict,
-                        audit["evidence_id"], step=tools.action_count,
+                        expected_pattern["pattern_id"], verdict, step=tools.action_count,
                     )
                     pattern_predictions += 1
                     if verdict == "matched":

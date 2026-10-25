@@ -422,6 +422,8 @@ class GameTools:
         self,
         action: str,
         args: Mapping[str, Any] | None = None,
+        *,
+        action_name: str | None = None,
     ) -> dict[str, Any]:
         if self.action_count >= self.max_actions:
             raise BudgetExceeded(f"action budget exhausted ({self.max_actions})")
@@ -435,7 +437,8 @@ class GameTools:
             result_raw = self.env.act(table[action].get("_environment_id", action), safe_args)
         except Exception as exc:
             self.history.append({
-                "type": "audit", "kind": "action_error", "action": action,
+                "type": "audit", "kind": "action_error",
+                "action": str(action_name) if action_name else action,
                 "error": f"{type(exc).__name__}: {exc}", "reset_generation": self.reset_generation,
             })
             raise
@@ -467,7 +470,9 @@ class GameTools:
         self.action_count += 1
         evidence = self.history.append({
             "evidence_id": transition_id,
-            "type": "transition", "action": action, "args": safe_args,
+            "type": "transition",
+            "action": str(action_name) if action_name else action,
+            "args": safe_args,
             "pre_frame_id": before["frame_id"], "post_frame_id": after["frame_id"],
             "pre_frame_image_id": before["frame_image_id"], "post_frame_image_id": after["frame_image_id"],
             "pre_evidence_id": before.get("evidence_id"),

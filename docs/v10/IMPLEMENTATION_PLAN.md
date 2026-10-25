@@ -5,19 +5,19 @@
 
 ## Implementation
 
-- `src/v10/tools/memory.py` remains the owner of ledger reduction, stable pattern identities, append-only revisions, evidence qualification/deduplication, deterministic confidence/status, applicability filtering, and bounded `MEMORY.md` rendering.
+- `src/v10/tools/memory.py` remains the owner of ledger reduction, stable pattern identities, append-only revisions, qualitative status, applicability filtering, and bounded `MEMORY.md` rendering.
 - `src/v10/live.py` owns review prompting and persistence, run-state snapshots, applicable memory in action context, and harness-authored validation of pattern expectations.
-- Existing `memory.jsonl` rows are still readable. Structured changes append independent revisions. Each review receives only evidence since its prior checkpoint, while the checkpoint tracks cumulative run evidence for idempotence. Legacy review content remains available until marked migrated.
-- Review evidence may reference transition, state, reset, or prediction-audit records supplied in the review events. Prompt selectors are restricted to observable state fields.
+- Existing `memory.jsonl` rows are still readable. Structured changes append independent revisions. Each review receives only events since its prior checkpoint; the checkpoint stores the covered event count, not observation identifiers. Legacy review content remains available until marked migrated.
+- Pattern memory and reviewer responses contain no evidence references, evidence counts, or numeric confidence. Observation identifiers remain in run history and prediction audits, where they support traceability.
 - The action response remains action-only. Separate review calls produce structured changes, and prediction audits are based on harness measurements rather than model-authored verdicts.
 
 ## Regression coverage
 
-The v10 tests cover existing ledger compatibility, independent pattern revisions, idempotent reviews, deterministic confidence, condition selectors, audit evidence references, retirement history, strategy persistence, cross-run state separation and pattern retrieval, prediction conflicts, and live review triggers. The ez01 fixture keeps distinct:
+The v10 tests cover existing ledger compatibility, independent pattern revisions, idempotent reviews, qualitative status, condition selectors, prediction audits, retirement history, strategy persistence, cross-run state separation and pattern retrieval, prediction conflicts, and live review triggers. The ez01 fixture keeps distinct:
 
-- `T2` and `T25`: gap-closing transitions with 128 changed pixels and measured vertical displacement;
-- `T3`: intermediate completion (`NOT_FINISHED`) with ambiguous displacement;
-- `T26`: final `WIN` transition with 145 changed pixels and distinct color transitions.
+- gap-closing transitions with measured vertical displacement;
+- intermediate completion (`NOT_FINISHED`) with ambiguous displacement;
+- the final `WIN` transition with distinct color transitions.
 
 ## Validation command
 

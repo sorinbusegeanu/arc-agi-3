@@ -42,7 +42,7 @@ def test_global_memory_is_bounded_markdown_and_replacement_is_atomic(tmp_path) -
     assert "truncated for prompt budget" in read_global_memory(tmp_path)
 
 
-def test_model_cannot_author_prediction_verdict_or_self_promote(tmp_path) -> None:
+def test_model_cannot_author_prediction_verdict_or_evidence_metadata(tmp_path) -> None:
     memory = GameMemory(tmp_path)
     result = memory.propose_update([
         {"op": "upsert", "id": "PR1", "type": "prediction", "claim": "ACTION1 changes one pixel", "status": "pending"},
@@ -53,7 +53,7 @@ def test_model_cannot_author_prediction_verdict_or_self_promote(tmp_path) -> Non
     assert [row["id"] for row in result["accepted"]] == ["PR1"]
     assert [row["reason"] for row in result["rejected"]] == [
         "prediction_verdict_is_harness_owned",
-        "promotion_without_matched_prediction: PR1",
+        "unknown_field: verified_by",
     ]
 
 
@@ -75,11 +75,11 @@ def test_only_matching_harness_audit_can_record_prediction_verdict(tmp_path) -> 
 
     assert memory.get("PR1", through_step=1)["status"] == "pending"
     assert memory.get("PR1", through_step=2)["status"] == "matched"
-    assert memory.get("PR1")["verified_by"] == audit_id
-    assert audit_id in memory.get("PR1")["evidence_ids"]
+    assert "verified_by" not in memory.get("PR1")
+    assert "evidence_ids" not in memory.get("PR1")
 
 
-def test_harness_matched_prediction_can_support_mechanic_promotion(tmp_path) -> None:
+def test_pattern_updates_do_not_store_prediction_evidence(tmp_path) -> None:
     history = History(tmp_path)
     audit = history.append({
         "type": "audit", "kind": "prediction_result", "prediction_id": "PR1",
@@ -92,10 +92,11 @@ def test_harness_matched_prediction_can_support_mechanic_promotion(tmp_path) -> 
     memory.record_prediction_verdict("PR1", "matched", audit["evidence_id"])
 
     result = memory.propose_update([
-        {"op": "upsert", "id": "M1", "type": "mechanic", "claim": "ACTION1 changes one pixel", "verified_by": ["PR1"]},
+        {"op": "upsert", "id": "M1", "type": "mechanic", "claim": "ACTION1 changes one pixel", "status": "confirmed"},
     ])
 
     assert result["accepted"][0]["id"] == "M1"
+    assert "verified_by" not in result["accepted"][0]
 
 
 def test_step_bounded_read_does_not_reveal_future_revision_or_entries(tmp_path) -> None:
@@ -129,15 +130,14 @@ def test_memory_persists_between_runs_but_isolated_by_game(tmp_path) -> None:
         {
             "op": "upsert", "id": "H1", "type": "hypothesis",
             "claim": "A persistent fact. (evidence: T1)",
-            "evidence_ids": ["T1"],
         },
-    ], known_evidence_ids={"T1"}, current_step=1)
+    ], current_step=1)
 
     next_run = GameMemory(tmp_path / "run-two", store_dir=game_a, run_id="run-two")
     other_game = GameMemory(tmp_path / "other", store_dir=game_memory_dir(state_dir, "game-b"), run_id="run-three")
 
     assert next_run.read()["entries"][0]["id"] == "run-one:H1"
-    assert next_run.read()["entries"][0]["evidence_ids"] == ["run-one:T1"]
+    assert "evidence_ids" not in next_run.read()["entries"][0]
     assert next_run.read()["entries"][0]["claim"] == "A persistent fact."
     assert "evidence:" not in (game_a / "MEMORY.md").read_text().casefold()
     assert "evidence_ids" not in next_run.compact()["entries"][0]
@@ -154,7 +154,7 @@ def test_review_summary_replaces_view_and_is_the_only_compacted_memory(tmp_path)
     markdown = "## Patterns\nA recurring effect. (evidence: T1)\n\n## Uncertain ideas\n- none"
     clean_markdown = "## Patterns\nA recurring effect.\n\n## Uncertain ideas\n- none"
 
-    saved = first.save_review_summary(markdown, evidence_ids=["T1"], current_step=2)
+    saved = first.save_review_summary(markdown, current_step=2)
 
     assert saved["id"] == "review:latest"
     assert saved["revision"] == 2
@@ -165,7 +165,7 @@ def test_review_summary_replaces_view_and_is_the_only_compacted_memory(tmp_path)
     assert compact["entries"][0]["claim"] == clean_markdown
     assert "evidence_ids" not in compact["entries"][0]
     assert compact["entries"][0]["id"] == "review:latest"
-    assert first.read()["entries"][-1]["evidence_ids"] == ["run-one:T1"]
+    assert "evidence_ids" not in first.read()["entries"][-1]
 
     next_run = GameMemory(tmp_path / "run-two", store_dir=store_dir, run_id="run-two")
     assert next_run.compact(max_entries=5, through_step=0)["entries"][0]["claim"] == clean_markdown
@@ -180,7 +180,7 @@ def test_empty_review_preserves_existing_memory_and_review_entries_are_harness_o
     before_ledger = memory.path.read_text()
 
     with pytest.raises(MemoryValidationError, match="non-empty"):
-        memory.save_review_summary("  \n", evidence_ids=[], current_step=2)
+        memory.save_review_summary("  \n", current_step=2)
     result = memory.propose_update([
         {"op": "upsert", "id": "R1", "type": "review", "claim": "Model-authored review"},
     ], current_step=2)
@@ -192,12 +192,12 @@ def test_empty_review_preserves_existing_memory_and_review_entries_are_harness_o
 
 def test_failed_review_view_save_rolls_back_latest_summary(tmp_path, monkeypatch) -> None:
     memory = GameMemory(tmp_path, run_id="run-one")
-    memory.save_review_summary("## Patterns\nPrevious summary.", evidence_ids=["T1"], current_step=1)
+    memory.save_review_summary("## Patterns\nPrevious summary.", current_step=1)
     before_view = memory.view_path.read_text()
     monkeypatch.setattr(memory, "write_view", lambda: (_ for _ in ()).throw(OSError("view is read-only")))
 
     with pytest.raises(OSError, match="view is read-only"):
-        memory.save_review_summary("## Patterns\nReplacement summary.", evidence_ids=["T2"], current_step=2)
+        memory.save_review_summary("## Patterns\nReplacement summary.", current_step=2)
 
     assert memory.view_path.read_text() == before_view
     assert memory.compact()["entries"][0]["claim"] == "## Patterns\nPrevious summary."
@@ -208,10 +208,9 @@ def test_pattern_updates_are_independent_incremental_and_idempotent(tmp_path) ->
     memory = GameMemory(tmp_path / "run-one", store_dir=state_dir, run_id="run-one", game_id="ez01")
     first = memory.apply_review_changes([
         {
-            "operation": "upsert", "pattern_type": "mechanic",
+            "operation": "upsert", "pattern_type": "mechanic", "status": "confirmed",
             "claim": "Up closes the gap by moving blue upward.",
             "applicability_conditions": ["The squares are vertically separated."],
-            "supporting_evidence": ["T2"], "contradicting_evidence": [],
             "state_selector": {"level": 0},
             "expected_observations": [{
                 "action": "up", "state_selector": {"level": 0},
@@ -221,37 +220,37 @@ def test_pattern_updates_are_independent_incremental_and_idempotent(tmp_path) ->
             }],
         },
         {
-            "operation": "upsert", "pattern_type": "strategy",
+            "operation": "upsert", "pattern_type": "strategy", "status": "confirmed",
             "claim": "Stack, then separate to finish a level.",
             "applicability_conditions": ["A level uses the two-square mechanic."],
-            "supporting_evidence": ["T3"], "contradicting_evidence": [],
             "goal": "Complete the current level.", "preconditions": ["Two squares are visible."],
             "action_policy": "Press up until stacked, then press up once more.",
             "success_conditions": ["levels_completed increases."],
         },
-    ], game_id="ez01", evidence_ids=["T2", "T3"], current_step=2)
+    ], game_id="ez01", current_step=2, covered_event_count=2)
 
     assert first["added"] == 2
     assert first["committed"] is True
     mechanic, strategy = memory.patterns("ez01")
-    assert mechanic["status"] == "candidate"
-    assert mechanic["confidence"] == 0.6667
-    assert mechanic["supporting_evidence"] == ["run-one:T2"]
+    assert mechanic["status"] == "confirmed"
+    assert "confidence" not in mechanic
+    assert "supporting_evidence" not in mechanic
     assert strategy["pattern_type"] == "strategy"
     assert strategy["goal"] == "Complete the current level."
-    assert "Refs: + run-one:T2" in memory.view_path.read_text()
+    view_text = memory.view_path.read_text()
+    assert "Refs:" not in view_text
+    assert "confidence" not in view_text
+    assert "T2" not in view_text
 
     prior_strategy = dict(strategy)
     row_count = len(memory.ledger())
     updated = memory.apply_review_changes([{
         "operation": "upsert", "pattern_id": mechanic["id"],
-        "supporting_evidence": ["T3"], "contradicting_evidence": ["T4"],
+        "status": "candidate",
         "applicability_conditions": ["The squares are vertically separated, not stacked."],
-    }], game_id="ez01", evidence_ids=["T3", "T4"], current_step=4)
+    }], game_id="ez01", current_step=4, covered_event_count=4)
     assert updated["updated"] == 1
     current = {entry["id"]: entry for entry in memory.patterns("ez01")}
-    assert current[mechanic["id"]]["supporting_evidence"] == ["run-one:T2", "run-one:T3"]
-    assert current[mechanic["id"]]["contradicting_evidence"] == ["run-one:T4"]
     assert current[mechanic["id"]]["status"] == "candidate"
     assert current[strategy["id"]] == prior_strategy
     history = [row for row in memory.ledger() if row.get("id") == mechanic["id"]]
@@ -260,9 +259,9 @@ def test_pattern_updates_are_independent_incremental_and_idempotent(tmp_path) ->
 
     before_repeat = len(memory.ledger())
     duplicate = memory.apply_review_changes([{
-        "operation": "upsert", "pattern_id": mechanic["id"],
-        "supporting_evidence": ["T3"], "contradicting_evidence": ["T4"],
-    }], game_id="ez01", evidence_ids=["T3", "T4"], current_step=4)
+        "operation": "upsert", "pattern_id": mechanic["id"], "status": "candidate",
+        "applicability_conditions": ["The squares are vertically separated, not stacked."],
+    }], game_id="ez01", current_step=4, covered_event_count=4)
     assert duplicate["duplicate_review"] is True
     assert len(memory.ledger()) == before_repeat
     assert row_count < before_repeat
@@ -275,10 +274,10 @@ def test_run_state_is_owned_by_its_run_and_second_run_reuses_patterns(tmp_path) 
         "level": 5, "levels_completed": 5, "win_levels": 5, "game_state": "WIN", "terminal": True,
     }, step=25)
     first.apply_review_changes([{
-        "operation": "upsert", "pattern_type": "mechanic", "claim": "Up moves blue upward by eight pixels.",
+        "operation": "upsert", "pattern_type": "mechanic", "status": "confirmed", "claim": "Up moves blue upward by eight pixels.",
         "applicability_conditions": ["Squares are vertically separated."],
-        "supporting_evidence": ["T2", "T4"], "contradicting_evidence": [], "state_selector": {},
-    }], game_id="ez01", evidence_ids=["T2", "T4"], current_step=25)
+        "state_selector": {},
+    }], game_id="ez01", current_step=25, covered_event_count=2)
 
     second = GameMemory(tmp_path / "run-two", store_dir=state_dir, run_id="run-two", game_id="ez01")
     second.record_run_state("ez01", {
@@ -290,7 +289,8 @@ def test_run_state_is_owned_by_its_run_and_second_run_reuses_patterns(tmp_path) 
     assert [entry["pattern_type"] for entry in prompt_memory["entries"]] == ["mechanic"]
     assert prompt_memory["entries"][0]["id"] == first.patterns("ez01")[0]["id"]
     assert all(entry.get("run_id") != "run-one" for entry in prompt_memory["entries"] if entry.get("type") == "state")
-    assert "From run run-two: level 0" in second.view_path.read_text()
+    assert "level 0" in second.view_path.read_text()
+    assert "From run" not in second.view_path.read_text()
 
 
 def test_legacy_run_ledger_migrates_before_run_dir_reuse(tmp_path) -> None:
@@ -300,8 +300,8 @@ def test_legacy_run_ledger_migrates_before_run_dir_reuse(tmp_path) -> None:
     legacy.mkdir()
     memory = GameMemory(legacy)
     memory.propose_update([
-        {"op": "upsert", "id": "H1", "type": "hypothesis", "claim": "Older knowledge", "evidence_ids": ["T1"]},
-    ], known_evidence_ids={"T1"}, current_step=1)
+        {"op": "upsert", "id": "H1", "type": "hypothesis", "claim": "Older knowledge"},
+    ], current_step=1)
     write_json(legacy / "run_manifest.json", {"run_id": "old-run", "game_id": "fixture"})
 
     imported = GameMemory.migrate_run_ledger(legacy, tmp_path / "persistent", "fixture")
@@ -311,37 +311,34 @@ def test_legacy_run_ledger_migrates_before_run_dir_reuse(tmp_path) -> None:
     assert GameMemory.migrate_run_ledger(legacy, tmp_path / "persistent", "fixture") == 0
 
 
-def test_review_accepts_audit_evidence_and_rejects_unusable_state_selectors(tmp_path) -> None:
+def test_review_rejects_unusable_state_selectors_without_persisting_evidence_refs(tmp_path) -> None:
     memory = GameMemory(tmp_path / "run", store_dir=tmp_path / "state", run_id="run-a", game_id="ez01")
     result = memory.apply_review_changes([
         {
-            "operation": "upsert", "pattern_type": "mechanic", "claim": "A measured action changes the board.",
-            "supporting_evidence": ["T2", "A3"], "contradicting_evidence": [],
+            "operation": "upsert", "pattern_type": "mechanic", "status": "confirmed", "claim": "A measured action changes the board.",
             "applicability_conditions": [], "state_selector": {"unknown_field": True},
         },
         {
-            "operation": "upsert", "pattern_type": "mechanic", "claim": "A measured action changes the board.",
-            "supporting_evidence": ["T2", "A3"], "contradicting_evidence": [],
+            "operation": "upsert", "pattern_type": "mechanic", "status": "confirmed", "claim": "A measured action changes the board.",
             "applicability_conditions": [], "state_selector": {"level": 0},
         },
-    ], game_id="ez01", evidence_ids=["T2", "A3"], current_step=2)
+    ], game_id="ez01", current_step=2, covered_event_count=2)
 
     assert result["added"] == 1
     assert result["rejected"] == [{"index": 0, "pattern_id": None, "reason": "invalid_state_selector"}]
-    assert memory.patterns("ez01")[0]["supporting_evidence"] == ["run-a:T2", "run-a:A3"]
+    assert "supporting_evidence" not in memory.patterns("ez01")[0]
 
 
 def test_retirement_is_a_revision_and_does_not_erase_history(tmp_path) -> None:
     memory = GameMemory(tmp_path / "run", store_dir=tmp_path / "state", run_id="run-a", game_id="ez01")
     memory.apply_review_changes([{
         "operation": "upsert", "pattern_type": "hypothesis", "claim": "The cue indicates a reset.",
-        "supporting_evidence": ["T1"], "contradicting_evidence": [],
-    }], game_id="ez01", evidence_ids=["T1"], current_step=1)
+    }], game_id="ez01", current_step=1, covered_event_count=1)
     pattern_id = memory.patterns("ez01")[0]["id"]
 
     result = memory.apply_review_changes([{
         "operation": "retire", "pattern_id": pattern_id,
-    }], game_id="ez01", evidence_ids=["T2"], current_step=2)
+    }], game_id="ez01", current_step=2, covered_event_count=2)
 
     revisions = [row for row in memory.ledger() if row.get("id") == pattern_id]
     assert result["retired"] == 1
@@ -351,15 +348,54 @@ def test_retirement_is_a_revision_and_does_not_erase_history(tmp_path) -> None:
     assert memory.patterns("ez01", include_retired=True)[0]["claim"] == "The cue indicates a reset."
 
 
-def test_review_checkpoints_track_cumulative_coverage_while_changes_use_only_new_evidence(tmp_path) -> None:
+def test_review_checkpoints_store_event_count_without_observation_ids(tmp_path) -> None:
     memory = GameMemory(tmp_path / "run", store_dir=tmp_path / "state", run_id="run-a", game_id="ez01")
-    memory.apply_review_changes([], game_id="ez01", evidence_ids=["T1"], current_step=1)
+    memory.apply_review_changes([], game_id="ez01", current_step=1, covered_event_count=1)
 
     result = memory.apply_review_changes([{
         "operation": "upsert", "pattern_type": "hypothesis", "claim": "A later cue may signal a reset.",
-        "supporting_evidence": ["T2"], "contradicting_evidence": [],
-    }], game_id="ez01", evidence_ids=["T2"], current_step=2, coverage_evidence_ids=["T1", "T2"])
+    }], game_id="ez01", current_step=2, covered_event_count=2)
 
     assert result["added"] == 1
-    assert memory.reviewed_evidence_ids("ez01") == {"T1", "T2"}
-    assert memory.has_review_coverage("ez01", ["T1", "T2"])
+    assert memory.reviewed_event_count("ez01") == 2
+    assert memory.has_review_coverage("ez01", 2)
+    assert "T1" not in memory.path.read_text()
+    assert "T2" not in memory.path.read_text()
+
+
+def test_partial_review_rejections_do_not_checkpoint_unreviewed_evidence(tmp_path) -> None:
+    memory = GameMemory(tmp_path / "run", store_dir=tmp_path / "state", run_id="run-a", game_id="ez01")
+    result = memory.apply_review_changes([
+        {
+            "operation": "upsert", "pattern_type": "mechanic", "claim": "Up moves the player.",
+            "applicability_conditions": [], "state_selector": {},
+        },
+        {
+            "operation": "upsert", "pattern_type": "strategy", "claim": "Move to the goal.",
+            "goal": "Complete the level.", "preconditions": [], "action_policy": "Move to the goal.",
+            "success_conditions": ["levels_completed increases."],
+            "expected_observations": [{"action": "up", "prediction": "pixels change"}],
+        },
+    ], game_id="ez01", current_step=3, covered_event_count=2)
+
+    assert result["added"] == 1
+    assert result["checkpointed"] is False
+    assert result["rejected"][0]["reason"] == "invalid_expected_observations"
+    assert not memory.has_review_coverage("ez01", 2)
+    assert memory.reviewed_event_count("ez01") == 0
+
+    repaired = memory.apply_review_changes([{
+        "operation": "upsert", "pattern_type": "strategy", "claim": "Move to the goal.",
+        "goal": "Complete the level.", "preconditions": [], "action_policy": "Move to the goal.",
+        "success_conditions": ["levels_completed increases."],
+        "expected_observations": [{
+            "action": "up", "measurable_prediction": {"all": [
+                {"path": "measurements.changed_pixels", "op": "gt", "value": 0},
+            ]},
+        }],
+    }], game_id="ez01", current_step=3, covered_event_count=2)
+
+    assert repaired["added"] == 1
+    assert repaired["checkpointed"] is True
+    assert memory.has_review_coverage("ez01", 2)
+    assert len(memory.patterns("ez01")) == 2

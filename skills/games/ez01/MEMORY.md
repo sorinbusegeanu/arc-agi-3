@@ -1,11 +1,14 @@
 # Game Memory
 
 ## 1. Current State
-- From run bd014adb: level 1; 1/5 completed; state NOT_FINISHED.
+- level 0; 0/5 completed; state NOT_FINISHED.
 
 ## 2. Confirmed Mechanics
-- [P-e8566ad270a4887b] confirmed, confidence 0.95: The player (yellow square, color 9) moves exactly 8 pixels per directional action (up/down/left/right). Attempting to move into a boundary or obstacle produces 0 pixel change (blocked).
-  Refs: + bd014adb:T18, bd014adb:T19, bd014adb:T20, +16
+- confirmed: A stationary blue square (color 11) serves as the level goal and acts as a physical obstacle. The player cannot move into the blue square (blocked). The level completes when the player is adjacent to the blue square and takes a directional action that separates them. The blue square is positioned in the bottom-left corner of the level.
+  Applies: level 0 of ez01
+- confirmed: Level progress is tracked by a row of small squares in the top-left corner; completed levels turn yellow.
+- confirmed: The player (yellow square, color 9) moves exactly 8 pixels per directional action. From center: up is open, left is blocked, down succeeds once then blocked, right is open. The player successfully navigated right→right→up→left→down→left, proving a path exists around obstacles. From center, left and down are both blocked (confirmed across multiple attempts including 3 additional consecutive blocked tries). The player is stuck at center with only up and right available; the blue goal in the bottom-left corner is not adjacent to the player at this position.
+  Applies: level 0 of ez01
 
 ## 3. Successful Strategies
 - none
@@ -14,10 +17,7 @@
 - none
 
 ## 5. Active Hypotheses
-- [P-4b1094ee143c3071] candidate, confidence 0.67: A stationary blue square (color 11) serves as the level goal. The level completes when the player is adjacent to the blue square and takes a directional action that separates them.
-  Refs: + bd014adb:T10
-- [P-91d3d858815bb42f] candidate, confidence 0.67: Level progress is tracked by a row of small squares in the top-left corner; completed levels turn yellow.
-  Refs: + bd014adb:T10
+- none
 
 ## 6. Failed Approaches
 - none

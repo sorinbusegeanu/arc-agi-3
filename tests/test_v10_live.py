@@ -32,9 +32,9 @@ def _action(action="up"):
 
 
 _VALID_REVIEW = json.dumps({"changes": [{
-    "operation": "upsert", "pattern_type": "mechanic", "claim": "A cue is visible.",
+    "operation": "upsert", "pattern_type": "mechanic", "status": "confirmed", "claim": "A cue is visible.",
     "applicability_conditions": ["The cue appears in the current state."],
-    "supporting_evidence": ["T2"], "contradicting_evidence": [], "state_selector": {},
+    "state_selector": {},
 }]})
 
 
@@ -182,9 +182,8 @@ def test_confirmed_pattern_prediction_is_audited_and_triggers_review_on_conflict
         run_id="prior-run", game_id="fixture",
     )
     prior.apply_review_changes([{
-        "operation": "upsert", "pattern_type": "mechanic", "claim": "Up changes 999 pixels.",
+        "operation": "upsert", "pattern_type": "mechanic", "status": "confirmed", "claim": "Up changes 999 pixels.",
         "applicability_conditions": ["Any level."],
-        "supporting_evidence": ["T1", "T2"], "contradicting_evidence": [],
         "state_selector": {},
         "expected_observations": [{
             "action": "up", "state_selector": {},
@@ -192,7 +191,7 @@ def test_confirmed_pattern_prediction_is_audited_and_triggers_review_on_conflict
                 {"path": "measurements.changed_pixels", "op": "eq", "value": 999},
             ]},
         }],
-    }], game_id="fixture", evidence_ids=["T1", "T2"], current_step=2)
+    }], game_id="fixture", current_step=2, covered_event_count=2)
     pattern_id = prior.patterns("fixture")[0]["id"]
     client = _FakeClient(
         [_decision([_action()])], review_responses=['{"changes": []}'],
@@ -217,8 +216,8 @@ def test_confirmed_pattern_prediction_is_audited_and_triggers_review_on_conflict
         tmp_path / "run", store_dir=state_dir / "games/fixture",
         run_id=json.loads((tmp_path / "run/run_manifest.json").read_text())["run_id"], game_id="fixture",
     ).patterns("fixture")[0]
-    assert updated["contradicting_evidence"][-1].endswith(":T2")
-    assert updated["status"] == "candidate"
+    assert updated["status"] == "contradicted"
+    assert "contradicting_evidence" not in updated
 
 
 def test_live_repairs_response_that_includes_prediction_fields(tmp_path: Path) -> None:
@@ -233,7 +232,7 @@ def test_live_repairs_response_that_includes_prediction_fields(tmp_path: Path) -
     assert metrics["actions"] == 1
     rows = [json.loads(line) for line in (tmp_path / "run" / "decisions.jsonl").read_text().splitlines()]
     accepted = next(row for row in rows if row.get("status") == "accepted")
-    assert accepted["decision"]["actions"] == [{"action": "ACTION1", "args": {}}]
+    assert accepted["decision"]["actions"] == [{"action": "up", "args": {}}]
     assert accepted["repair_attempted"] is True
 
 
@@ -462,11 +461,13 @@ def test_review_runs_on_level_completion_and_next_action_receives_pattern(tmp_pa
     view = (tmp_path / "state/games/fixture/MEMORY.md").read_text()
     assert "## 2. Confirmed Mechanics" in view
     assert "A cue is visible." in view
-    assert "T2" in view
+    assert "T2" not in view
+    assert "confidence" not in view
+    assert "Refs:" not in view
     review_row = _review_rows(run_dir)[0]
     assert review_row["status"] == "saved"
     assert review_row["trigger_reasons"] == ["level_completed"]
-    assert review_row["covered_transitions"] == {"count": 1, "first": "T2", "last": "T2"}
+    assert review_row["covered_transition_count"] == 1
 
 
 def test_ez01_fixture_keeps_gap_intermediate_and_final_win_patterns_distinct(tmp_path: Path) -> None:
@@ -485,10 +486,9 @@ def test_ez01_fixture_keeps_gap_intermediate_and_final_win_patterns_distinct(tmp
     }, step=tools.action_count)
     changes = [
         {
-            "operation": "upsert", "pattern_type": "mechanic",
+            "operation": "upsert", "pattern_type": "mechanic", "status": "confirmed",
             "claim": "Pressing up closes a vertical gap by moving blue upward eight pixels.",
             "applicability_conditions": ["The squares are vertically separated."],
-            "supporting_evidence": ["T2", "T25"], "contradicting_evidence": [],
             "state_selector": {"level": 0},
             "expected_observations": [{
                 "action": "up", "state_selector": {"level": 0},
@@ -498,16 +498,15 @@ def test_ez01_fixture_keeps_gap_intermediate_and_final_win_patterns_distinct(tmp
             }],
         },
         {
-            "operation": "upsert", "pattern_type": "exception",
+            "operation": "upsert", "pattern_type": "exception", "status": "candidate",
             "claim": "Separating a stacked pair completes an intermediate level without winning the game.",
             "applicability_conditions": ["The current level is not the final level."],
-            "supporting_evidence": ["T3"], "contradicting_evidence": [], "state_selector": {},
+            "state_selector": {},
         },
         {
-            "operation": "upsert", "pattern_type": "strategy",
+            "operation": "upsert", "pattern_type": "strategy", "status": "confirmed",
             "claim": "On the final level, close the gap with six up presses, then press up once to win.",
             "applicability_conditions": ["The current level is the last level."],
-            "supporting_evidence": ["T26"], "contradicting_evidence": [],
             "goal": "Win ez01.", "preconditions": ["The final level is active."],
             "action_policy": "Close the gap with up, then press up once more and verify WIN.",
             "success_conditions": ["game_state is WIN."],
@@ -535,14 +534,14 @@ def test_ez01_fixture_keeps_gap_intermediate_and_final_win_patterns_distinct(tmp
     exception = next(entry for entry in patterns if entry["pattern_type"] == "exception")
     strategy = next(entry for entry in patterns if entry["pattern_type"] == "strategy")
     assert mechanic["status"] == "confirmed"
-    assert mechanic["confidence"] == 0.75
-    assert exception["supporting_evidence"] == [f"{run_id}:T3"]
-    assert strategy["supporting_evidence"] == [f"{run_id}:T26"]
+    assert "confidence" not in mechanic
+    assert "supporting_evidence" not in exception
+    assert "supporting_evidence" not in strategy
     assert "145" not in mechanic["claim"]
-    assert "T26" not in mechanic["supporting_evidence"]
+    assert "T26" not in memory.view_path.read_text()
+    assert "confidence" not in memory.view_path.read_text()
     assert "## 2. Confirmed Mechanics" in memory.view_path.read_text()
     assert "## 3. Successful Strategies" in memory.view_path.read_text()
-    assert f"{run_id[:8]}:T26" in memory.view_path.read_text()
 
 
 def test_incremental_review_prompt_contains_only_uncovered_observations(tmp_path: Path) -> None:
@@ -571,8 +570,41 @@ def test_incremental_review_prompt_contains_only_uncovered_observations(tmp_path
     )
 
     assert second["row"]["status"] == "saved"
-    assert '"evidence_id":"T2"' in client.calls[1][0]
-    assert '"evidence_id":"T1"' not in client.calls[1][0]
+    assert '"changed_pixels":2' in client.calls[1][0]
+    assert '"changed_pixels":1' not in client.calls[1][0]
+
+
+def test_review_repairs_invalid_pattern_schema_then_checkpoints(tmp_path: Path) -> None:
+    tools = GameTools(_FakeEnv(), tmp_path / "review-run")
+    tools.observe()
+    tools.act("ACTION1", {})
+    invalid = json.dumps({"changes": [{
+        "operation": "upsert", "pattern_type": "mechanic", "status": "confirmed", "claim": "A cue is visible.",
+        "applicability_conditions": "always", "state_selector": {},
+    }]})
+    repaired = json.dumps({"changes": [{
+        "operation": "upsert", "pattern_type": "mechanic", "status": "confirmed", "claim": "A cue is visible.",
+        "applicability_conditions": ["The cue appears in the current state."],
+        "state_selector": {},
+    }]})
+    client = _FakeClient([], review_responses=[invalid, repaired])
+
+    result = _perform_review(
+        tools, client, game_id="fixture", run_id="review-repair",
+        memory_store_dir=tmp_path / "state/games/fixture", trigger_reasons=["level_completed"],
+    )
+
+    assert len(client.calls) == 2
+    assert "Your prior response had review validation errors" in client.calls[1][0]
+    assert result["row"]["status"] == "saved"
+    assert result["row"]["request_attempts"] == 2
+    assert result["row"]["review_checkpoint_saved"] is True
+    memory = GameMemory(
+        tmp_path / "review-run", store_dir=tmp_path / "state/games/fixture",
+        run_id="review-repair", game_id="fixture",
+    )
+    assert memory.patterns("fixture")[0]["claim"] == "A cue is visible."
+    assert memory.reviewed_event_count("fixture") == 2
 
 
 def test_review_interval_defaults_to_50_and_runs_after_fiftieth_action(tmp_path: Path) -> None:
@@ -588,7 +620,7 @@ def test_review_interval_defaults_to_50_and_runs_after_fiftieth_action(tmp_path:
     assert metrics["review_count"] == 1
     review_row = _review_rows(tmp_path / "run")[0]
     assert review_row["trigger_reasons"] == ["action_interval"]
-    assert review_row["covered_transitions"]["count"] == 50
+    assert review_row["covered_transition_count"] == 50
     assert len(review_row["selected_image_labels"]) <= 8
 
 
@@ -668,7 +700,7 @@ def test_malformed_review_preserves_existing_memory(tmp_path: Path) -> None:
     )
     client = _FakeClient(
         [_decision([_action()])],
-        review_responses=["not json"],
+        review_responses=["not json", "still not json"],
     )
 
     metrics = run_live(
@@ -680,6 +712,8 @@ def test_malformed_review_preserves_existing_memory(tmp_path: Path) -> None:
     row = _review_rows(tmp_path / "run")[0]
     assert row["status"] == "failed"
     assert "not valid JSON" in row["error"]
+    assert row["review_checkpoint_saved"] is False
+    assert len(row["repair_history"]) == 2
     assert "Prior durable finding." in memory.view_path.read_text()
 
 
@@ -761,8 +795,8 @@ def test_global_lessons_learned_in_ez01_are_loaded_for_ez02(tmp_path: Path) -> N
     reusable_lesson = "Track each object's motion separately when several move at once."
     review = json.dumps({
         "changes": [{
-            "operation": "upsert", "pattern_type": "mechanic", "claim": "A fixture mechanic.",
-            "supporting_evidence": ["T2"], "contradicting_evidence": [],
+            "operation": "upsert", "pattern_type": "mechanic", "status": "confirmed",
+            "claim": "A fixture mechanic.",
         }],
         "global_memory_markdown": f"# Global Memory\n\n- {reusable_lesson}",
     })
@@ -803,7 +837,9 @@ def test_global_lessons_learned_in_ez01_are_loaded_for_ez02(tmp_path: Path) -> N
     ).patterns("ez02") == []
 
 
-def test_live_direction_words_are_converted_to_environment_action_ids(tmp_path: Path) -> None:
+def test_live_direction_words_map_to_ids_and_logs_use_direction_names(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
     class FourActionEnv(_FakeEnv):
         def observe(self):
             result = super().observe()
@@ -829,6 +865,19 @@ def test_live_direction_words_are_converted_to_environment_action_ids(tmp_path: 
     rows = [json.loads(line) for line in (tmp_path / "run" / "decisions.jsonl").read_text().splitlines()]
     accepted = next(row for row in rows if row.get("status") == "accepted")
     assert [item["action"] for item in accepted["decision"]["actions"]] == [
-        "ACTION4", "ACTION3", "ACTION2", "ACTION1",
+        "right", "left", "down", "up",
     ]
+    plan_result = next(row for row in rows if row.get("schema") == "v10.live_plan_result/2")
+    assert [item["action"] for item in plan_result["executed"]] == [
+        "right", "left", "down", "up",
+    ]
+    transitions = [row for row in History(tmp_path / "run").records() if row.get("type") == "transition"]
+    assert [row["action"] for row in transitions] == [
+        "right", "left", "down", "up",
+    ]
+    output = capsys.readouterr().err
+    for direction in ("up", "down", "left", "right"):
+        assert direction in output
+    assert "planned=['ACTION" not in output
+    assert "taking action 1: ACTION4" not in output
     assert metrics["actions"] == 4
