@@ -26,6 +26,7 @@ REVIEW_SUMMARY_ID = "review:latest"
 DEFAULT_MAX_ENTRIES = 60
 DEFAULT_CONTEXT_ENTRIES = 5
 MAX_MEMORY_MARKDOWN_CHARS = 12_000
+MAX_GLOBAL_MEMORY_MARKDOWN_CHARS = 3_000
 PATTERN_TYPES: tuple[str, ...] = ("mechanic", "strategy", "exception", "hypothesis")
 PATTERN_STATUSES: tuple[str, ...] = ("candidate", "confirmed", "contradicted", "retired")
 STATE_SELECTOR_FIELDS = frozenset({"game_state", "level", "levels_completed", "win_levels", "terminal"})
@@ -63,6 +64,62 @@ def game_memory_dir(state_dir: Path | str, game_id: str) -> Path:
     if not safe_id:
         raise ValueError("game_id must be non-empty")
     return Path(state_dir) / "games" / safe_id
+
+
+def global_memory_path(state_dir: Path | str) -> Path:
+    """Shared cross-game Markdown memory under the selected persistent root."""
+    return Path(state_dir) / "global" / MEMORY_VIEW_NAME
+
+
+def read_global_memory(state_dir: Path | str) -> str:
+    """Read bounded shared guidance for a model prompt; absent memory is empty."""
+    path = global_memory_path(state_dir)
+    if not path.is_file():
+        return ""
+    content = path.read_text(encoding="utf-8").strip()
+    if len(content) <= MAX_GLOBAL_MEMORY_MARKDOWN_CHARS:
+        return content
+    marker = "\n[Global memory truncated for prompt budget.]"
+    bounded = content[:MAX_GLOBAL_MEMORY_MARKDOWN_CHARS - len(marker)]
+    return bounded.rsplit("\n", 1)[0].rstrip() + marker
+
+
+def save_global_memory(state_dir: Path | str, markdown: str) -> bool:
+    """Atomically replace global Markdown when content changed and remains bounded."""
+    content = str(markdown).strip()
+    if not content:
+        return False
+    if not content.startswith("# Global Memory"):
+        content = "# Global Memory\n\n" + content
+    if len(content) > MAX_GLOBAL_MEMORY_MARKDOWN_CHARS:
+        raise ValueError(
+            f"global memory exceeds {MAX_GLOBAL_MEMORY_MARKDOWN_CHARS} characters"
+        )
+    rendered = content.rstrip() + "\n"
+    if len(rendered) > MAX_GLOBAL_MEMORY_MARKDOWN_CHARS:
+        raise ValueError(
+            f"global memory exceeds {MAX_GLOBAL_MEMORY_MARKDOWN_CHARS} characters"
+        )
+    path = global_memory_path(state_dir)
+    if path.is_file() and path.read_text(encoding="utf-8") == rendered:
+        return False
+    _atomic_write_text(path, rendered)
+    return True
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
 
 ENTRY_TYPES: tuple[str, ...] = (
     "state",
@@ -1293,21 +1350,8 @@ class GameMemory:
         return detail
 
     def write_view(self, through_step: int | None = None) -> Path:
-        self.view_path.parent.mkdir(parents=True, exist_ok=True)
         rendered = self.render(through_step=through_step)
-        temp_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                "w", encoding="utf-8", dir=self.view_path.parent, delete=False,
-            ) as handle:
-                handle.write(rendered)
-                handle.flush()
-                os.fsync(handle.fileno())
-                temp_path = Path(handle.name)
-            os.replace(temp_path, self.view_path)
-        finally:
-            if temp_path is not None and temp_path.exists():
-                temp_path.unlink()
+        _atomic_write_text(self.view_path, rendered)
         return self.view_path
 
     def save_review_summary(
@@ -1412,6 +1456,10 @@ __all__ = [
     "GameMemory",
     "default_state_dir",
     "game_memory_dir",
+    "global_memory_path",
+    "read_global_memory",
+    "save_global_memory",
+    "MAX_GLOBAL_MEMORY_MARKDOWN_CHARS",
     "project_skills_dir",
     "shared_skill_path",
     "LEDGER_NAME",

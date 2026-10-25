@@ -31,6 +31,9 @@ from .tools.memory import (
     GameMemory,
     default_state_dir,
     game_memory_dir,
+    global_memory_path,
+    read_global_memory,
+    save_global_memory,
     shared_skill_path,
 )
 
@@ -174,9 +177,9 @@ def _random_legal_action(legal_actions: Any, rng: random.Random) -> dict[str, An
     return rng.choice(candidates) if candidates else None
 
 
-_REVIEW_SYSTEM_PROMPT = """# ez01 incremental memory review
+_REVIEW_SYSTEM_PROMPT = """# V10 incremental memory review
 
-Review this run's ordered observations against the existing structured patterns. You do not control the game and must not request actions or resets. Return only a JSON object with a `changes` array and boolean `legacy_memory_migrated`. Set the latter true only when all useful legacy MEMORY.md findings have been converted to structured patterns or strategies; otherwise keep the legacy note active. Do not rewrite the whole memory.
+Review this game's new ordered observations against existing game patterns and shared global memory. Answer two questions: what was learned about this specific game, and what meaningful reusable technique could help solve other games? You do not control the game and must not request actions or resets. Return only a JSON object with a `changes` array, boolean `legacy_memory_migrated`, and complete `global_memory_markdown` text for the shared file. Keep that Markdown under 3000 characters. If no useful global lesson was learned, return the existing global memory unchanged. Do not add global entries for game-specific mechanics.
 
 Each change is one of:
 - An upsert with `operation`, optional existing `pattern_id`, `pattern_type` (`mechanic`, `strategy`, `exception`, or `hypothesis`), a concise `claim`, optional `applicability_conditions`, optional `state_selector`, and only newly observed `supporting_evidence` / `contradicting_evidence` IDs from this review's events.
@@ -186,11 +189,13 @@ When revising an existing pattern, reuse its ID. Use distinct conditional varian
 
 For useful successful action sequences, use `pattern_type: "strategy"` and provide `goal`, `preconditions` (string list), `action_policy`, `expected_observations`, and `success_conditions` (string list). Each expected observation has `action`, optional `state_selector` over game_state/level/levels_completed/terminal, and a measurable prediction in the supported all-of predicate format. Do not produce strategies that are not supported by a successful transition.
 
-Distinguish direct observations from explanations. Direction words name commands; infer movement from frames and measurements. Keep claims game-specific and concise. Return `{"changes": [], "legacy_memory_migrated": true}` when no useful legacy content remains."""
+Distinguish direct observations from explanations. Direction words name commands; infer movement from frames and measurements. Keep game claims specific and concise. Global lessons must be broadly reusable and actionable, such as tracking objects separately when they move together, testing action effects systematically, reading progress indicators, comparing frames, exploring efficiently, or accounting for tool limitations. Merge equivalent lessons, refine or correct contradictions using the new experience, and omit unsupported or trivial lessons. Global Markdown has no evidence references, scores, or per-pattern records. Return the existing global Markdown unchanged when there is no meaningful update. Return `{"changes": [], "legacy_memory_migrated": true, "global_memory_markdown": "# Global Memory\\n"}` when no useful prior game memory or global lesson exists."""
 
 
-def _validate_review_payload(value: Any) -> tuple[list[dict[str, Any]], bool]:
-    if not isinstance(value, Mapping) or set(value) - {"changes", "legacy_memory_migrated"} or "changes" not in value:
+def _validate_review_payload(value: Any) -> tuple[list[dict[str, Any]], bool, str | None]:
+    if not isinstance(value, Mapping) or set(value) - {
+        "changes", "legacy_memory_migrated", "global_memory_markdown",
+    } or "changes" not in value:
         raise ValueError("review response must be a JSON object containing changes")
     legacy_migrated = value.get("legacy_memory_migrated", False)
     if not isinstance(legacy_migrated, bool):
@@ -200,7 +205,10 @@ def _validate_review_payload(value: Any) -> tuple[list[dict[str, Any]], bool]:
         raise ValueError("review changes must be a list")
     if any(not isinstance(change, Mapping) for change in changes):
         raise ValueError("each review change must be an object")
-    return [dict(change) for change in changes], legacy_migrated
+    global_memory = value.get("global_memory_markdown")
+    if global_memory is not None and not isinstance(global_memory, str):
+        raise ValueError("global_memory_markdown must be text or null")
+    return [dict(change) for change in changes], legacy_migrated, global_memory
 
 
 def _review_events(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -331,6 +339,8 @@ def _perform_review(
         last_id = transition_ids[-1] if transition_ids else None
         memory = GameMemory(tools.run_dir, store_dir=memory_store_dir, run_id=run_id, game_id=game_id)
         memory_text = memory.write_view().read_text(encoding="utf-8")
+        state_root = memory_store_dir.parent.parent
+        shared_memory = read_global_memory(state_root)
         legacy_review = memory.get("review:latest")
         legacy_review_text = str(legacy_review.get("claim", "")) if legacy_review else ""
         events = _review_events(records)
@@ -391,6 +401,8 @@ def _perform_review(
             + json.dumps(patterns, ensure_ascii=False, separators=(",", ":")) + "\n\n"
             "Existing MEMORY.md view (legacy content may be migrated into patterns):\n"
             + memory_text + "\n\n"
+            "Current shared global/MEMORY.md (reusable cross-game techniques only):\n"
+            + (shared_memory or "(no global lessons stored yet)") + "\n\n"
             "Prior unstructured review, if any (bounded to 4000 characters):\n" + legacy_review_text + "\n\n"
             "New ordered run observations since the last review checkpoint (evidence IDs are valid only in the evidence arrays):\n"
             + json.dumps(new_events, ensure_ascii=False, separators=(",", ":"))
@@ -406,7 +418,7 @@ def _perform_review(
         content = response.get("content")
         if response.get("finish_reason") == "length":
             raise ValueError("review response was truncated at the output-token limit")
-        changes, legacy_migrated = _validate_review_payload(_parse_content(content))
+        changes, legacy_migrated, global_memory_markdown = _validate_review_payload(_parse_content(content))
         applied = memory.apply_review_changes(
             changes, game_id=game_id, evidence_ids=new_evidence_ids,
             current_step=tools.action_count, coverage_evidence_ids=review_evidence_ids,
@@ -414,10 +426,20 @@ def _perform_review(
         if not applied.get("committed", True):
             raise ValueError(f"review contained no valid changes: {applied['rejected']}")
         legacy_review_retired = memory.retire_legacy_review(current_step=tools.action_count) if legacy_migrated else False
+        global_memory_updated = False
+        global_memory_error = None
+        if global_memory_markdown is not None:
+            try:
+                global_memory_updated = save_global_memory(state_root, global_memory_markdown)
+            except (OSError, ValueError) as exc:
+                global_memory_error = f"{type(exc).__name__}: {exc}"
         canonical = json.dumps(changes, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         row = {
             "schema": "v10.live_review/2",
-            "status": "saved_with_rejections" if applied["rejected"] else "saved",
+            "status": (
+                "saved_with_global_memory_error" if global_memory_error else
+                "saved_with_rejections" if applied["rejected"] else "saved"
+            ),
             "trigger_reasons": list(trigger_reasons),
             "through_action": tools.action_count,
             "covered_transitions": {"count": len(transition_ids), "first": first_id, "last": last_id},
@@ -430,9 +452,14 @@ def _perform_review(
             "patterns_retired": applied["retired"], "unchanged_patterns": applied["unchanged"],
             "rejected_changes": applied["rejected"], "duplicate_review": applied["duplicate_review"],
             "legacy_memory_migrated": legacy_migrated, "legacy_review_retired": legacy_review_retired,
+            "global_memory_path": str(global_memory_path(state_root)),
+            "global_memory_updated": global_memory_updated,
+            "global_memory_characters": len(global_memory_markdown or shared_memory),
             "result_characters": len(canonical),
             "result_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
         }
+        if global_memory_error:
+            row["global_memory_error"] = global_memory_error
     except Exception as exc:
         attempts = max(attempts, int(getattr(exc, "request_attempts", 0)))
         if getattr(exc, "latency_seconds", None) is not None:
@@ -487,6 +514,7 @@ def _live_context(
         max_entries=memory_context_entries, through_step=visible_step,
         game_id=game_id, current_state=current,
     )
+    global_memory = read_global_memory(memory_store_dir.parent.parent)
     for entry in memory["entries"]:
         visible_ids.update(str(value) for value in entry.get("evidence_ids", []))
     context = {
@@ -506,6 +534,7 @@ def _live_context(
             for row in transitions
         ],
         "memory": memory,
+        "global_memory": global_memory,
         "budgets": {
             "actions_used": tools.action_count, "actions_remaining": max(0, tools.max_actions - tools.action_count),
             "resets_used": tools.reset_count, "resets_remaining": max(0, tools.max_resets - tools.reset_count),
@@ -540,6 +569,7 @@ def _live_context(
     ]
     prompt = (
         f"Choose up to {horizon} legal actions from the current state, recent outcomes, and read-only memory. "
+        "Use game memory first for this game's established mechanics and strategies. Use global memory only as reusable exploration guidance; it must not override game-specific observations. "
         "Return only an actions list. Each action must contain only action and args. "
         "Do not include analysis, memory updates, predictions, goals, or narrative. "
         "If RESET is listed, use it alone and include args.justification.\n\n"
@@ -582,7 +612,8 @@ def run_live(
     destination = Path(run_dir)
     source_skill = Path(skill_path) if skill_path is not None else shared_skill_path()
     run_id = uuid.uuid4().hex
-    memory_store_dir = game_memory_dir(state_dir or default_state_dir(), game_id)
+    state_root = Path(state_dir) if state_dir is not None else default_state_dir()
+    memory_store_dir = game_memory_dir(state_root, game_id)
     # Old versions kept the only copy of knowledge inside the disposable run directory.
     GameMemory.migrate_run_ledger(destination, memory_store_dir, game_id)
     _prepare_live_run_directory(destination)
@@ -593,6 +624,7 @@ def run_live(
         "schema": "v10.live_run/1", "run_id": run_id, "game_id": game_id,
         "seed": int(seed), "skill_sha256": skill_sha256,
         "persistent_memory_dir": str(memory_store_dir),
+        "global_memory_path": str(global_memory_path(state_root)),
     })
     tools = GameTools(env, destination, max_actions=max_actions, max_resets=max_resets)
     current = tools.observe()
@@ -610,6 +642,7 @@ def run_live(
     pattern_prediction_contradictions = 0
     pattern_prediction_inconclusive = 0
     actions_since_review = 0
+    consecutive_unchanged_actions = 0
     interrupted_plans = 0
     stop_reason = "running"
     decisions_path = destination / "decisions.jsonl"
@@ -814,6 +847,11 @@ def run_live(
                     })
                     break
                 current = result["observation"]
+                changed_pixels = (result.get("measurements") or {}).get("changed_pixels")
+                if changed_pixels == 0:
+                    consecutive_unchanged_actions += 1
+                else:
+                    consecutive_unchanged_actions = 0
                 memory = GameMemory(
                     destination, store_dir=memory_store_dir, run_id=run_id, game_id=game_id,
                 )
@@ -870,6 +908,10 @@ def run_live(
                 )
                 if level_completed:
                     trigger_reasons.append("level_completed")
+                if str(current.get("game_state", "")).upper() == "WIN":
+                    trigger_reasons.append("win")
+                if consecutive_unchanged_actions >= 3:
+                    trigger_reasons.append("stagnation")
                 if actions_since_review >= int(review_interval):
                     trigger_reasons.append("action_interval")
                 if trigger_reasons:
@@ -882,6 +924,7 @@ def run_live(
                     )
                     # One attempt, successful or not, starts the next interval.
                     actions_since_review = 0
+                    consecutive_unchanged_actions = 0
                     attempts = int(review_result["attempts"])
                     review_model_calls += attempts
                     model_calls += attempts

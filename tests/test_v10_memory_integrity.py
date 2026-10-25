@@ -8,7 +8,8 @@ import pytest
 from v10.frames import FrameStore
 from v10.tools.history import History
 from v10.tools.memory import (
-    GameMemory, MemoryValidationError, default_state_dir, game_memory_dir, shared_skill_path,
+    MAX_GLOBAL_MEMORY_MARKDOWN_CHARS, GameMemory, MemoryValidationError, default_state_dir,
+    game_memory_dir, global_memory_path, read_global_memory, save_global_memory, shared_skill_path,
 )
 
 
@@ -18,8 +19,27 @@ def test_default_persistent_memory_and_shared_skill_are_project_local(monkeypatc
 
     assert default_state_dir() == project_skills
     assert game_memory_dir(default_state_dir(), "ez01") == project_skills / "games/ez01"
+    assert global_memory_path(default_state_dir()) == project_skills / "global/MEMORY.md"
     assert shared_skill_path() == project_skills / "SKILL.md"
     assert shared_skill_path().is_file()
+
+
+def test_global_memory_is_bounded_markdown_and_replacement_is_atomic(tmp_path) -> None:
+    memory_text = "# Global Memory\n\n- Compare each object before and after an action."
+
+    assert save_global_memory(tmp_path, memory_text) is True
+    path = global_memory_path(tmp_path)
+    assert path.read_text() == memory_text + "\n"
+    assert read_global_memory(tmp_path) == memory_text
+    assert save_global_memory(tmp_path, memory_text) is False
+
+    with pytest.raises(ValueError, match="exceeds"):
+        save_global_memory(tmp_path, "# Global Memory\n\n" + "x" * MAX_GLOBAL_MEMORY_MARKDOWN_CHARS)
+    assert path.read_text() == memory_text + "\n"
+
+    path.write_text("# Global Memory\n\n" + "x" * MAX_GLOBAL_MEMORY_MARKDOWN_CHARS)
+    assert len(read_global_memory(tmp_path)) <= MAX_GLOBAL_MEMORY_MARKDOWN_CHARS
+    assert "truncated for prompt budget" in read_global_memory(tmp_path)
 
 
 def test_model_cannot_author_prediction_verdict_or_self_promote(tmp_path) -> None:

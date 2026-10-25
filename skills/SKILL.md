@@ -2,6 +2,8 @@
 
 Use the current and previous game images, legal actions, recent outcomes, and supplied memory to choose a short action plan. The request states the maximum plan length. Memory is read-only; do not create or update memories.
 
+Game memory contains established mechanics and strategies for the current game and takes priority when applicable. Global memory contains reusable exploration and visual-analysis techniques; use it as guidance, and do not let it override observations or game-specific knowledge.
+
 The four standard movement actions are named `up`, `down`, `left`, and `right`. Use these exact lowercase words in your response. Other legal actions keep their listed names. The harness converts movement words to the environment's action IDs.
 
 Return exactly one JSON object with an `actions` array. Each item must contain only:

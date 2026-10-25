@@ -13,7 +13,7 @@ from v10.live import _perform_review, run_live
 from v10.tools.game import GameTools
 from v10.tools.game import ActionError
 from v10.tools.history import History
-from v10.tools.memory import GameMemory
+from v10.tools.memory import GameMemory, global_memory_path
 
 
 @pytest.fixture(autouse=True)
@@ -56,7 +56,7 @@ class _FakeClient:
     def complete(self, system_prompt, user_prompt, image_paths, image_labels, response_format="json_object"):
         self.calls.append((user_prompt, list(image_paths), list(image_labels)))
         self.response_formats.append(response_format)
-        if system_prompt.startswith("# ez01 incremental memory review"):
+        if system_prompt.startswith("# V10 incremental memory review"):
             if self.review_errors:
                 raise self.review_errors.pop(0)
             content = self.review_responses.pop(0) if self.review_responses else _VALID_REVIEW
@@ -696,6 +696,110 @@ def test_terminal_level_completion_is_reviewed_without_resuming_play(tmp_path: P
     assert metrics["review_count"] == 1
     assert len(client.calls) == 2
     assert _review_rows(tmp_path / "run")[0]["status"] == "saved"
+    assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["level_completed", "win"]
+
+
+def test_win_without_level_counter_change_triggers_review(tmp_path: Path) -> None:
+    class WinWithoutLevelChange(_FakeEnv):
+        def observe(self):
+            result = super().observe()
+            result["terminal"] = bool(self.actions)
+            result["game_state"] = "WIN" if result["terminal"] else "NOT_FINISHED"
+            return result
+
+    client = _FakeClient([_decision([_action()])], review_responses=['{"changes": []}'])
+    metrics = run_live(WinWithoutLevelChange(), tmp_path / "run", client, game_id="fixture", max_actions=2)
+
+    assert metrics["stop_reason"] == "win"
+    assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["win"]
+
+
+def test_three_consecutive_unchanged_actions_trigger_stagnation_review(tmp_path: Path) -> None:
+    client = _FakeClient(
+        [_decision([_action()] * 4), _decision([])], review_responses=['{"changes": []}'],
+    )
+    metrics = run_live(
+        _FakeEnv(change_every_action=False), tmp_path / "run", client,
+        game_id="fixture", max_actions=4, review_interval=50,
+    )
+
+    assert metrics["review_count"] == 1
+    assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["stagnation"]
+
+
+def test_changed_transition_resets_stagnation_streak(tmp_path: Path) -> None:
+    class OneChangedAction(_FakeEnv):
+        def __init__(self):
+            super().__init__(change_every_action=False)
+
+        def act(self, action, args):
+            super().act(action, args)
+            if action == "ACTION2":
+                self.frame[0, 0] = 9
+            return {}
+
+    client = _FakeClient(
+        [
+            _decision([_action("up"), _action("down"), _action("up"), _action("up")]),
+            _decision([_action("up")]),
+        ],
+        review_responses=['{"changes": []}'],
+    )
+    metrics = run_live(
+        OneChangedAction(), tmp_path / "run", client,
+        game_id="fixture", max_actions=5, plan_horizon=4, review_interval=50,
+    )
+
+    assert metrics["review_count"] == 1
+    assert _review_rows(tmp_path / "run")[0]["through_action"] == 5
+    assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["stagnation"]
+
+
+def test_global_lessons_learned_in_ez01_are_loaded_for_ez02(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    reusable_lesson = "Track each object's motion separately when several move at once."
+    review = json.dumps({
+        "changes": [{
+            "operation": "upsert", "pattern_type": "mechanic", "claim": "A fixture mechanic.",
+            "supporting_evidence": ["T2"], "contradicting_evidence": [],
+        }],
+        "global_memory_markdown": f"# Global Memory\n\n- {reusable_lesson}",
+    })
+    first_client = _FakeClient(
+        [_decision([_action()])], review_responses=[review],
+    )
+    first_metrics = run_live(
+        _LevelCompleteEnv(), tmp_path / "ez01-run", first_client,
+        game_id="ez01", max_actions=1, state_dir=state_dir,
+    )
+    corrected_lesson = "Compare each object's before/after position independently when several move."
+    correction = json.dumps({
+        "changes": [],
+        "global_memory_markdown": f"# Global Memory\n\n- {corrected_lesson}",
+    })
+    second_client = _FakeClient(
+        [_decision([_action()])], review_responses=[correction],
+    )
+    second_metrics = run_live(
+        _LevelCompleteEnv(), tmp_path / "ez02-run", second_client,
+        game_id="ez02", max_actions=1, state_dir=state_dir,
+    )
+
+    assert first_metrics["review_count"] == 1
+    assert second_metrics["game_id"] == "ez02"
+    assert second_metrics["review_count"] == 1
+    assert reusable_lesson in second_client.calls[0][0]
+    assert "global_memory" in second_client.calls[0][0]
+    assert corrected_lesson in global_memory_path(state_dir).read_text()
+    assert reusable_lesson not in global_memory_path(state_dir).read_text()
+    assert reusable_lesson in second_client.calls[1][0]
+    ez01_memory = GameMemory(
+        tmp_path / "ez01-run", store_dir=state_dir / "games/ez01", game_id="ez01",
+    )
+    assert any(entry.get("claim") == "A fixture mechanic." for entry in ez01_memory.read()["entries"])
+    assert GameMemory(
+        tmp_path / "ez02-run", store_dir=state_dir / "games/ez02", game_id="ez02",
+    ).patterns("ez02") == []
 
 
 def test_live_direction_words_are_converted_to_environment_action_ids(tmp_path: Path) -> None:
