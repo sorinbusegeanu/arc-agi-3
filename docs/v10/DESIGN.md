@@ -1,28 +1,29 @@
-# Hydra Next — Single-Agent Active Mechanic Discovery
+# V10 — Single-Agent Action Planning
 
-**Design specification v0.1 · 24 October 2026**  
-**Status:** Proposed; not yet validated with Qwen/Strata in a live ARC-AGI-3 environment.
+**Design specification v0.2 · 25 October 2026**
+
+**Status:** Runtime phases 1–5 are implemented. Live task performance remains under evaluation.
 
 ## 1. Objective
 
-Build a minimal, general-purpose agent that learns to play an unfamiliar visual game through repeated cycles of observation, hypothesis formation, experiment, prediction, action, and revision. The agent receives pixels, available actions, and environment feedback; no game rules, object meanings, or goals are preprogrammed.
+Build a minimal, general-purpose agent that learns to play an unfamiliar visual game through repeated cycles of observation, action planning, outcome measurement, and revision. The agent receives pixels, available actions, and environment feedback; no game rules, object meanings, or goals are preprogrammed.
 
 **Primary hypothesis:** A single multimodal LLM with compact per-game memory and precise Python tools can discover useful mechanics and exploit them without an HGT, multi-agent architecture, or trained game-specific world model.
 
-**Success criteria:** measurable progress or level completion; accurate held-out transition predictions; improved action efficiency versus a no-memory baseline; bounded inference cost and memory growth. Plausible textual explanations alone are not success.
+**Success criteria:** measurable progress or level completion; improved action efficiency versus a no-memory baseline; bounded inference cost and memory growth. Offline action matches indicate agreement with a recorded continuation, not policy quality.
 
 ## 2. Design principles
 
-1. **One reasoning agent.** Qwen vision-language model served through Strata handles interpretation, hypotheses, experiments, and plans.
+1. **One action-selection agent.** Qwen vision-language model served through Strata uses the supplied state and history to choose a short action sequence.
 2. **Tools provide measurements and effects.** Python tools observe and act, compute exact pixel changes, retrieve evidence, and persist structured records. They do not invent game semantics.
-3. **Short adaptive action horizon.** Initially propose **1–4 actions**, executed one at a time; interrupt immediately on significant surprises or terminal events. Longer sequences are a future optimization.
+3. **Short adaptive action horizon.** Propose up to **1–4 actions**, executed one at a time; interrupt on level changes, terminal events, illegal actions, errors, or exhausted budgets. Longer sequences are a future optimization.
 4. **Continue by default.** An analysis boundary never implies a reset. Reset is a deliberate, costed action requiring justification.
-5. **Predict before acting.** Record observable predictions and alternatives before executing each diagnostic action.
-6. **Separate facts from beliefs.** Observations, correlations, hypotheses, validated rules, and goal guesses have different epistemic status.
+5. **Measure action outcomes.** Record each environment response and its measured visual changes.
+6. **Keep evidence and interpretation distinct.** Any persistent knowledge is harness-managed context; the action response does not create or update it.
 7. **No future leakage.** At time *t*, the agent may see only evidence available through *t*.
 8. **Evidence is durable, context is compact.** Full logs are append-only; the LLM receives a concise current memory and relevant recent frames.
 9. **General method, local facts.** `SKILL.md` is game-independent; `MEMORY.md` is specific to the active game.
-10. **Measure before adding complexity.** No HGT, vector database, external planner, or extra LLM stages in v0.1.
+10. **Measure before adding complexity.** No HGT, vector database, external planner, or extra LLM stages in the current v10 baseline.
 
 ## 3. System architecture
 
@@ -35,14 +36,14 @@ Build a minimal, general-purpose agent that learns to play an unfamiliar visual 
                      ┌──────────────▼─────────────┐
                      │ Python agent/harness       │
                      │ budget · tools · evidence  │
-                     │ prediction audit · safety  │
+                     │ transition evidence · safety│
                      └──────────────┬─────────────┘
                                     │ context + images
                      ┌──────────────▼─────────────┐
                      │ Qwen-VL via Strata          │
-                     │ discover · test · plan     │
+                     │ choose actions · args      │
                      └──────────────┬─────────────┘
-                                    │ typed decision
+                                    │ JSON action list
                      ┌──────────────▼─────────────┐
                      │ Harness validates/executes │
                      │ one action at a time       │
@@ -57,103 +58,78 @@ Build a minimal, general-purpose agent that learns to play an unfamiliar visual 
 
 | Component | Owns | Must not do |
 |---|---|---|
-| Qwen via Strata | Semantic observations, competing explanations, experiment choice, conditional plans | Claim execution or fabricate evidence |
-| Agent harness | Call orchestration, legal-action validation, step budgets, interrupts, retries, state continuity | Infer game rules silently |
+| Qwen via Strata | Choose a legal action sequence from the supplied state and history | Claim execution, predict outcomes, update memory, or fabricate action IDs |
+| Agent harness | Model call orchestration, legal-action validation, step budgets, interrupts, retries, state continuity | Infer game rules silently |
 | Python vision tools | Pixel masks, regions, temporal comparisons, candidate tracking with uncertainty | Declare an object a player, goal, or HUD without evidence |
-| Evidence store | Immutable actions, original frames, action outcomes, prediction/decision records | Rewrite past transitions |
-| Memory manager | Stable IDs, merge/update/retire with provenance, compact context generation | Promote hypotheses to facts merely because the LLM says so |
-| SKILL.md | General reasoning protocol and tool usage | Store per-game colors, coordinates, or action mappings |
-| MEMORY.md | Current game's state, mechanic candidates, goals, failures, plans | Duplicate all frames or unrestricted free-form reasoning |
+| Evidence store | Immutable state, action transitions, original frames, measurements, and run decisions | Rewrite past transitions |
+| Memory manager | Stable IDs, provenance, and compact read-only context generation | Depend on memory edits from the action-selection response |
+| SKILL.md | Shared action-only response contract | Store per-game colors, coordinates, or action mappings |
+| MEMORY.md | Persistent per-game context and prior observations | Duplicate all frames or unrestricted free-form reasoning |
 
 ## 4. Interaction cycle
 
-**Bootstrap:** Load `SKILL.md`; create empty game memory; call `game.observe`; supply initial image, available actions, game status, and budget to Qwen.
+**Bootstrap:** Load the shared `SKILL.md`; load the persistent per-game memory read-only; observe the game; supply the current state, legal actions, action budget, and current frame to Qwen through Strata.
 
 **Repeated cycle:**
 
-1. Harness assembles the latest **1–4 action transitions**, relevant prior predictions, current image, optional delta visualizations, concise memory, and tool inventory.
-2. Qwen answers: What changed? What repeats? What is still unknown? Which hypotheses explain it? Which previous predictions succeeded/failed? What goal is plausible? What is the cheapest informative experiment? What should happen next?
-3. Qwen emits **one schema-conformant decision**: evidence-linked observations, proposed memory changes, priority question, mode, and 1–4 actions with observable predictions and stop conditions.
-4. Harness validates the decision and action IDs. Invalid outputs are rejected or repaired with bounded retry; no illegal action is executed.
-5. Harness records predictions **before** actions. Execute **one action**; collect original frames, intermediate frames and metadata; compute measurements; check stop conditions.
-6. If an unexpected transition, level change, terminal state, resource threshold, or failed prediction occurs, stop the remaining plan and reconsult Qwen.
-7. Audit predicted versus actual observations; append evidence and decisions; apply allowed memory patches; repeat.
+1. Harness assembles the current and previous game frames, recent action outcomes, legal actions, budgets, and up to five read-only memory entries.
+2. Qwen chooses up to the configured **1–4 action plan horizon** and returns only action IDs and arguments.
+3. Harness validates the action list and arguments. Invalid outputs are rejected or repaired with bounded retry; no illegal action is executed.
+4. Execute actions one at a time; collect original frames and metadata, compute measurements, and record each transition.
+5. On a level change, terminal state, illegal next action, action error, or exhausted budget, stop the remaining plan and consult Qwen again when appropriate.
+6. Repeat with the latest state and outcomes. The harness maintains evidence and persistent memory; the model does not write memory or predict outcomes.
 
-**Important distinction:** A 1–4 action *plan* does not mean the LLM must consume 1–4 separate tool calls. A tool-calling loop can return after each action, or the harness can execute a bounded plan with local stop checks. Begin with one model decision per bounded plan and a deterministic interrupt mechanism.
+The model does not call game tools directly. It returns JSON to the Python runner, which validates and executes one action at a time. The runner checks the latest observation before each action and interrupts the remainder of a plan when needed.
 
 ## 5. Inputs to each Qwen decision
 
 | Input | Format | Notes |
 |---|---|---|
 | General instruction | `SKILL.md` or distilled prompt | Stable and cacheable when supported |
-| Current game memory | Compact Markdown or JSON | Active hypotheses, evidence counts, contradictions, current goals |
-| Recent transitions | Ordered structured records | Action ID, pre/post evidence IDs, frame counts, outcomes |
-| Original images | Initial/current plus relevant keyframes | Preserve visual meaning; do not replace with delta-only views |
-| Delta images | One per informative action, when useful | Pixel changes, preferably with appeared/disappeared overlay |
-| Exact measurements | JSON | Changed-pixel count, region boxes, candidate displacements, temporal changes |
-| Prediction audit | Structured entries | Previous prediction, observation, match/fail/inconclusive |
-| Game affordances | Tool schema and available actions | No assumptions about action names or coordinate semantics |
-| Budgets | Counts/time/resources, if known | Reset and inference costs explicitly represented |
+| Game frames | Current and previous actual frame, at most two | Do not send initial-frame or delta-image stacks |
+| Current state | Game status, level, legal action IDs and argument information | Live includes action schemas; offline replay uses recorded action IDs and observed args |
+| Recent outcomes | Ordered action, arguments, and measured result | Bounded by the configured plan horizon |
+| Game memory | Up to five compact entries, read-only | Existing memory is context; the model does not edit it |
+| Budgets | Live remaining action/reset counts and plan horizon | Offline replay has no live remaining-budget estimate |
 
-**Image selection:** For a four-action cycle, start with the initial or prior state image, four delta visualizations, and the current image (approximately six images). Include intermediate frames selectively when an action spans multiple frames or delta interpretation is ambiguous. Do not send all frames blindly.
+**Image selection:** Send the current actual game frame and, when available, the immediately previous actual frame. Do not send a history stack or delta overlays to action selection.
 
-**Token budgeting:** Earlier planning estimates were roughly 2,900–8,550 input tokens and 500–800 output tokens for a four-action cycle, but **image token cost is unmeasured** and depends on the exact Strata/Qwen multimodal path. Treat all numbers as provisional. Set a 1,024-token output cap initially; log actual input, image, reasoning, output tokens and latency if the runtime exposes them.
+**Token budgeting:** Live defaults to a 4,096-token output cap; offline analysis and ablation default to 1,024. Reasoning effort defaults to `medium`; a separate reasoning-token budget is optional. Image token cost depends on the deployed Strata/Qwen path; use returned usage/latency and opt-in request/response logs rather than planning estimates.
 
-## 6. LLM reasoning contract
+## 6. LLM action contract
 
-The analyst must answer these eight questions, allowing `unknown`:
-
-1. **Observations:** What changed, and what stayed invariant? Cite exact transition/frame IDs.
-2. **State candidates:** Which persistent regions, entities, temporal signals or HUD candidates are supported? Distinguish pixels from semantics.
-3. **Patterns:** Which relations recur, under what conditions, and with which exceptions?
-4. **Mechanics:** What competing causal explanations fit the observations? What would falsify each?
-5. **Prediction audit:** Which prior predictions matched, failed or were inconclusive? What belief changes follow?
-6. **Goal:** What objective is supported by outcome feedback? Which visually plausible targets remain guesses?
-7. **Experiment:** What single unresolved question matters most, and what is the cheapest discriminating test?
-8. **Decision:** Explore, exploit, or recover? Continue or reset? Which 1–4 legal actions, predictions and stop conditions?
-
-**Fixed response schema (logical contract; validate with JSON Schema):**
+The model receives the current and previous actual game frames when available, legal actions, recent action outcomes, live budgets, and up to five read-only memory entries. It may reason internally, but the action loop does not request a written analysis report or memory updates. The configured plan horizon is at most four actions. Offline analysis has no live budget values.
 
 ```json
 {
-  "observations": [{"id":"O1","claim":"...","evidence_ids":["T4"]}],
-  "patterns": [{"id":"P1","relation":"...","conditions":"...","evidence_ids":["T1","T2"],"exceptions":[],"status":"candidate"}],
-  "hypotheses": [{"id":"H1","claim":"...","alternatives":["..."],"prediction":"...","falsification":"...","status":"candidate"}],
-  "prediction_audit": [{"prediction_id":"PR1","verdict":"matched","evidence_ids":["T4"]}],
-  "goals": [{"id":"G1","claim":"...","status":"unverified","evidence_ids":[]}],
-  "priority_question": "...",
-  "decision": {
-    "mode":"explore",
-    "continue_or_reset":"continue",
-    "reset_justification":null,
-    "actions":[{"action":"ACTION3","args":{},"prediction_id":"PR2","expected_observation":"...","measurable_prediction":{"all":[{"path":"measurements.changed_pixels","op":"gt","value":0}]},"stop_if":["unexpected_transition","level_change"]}]
-  },
-  "memory_patch": [{"op":"upsert","id":"H1","type":"hypothesis","claim":"...","evidence_ids":["T4"]}]
+  "actions": [
+    {"action":"ACTION3","args":{}},
+    {"action":"ACTION1","args":{}}
+  ]
 }
 ```
 
-Each action must include `measurable_prediction`. Use a non-empty `all` list of `{path, op, value}` comparisons against allowlisted measurement or outcome fields, with `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, or inclusive `between`. If no supported measurement fits, use `null` and a non-empty `unmeasurable_reason`; that prediction is audited as inconclusive. Legacy flat pixel-diff predictions are normalized for existing callers. Frame IDs beginning with `F` are image handles and are never valid evidence citations. Memory patches accept only `upsert` and `retire`; the harness owns prediction verdicts.
+The `v10.action_set/2` response must contain only the top-level `actions` array. Each action object must contain only a legal action ID and its `args`; extra fields are rejected. The array may contain zero to the configured horizon, with a maximum horizon of four. An empty list ends a live run. If reset budget is available, `RESET` is listed as a pseudo-action and must be the only returned action, with its justification in `args`. The harness validates every action against the latest legal-action schema, records transitions and measurements, and interrupts the remaining plan on a level change, terminal state, illegal next action, action error, or exhausted budget. Offline analysis compares proposed actions with the recorded continuation as action matches only; this is not a measure of policy quality.
 
-This is a **representative schema**, not executable code. Real tool/action schemas must support game-specific arguments (e.g. coordinates), enforce enum values, bounds and valid evidence IDs, and forbid invented tool names. Avoid free-form numeric confidence until calibrated; retain support/contradiction counts and qualitative status.
+The response schema is enforced by the runtime validator. Legal action IDs and argument schemas come from the current environment observation.
 
-## 7. Tools: initial MCP-compatible interface
+## 7. Python runner interfaces
 
-Expose tools through a Python adapter; MCP compatibility is optional at runtime but useful for portability. Tool calls must be bounded, typed, and logged.
+The model interface is a Strata chat completion with system instructions, a user prompt, up to two actual game frames, and JSON output. The model does not receive callable tools. Python validates the action list, then dispatches actions through the environment adapter. The internal interfaces are:
 
 | Tool | Inputs | Outputs | Rules |
 |---|---|---|---|
-| `game.observe` | optional frame selection | Current frame ID/image, state, legal actions, level/terminal metadata | Read-only; does not advance game |
-| `game.act` | action ID, validated args | Action result, new frame IDs, intermediate frames, metadata, transition ID | Single action; consumes budget; never speculative |
-| `vision.diff` | two frame IDs, optional region | Exact changed pixels, boxes, masks/overlay | Report measurements, not causal labels |
-| `history.query` | bounded filters, limit | Matching transition IDs, actions, measurements, frame links | No future records; enforce output cap |
-| `memory.read` | IDs or concise summary | Current knowledge and evidence references | Read-only |
-| `memory.propose_update` | typed patches | Accepted/rejected patches with reasons | Preserve prior evidence; harness controls promotion |
+| `GameTools.observe` | environment observation | Current frame, state, legal actions, level/terminal metadata | Read-only; does not advance game |
+| `GameTools.act` | action ID, validated args | Result, new frame IDs, intermediate frames, measurements, transition evidence | Single action; consumes budget |
+| `History` | bounded evidence reads | State and transition records with frame links | Append-only; prefix reads prevent future leakage |
+| `GameMemory.compact` | entry limit and visible step | Compact persistent game context | Read-only from the action-selection loop; maximum five entries |
+| Vision helpers | before/after frames | Pixel changes and candidate displacement measurements | Measurements only; no game semantics |
 
-**Defer:** `vision.track` until necessary for robust identity/displacement; `experiment.compare` until comparison queries are frequent; specialized planning/search tools until baseline measurements justify them. A local deterministic tracking helper can still run inside preprocessing without being an LLM-visible tool.
-
-**Tool interface caveat:** Verify Strata's *specific deployed model* supports multimodal image inputs and tool-call output together. If tool calling is unreliable, have Qwen emit schema-constrained JSON and let Python dispatch it. Do not assume that a runtime supporting vision automatically supports reliable agentic tool use.
+`StrataClient` requests JSON output and retries once without server-side JSON enforcement if the endpoint rejects structured output. The v10 validator then checks the response; the live runner allows one corrective model call before using a seeded random legal fallback when one can be safely formed.
 
 ## 8. Knowledge model
+
+The persistent ledger retains typed knowledge entries for continuity with existing game memory. These categories describe stored context; they are not fields the model must produce during action selection. The live and offline action-selection loops read memory only.
 
 ### 8.1 Epistemic levels
 
@@ -166,6 +142,8 @@ Expose tools through a Python adapter; MCP compatibility is optional at runtime 
 
 ### 8.2 Per-game `MEMORY.md`
 
+This is an internal knowledge organization reference, not a required model response. The action-selection loop supplies existing memory read-only and does not ask the model to build or update it.
+
 Recommended compact sections:
 
 1. **Current state:** last evidence ID, level, known budgets, controllable candidates.
@@ -174,106 +152,92 @@ Recommended compact sections:
 4. **Patterns:** descriptive/temporal/relational patterns and exceptions.
 5. **Goal candidates:** evidence for/against; terminal semantics if established.
 6. **Current strategy:** mode, near-term objective, recovery triggers.
-7. **Prediction register:** outstanding predictions and evaluation status.
+7. **Action history:** tried actions and their observed outcomes. Older prediction entries may remain in existing ledgers, but the current action loop neither requests nor writes them.
 8. **Known failures/contradictions:** what should not be assumed.
 
-Keep evidence IDs, not embedded screenshots. Maintain an append-only machine-readable ledger as the authoritative record; `MEMORY.md` is a concise, regenerated view. A proposed update must not silently delete contradictory evidence.
+Keep evidence IDs, not embedded screenshots. Maintain an append-only machine-readable ledger as the authoritative record; `MEMORY.md` is a concise, regenerated view. Memory may be supplied read-only to action selection, with at most five entries. The model is not asked to propose memory edits.
 
 ### 8.3 `SKILL.md`
 
-Reusable, game-independent instructions: how to compare transitions, detect patterns, formulate causal hypotheses, design controlled experiments, distinguish goals from visual guesses, choose explore/exploit/recover, handle reset, and cite evidence. No `ls20`-specific action mapping or color labels.
+Reusable, game-independent instructions for choosing legal actions, returning a bounded action sequence, and handling reset. No `ls20`-specific action mapping or color labels.
 
 ### 8.4 Reasoning and decision history
 
-Preserve **structured decisions and predictions** in `decisions.jsonl`, with optional raw model reasoning stored separately when the runtime permits it. Do not routinely feed the full reasoning transcript back: it is verbose and can reinforce false hypotheses. Retrieve only selected historical rationales when auditing contradictions. Record model version, prompt/schema version, evidence IDs, chosen action, predicted effect, actual effect, and verdict.
+Preserve **structured action plans and outcomes** in `decisions.jsonl`. Record model version, prompt/schema version, visible evidence IDs, chosen actions, actual outcomes, and action-match results for offline runs. Raw request and response bodies are logged only when the user enables the corresponding CLI flags.
 
-## 9. Exploration–exploitation policy
+## 9. Action selection and control
 
 The LLM proposes a decision, but the harness enforces budgets and interrupts.
 
-**Explore** when action semantics, hidden state, goals or key mechanics remain uncertain and a cheap test could change the plan. Prefer one-variable comparisons, matched contexts where feasible, and actions that distinguish competing hypotheses.
+Choose actions that make progress or clarify the current state, based on the supplied context. The model need only return the action sequence; it is not asked to label its mode or explain its reasoning.
 
-**Exploit** when a supported mechanic and plausible goal justify a low-risk action sequence. Still attach predictions and verify each action.
+The harness executes each action separately and observes the result before continuing the plan.
 
-**Recover** when predictions repeatedly fail, progress stalls, a resource becomes critical, or state becomes irrecoverable. Consider revising the state model, backtracking, or resetting.
+The harness stops a plan when the game changes level, reaches a terminal state, rejects an action, or exhausts a budget. A new decision then uses the latest observation.
 
-**Reset policy:** Continue by default. Reset only if (a) the state is irrecoverable, (b) a controlled experiment requires a reproducible start, or (c) expected progress after reset outweighs reset and replay cost. The LLM must state its reason; the harness validates permission and budget. Never reset solely because a cycle ended.
+**Reset policy:** Continue by default. When reset budget is available, the runner lists `RESET` as a legal pseudo-action. The model may return it alone with a justification in `args`; the harness enforces reset permission and budget. Never reset solely because a plan ended.
 
-**Action horizon:** Start with 1–2 actions for unknown mechanics and 2–4 for short tests or reliable progress. Interrupt at any point on terminal/level changes, action failure, prediction mismatch, or significant unexpected visual changes. A later version may extend to 4–10 actions once validated.
+**Action horizon:** Configure a plan horizon of 1–4 actions. Interrupt on terminal or level changes, action failure, illegal next actions, or budget exhaustion.
 
-## 10. Concrete worked example: `ls20`, first four actions
+## 10. Action contract example
 
-**Source:** Earlier analysis of the supplied `ls20` game log; this is an illustrative retrospective reconstruction, not a Qwen/Strata live result.
+For a requested horizon of four, a valid response can contain one to four actions:
 
-| Step | Action | Measured changed pixels | Tracked marker effect |
-|---|---|---:|---|
-| 1 | ACTION1 | 52 | Up approximately 5 px |
-| 2 | ACTION1 | 52 | Up approximately 5 px |
-| 3 | ACTION1 | 52 | Up approximately 5 px |
-| 4 | ACTION3 | 2 | No tracked displacement |
+```json
+{"actions":[{"action":"ACTION1","args":{}},{"action":"ACTION3","args":{}}]}
+```
 
-**Observation:** ACTION1 repeatedly correlates with a similar upward displacement of a candidate visual marker; ACTION3 at step 4 produces little visible change. A separate small region may still change.
+The harness validates both actions against the current legal-action schemas. It executes the first action, observes the resulting state, and executes the second only if it remains legal and the game has not changed level or ended. It records measured outcomes but does not compare them against model-authored predictions.
 
-**Pattern P1:** Repeated action-conditioned displacement. Evidence: T1–T3. Candidate, not yet a fully proven control rule.
-
-**Hypothesis H1:** ACTION1 controls upward movement. Prediction: at another permissive location, ACTION1 again moves the tracked region upward by about 5 pixels. Alternative: repeated animation or mistaken identity.
-
-**Hypothesis H2:** ACTION3 failed because movement was blocked. Prediction: ACTION3 will cause displacement in a different spatial context. Alternative: ACTION3 has another meaning or changes hidden state.
-
-**Goal G1:** Unknown. A visually prominent region may be a destination, but there is no completion evidence in these four actions.
-
-**Next experiment:** Choose a legal action that discriminates blocked movement from an alternative action meaning; compare the marker and other changed regions. Continue the existing game state unless geometry makes a matched comparison impossible. Record predicted displacement before executing.
-
-**Limit of offline replay:** We can score predictions only for actions actually present in the recorded continuation. We cannot claim that an alternative experiment would succeed without a live environment or validated simulator.
+An invalid response receives one corrective prompt. If the repair is also invalid, the runner logs the rejection and attempts a seeded random legal action when its required arguments can be generated safely; otherwise, it stops. Offline analysis compares the proposed list to the recorded continuation and labels each item as matched, mismatched, or unscorable. This is action match only, not policy quality.
 
 ## 11. Harness behavior and failure handling
 
 - **Input integrity:** Preserve ordered action-to-frame mapping, including intermediate frames and resets; verify image dimensions and palette fidelity.
 - **Action legality:** Validate action IDs, coordinate ranges, required arguments, and remaining budget before execution.
 - **State consistency:** Associate all evidence with game/session, level, action index and reset generation; do not merge transitions across resets as continuous state.
-- **JSON robustness:** Strict schema validation; one bounded repair attempt; on failure, take no action and surface error.
-- **Prediction evaluation:** Distinguish exact measurable predicates (e.g. changed pixel count) from semantic predictions requiring further interpretation; mark ambiguous outcomes `inconclusive`.
-- **Memory integrity:** Version patches, preserve conflicting hypotheses, deduplicate observations, and cap active memory size; archive retired details with references.
+- **JSON robustness:** Strict action-only schema validation; one bounded repair attempt; then a seeded random legal fallback if safe arguments can be generated, otherwise stop.
+- **Offline scoring:** Report action matches only; do not infer prediction accuracy or policy quality from a fixed trace.
+- **Memory integrity:** Preserve evidence provenance, deduplicate repeated entries, and cap active memory size; archive retired details with references.
 - **Tool budgets:** Cap history query size, number of images, model calls per game step, tool retries, wall-clock time, and total actions.
-- **Safety of autonomous action:** Never assume an LLM tool response is a real game outcome; only the environment adapter can assert state transitions.
-- **Observability:** Record per-cycle prompt version, images, tokens, latency, tool calls, prediction verdicts, memory size and action counts.
+- **Safety of autonomous action:** Treat the model response as a proposed action list; only the environment adapter can assert state transitions.
+- **Observability:** Record prompt version, input images, token usage, latency, action plans, transition evidence, memory size and action counts.
 
 ## 12. Project layout
 
 ```text
-hydra-next/
-├── agent.py                   # single agent/harness loop
-├── strata_client.py           # multimodal inference and schema adapter
-├── SKILL.md                   # reusable mechanic-discovery method
-├── schemas/                   # validated tool/decision/memory contracts
-├── tools/
-│   ├── game.py                # observe, act, reset
-│   ├── vision.py              # frame deltas and candidate tracking
-│   ├── history.py             # bounded evidence queries
-│   └── memory.py              # read and propose patches
-├── tests/                     # deterministic runtime smoke tests
-└── runs/
-    └── <session-id>/
-        ├── MEMORY.md          # concise current game knowledge
-        ├── evidence.jsonl     # immutable environment transitions
-        ├── decisions.jsonl    # plans, predictions, audits
-        ├── frames/            # original and selected derived images
-        └── metrics.json       # cost, quality and outcome counters
+src/v10/
+├── cli.py              # replay, analyze, ablate, optimize, and live commands
+├── strata_client.py    # multimodal JSON inference and optional HTTP logs
+├── analysis.py         # action-only validation, offline context, trace matching
+├── live.py             # bounded multi-action live runner and repair/fallback flow
+├── SKILL.md            # shared action-only model instructions
+└── tools/
+    ├── game.py         # legal action validation, environment actions, transitions
+    ├── history.py      # append-only evidence and prefix-bounded reads
+    └── memory.py       # persistent game ledger and compact read-only context
+
+runs/v10/<run>/
+├── evidence.jsonl      # state and action transition records
+├── decisions.jsonl     # model plans and execution results
+├── frames/             # original and derived images
+├── metrics.json        # live action, level, usage, and timing metrics
+└── model_*.jsonl       # optional raw HTTP request/response logs
 ```
 
-This is a suggested layout, not a claim about existing repository paths. Tool implementations are Python modules; `SKILL.md` documents how to use them and does not embed executable tools.
+The shared game memory ledger and generated view live outside disposable run directories under `$V10_STATE_DIR/games/<game-id>/`.
 
 ## 13. Implementation sequence
 
-**Phase 1 — Replay harness:** Read one existing log, expose only evidence through the current step, generate exact delta images and structured transitions, and validate output JSON. No game actions are executed.
+**Phase 1 — Replay harness:** Implemented. Reads recorded traces, stores state/transition evidence and images, and prevents future transitions from entering the prompt.
 
-**Phase 2 — Offline analysis:** Run Qwen via Strata on the first 1–4 `ls20` actions; inspect hypotheses and predicted outcomes; score against subsequent *recorded* actions without leaking them into the prompt.
+**Phase 2 — Offline analysis:** Implemented. Runs Qwen via Strata on a replay prefix and compares its proposed action sequence with subsequent recorded actions without leaking them into the prompt. This measures action match only, not policy quality.
 
-**Phase 3 — Live single-agent loop:** Add `game.observe`/`game.act`, interruptible 1–4-action plans, memory patches and prediction audits. Continue by default; reset only explicitly.
+**Phase 3 — Live single-agent loop:** Implemented. Runs interruptible 1–4-action plans, records transition evidence, and offers reset only when budgeted.
 
-**Phase 4 — Ablation:** Compare pixels+actions alone, pixels+actions+memory, and memory+delta frames under matched budgets. Separately compare optional prior reasoning snippets.
+**Phase 4 — Ablation:** Implemented. Compares pixels+actions with pixels+actions plus up to five read-only memory entries under matched budgets; can also compare prior action plans.
 
-**Phase 5 — Optimization:** Tune image selection, token budgets, horizon and memory compaction. Add advanced tools or HGT only if measured bottlenecks justify them.
+**Phase 5 — Optimization:** Implemented. Sweeps plan horizon, output-token budget, memory limit, and context profile on a fixed offline cut.
 
 **Persistence invariant:** `SKILL.md` is the shared, game-independent source and is referenced by digest rather than copied into each run. The append-only game ledger and generated `MEMORY.md` live in a durable per-game state directory outside disposable run outputs. Every evidence reference carries its run ID. Model context is compacted from the persistent ledger without rewriting its history; evaluation arms are read-only with respect to that ledger.
 
@@ -283,31 +247,29 @@ This is a suggested layout, not a claim about existing repository paths. Tool im
 |---|---|
 | Levels solved / WIN | Primary task outcome |
 | Actions to first progress / completion | Interaction efficiency |
-| Held-out action-effect prediction accuracy | Whether mechanics predict observations |
-| Prediction calibration and exception rate | Whether knowledge is appropriately qualified |
-| Experiment yield | Fraction of tests that discriminate important hypotheses |
+| Offline action match | Agreement with the recorded continuation; not policy quality |
 | Invalid actions / resets / interrupted plans | Control reliability and wasted budget |
 | Input/output/image tokens, latency, GPU usage | Runtime cost |
 | Active memory size and growth | Sustainability |
 | Performance with vs without memory | Whether learned knowledge actually helps |
 
-**Evaluation safeguards:** Compare at equal action and compute budgets; use unseen episodes/levels where possible; do not evaluate counterfactual actions using a fixed log. Offline traces measure prediction and analysis quality, not the performance of a policy that would have chosen different actions.
+**Evaluation safeguards:** Compare at equal action and compute budgets; use unseen episodes/levels where possible; do not evaluate counterfactual actions using a fixed log. Offline traces report whether proposed actions match the recorded continuation; they do not measure policy quality.
 
 ## 15. Open decisions and risks
 
-1. **Strata/Qwen interface:** Confirm exact vision encoding, image limits, JSON/tool-call reliability and reasoning-token accounting on the intended model and hardware.
-2. **Visual representation:** Determine whether delta images, overlays, intermediate frames and structured tracking improve prediction accuracy enough to justify cost.
+1. **Strata/Qwen interface:** Continue measuring image encoding cost, JSON reliability, reasoning-token accounting, and inference latency on the deployed model and hardware.
+2. **Visual representation:** Determine whether the current/previous frame pair and structured measurements provide enough context at acceptable cost.
 3. **Hidden state:** Visually identical frames can have different future dynamics; memory must represent relevant history and uncertainty.
 4. **Goal discovery:** Visual salience is not proof of a target; require feedback and explicit competing goal hypotheses.
-5. **Model self-confirmation:** Prior reasoning can anchor false mechanics; score against observations and preserve counterexamples.
+5. **Context anchoring:** Prior action plans may bias later choices; compare with and without prior plan summaries.
 6. **Experiment cost:** Some actions consume scarce resources or irreversible progress; information gain must be balanced against risk.
 7. **Memory quality:** Avoid runaway accumulation; compact repeated evidence and archive obsolete hypotheses without losing provenance.
 8. **Generalization:** The method should work for click-based, directional, temporal and other unknown interfaces; no genre-specific assumptions in the skill.
 
-## 16. Explicitly out of scope for v0.1
+## 16. Future work outside the current v10 baseline
 
-HGT training, learned latent world models, multi-agent exploration, cross-game permanent pattern transfer, autonomous skill rewriting, broad graph databases, and guaranteed optimal planning. These remain possible future research directions, not prerequisites for the first experiment.
+HGT training, learned latent world models, multi-agent exploration, cross-game permanent pattern transfer, autonomous skill rewriting, broad graph databases, and guaranteed optimal planning remain possible future research directions.
 
 ---
 
-**Decision:** Build the smallest observable loop first: **Qwen/Strata + Python game/vision/history/memory tools + `SKILL.md` + per-game `MEMORY.md` + append-only evidence + strict schemas**. Evaluate whether predictions and decisions improve before adding architecture.
+**Current baseline:** **Qwen/Strata JSON action selection + Python validation and game execution + `SKILL.md` + read-only per-game memory context + append-only transition evidence + configurable 1–4 action plans.** Evaluate live progress and action efficiency; use offline action matches as a trace comparison only.

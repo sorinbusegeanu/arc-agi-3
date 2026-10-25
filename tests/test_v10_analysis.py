@@ -20,7 +20,7 @@ from v10.cli import build_parser
 from v10.frames import FrameStore, png_bytes
 from v10.evaluation import run_ablation
 from v10.replay import replay_trace
-from v10.strata_client import StrataClient
+from v10.strata_client import StrataClient, StrataRequestError
 from v10.tools.game import evaluate_prediction
 from v10.tools.history import History
 
@@ -60,30 +60,7 @@ def _write_trace(path: Path) -> None:
 
 
 def _valid_decision(action: str = "ACTION2", args: dict | None = None) -> dict:
-    return {
-        "observations": [],
-        "patterns": [],
-        "hypotheses": [],
-        "prediction_audit": [],
-        "goals": [],
-        "priority_question": "Does the next action change the frame?",
-        "decision": {
-            "mode": "explore",
-            "continue_or_reset": "continue",
-            "reset_justification": None,
-            "actions": [{
-                "action": action,
-                "args": args or {},
-                "prediction_id": "PR_NEXT",
-                "expected_observation": "One pixel changes.",
-                "measurable_prediction": {
-                    "all": [{"path": "measurements.changed_pixels", "op": "eq", "value": 1}],
-                },
-                "stop_if": ["unexpected_transition", "level_change"],
-            }],
-        },
-        "memory_patch": [],
-    }
+    return {"actions": [{"action": action, "args": args or {}}]}
 
 
 class _FakeClient:
@@ -112,7 +89,7 @@ def test_analysis_context_contains_only_prefix_and_selected_images(tmp_path: Pat
     context = build_analysis_input(run_dir, through_action=4)
 
     assert len(context["prefix_transitions"]) == 4
-    assert len(context["image_paths"]) == 6
+    assert len(context["image_paths"]) == 2
     assert "replay_records" not in context
     assert "FUTURE_ONLY" not in context["user_prompt"]
     assert "HISTORICAL_REASONING" not in context["user_prompt"]
@@ -120,12 +97,9 @@ def test_analysis_context_contains_only_prefix_and_selected_images(tmp_path: Pat
     visible_ids = set(context["visible_evidence_ids"])
     assert context["initial_state_evidence_id"] in visible_ids
     assert all(row["evidence_id"] in visible_ids for row in context["prefix_transitions"])
-    assert all(
-        row["prediction_evidence_id"] in visible_ids
-        for row in context["prefix_transitions"] if row.get("prediction_evidence_id")
-    )
     assert all(frame["frame_id"] not in visible_ids for frame in FrameStore(run_dir).entries())
-    assert set(context["context"]["citable_evidence_ids"]) == visible_ids
+    assert "citable_evidence_ids" not in context["context"]
+    assert "visible_prediction_ids" not in context["context"]
 
 
 def test_context_reader_stops_before_malformed_future_evidence(tmp_path: Path) -> None:
@@ -149,13 +123,9 @@ def test_ablation_profiles_select_expected_memory_and_delta_images(tmp_path: Pat
 
     pixels = build_analysis_input(run_dir, conditioning="pixels_actions", horizon=2)
     with_memory = build_analysis_input(run_dir, conditioning="pixels_actions_memory", horizon=2)
-    memory_delta = build_analysis_input(run_dir, conditioning="memory_delta", horizon=2)
-
     assert len(pixels["image_paths"]) == len(with_memory["image_paths"]) == 2
-    assert len(memory_delta["image_paths"]) == 4
     assert pixels["context"]["memory"] is None
     assert with_memory["context"]["memory"] is not None
-    assert memory_delta["context"]["conditioning"] == "memory_delta"
 
 
 def test_ablation_runs_matched_profiles_without_writing_analysis_decisions(tmp_path: Path) -> None:
@@ -167,10 +137,10 @@ def test_ablation_runs_matched_profiles_without_writing_analysis_decisions(tmp_p
     result = run_ablation(run_dir, _FakeClient(), through_action=4, horizon=2)
 
     assert [arm["conditioning"] for arm in result["arms"]] == [
-        profile for profile in ("pixels_actions", "pixels_actions_memory", "memory_delta")
+        profile for profile in ("pixels_actions", "pixels_actions_memory")
         for _ in (False, True)
     ]
-    assert [arm["include_prior_decisions"] for arm in result["arms"]] == [False, True] * 3
+    assert [arm["include_prior_decisions"] for arm in result["arms"]] == [False, True] * 2
     assert all(arm["status"] == "ok" for arm in result["arms"])
     assert not (run_dir / "decisions.jsonl").exists()
     assert (run_dir / "ablation_runs.jsonl").exists()
@@ -185,18 +155,17 @@ def test_run_analysis_scores_matching_recorded_action_after_model_call(tmp_path:
 
     result = run_analysis(run_dir, client, through_action=4)
 
-    assert result["prediction_audits"] == [{
-        "prediction_id": "PR_NEXT",
+    assert result["action_matches"] == [{
         "plan_index": 0,
-        "verdict": "matched",
-        "compared": [{
-            "path": "measurements.changed_pixels", "op": "eq", "expected": 1,
-            "actual": 1, "matched": True,
-        }],
+        "planned_action": "ACTION2",
+        "status": "matched",
         "recorded_evidence_id": "T6",
         "recorded_action": "ACTION2",
     }]
     assert "FUTURE_ONLY" not in client.calls[0][1]
+    assert '"actions"' in client.calls[0][1]
+    assert "memory_patch" not in client.calls[0][1]
+    assert "hypotheses_item" not in client.calls[0][1]
     assert result["usage"]["total_tokens"] == 17
     assert (run_dir / "decisions.jsonl").exists()
 
@@ -216,50 +185,58 @@ def test_analysis_retries_once_for_invalid_json_and_never_scores_before_validity
     assert "FUTURE_ONLY" not in client.calls[1][1]
 
 
-def test_model_decision_rejects_future_or_unknown_evidence(tmp_path: Path) -> None:
+def test_action_only_response_rejects_unrequested_analysis_and_memory_fields(tmp_path: Path) -> None:
     trace = tmp_path / "trace.jsonl"
     _write_trace(trace)
     run_dir = tmp_path / "run"
     replay_trace(trace, run_dir)
     context = build_analysis_input(run_dir, through_action=4)
     decision = _valid_decision()
-    decision["observations"] = [{"id": "O1", "claim": "future", "evidence_ids": ["T999"]}]
+    decision["memory_patch"] = {"upsert": "legacy malformed patch ignored by action selector"}
+    decision["observations"] = [{"id": "O1", "claim": "legacy", "evidence_ids": ["F0"]}]
 
-    with pytest.raises(DecisionValidationError, match="unavailable evidence"):
+    with pytest.raises(DecisionValidationError, match="only an actions list"):
+        validate_model_decision(decision, context["legal_action_specs"])
+
+
+def test_action_response_needs_only_action_and_args(tmp_path: Path) -> None:
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run_dir = tmp_path / "run"
+    replay_trace(trace, run_dir)
+    context = build_analysis_input(run_dir, through_action=4)
+
+    normalized = validate_model_decision(
+        {"actions": [{"action": "ACTION2", "args": {}}]},
+        context["legal_action_specs"],
+    )
+
+    assert normalized["actions"][0]["action"] == "ACTION2"
+    assert normalized == {"actions": [{"action": "ACTION2", "args": {}}]}
+
+
+def test_action_response_respects_requested_plan_horizon(tmp_path: Path) -> None:
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run_dir = tmp_path / "run"
+    replay_trace(trace, run_dir)
+    context = build_analysis_input(run_dir, through_action=4)
+
+    with pytest.raises(DecisionValidationError, match="0 to 1 actions"):
         validate_model_decision(
-            decision, context["legal_action_specs"], context["visible_evidence_ids"],
+            {"actions": [{"action": "ACTION1", "args": {}}, {"action": "ACTION2", "args": {}}]},
+            context["legal_action_specs"], max_actions=1,
         )
 
 
-def test_model_decision_rejects_frame_handle_as_citation(tmp_path: Path) -> None:
+def test_model_memory_context_is_capped_at_five_entries(tmp_path: Path) -> None:
     trace = tmp_path / "trace.jsonl"
     _write_trace(trace)
     run_dir = tmp_path / "run"
     replay_trace(trace, run_dir)
-    context = build_analysis_input(run_dir, through_action=4)
-    decision = _valid_decision()
-    decision["observations"] = [{"id": "O1", "claim": "visible", "evidence_ids": ["F0"]}]
 
-    with pytest.raises(DecisionValidationError, match="frame handle F0"):
-        validate_model_decision(decision, context["legal_action_specs"], context["visible_evidence_ids"])
-
-
-@pytest.mark.parametrize("patch, message", [
-    ({"op": "verdict", "id": "P1", "status": "matched"}, "harness-owned"),
-    ({"op": "upsert", "id": "O1", "type": "observation", "claim": "x", "evidence_ids": ["T1"]}, "entry type"),
-    ({"op": "upsert", "id": "H1", "type": "hypothesis", "claim": "x", "evidence_ids": []}, "non-empty"),
-])
-def test_model_decision_rejects_structurally_invalid_memory_patch(tmp_path: Path, patch: dict, message: str) -> None:
-    trace = tmp_path / "trace.jsonl"
-    _write_trace(trace)
-    run_dir = tmp_path / "run"
-    replay_trace(trace, run_dir)
-    context = build_analysis_input(run_dir, through_action=4)
-    decision = _valid_decision()
-    decision["memory_patch"] = [patch]
-
-    with pytest.raises(DecisionValidationError, match=message):
-        validate_model_decision(decision, context["legal_action_specs"], context["visible_evidence_ids"])
+    with pytest.raises(ValueError, match="between 0 and 5"):
+        build_analysis_input(run_dir, through_action=4, memory_context_entries=6)
 
 
 def test_model_decision_rejects_malformed_enum_types_cleanly(tmp_path: Path) -> None:
@@ -269,45 +246,44 @@ def test_model_decision_rejects_malformed_enum_types_cleanly(tmp_path: Path) -> 
     replay_trace(trace, run_dir)
     context = build_analysis_input(run_dir, through_action=4)
     decision = _valid_decision()
-    decision["decision"]["mode"] = ["explore"]
+    decision["actions"][0]["action"] = ["ACTION2"]
 
-    with pytest.raises(DecisionValidationError, match="mode must be a string"):
+    with pytest.raises(DecisionValidationError, match="illegal action"):
         validate_model_decision(
-            decision, context["legal_action_specs"], context["visible_evidence_ids"],
+            decision, context["legal_action_specs"],
         )
 
 
 def test_scoring_stops_at_first_action_divergence() -> None:
     decision = _valid_decision(action="ACTION1")
-    plan = decision["decision"]["actions"]
-    plan.append({**plan[0], "prediction_id": "PR_NEXT_2"})
+    plan = decision["actions"]
+    plan.append({**plan[0], "prediction_id": "PLAN_2"})
     future = [{
         "action": "ACTION2", "args": {}, "evidence_id": "T10",
         "measurements": {"changed_pixels": 1},
     }]
 
-    audits = score_recorded_plan(decision, future)
+    matches = score_recorded_plan(decision, future)
 
-    assert audits[0]["verdict"] == "unscorable"
-    assert audits[1]["verdict"] == "unscorable"
-    assert audits[1]["reason"] == "prior action diverged from recorded trace"
+    assert matches[0]["status"] == "mismatch"
+    assert matches[1]["status"] == "unscorable"
+    assert matches[1]["reason"] == "prior action diverged or interrupted the trace"
 
 
-def test_scoring_interrupts_plan_after_measurable_prediction_failure() -> None:
+def test_scoring_matches_actions_without_claiming_policy_quality() -> None:
     decision = _valid_decision(action="ACTION2")
-    first = decision["decision"]["actions"][0]
-    second = {**first, "action": "ACTION1", "prediction_id": "PR_NEXT_2"}
-    decision["decision"]["actions"].append(second)
+    first = decision["actions"][0]
+    second = {**first, "action": "ACTION1"}
+    decision["actions"].append(second)
     future = [
         {"action": "ACTION2", "args": {}, "evidence_id": "T10", "measurements": {"changed_pixels": 2}},
         {"action": "ACTION1", "args": {}, "evidence_id": "T11", "measurements": {"changed_pixels": 1}},
     ]
 
-    audits = score_recorded_plan(decision, future)
+    matches = score_recorded_plan(decision, future)
 
-    assert audits[0]["verdict"] == "failed"
-    assert audits[0]["interrupt_reason"] == "prediction_mismatch"
-    assert audits[1]["verdict"] == "unscorable"
+    assert [item["status"] for item in matches] == ["matched", "matched"]
+    assert all("policy" not in item and "prediction" not in item for item in matches)
 
 
 def test_prediction_type_mismatch_is_inconclusive_not_failed() -> None:
@@ -459,3 +435,22 @@ def test_strata_client_falls_back_when_strata_rejects_json_mode_output(tmp_path:
     logged_responses = [json.loads(line) for line in (tmp_path / "model_responses.jsonl").read_text().splitlines()]
     assert len(logged_requests) == len(logged_responses) == 2
     assert [row["status"] for row in logged_responses] == [502, 200]
+
+
+@pytest.mark.parametrize("body", [
+    '{"choices":[{"message":null}]}',
+    '{"choices":[null]}',
+    '{"choices":[]}',
+    '[]',
+])
+def test_strata_malformed_envelope_raises_request_error(monkeypatch, body: str) -> None:
+    class FakeResponse:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self): return body.encode()
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: FakeResponse())
+    client = StrataClient("http://strata.example", "qwen-test")
+    with pytest.raises(StrataRequestError, match="invalid Strata response"):
+        client.complete("system", "user")

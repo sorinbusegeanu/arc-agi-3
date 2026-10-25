@@ -129,7 +129,14 @@ class StrataClient:
                 ) from fallback_error
         try:
             result = json.loads(response_body)
-            message = result["choices"][0]["message"]
+            if not isinstance(result, dict):
+                raise ValueError("response envelope must be an object")
+            choices = result.get("choices")
+            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                raise ValueError("response choices must contain an object")
+            message = choices[0].get("message")
+            if not isinstance(message, dict):
+                raise ValueError("response message must be an object")
             content_text = message.get("content")
             if isinstance(content_text, list):
                 content_text = "".join(
@@ -146,6 +153,7 @@ class StrataClient:
         return {
             "content": content_text,
             "model": result.get("model", self.model),
+            "finish_reason": choices[0].get("finish_reason"),
             "usage": {
                 "prompt_tokens": usage.get("prompt_tokens"),
                 "completion_tokens": usage.get("completion_tokens"),

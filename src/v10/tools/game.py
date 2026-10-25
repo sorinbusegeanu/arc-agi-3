@@ -10,6 +10,7 @@ is only called through this adapter and requires an explicit justification.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -196,6 +197,27 @@ def _validate_args(action_id: str, args: Any, descriptor: Mapping[str, Any]) -> 
     if not isinstance(args, Mapping):
         raise ActionError("action args must be an object")
     result = dict(args)
+
+    def is_json_value(value: Any) -> bool:
+        if value is None or isinstance(value, (str, bool, int)):
+            return True
+        if isinstance(value, float):
+            return math.isfinite(value)
+        if isinstance(value, list):
+            return all(is_json_value(item) for item in value)
+        if isinstance(value, Mapping):
+            return all(isinstance(key, str) and is_json_value(item) for key, item in value.items())
+        return False
+
+    try:
+        # Validate the complete argument tree before consulting the schema or
+        # allowing GameTools to call the environment. This rejects nested NaN,
+        # infinities, non-string object keys, and non-JSON Python values too.
+        if not is_json_value(result):
+            raise ValueError("unsupported JSON value")
+        json.dumps(result, allow_nan=False)
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ActionError(f"{action_id} args must be finite JSON data") from exc
     schema = descriptor.get("parameters", descriptor.get("args_schema"))
     if not isinstance(schema, Mapping):
         return result
@@ -234,68 +256,31 @@ def _validate_args(action_id: str, args: Any, descriptor: Mapping[str, Any]) -> 
 
 
 def validate_decision(payload: Any, legal_actions: Any, max_actions: int = 4) -> dict[str, Any]:
-    """Validate the decision envelope and every proposed action before execution."""
+    """Validate an action-only plan against the current legal action schemas."""
     if not isinstance(payload, Mapping):
-        raise ActionError("decision must be an object")
-    decision = dict(payload)
-    for field in ("observations", "patterns", "hypotheses", "prediction_audit", "goals", "memory_patch"):
-        if field in decision and not isinstance(decision[field], list):
-            raise ActionError(f"decision.{field} must be a list")
-    plan = decision.get("decision")
-    if not isinstance(plan, Mapping):
-        raise ActionError("decision.decision must be an object")
-    plan = dict(plan)
-    if plan.get("mode") not in {"explore", "exploit", "recover"}:
-        raise ActionError("decision.mode must be explore, exploit, or recover")
-    if plan.get("continue_or_reset") not in {"continue", "reset"}:
-        raise ActionError("decision.continue_or_reset must be continue or reset")
-    if plan["continue_or_reset"] == "reset":
-        justification = plan.get("reset_justification")
-        if not isinstance(justification, str) or not justification.strip():
-            raise ActionError("reset requires a non-empty reset_justification")
-    actions = plan.get("actions")
+        raise ActionError("response must be an object")
+    if set(payload) != {"actions"}:
+        raise ActionError("response must contain only an actions list")
+    actions = payload["actions"]
     if not isinstance(actions, list) or len(actions) > int(max_actions):
-        raise ActionError(f"decision.actions must contain 0 to {int(max_actions)} actions")
+        raise ActionError(f"actions must contain 0 to {int(max_actions)} actions")
     table = _action_table(legal_actions)
     validated = []
     for index, item in enumerate(actions):
         if not isinstance(item, Mapping):
-            raise ActionError(f"decision.actions[{index}] must be an object")
+            raise ActionError(f"actions[{index}] must be an object")
+        if set(item) - {"action", "args"}:
+            raise ActionError(f"actions[{index}] may contain only action and args")
         action_id = item.get("action")
         if not isinstance(action_id, str) or action_id not in table:
-            raise ActionError(f"decision.actions[{index}] has illegal action: {action_id}")
-        prediction_id = item.get("prediction_id")
-        prediction = item.get("expected_observation")
-        if not isinstance(prediction_id, str) or not prediction_id:
-            raise ActionError(f"decision.actions[{index}] needs prediction_id")
-        if not isinstance(prediction, str) or not prediction.strip():
-            raise ActionError(f"decision.actions[{index}] needs expected_observation")
-        if "measurable_prediction" not in item:
-            raise ActionError(f"decision.actions[{index}] must include measurable_prediction (object or null)")
-        measurable_prediction = normalize_measurable_prediction(item.get("measurable_prediction"))
-        unmeasurable_reason = item.get("unmeasurable_reason")
-        if measurable_prediction is None:
-            if not isinstance(unmeasurable_reason, str) or not unmeasurable_reason.strip():
-                raise ActionError(
-                    f"decision.actions[{index}] needs unmeasurable_reason when measurable_prediction is null"
-                )
-        else:
-            if unmeasurable_reason is not None:
-                raise ActionError(
-                    f"decision.actions[{index}].unmeasurable_reason is only allowed when measurable_prediction is null"
-                )
-            validate_measurable_prediction(measurable_prediction, f"decision.actions[{index}]")
-        stop_if = item.get("stop_if", [])
-        if not isinstance(stop_if, list) or any(not isinstance(value, str) for value in stop_if):
-            raise ActionError(f"decision.actions[{index}].stop_if must be a list of strings")
+            raise ActionError(f"actions[{index}] has illegal action: {action_id}")
         validated.append({
-            **dict(item), "action": action_id,
+            "action": action_id,
             "args": _validate_args(action_id, item.get("args", {}), table[action_id]),
-            "measurable_prediction": measurable_prediction,
         })
-    plan["actions"] = validated
-    decision["decision"] = plan
-    return decision
+    if any(item["action"] == "RESET" for item in validated) and len(validated) != 1:
+        raise ActionError("RESET must be the only action in the response")
+    return {"actions": validated}
 
 
 def evaluate_prediction(
@@ -437,10 +422,6 @@ class GameTools:
         self,
         action: str,
         args: Mapping[str, Any] | None = None,
-        prediction_id: str | None = None,
-        expected_observation: Any = None,
-        measurable_prediction: Mapping[str, Any] | None = None,
-        unmeasurable_reason: str | None = None,
     ) -> dict[str, Any]:
         if self.action_count >= self.max_actions:
             raise BudgetExceeded(f"action budget exhausted ({self.max_actions})")
@@ -450,26 +431,11 @@ class GameTools:
             raise ActionError(f"illegal action: {action}")
         safe_args = _validate_args(action, args or {}, table[action])
         pre_step = self.history.next_step()
-        measurable_prediction = normalize_measurable_prediction(measurable_prediction)
-        prediction = {
-            "prediction_id": prediction_id,
-            "expected_observation": expected_observation,
-            "measurable_prediction": measurable_prediction,
-            "unmeasurable_reason": unmeasurable_reason,
-            "recorded_before_action": True,
-        }
-        prediction_record = self.history.append({
-            "type": "audit", "kind": "prediction", "action": action,
-            "prediction": prediction, "pre_frame_id": before["frame_id"],
-            "pre_evidence_id": before.get("evidence_id"),
-            "reset_generation": self.reset_generation,
-        })
         try:
             result_raw = self.env.act(table[action].get("_environment_id", action), safe_args)
         except Exception as exc:
             self.history.append({
                 "type": "audit", "kind": "action_error", "action": action,
-                "prediction_id": prediction_id, "prediction_evidence_id": prediction_record["evidence_id"],
                 "error": f"{type(exc).__name__}: {exc}", "reset_generation": self.reset_generation,
             })
             raise
@@ -492,46 +458,30 @@ class GameTools:
 
         delta = Image.fromarray(delta_image(before_frame, after_frame), mode="RGB")
         delta = delta.resize((delta.width * 10, delta.height * 10), resample=Image.Resampling.NEAREST)
-        delta_image_id = f"D{prediction_record['evidence_id']}"
+        transition_id = self.history.next_evidence_id()
+        delta_image_id = f"D{transition_id}"
         self.frames.put_image(
             np.asarray(delta, dtype=np.uint8), delta_image_id,
-            source=prediction_record["evidence_id"], step=pre_step, kind=DELTA_KIND,
+            source=transition_id, step=pre_step, kind=DELTA_KIND,
         )
         self.action_count += 1
         evidence = self.history.append({
+            "evidence_id": transition_id,
             "type": "transition", "action": action, "args": safe_args,
             "pre_frame_id": before["frame_id"], "post_frame_id": after["frame_id"],
             "pre_frame_image_id": before["frame_image_id"], "post_frame_image_id": after["frame_image_id"],
+            "pre_evidence_id": before.get("evidence_id"),
             "delta_image_id": delta_image_id,
-            "pre_evidence_id": before.get("evidence_id"), "prediction_evidence_id": prediction_record["evidence_id"],
-            "prediction": prediction,
             "result": {key: value for key, value in result.items() if key not in {"frames", "frame", "image"}},
             "measurements": measurements, "legal_actions": after["legal_actions"],
             "level": after.get("level"), "levels_completed": after.get("levels_completed"),
             "terminal": after.get("terminal"), "game_state": after.get("game_state"),
             "reset_generation": self.reset_generation,
         })
-        observed_outcome = {
-            "measurements": measurements,
-            "game_state": after.get("game_state"),
-            "level": after.get("level"),
-            "levels_completed": after.get("levels_completed"),
-            "win_levels": after.get("win_levels"),
-            "terminal": after.get("terminal", False),
-        }
-        prediction_audit = evaluate_prediction(
-            measurable_prediction, observed_outcome, unmeasurable_reason=unmeasurable_reason,
-        )
-        audit_evidence = self.history.append({
-            "type": "audit", "kind": "prediction_result",
-            "prediction_id": prediction_id, "prediction_evidence_id": prediction_record["evidence_id"],
-            "transition_evidence_id": evidence["evidence_id"], "verdict": prediction_audit["verdict"],
-            "details": prediction_audit, "reset_generation": self.reset_generation,
-        })
         after["evidence_id"] = evidence["evidence_id"]
         self._current = after
         return {
-            "evidence": evidence, "prediction_audit": audit_evidence,
+            "evidence": evidence,
             "observation": dict(after), "result": result,
             "measurements": measurements, "action_count": self.action_count,
         }

@@ -182,72 +182,47 @@ def _live_context(
     memory_context_entries: int,
 ) -> dict[str, Any]:
     records = tools.history.records()
-    transitions = [row for row in records if row.get("type") == "transition"][-horizon:]
+    transitions = [
+        row for row in records
+        if row.get("type") == "transition"
+        and int(row.get("reset_generation", 0)) == int(tools.reset_generation)
+    ][-horizon:]
     first = next((row for row in records if row.get("type") == "state"), None)
     visible_ids = {str(current["evidence_id"])} if current.get("evidence_id") else set()
     if first and first.get("evidence_id"):
         visible_ids.add(str(first["evidence_id"]))
     visible_ids.update(str(row["evidence_id"]) for row in transitions if row.get("evidence_id"))
-    relevant_ids = {str(row["evidence_id"]) for row in transitions}
-    prior_audits = [
-        {
-            "evidence_id": row.get("evidence_id"), "prediction_id": row.get("prediction_id"),
-            "prediction_evidence_id": row.get("prediction_evidence_id"),
-            "transition_evidence_id": row.get("transition_evidence_id"), "verdict": row.get("verdict"),
-            "details": row.get("details"),
-        }
-        for row in records
-        if row.get("type") == "audit" and row.get("kind") == "prediction_result"
-        and row.get("transition_evidence_id") in relevant_ids
-    ]
-    visible_predictions = {
-        str(row.get("prediction", {}).get("prediction_id")) for row in transitions
-        if isinstance(row.get("prediction"), Mapping) and row.get("prediction", {}).get("prediction_id")
-    }
-    visible_prediction_rows = [
-        row for row in records
-        if row.get("type") == "audit" and row.get("kind") == "prediction"
-        and isinstance(row.get("prediction"), Mapping)
-        and row.get("prediction", {}).get("prediction_id") in visible_predictions
-    ]
-    for row in [*visible_prediction_rows, *prior_audits]:
-        if row.get("evidence_id"):
-            visible_ids.add(str(row["evidence_id"]))
-        for field in ("prediction_evidence_id", "transition_evidence_id"):
-            if row.get(field):
-                visible_ids.add(str(row[field]))
     legal_actions = _public_actions(current.get("legal_actions", []))
+    if tools.reset_count < tools.max_resets:
+        legal_actions.append({
+            "id": "RESET",
+            "description": "Reset the game when a controlled restart is justified.",
+            "parameters": {
+                "type": "object", "properties": {"justification": {"type": "string"}},
+                "required": ["justification"], "additionalProperties": False,
+            },
+        })
     visible_step = int(current.get("step", max((int(row.get("step", 0)) for row in records), default=0)))
     memory_store = GameMemory(tools.run_dir, store_dir=memory_store_dir, run_id=run_id)
     memory = memory_store.compact(max_entries=memory_context_entries, through_step=visible_step)
     for entry in memory["entries"]:
         visible_ids.update(str(value) for value in entry.get("evidence_ids", []))
     context = {
-        "analysis_schema": DECISION_SCHEMA,
         "game_id": game_id,
-        "initial_state_evidence_id": first.get("evidence_id") if first else None,
-        "current_evidence_id": current.get("evidence_id"),
-        "citable_evidence_ids": sorted(visible_ids),
-        "visible_prediction_ids": sorted(visible_predictions),
-        "frame_ids_are_image_handles_not_evidence": True,
         "current_state": {
             "game_state": current.get("game_state"), "level": current.get("level"),
             "levels_completed": current.get("levels_completed"), "win_levels": current.get("win_levels"),
-            "terminal": current.get("terminal", False), "frame_shape": list(current["frame"].shape),
+            "terminal": current.get("terminal", False),
             "legal_actions": legal_actions,
         },
         "recent_transitions": [
             {
-                "evidence_id": row["evidence_id"], "action": row.get("action"), "args": row.get("args", {}),
-                "pre_frame_id": row.get("pre_frame_id"), "post_frame_id": row.get("post_frame_id"),
-                "prediction_evidence_id": row.get("prediction_evidence_id"),
+                "action": row.get("action"), "args": row.get("args", {}),
                 "measurements": row.get("measurements"), "level": row.get("level"),
                 "levels_completed": row.get("levels_completed"), "game_state": row.get("game_state"),
-                "prediction": row.get("prediction"),
             }
             for row in transitions
         ],
-        "prediction_audits": prior_audits,
         "memory": memory,
         "budgets": {
             "actions_used": tools.action_count, "actions_remaining": max(0, tools.max_actions - tools.action_count),
@@ -256,13 +231,12 @@ def _live_context(
         },
     }
     image_ids: list[tuple[str, str]] = []
-    if first and first.get("frame_image_id"):
-        image_ids.append(("Initial state image (frame handle, not an evidence ID)", str(first["frame_image_id"])))
-    for row in transitions:
-        if row.get("delta_image_id"):
-            image_ids.append((f"Delta visualization (not a game frame) after {row.get('action')} ({row['evidence_id']})", str(row["delta_image_id"])))
-    if current.get("frame_image_id"):
-        image_ids.append(("Current state image (actual game frame; frame handle, not an evidence ID)", str(current["frame_image_id"])))
+    current_image_id = current.get("frame_image_id")
+    previous_image_id = transitions[-1].get("pre_frame_image_id") if transitions else None
+    if previous_image_id and previous_image_id != current_image_id:
+        image_ids.append(("Previous actual game frame", str(previous_image_id)))
+    if current_image_id:
+        image_ids.append(("Current actual game frame", str(current_image_id)))
     frames = FrameStore(tools.run_dir)
     entries = {entry["frame_id"]: entry for entry in frames.entries()}
     image_paths: list[Path] = []
@@ -275,20 +249,17 @@ def _live_context(
         image_labels.append(label)
     system_prompt = skill_path.read_text(encoding="utf-8")
     prompt = (
-        "Analyze only the visible current state, recent transitions, audits, and memory below. "
-        "Return compact JSON matching the contract. Keep each claim brief and omit unsupported list entries. "
-        "Do not invent mechanics or outcomes. Recommend up to four legal actions when the sequence remains safe; "
-        "otherwise recommend one informative action. Give concise predictions. "
-        "Continue by default; reset only with an explicit evidence-based reason. "
-        "Cite only IDs listed in citable_evidence_ids; F-prefixed frame handles are not evidence IDs. "
-        "Delta images are overlays of changed pixels, not game states; use the current-state image for object positions.\n\n"
-        "Decision contract:\n" + json.dumps(_decision_contract_description(), ensure_ascii=False, separators=(",", ":"))
+        f"Choose up to {horizon} legal actions from the current state, recent outcomes, and read-only memory. "
+        "Return only an actions list. Each action must contain only action and args. "
+        "Do not include analysis, memory updates, predictions, goals, or narrative. "
+        "If RESET is listed, use it alone and include args.justification.\n\n"
+        "Required response shape:\n" + json.dumps(_decision_contract_description(), ensure_ascii=False, separators=(",", ":"))
         + "\n\nVisible context:\n" + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
     )
     return {
         "system_prompt": system_prompt, "user_prompt": prompt, "context": context,
         "image_paths": image_paths, "image_labels": image_labels,
-        "visible_evidence_ids": visible_ids, "visible_prediction_ids": visible_predictions,
+        "visible_evidence_ids": visible_ids,
         "legal_action_specs": legal_actions, "visible_step": visible_step,
         "skill_sha256": hashlib.sha256(skill_path.read_bytes()).hexdigest(),
     }
@@ -313,8 +284,8 @@ def run_live(
         raise ValueError("plan_horizon must be between 1 and 4")
     if int(max_actions) < 1 or int(max_resets) < 0:
         raise ValueError("action budget must be positive and reset budget non-negative")
-    if int(memory_context_entries) < 0:
-        raise ValueError("memory_context_entries must be non-negative")
+    if not 0 <= int(memory_context_entries) <= 5:
+        raise ValueError("memory_context_entries must be between 0 and 5")
     destination = Path(run_dir)
     source_skill = Path(skill_path) if skill_path is not None else Path(__file__).with_name("SKILL.md")
     run_id = uuid.uuid4().hex
@@ -347,7 +318,7 @@ def run_live(
         terminal = bool(current.get("terminal"))
         state = current.get("game_state")
         result = {
-            "schema": "v10.live_metrics/1", "game_id": game_id, "model": getattr(client, "model", None),
+            "schema": "v10.live_metrics/2", "game_id": game_id, "model": getattr(client, "model", None),
             "run_id": run_id, "seed": int(seed),
             "actions": tools.action_count, "action_budget": tools.max_actions,
             "resets": tools.reset_count, "reset_budget": tools.max_resets,
@@ -360,14 +331,6 @@ def run_live(
                 destination, store_dir=memory_store_dir, run_id=run_id,
             ).read().get("count", 0),
             "memory_context_entries": int(memory_context_entries),
-            "prediction_verdicts": {
-                verdict: sum(
-                    row.get("type") == "audit" and row.get("kind") == "prediction_result"
-                    and row.get("verdict") == verdict
-                    for row in tools.history.records()
-                )
-                for verdict in ("matched", "failed", "inconclusive")
-            },
         }
         write_json(destination / "metrics.json", result)
         return result
@@ -417,28 +380,20 @@ def run_live(
                 try:
                     decision = validate_model_decision(
                         _parse_content(response.get("content")), inputs["legal_action_specs"],
-                        inputs["visible_evidence_ids"], inputs["visible_prediction_ids"],
+                        max_actions=plan_horizon,
                     )
-                    used_ids = {
-                        row.get("prediction", {}).get("prediction_id")
-                        for row in tools.history.records()
-                        if row.get("type") == "audit" and row.get("kind") == "prediction"
-                        and isinstance(row.get("prediction"), Mapping)
-                    }
-                    duplicate = next((item["prediction_id"] for item in decision["decision"]["actions"]
-                                      if item["prediction_id"] in used_ids), None)
-                    if duplicate:
-                        raise DecisionValidationError(f"prediction_id already used: {duplicate}")
                     break
                 except (DecisionValidationError, ActionError) as exc:
+                    # Never retain a partially accepted candidate across repair.
+                    decision = None
                     validation_error = str(exc)
                     if attempt == 0:
                         inputs["user_prompt"] = _decision_repair_prompt(
-                            inputs["user_prompt"], validation_error, inputs["visible_evidence_ids"],
+                            inputs["user_prompt"], validation_error,
                         )
             if decision is None:
                 append_jsonl(decisions_path, {
-                    "schema": "v10.live_decision/1", "status": "rejected",
+                    "schema": "v10.live_decision/2", "status": "rejected",
                     "game_id": game_id, "visible_evidence_ids": sorted(inputs["visible_evidence_ids"]),
                     "validation_error": validation_error, "repair_attempted": len(responses) > 1,
                     "model": responses[-1].get("model"), "usage": _sum_usage(responses),
@@ -449,32 +404,23 @@ def run_live(
                 if fallback is None:
                     stop_reason = "invalid_decision_no_legal_fallback"
                     append_jsonl(decisions_path, {
-                        "schema": "v10.live_fallback/1", "status": "unavailable",
+                        "schema": "v10.live_fallback/2", "status": "unavailable",
                         "reason": "no legal action has arguments that can be generated safely",
                         "validation_error": validation_error,
                     })
                     break
                 action_number = tools.action_count + 1
-                fallback_prediction_id = f"FALLBACK_{run_id}_{action_number}"
                 progress(
                     f"decision invalid after repair; taking random legal fallback action "
                     f"{action_number}: {fallback['action']}"
                 )
-                result = tools.act(
-                    fallback["action"], fallback["args"],
-                    prediction_id=fallback_prediction_id,
-                    expected_observation="No reliable model prediction; observe the result of this fallback action.",
-                    measurable_prediction=None,
-                    unmeasurable_reason="The model decision failed validation; this random fallback has no model prediction.",
-                )
+                result = tools.act(fallback["action"], fallback["args"])
                 current = result["observation"]
                 append_jsonl(decisions_path, {
-                    "schema": "v10.live_fallback/1", "status": "executed",
+                    "schema": "v10.live_fallback/2", "status": "executed",
                     "cause": "invalid_decision", "validation_error": validation_error,
                     "action": fallback["action"], "args": fallback["args"],
-                    "prediction_id": fallback_prediction_id,
                     "evidence_id": result["evidence"]["evidence_id"],
-                    "prediction_verdict": result["prediction_audit"].get("verdict"),
                 })
                 progress(
                     f"fallback action {tools.action_count}: {fallback['action']} -> "
@@ -483,43 +429,38 @@ def run_live(
                 update_metrics()
                 continue
 
-            memory_result = GameMemory(
-                destination, store_dir=memory_store_dir, run_id=run_id,
-            ).propose_update(
-                decision["memory_patch"], known_evidence_ids=inputs["visible_evidence_ids"],
-                current_step=inputs["visible_step"],
-            )
             decision_row = {
-                "schema": "v10.live_decision/1", "status": "accepted",
+                "schema": "v10.live_decision/2", "status": "accepted",
                 "game_id": game_id, "decision_schema": DECISION_SCHEMA,
-                "prompt_version": "v10.live_prompt/1", "skill_sha256": inputs["skill_sha256"],
+                "prompt_version": "v10.live_prompt/2", "skill_sha256": inputs["skill_sha256"],
                 "model": responses[-1].get("model"),
                 "visible_evidence_ids": sorted(inputs["visible_evidence_ids"]),
                 "input_image_labels": inputs["image_labels"], "decision": decision,
-                "memory_updates": memory_result, "repair_attempted": len(responses) > 1,
+                "repair_attempted": len(responses) > 1,
                 "initial_validation_error": validation_error, "usage": _sum_usage(responses),
                 "request_attempts": sum(int(item.get("request_attempts", 1)) for item in responses),
                 "latency_seconds": round(sum(float(item.get("latency_seconds", 0.0)) for item in responses), 6),
             }
             append_jsonl(decisions_path, decision_row)
 
-            plan = decision["decision"]
+            plan = decision
             progress(
                 f"decision ready in {decision_row['latency_seconds']:.1f}s; "
                 f"planned={[item['action'] for item in plan['actions']]}"
             )
-            if plan["continue_or_reset"] == "reset":
+            reset_action = next((item for item in plan["actions"] if item["action"] == "RESET"), None)
+            if reset_action is not None:
                 try:
-                    reset_result = tools.reset(plan["reset_justification"])
+                    reset_result = tools.reset(reset_action["args"]["justification"])
                 except BudgetExceeded:
                     stop_reason = "reset_budget_exhausted"
-                    append_jsonl(decisions_path, {"schema": "v10.live_plan_result/1", "status": stop_reason})
+                    append_jsonl(decisions_path, {"schema": "v10.live_plan_result/2", "status": stop_reason})
                     break
                 current = reset_result["observation"]
                 progress("reset executed")
                 interrupted_plans += 1
                 append_jsonl(decisions_path, {
-                    "schema": "v10.live_plan_result/1", "status": "reset",
+                    "schema": "v10.live_plan_result/2", "status": "reset",
                     "reset_evidence_id": reset_result["evidence"]["evidence_id"],
                 })
                 update_metrics()
@@ -527,7 +468,7 @@ def run_live(
             actions = plan["actions"]
             if not actions:
                 stop_reason = "model_returned_no_actions"
-                append_jsonl(decisions_path, {"schema": "v10.live_plan_result/1", "status": stop_reason})
+                append_jsonl(decisions_path, {"schema": "v10.live_plan_result/2", "status": stop_reason})
                 break
 
             executed: list[dict[str, Any]] = []
@@ -547,41 +488,32 @@ def run_live(
                     progress(f"taking action {next_number}: {action['action']}")
                     result = tools.act(
                         action["action"], action.get("args", {}),
-                        prediction_id=action["prediction_id"],
-                        expected_observation=action["expected_observation"],
-                        measurable_prediction=action.get("measurable_prediction"),
-                        unmeasurable_reason=action.get("unmeasurable_reason"),
                     )
                 except (ActionError, BudgetExceeded) as exc:
                     interruption = "action_error" if isinstance(exc, ActionError) else "action_budget_exhausted"
                     append_jsonl(decisions_path, {
-                        "schema": "v10.live_plan_result/1", "status": "action_error",
+                        "schema": "v10.live_plan_result/2", "status": "action_error",
                         "error": f"{type(exc).__name__}: {exc}",
                     })
                     break
                 current = result["observation"]
                 progress(
                     f"action {tools.action_count}: {action['action']} -> "
-                    f"{current.get('game_state', '?')}; "
-                    f"prediction={result['prediction_audit'].get('verdict', '?')}"
+                    f"{current.get('game_state', '?')}"
                 )
                 executed.append({
-                    "prediction_id": action["prediction_id"],
                     "evidence_id": result["evidence"]["evidence_id"],
-                    "verdict": result["prediction_audit"].get("verdict"),
                 })
                 if current.get("terminal"):
                     interruption = "terminal_state"
                 elif current.get("level") != previous_level or current.get("levels_completed") != previous_levels_completed:
                     interruption = "level_change"
-                elif result["prediction_audit"].get("verdict") == "failed":
-                    interruption = "prediction_mismatch"
                 if interruption:
                     break
             if interruption:
                 interrupted_plans += 1
             append_jsonl(decisions_path, {
-                "schema": "v10.live_plan_result/1", "status": "interrupted" if interruption else "completed",
+                "schema": "v10.live_plan_result/2", "status": "interrupted" if interruption else "completed",
                 "executed": executed, "interrupt_reason": interruption,
             })
             update_metrics()

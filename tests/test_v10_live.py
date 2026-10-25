@@ -11,6 +11,7 @@ import pytest
 from v10.arcade_env import ArcadeGameEnv
 from v10.live import run_live
 from v10.tools.game import GameTools
+from v10.tools.game import ActionError
 from v10.tools.history import History
 
 
@@ -20,24 +21,13 @@ def _isolated_memory_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def _decision(actions=None, *, reset: bool = False) -> dict:
-    return {
-        "observations": [], "patterns": [], "hypotheses": [], "prediction_audit": [], "goals": [],
-        "priority_question": "What changes after the next legal action?",
-        "decision": {
-            "mode": "explore", "continue_or_reset": "reset" if reset else "continue",
-            "reset_justification": "A controlled restart is required." if reset else None,
-            "actions": list(actions or []),
-        },
-        "memory_patch": [],
-    }
+    if reset:
+        return {"actions": [{"action": "RESET", "args": {"justification": "A controlled restart is required."}}]}
+    return {"actions": list(actions or [])}
 
 
-def _action(action="ACTION1", prediction="P1", changed_pixels=1):
-    return {
-        "action": action, "args": {}, "prediction_id": prediction,
-        "expected_observation": "The frame changes.",
-        "measurable_prediction": {"changed_pixels": changed_pixels}, "stop_if": [],
-    }
+def _action(action="ACTION1"):
+    return {"action": action, "args": {}}
 
 
 class _FakeClient:
@@ -88,23 +78,23 @@ class _FakeEnv:
         return self.observe()
 
 
-def test_live_loop_interrupts_remaining_actions_after_prediction_failure(tmp_path: Path) -> None:
+def test_live_executes_action_plan_without_prediction_interrupts(tmp_path: Path) -> None:
     env = _FakeEnv()
-    first = _decision([_action(changed_pixels=0), _action("ACTION2", "P2")])
+    first = _decision([_action(), _action("ACTION2")])
     second = _decision([])
     client = _FakeClient([first, second])
 
     metrics = run_live(env, tmp_path / "run", client, game_id="fixture", max_actions=5)
 
-    assert env.actions == [("ACTION1", {})]
-    assert metrics["actions"] == 1
+    assert env.actions == [("ACTION1", {}), ("ACTION2", {})]
+    assert metrics["actions"] == 2
     assert metrics["stop_reason"] == "model_returned_no_actions"
     rows = [json.loads(line) for line in (tmp_path / "run" / "decisions.jsonl").read_text().splitlines()]
-    plan_results = [row for row in rows if row["schema"] == "v10.live_plan_result/1"]
-    assert plan_results[0]["interrupt_reason"] == "prediction_mismatch"
+    plan_results = [row for row in rows if row["schema"] == "v10.live_plan_result/2"]
+    assert plan_results[0]["interrupt_reason"] is None
     transitions = [row for row in History(tmp_path / "run").records() if row.get("type") == "transition"]
-    assert len(transitions) == 1
-    assert transitions[0]["prediction_evidence_id"]
+    assert len(transitions) == 2
+    assert all("prediction_evidence_id" not in row and "prediction" not in row for row in transitions)
     assert transitions[0]["delta_image_id"]
 
 
@@ -123,14 +113,14 @@ def test_live_run_clears_existing_run_directory_contents(tmp_path: Path) -> None
     assert metrics["actions"] == 0
 
 
-def test_live_loop_rejects_reset_when_reset_budget_is_zero(tmp_path: Path) -> None:
+def test_live_executes_reset_action_only_when_budgeted(tmp_path: Path) -> None:
     env = _FakeEnv()
-    client = _FakeClient([_decision(reset=True)])
+    client = _FakeClient([_decision(reset=True), _decision([])])
 
-    metrics = run_live(env, tmp_path / "run", client, game_id="fixture", max_actions=3, max_resets=0)
+    metrics = run_live(env, tmp_path / "run", client, game_id="fixture", max_actions=3, max_resets=1)
 
-    assert env.resets == 0
-    assert metrics["stop_reason"] == "reset_budget_exhausted"
+    assert env.resets == 1
+    assert metrics["stop_reason"] == "model_returned_no_actions"
     assert metrics["actions"] == 0
 
 
@@ -144,28 +134,41 @@ def test_live_metrics_include_strata_json_recovery_attempt(tmp_path: Path) -> No
     assert metrics["stop_reason"] == "model_returned_no_actions"
 
 
-def test_live_smoke_accepts_wrapped_pixel_diff_prediction(tmp_path: Path) -> None:
+def test_live_action_only_responses_create_no_prediction_audits(tmp_path: Path) -> None:
+    client = _FakeClient([_decision([_action(), _action("ACTION2")]), _decision([])])
+    env = _FakeEnv()
+
+    metrics = run_live(
+        env, tmp_path / "run", client, game_id="fixture", max_actions=2, plan_horizon=2,
+    )
+
+    assert metrics["actions"] == 2
+    prediction_rows = [
+        row for row in History(tmp_path / "run").records()
+        if row.get("type") == "audit" and row.get("kind") == "prediction"
+    ]
+    assert prediction_rows == []
+
+
+def test_live_repairs_response_that_includes_prediction_fields(tmp_path: Path) -> None:
     env = _FakeEnv()
     wrapped = _decision([_action()])
-    wrapped["decision"]["actions"][0]["measurable_prediction"] = {
-        "pixel_diff": {"changed_pixels": 1},
-    }
-    client = _FakeClient([wrapped, _decision([])])
+    wrapped["actions"][0]["measurable_prediction"] = {"changed_pixels": 1}
+    client = _FakeClient([wrapped, _decision([_action()])])
 
-    metrics = run_live(env, tmp_path / "run", client, game_id="fixture", max_actions=3)
+    metrics = run_live(env, tmp_path / "run", client, game_id="fixture", max_actions=1)
 
     assert env.actions == [("ACTION1", {})]
     assert metrics["actions"] == 1
     rows = [json.loads(line) for line in (tmp_path / "run" / "decisions.jsonl").read_text().splitlines()]
     accepted = next(row for row in rows if row.get("status") == "accepted")
-    assert accepted["decision"]["decision"]["actions"][0]["measurable_prediction"] == {
-        "all": [{"path": "measurements.changed_pixels", "op": "eq", "value": 1}],
-    }
+    assert accepted["decision"]["actions"] == [{"action": "ACTION1", "args": {}}]
+    assert accepted["repair_attempted"] is True
 
 
-def test_live_repairs_invalid_measurement_schema_with_targeted_guidance(tmp_path: Path) -> None:
+def test_live_repairs_response_with_extra_fields(tmp_path: Path) -> None:
     invalid = _decision([_action()])
-    invalid["decision"]["actions"][0]["measurable_prediction"] = {"pixel_diff": {"invented": 1}}
+    invalid["actions"][0]["measurable_prediction"] = {"pixel_diff": {"invented": 1}}
     client = _FakeClient([invalid, _decision([_action()]), _decision([])])
 
     metrics = run_live(_FakeEnv(), tmp_path / "run", client, game_id="fixture", max_actions=1)
@@ -174,19 +177,20 @@ def test_live_repairs_invalid_measurement_schema_with_targeted_guidance(tmp_path
     assert len(client.calls) == 2
     repair_prompt = client.calls[1][0]
     assert "Your previous JSON failed validation" in repair_prompt
-    assert "measurements.changed_pixels" in repair_prompt
-    assert "not citable evidence" in repair_prompt
+    assert "predictions" in repair_prompt
+    assert '"actions"' in repair_prompt
+    assert "memory updates" in repair_prompt
     rows = [json.loads(line) for line in (tmp_path / "run" / "decisions.jsonl").read_text().splitlines()]
     accepted = next(row for row in rows if row.get("status") == "accepted")
     assert accepted["repair_attempted"] is True
-    assert "unsupported" in accepted["initial_validation_error"]
+    assert "only action and args" in accepted["initial_validation_error"]
 
 
 def test_live_executes_random_fallback_after_invalid_decision_and_repair(tmp_path: Path) -> None:
     invalid = _decision([_action()])
-    invalid["decision"]["actions"][0]["measurable_prediction"] = {"pixel_diff": {"invented": 1}}
+    invalid["actions"][0]["measurable_prediction"] = {"pixel_diff": {"invented": 1}}
     still_invalid = _decision([_action()])
-    still_invalid["decision"]["actions"][0]["measurable_prediction"] = {"pixel_diff": {"invented": 1}}
+    still_invalid["actions"][0]["measurable_prediction"] = {"pixel_diff": {"invented": 1}}
     env = _FakeEnv()
 
     metrics = run_live(
@@ -197,17 +201,70 @@ def test_live_executes_random_fallback_after_invalid_decision_and_repair(tmp_pat
     assert env.actions[0][0] in {"ACTION1", "ACTION2"}
     assert metrics["stop_reason"] == "action_budget_exhausted"
     rows = [json.loads(line) for line in (tmp_path / "run" / "decisions.jsonl").read_text().splitlines()]
-    fallback = next(row for row in rows if row.get("schema") == "v10.live_fallback/1")
+    fallback = next(row for row in rows if row.get("schema") == "v10.live_fallback/2")
     assert fallback["status"] == "executed"
     assert fallback["cause"] == "invalid_decision"
-    assert fallback["prediction_verdict"] == "inconclusive"
+    assert "prediction_verdict" not in fallback
+
+
+@pytest.mark.parametrize("repair_action", ["ACTION1", "NOT_LEGAL"])
+def test_live_rejected_duplicate_candidate_cannot_execute_when_repair_fails(
+    tmp_path: Path, repair_action: str,
+) -> None:
+    duplicate = _decision([_action("ACTION1"), _action("ACTION2")])
+    duplicate["actions"][1]["prediction_id"] = duplicate["actions"][0]["prediction_id"] = "P_DUP"
+    repair = _decision([_action(repair_action), _action("ACTION2")])
+    if repair_action == "ACTION1":
+        repair["actions"][1]["prediction_id"] = repair["actions"][0]["prediction_id"] = "P_DUP"
+    env = _FakeEnv()
+    metrics = run_live(
+        env, tmp_path / "run", _FakeClient([duplicate, repair]),
+        game_id="fixture", max_actions=1,
+    )
+    rows = [json.loads(line) for line in (tmp_path / "run" / "decisions.jsonl").read_text().splitlines()]
+    rejected = next(row for row in rows if row.get("status") == "rejected")
+    fallback = next(row for row in rows if row.get("schema") == "v10.live_fallback/2" and row.get("status") == "executed")
+    expected_error = (
+        "actions[0] may contain only action and args" if repair_action == "ACTION1"
+        else "actions[0] has illegal action: NOT_LEGAL"
+    )
+    assert rejected["validation_error"] == expected_error
+    assert fallback["cause"] == "invalid_decision"
+    assert len(env.actions) == metrics["actions"] == 1
+    assert env.actions[0][0] in {"ACTION1", "ACTION2"}
+
+
+@pytest.mark.parametrize("bad_value", [
+    float("nan"), float("inf"), {"nested": [float("-inf")]},
+    {"nested": {1: "non-string key"}}, ("tuple", "is not JSON data"),
+])
+def test_game_tools_reject_non_finite_args_before_environment_action(
+    tmp_path: Path, bad_value: object,
+) -> None:
+    class ArgsEnv(_FakeEnv):
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"] = [{
+                "id": "ARG_ACTION", "parameters": {
+                    "type": "object", "properties": {"value": {}},
+                    "required": ["value"], "additionalProperties": False,
+                },
+            }]
+            return result
+
+    env = ArgsEnv()
+    tools = GameTools(env, tmp_path / "run")
+    tools.observe()
+    with pytest.raises(ActionError, match="finite JSON data"):
+        tools.act("ARG_ACTION", {"value": bad_value})
+    assert env.actions == []
 
 
 def test_live_resumes_model_loop_after_invalid_decision_fallback(tmp_path: Path) -> None:
     invalid = _decision([_action()])
-    invalid["decision"]["actions"][0]["measurable_prediction"] = {"pixel_diff": {"invented": 1}}
+    invalid["actions"][0]["measurable_prediction"] = {"pixel_diff": {"invented": 1}}
     still_invalid = _decision([_action()])
-    still_invalid["decision"]["actions"][0]["measurable_prediction"] = {"pixel_diff": {"invented": 1}}
+    still_invalid["actions"][0]["measurable_prediction"] = {"pixel_diff": {"invented": 1}}
     client = _FakeClient([invalid, still_invalid, _decision([])])
 
     metrics = run_live(_FakeEnv(), tmp_path / "run", client, game_id="fixture", max_actions=2)
@@ -279,6 +336,10 @@ def test_live_context_has_no_future_records_and_includes_current_images(tmp_path
 
     assert metrics["stop_reason"] == "model_returned_no_actions"
     prompt, image_paths, labels = client.calls[0]
-    assert '"current_evidence_id":"T1"' in prompt
-    assert len(image_paths) == 2
-    assert labels == ["Initial state", "Current state"]
+    assert "current_evidence_id" not in prompt
+    assert "initial_state_evidence_id" not in prompt
+    assert "measurable_prediction" not in prompt
+    assert "memory_patch" not in prompt
+    assert "up to 4 legal actions" in prompt
+    assert len(image_paths) == 1
+    assert labels == ["Current actual game frame"]

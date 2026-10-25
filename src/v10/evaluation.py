@@ -10,17 +10,17 @@ from typing import Any, Callable, Iterable
 from .analysis import run_analysis
 from .runlog import append_jsonl
 
-CONDITIONING_PROFILES = ("pixels_actions", "pixels_actions_memory", "memory_delta")
+CONDITIONING_PROFILES = ("pixels_actions", "pixels_actions_memory")
 
 
 def _summary(record: dict[str, Any]) -> dict[str, Any]:
-    audits = record["prediction_audits"]
-    scored = [item for item in audits if item.get("verdict") in {"matched", "failed"}]
+    matches = record["action_matches"]
+    scored = [item for item in matches if item.get("status") in {"matched", "mismatch"}]
     return {
         "conditioning": record["conditioning"], "horizon": record["horizon"],
-        "prediction_audits": audits,
+        "action_matches": matches,
         "scored_actions": len(scored),
-        "matched_actions": sum(item.get("verdict") == "matched" for item in scored),
+        "matched_actions": sum(item.get("status") == "matched" for item in scored),
         "usage": record["usage"], "latency_seconds": record["latency_seconds"],
         "model": record.get("model"),
     }
@@ -33,7 +33,7 @@ def run_ablation(
     through_action: int = 4,
     horizon: int = 4,
     state_dir: str | Path | None = None,
-    memory_context_entries: int = 20,
+    memory_context_entries: int = 5,
     compare_prior_decisions: bool = True,
 ) -> dict[str, Any]:
     """Compare the three design conditions at one cut and one inference budget."""
@@ -46,7 +46,7 @@ def run_ablation(
                 run_dir, client, through_action, conditioning=profile, horizon=horizon,
                 state_dir=state_dir, memory_context_entries=memory_context_entries,
                 include_prior_decisions=include_prior,
-                persist_memory=False, write_decision=False,
+                write_decision=False,
             )
             arms.append({"status": "ok", "include_prior_decisions": include_prior, **_summary(result)})
         except Exception as exc:
@@ -69,7 +69,7 @@ def run_optimization(
     through_action: int = 4,
     horizons: Iterable[int] = (1, 2, 4),
     output_budgets: Iterable[int] = (1024, 4096),
-    memory_limits: Iterable[int] = (5, 20),
+    memory_limits: Iterable[int] = (0, 5),
     profiles: Iterable[str] = CONDITIONING_PROFILES,
     state_dir: str | Path | None = None,
     include_prior_decisions: bool = False,
@@ -84,8 +84,8 @@ def run_optimization(
         raise ValueError("horizons must be between 1 and 4")
     if any(int(value) < 1 for value in dimensions[2]):
         raise ValueError("output budgets must be positive")
-    if any(int(value) < 0 for value in dimensions[3]):
-        raise ValueError("memory limits must be non-negative")
+    if any(not 0 <= int(value) <= 5 for value in dimensions[3]):
+        raise ValueError("memory limits must be between 0 and 5")
     run_id = uuid.uuid4().hex
     arms = []
     for profile, horizon, budget, memory_limit in itertools.product(*dimensions):
@@ -99,7 +99,7 @@ def run_optimization(
                 conditioning=profile, horizon=int(horizon), state_dir=state_dir,
                 memory_context_entries=int(memory_limit),
                 include_prior_decisions=include_prior_decisions,
-                persist_memory=False, write_decision=False,
+                write_decision=False,
             )
             arms.append({"status": "ok", **config, **_summary(result)})
         except Exception as exc:

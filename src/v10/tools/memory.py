@@ -20,7 +20,7 @@ MEMORY_SCHEMA = "v10.memory/1"
 MEMORY_VIEW_NAME = "MEMORY.md"
 LEDGER_NAME = "memory.jsonl"
 DEFAULT_MAX_ENTRIES = 60
-DEFAULT_CONTEXT_ENTRIES = 20
+DEFAULT_CONTEXT_ENTRIES = 5
 
 
 def default_state_dir() -> Path:

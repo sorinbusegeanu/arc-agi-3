@@ -35,7 +35,7 @@ PYTHONPATH=src python -m v10.cli analyze \
   --model <deployed-qwen-model>
 ```
 
-The client reads `STRATA_API_KEY` from the environment. Analysis and live runs default to `http://127.0.0.1:8080` and model `qwen3.8-flash-next-iq3_s`; `--base-url` and `--model` remain available to override them. Replay stores ordered evidence, palette-rendered frames, intermediate frames, and same-shape pixel deltas. Analysis sends the initial frame, up to the configured recent transition horizon, the current frame, visible evidence, and compact memory. Continuation evidence is used only after a valid model response; a divergent action sequence is marked unscorable.
+The client reads `STRATA_API_KEY` from the environment. Analysis and live runs default to `http://127.0.0.1:8080` and model `qwen3.8-flash-next-iq3_s`; `--base-url` and `--model` remain available to override them. Replay stores ordered transition evidence, palette-rendered frames, intermediate frames, and same-shape pixel deltas. Analysis sends the previous and current actual frames, recent action outcomes, visible state, and compact read-only memory. Continuation evidence is used only after a valid model response; action comparison stops at the first divergence or a level/terminal interruption.
 
 ## Persistent skill and game memory
 
@@ -43,7 +43,7 @@ The general `src/v10/SKILL.md` is shared and referenced by hash in each run mani
 
 ## Phase 4: ablations
 
-Compare pixels/actions, pixels/actions plus memory, and memory plus delta frames with one output-token budget and one replay cut:
+Compare pixels/actions with and without up to five read-only memory entries using one output-token budget and one replay cut:
 
 ```sh
 PYTHONPATH=src python -m v10.cli ablate --run-dir runs/v10/ez01-replay \
@@ -54,15 +54,15 @@ By default, each condition is also run with and without earlier **structured dec
 
 ## Phase 5: optimization
 
-Sweep the recent delta horizon, output cap, compact-memory limit, and conditioning profile on the same offline cut:
+Sweep the plan horizon, output cap, memory limit, and conditioning profile on the same offline cut:
 
 ```sh
 PYTHONPATH=src python -m v10.cli optimize --run-dir runs/v10/ez01-replay \
   --through-action 4 --horizons 1,2,4 --output-budgets 1024,4096 \
-  --memory-limits 5,20
+  --memory-limits 0,5
 ```
 
-The Cartesian product is evaluated and appended to `optimization_runs.jsonl`. Each arm records scored actions, token usage, and latency; these offline results measure prediction quality and inference cost, not counterfactual live policy performance. Sweep lists can be shortened to limit model calls.
+The Cartesian product is evaluated and appended to `optimization_runs.jsonl`. Each arm records action matches, token usage, and latency. Offline action matches do not measure policy quality or counterfactual live performance. Sweep lists can be shortened to limit model calls.
 
 ## Live workflow
 
@@ -74,7 +74,7 @@ PYTHONPATH=src:other_repos/arc-agi:other_repos/ARCEngine python -m v10.cli live 
   --reasoning-effort medium --timeout-seconds 300 --max-output-tokens 4096
 ```
 
-The live command clears existing contents from its `--run-dir` before starting; it refuses protected locations and symlink run directories. `--game-id` selects the game and `--max-actions` sets the total action limit. It prints the current level, action count, each planned and executed action, prediction result, and inference time to stderr while running. It stores a run manifest, rendered frames, append-only evidence, decisions and plan outcomes, and `metrics.json`; game memory remains in the persistent game namespace described above. The model sees the current observation and recent evidence only. Actions are revalidated against each observation; plans stop on failed measurable predictions, level changes, terminal states, or illegal next actions. Resets require a model justification and an available reset budget. If the model decision and its single repair attempt both fail validation, the runner logs the rejection, takes a seeded-random legal action when its required arguments can be generated from the action schema, records that action with an inconclusive prediction audit, and resumes the model loop. If no safe fallback action can be generated, the run stops.
+The live command clears existing contents from its `--run-dir` before starting; it refuses protected locations and symlink run directories. `--game-id` selects the game, `--max-actions` sets the total action limit, and `--plan-horizon` sets how many actions the model may return at once (1–4). It prints the current level, action count, each planned and executed action, and inference time to stderr while running. It stores a run manifest, rendered frames, append-only transition evidence, decisions and plan outcomes, and `metrics.json`; existing game memory is supplied read-only from the persistent game namespace. The model returns only an `actions` array with legal action IDs and arguments. Actions are revalidated against each observation; plans stop on level changes, terminal states, action errors, budget exhaustion, or illegal next actions. When reset budget is available, `RESET` is listed as a legal pseudo-action and must be returned alone with a justification in `args`. If the model decision and its single repair attempt both fail validation, the runner logs the rejection, takes a seeded-random legal action when its required arguments can be generated from the action schema, records that transition, and resumes the model loop. If no safe fallback action can be generated, the run stops.
 
 Strata's per-request `reasoning_effort` defaults to `medium`, which enables the model's thinking phase. Use `--reasoning-effort none` to disable thinking, or choose `low` or `high`. Set `--reasoning-budget-tokens` to a positive value for a hard cap on thinking. `--max-output-tokens` caps reasoning plus the final JSON response. If Strata rejects a generated answer as malformed in JSON mode, the client retries once without server-side JSON validation; v10 then validates the returned text and can request its existing corrective response.
 

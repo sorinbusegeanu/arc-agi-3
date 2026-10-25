@@ -28,7 +28,7 @@ class History:
         self._records = read_jsonl(self.path)
         self._ids = {record["evidence_id"] for record in self._records}
 
-    def _next_evidence_id(self) -> str:
+    def next_evidence_id(self) -> str:
         numbers = [
             int(record["evidence_id"][1:])
             for record in self._records
@@ -42,7 +42,7 @@ class History:
         if not isinstance(record, dict):
             raise TypeError("evidence record must be an object")
         record = dict(record)
-        evidence_id = record.get("evidence_id") or self._next_evidence_id()
+        evidence_id = record.get("evidence_id") or self.next_evidence_id()
         if evidence_id in self._ids:
             raise ValueError(f"duplicate evidence_id: {evidence_id}")
         record["evidence_id"] = evidence_id

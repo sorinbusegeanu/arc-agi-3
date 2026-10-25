@@ -60,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"deployed Qwen model identifier (default: {DEFAULT_STRATA_MODEL})",
     )
     analyze.add_argument("--through-action", type=int, default=4)
-    analyze.add_argument("--conditioning", choices=CONDITIONING_PROFILES, default="memory_delta")
+    analyze.add_argument("--conditioning", choices=CONDITIONING_PROFILES, default="pixels_actions_memory")
     analyze.add_argument("--horizon", type=int, choices=(1, 2, 3, 4), default=4)
     analyze.add_argument("--memory-context-entries", type=int, default=DEFAULT_CONTEXT_ENTRIES)
     analyze.add_argument("--include-prior-decisions", action="store_true",
@@ -91,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     optimize.add_argument("--through-action", type=int, default=4)
     optimize.add_argument("--horizons", default="1,2,4")
     optimize.add_argument("--output-budgets", default="1024,4096")
-    optimize.add_argument("--memory-limits", default="5,20")
+    optimize.add_argument("--memory-limits", default="0,5")
     optimize.add_argument("--profiles", default=",".join(CONDITIONING_PROFILES))
     optimize.add_argument("--include-prior-decisions", action="store_true")
     for evaluation_parser in (ablate, optimize):
