@@ -28,6 +28,7 @@ DEFAULT_CONTEXT_ENTRIES = 5
 MAX_MEMORY_MARKDOWN_CHARS = 12_000
 PATTERN_TYPES: tuple[str, ...] = ("mechanic", "strategy", "exception", "hypothesis")
 PATTERN_STATUSES: tuple[str, ...] = ("candidate", "confirmed", "contradicted", "retired")
+STATE_SELECTOR_FIELDS = frozenset({"game_state", "level", "levels_completed", "win_levels", "terminal"})
 CONFIDENCE_PRIOR = 1
 CONFIDENCE_CONFIRMED_THRESHOLD = 0.75
 
@@ -650,7 +651,9 @@ class GameMemory:
                 rejected.append({"index": index, "pattern_id": pattern_id, "reason": "invalid_applicability_conditions"})
                 continue
             selector = raw.get("state_selector", (existing or {}).get("state_selector", {}))
-            if not isinstance(selector, Mapping) or any(not isinstance(key, str) for key in selector):
+            if not isinstance(selector, Mapping) or any(
+                not isinstance(key, str) or key not in STATE_SELECTOR_FIELDS for key in selector
+            ):
                 rejected.append({"index": index, "pattern_id": pattern_id, "reason": "invalid_state_selector"})
                 continue
             new_support = raw.get("supporting_evidence", [])
@@ -722,7 +725,9 @@ class GameMemory:
                     invalid_prediction = True
                     break
                 selector = expectation.get("state_selector", {})
-                if not isinstance(selector, Mapping):
+                if not isinstance(selector, Mapping) or any(
+                    not isinstance(key, str) or key not in STATE_SELECTOR_FIELDS for key in selector
+                ):
                     invalid_prediction = True
                     break
                 try:

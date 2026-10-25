@@ -332,7 +332,12 @@ def _perform_review(
         memory_text = memory.write_view().read_text(encoding="utf-8")
         legacy_review = memory.get("review:latest")
         legacy_review_text = str(legacy_review.get("claim", "")) if legacy_review else ""
-        if memory.has_review_coverage(game_id, transition_ids):
+        events = _review_events(records)
+        review_evidence_ids = list(dict.fromkeys(
+            str(event["evidence_id"]) for event in events
+            if event.get("evidence_id")
+        ))
+        if memory.has_review_coverage(game_id, review_evidence_ids):
             row = {
                 "schema": "v10.live_review/2", "status": "skipped_duplicate_evidence",
                 "trigger_reasons": list(trigger_reasons), "through_action": tools.action_count,
@@ -344,7 +349,7 @@ def _perform_review(
             return {"row": row, "attempts": 0, "usage": {}, "latency_seconds": 0.0}
         frames = FrameStore(tools.run_dir)
         image_paths, image_labels = _review_frame_selection(transitions, frames)
-        events = _review_events(records)
+        legacy_review_text = legacy_review_text[:4_000]
         patterns = [
             {
                 "pattern_id": entry["id"], "pattern_type": entry.get("pattern_type"),
@@ -371,7 +376,7 @@ def _perform_review(
             + json.dumps(patterns, ensure_ascii=False, separators=(",", ":")) + "\n\n"
             "Existing MEMORY.md view (legacy content may be migrated into patterns):\n"
             + memory_text + "\n\n"
-            "Prior unstructured review, if any:\n" + legacy_review_text + "\n\n"
+            "Prior unstructured review, if any (bounded to 4000 characters):\n" + legacy_review_text + "\n\n"
             "New ordered run observations (evidence IDs are valid only in the evidence arrays):\n"
             + json.dumps(events, ensure_ascii=False, separators=(",", ":"))
         )
@@ -388,7 +393,7 @@ def _perform_review(
             raise ValueError("review response was truncated at the output-token limit")
         changes, legacy_migrated = _validate_review_payload(_parse_content(content))
         applied = memory.apply_review_changes(
-            changes, game_id=game_id, evidence_ids=transition_ids,
+            changes, game_id=game_id, evidence_ids=review_evidence_ids,
             current_step=tools.action_count,
         )
         if not applied.get("committed", True):

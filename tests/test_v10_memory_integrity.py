@@ -275,3 +275,43 @@ def test_legacy_run_ledger_migrates_before_run_dir_reuse(tmp_path) -> None:
     assert imported == 1
     assert GameMemory(legacy, store_dir=tmp_path / "persistent").read()["entries"][0]["id"] == "old-run:H1"
     assert GameMemory.migrate_run_ledger(legacy, tmp_path / "persistent", "fixture") == 0
+
+
+def test_review_accepts_audit_evidence_and_rejects_unusable_state_selectors(tmp_path) -> None:
+    memory = GameMemory(tmp_path / "run", store_dir=tmp_path / "state", run_id="run-a", game_id="ez01")
+    result = memory.apply_review_changes([
+        {
+            "operation": "upsert", "pattern_type": "mechanic", "claim": "A measured action changes the board.",
+            "supporting_evidence": ["T2", "A3"], "contradicting_evidence": [],
+            "applicability_conditions": [], "state_selector": {"unknown_field": True},
+        },
+        {
+            "operation": "upsert", "pattern_type": "mechanic", "claim": "A measured action changes the board.",
+            "supporting_evidence": ["T2", "A3"], "contradicting_evidence": [],
+            "applicability_conditions": [], "state_selector": {"level": 0},
+        },
+    ], game_id="ez01", evidence_ids=["T2", "A3"], current_step=2)
+
+    assert result["added"] == 1
+    assert result["rejected"] == [{"index": 0, "pattern_id": None, "reason": "invalid_state_selector"}]
+    assert memory.patterns("ez01")[0]["supporting_evidence"] == ["run-a:T2", "run-a:A3"]
+
+
+def test_retirement_is_a_revision_and_does_not_erase_history(tmp_path) -> None:
+    memory = GameMemory(tmp_path / "run", store_dir=tmp_path / "state", run_id="run-a", game_id="ez01")
+    memory.apply_review_changes([{
+        "operation": "upsert", "pattern_type": "hypothesis", "claim": "The cue indicates a reset.",
+        "supporting_evidence": ["T1"], "contradicting_evidence": [],
+    }], game_id="ez01", evidence_ids=["T1"], current_step=1)
+    pattern_id = memory.patterns("ez01")[0]["id"]
+
+    result = memory.apply_review_changes([{
+        "operation": "retire", "pattern_id": pattern_id,
+    }], game_id="ez01", evidence_ids=["T2"], current_step=2)
+
+    revisions = [row for row in memory.ledger() if row.get("id") == pattern_id]
+    assert result["retired"] == 1
+    assert [row["pattern_revision"] for row in revisions] == [1, 2]
+    assert revisions[-1]["status"] == "retired"
+    assert memory.patterns("ez01") == []
+    assert memory.patterns("ez01", include_retired=True)[0]["claim"] == "The cue indicates a reset."
