@@ -11,7 +11,7 @@
 - Count actions since the last review attempt.
 - After each action, trigger review on a level-completion increase or the interval.
 - Coalesce simultaneous triggers into one review.
-- Pause/discard the remaining planned actions and request a fresh action decision after review.
+- Discard the remaining planned actions and request a fresh action decision after review.
 - Reset the interval counter after an attempt. Do not reset or advance the environment during review.
 - Preserve terminal handling: save a final-level review when possible, then end the run.
 
@@ -20,9 +20,9 @@
 **Files:** reuse the existing model client, history/frame helpers, and game-memory code. Keep the review helper alongside the owning runtime unless a separate module is clearly useful.
 
 - Build a review prompt from existing MEMORY.md, recorded actions and transformations so far, relevant frames, transition IDs, level/reset boundaries, and outcome feedback.
-- Ask the same model for compact consolidated Markdown covering patterns, useful approaches, failures/exceptions, and uncertain ideas.
+- Ask the same model for compact consolidated Markdown covering patterns, useful approaches, failures/exceptions, and uncertain ideas. Use a review-specific response format through the existing client; add only a small per-call format option if necessary. Keep action-call JSON handling unchanged.
 - Require evidence references and distinguish observations from guesses in the prompt.
-- Save a non-empty result using the existing memory path; preserve previous memory if the call or save fails.
+- Save a non-empty Markdown result using the existing memory path; preserve previous memory if the call or save fails. No new review schema or promotion rules are needed.
 - Log trigger, covered transitions, result/error, and available usage/latency.
 - Reuse existing persistence and logging utilities. Do not introduce another ledger or a new knowledge framework.
 
@@ -38,6 +38,8 @@
 - Inspect the saved memory and next prompt; report levels solved and added review cost. Do not promise an improvement over the reported three-of-five baseline.
 
 ## Completion
+
+Limit helper changes to what is needed to connect review, persistence, and action context. Existing unrelated issues do not become prerequisites.
 
 The addition is done when review runs at the requested boundaries, useful findings are saved to MEMORY.md, the next decision receives them, and review failures leave the working agent able to continue.
 
