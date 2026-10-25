@@ -220,9 +220,12 @@ def test_new_run_replays_successful_level_path_without_action_model_call(tmp_pat
     plan = next(row for row in rows if row.get("schema") == "v10.live_decision/2")
     assert second_env.actions == ["ACTION1"]
     assert second["cached_solution_actions"] == 1
-    assert second["model_calls"] == 1  # review call only; no action-decision call
+    assert second["model_calls"] == 0
+    assert second["review_skipped_cached_success_count"] == 1
     assert plan["source"] == "verified_level_path"
-    assert len(second_client.calls) == 1  # completion review only
+    assert second_client.calls == []
+    skipped_review = json.loads((tmp_path / "second/reviews.jsonl").read_text().splitlines()[0])
+    assert skipped_review["status"] == "skipped_verified_route_replay"
     assert plan["decision"]["actions"] == [{"action": "up", "args": {}}]
     assert "verified route" in (state_dir / "games/fixture/MEMORY.md").read_text()
 
@@ -249,8 +252,8 @@ def test_startup_skips_bootstrap_when_exact_route_exists_for_current_level(tmp_p
     assert env.actions == ["ACTION1"]
     assert metrics["cached_solution_actions"] == 1
     assert metrics["resets"] == 0
-    assert len(client.calls) == 1  # completion review only, no model action plan
-    assert client.calls[0].startswith("# V10 memory consolidation")
+    assert client.calls == []
+    assert metrics["review_skipped_cached_success_count"] == 1
     assert not any(row.get("schema") == "v10.live_bootstrap_reset/1" for row in rows)
 
 

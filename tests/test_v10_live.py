@@ -9,7 +9,10 @@ import numpy as np
 import pytest
 
 from v10.arcade_env import ArcadeGameEnv
-from v10.live import _live_context, _perform_review, _review_frame_selection, run_live
+from v10.live import (
+    _live_context, _perform_review, _review_events, _review_frame_selection,
+    _verified_route_summaries, run_live,
+)
 from v10.tools.game import GameTools
 from v10.tools.game import ActionError
 from v10.tools.history import History
@@ -196,12 +199,12 @@ def test_bootstrap_is_reset_before_single_startup_plan_from_first_screen(tmp_pat
     assert "short exploratory action sequence" in prompt
     assert len(images) == 6
     assert labels == [
-        "Bootstrap screen 1: initial before up",
-        "Bootstrap screen 2: after up",
-        "Bootstrap screen 3: after left",
-        "Bootstrap screen 4: after down",
-        "Bootstrap screen 5: after right",
-        "Bootstrap screen 6: restored initial screen after reset",
+        "Bootstrap for level index 0 screen 1: initial before up",
+        "Bootstrap for level index 0 screen 2: after up",
+        "Bootstrap for level index 0 screen 3: after left",
+        "Bootstrap for level index 0 screen 4: after down",
+        "Bootstrap for level index 0 screen 5: after right",
+        "Bootstrap for level index 0 screen 6: CURRENT SCREEN (restored initial screen after reset for level index 0)",
     ]
     decisions = [
         json.loads(line) for line in (tmp_path / "run/decisions.jsonl").read_text().splitlines()
@@ -676,7 +679,10 @@ def test_live_context_has_no_future_records_and_includes_current_images(tmp_path
     assert '"id":"down"' in prompt
     assert "ACTION1" not in prompt
     assert len(image_paths) == 1
-    assert labels == ["Current actual game frame"]
+    assert len(labels) == 1 and "CURRENT SCREEN" in labels[0]
+    assert '"index_zero_based":0' in prompt
+    assert '"display_number_one_based":1' in prompt
+    assert "The `level` field is zero-based" in prompt
 
 
 def test_action_context_sends_ordered_screens_and_all_intermediate_frames(tmp_path: Path) -> None:
@@ -719,13 +725,82 @@ def test_action_context_sends_ordered_screens_and_all_intermediate_frames(tmp_pa
         "during up, intermediate screen 1/2", "during up, intermediate screen 2/2", "after up",
         "during left, intermediate screen 1/2", "during left, intermediate screen 2/2", "after left",
         "during down, intermediate screen 1/2", "during down, intermediate screen 2/2", "after down",
-        "during right, intermediate screen 1/2", "during right, intermediate screen 2/2", "after right",
+        "during right, intermediate screen 1/2", "during right, intermediate screen 2/2", "CURRENT SCREEN (after right)",
     ]
     assert [item["action"] for item in sequence] == [
         None, "up", "up", "up", "left", "left", "left",
         "down", "down", "down", "right", "right", "right",
     ]
     assert all(path.suffix == ".png" for path in paths)
+
+
+def test_action_context_scopes_history_and_screens_to_active_level(tmp_path: Path) -> None:
+    class TwoLevelEnv(_FakeEnv):
+        def __init__(self):
+            super().__init__()
+            self.level = 0
+            self.levels_completed = 0
+
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"].extend([
+                {"id": action, "parameters": {
+                    "type": "object", "properties": {}, "required": [], "additionalProperties": False,
+                }}
+                for action in ("ACTION3", "ACTION4")
+            ])
+            result["level"] = self.level
+            result["levels_completed"] = self.levels_completed
+            return result
+
+        def act(self, action, args):
+            self.actions.append((action, dict(args)))
+            if len(self.actions) == 1:
+                self.level = 1
+                self.levels_completed = 1
+                self.frame[0, 0] = 10  # New level's starting frame.
+            else:
+                self.frame[0, len(self.actions) % self.frame.shape[1]] = len(self.actions)
+            return {}
+
+    client = _FakeClient([
+        _decision([_action("up")]),
+        _decision([_action("right")]),
+        _decision([]),
+    ])
+    _run_live_without_starting_routine(
+        TwoLevelEnv(), tmp_path / "run", client, game_id="fixture",
+        max_actions=3, plan_horizon=1,
+    )
+
+    action_prompts = [
+        (prompt, paths, labels) for prompt, paths, labels in client.calls
+        if "Visible context:\n" in prompt
+    ]
+    assert len(action_prompts) == 3
+
+    # The first action in level 1 completed level 0. Its old-level pre-frame
+    # and action must not appear in level 1's exploration context.
+    second_prompt, second_paths, second_labels = action_prompts[1]
+    second_context = json.loads(second_prompt.split("Visible context:\n", 1)[1])
+    assert second_context["active_level"] == {
+        "index_zero_based": 1, "display_number_one_based": 2, "levels_completed": 1,
+    }
+    assert second_context["recent_transitions"] == []
+    assert len(second_paths) == 1
+    assert "CURRENT SCREEN" in second_labels[0]
+    assert "earlier levels are omitted" in second_prompt
+
+    # Once level 1 has an action, its own start, transition, and current image
+    # are aligned; the level 0 completion action remains excluded.
+    third_prompt, third_paths, third_labels = action_prompts[2]
+    third_context_text = third_prompt.split("Visible context:\n", 1)[1]
+    third_context, _ = json.JSONDecoder().raw_decode(third_context_text)
+    assert [row["action"] for row in third_context["recent_transitions"]] == ["right"]
+    assert len(third_paths) == 2
+    assert "initial before right" in third_labels[0]
+    assert "CURRENT SCREEN" in third_labels[-1]
+    assert third_context["screen_sequence"][-1]["is_current_screen"] is True
 
 
 class _LevelCompleteEnv(_FakeEnv):
@@ -742,6 +817,85 @@ class _LevelCompleteEnv(_FakeEnv):
         result["terminal"] = self.terminal_after_action and bool(self.actions)
         result["game_state"] = "WIN" if result["terminal"] else "NOT_FINISHED"
         return result
+
+
+def test_review_context_marks_level_boundary_and_verified_scope(tmp_path: Path) -> None:
+    env = _LevelCompleteEnv()
+    client = _FakeClient([_decision([_action()])], review_responses=[_VALID_REVIEW])
+    _run_live_without_starting_routine(
+        env, tmp_path / "run", client, game_id="fixture", max_actions=1,
+    )
+
+    review_prompt = next(
+        prompt for prompt, _, _ in client.calls
+        if "Consolidate memory for game fixture" in prompt
+    )
+    assert "active level index 1 (zero-based), displayed as level 2" in review_prompt
+    assert "active level may be the newly started level after the completion boundary" in review_prompt
+    assert "only for the level scopes present in verified routes" in review_prompt
+    events = _review_events(History(tmp_path / "run").records())
+    transition = next(event for event in events if event["type"] == "transition")
+    assert transition["level_index_before_action_zero_based"] == 0
+    assert transition["level_index_after_action_zero_based"] == 1
+    assert transition["crossed_level_boundary"] is True
+
+
+def test_cached_level_success_skips_redundant_review_but_win_still_reviews(tmp_path: Path) -> None:
+    from v10.tools.solutions import LevelSolutionStore
+
+    state_dir = tmp_path / "state"
+    store_dir = game_memory_dir(state_dir, "fixture")
+    save_game_memory(store_dir, "# Game Memory\n\n- Use verified routes on matching starts.")
+
+    start = _LevelCompleteEnv().observe()
+    finish_frame = start["frame"].copy()
+    finish_frame[0, 1] = 1
+    finish = {
+        **start, "frame": finish_frame, "level": 1, "levels_completed": 1,
+        "terminal": False, "game_state": "NOT_FINISHED",
+    }
+    store = LevelSolutionStore(store_dir / "level_solutions.jsonl", "fixture")
+    edge = store.record_transition(start, "ACTION1", {}, finish, run_id="previous")
+    store.record_successful_trajectory(start, [edge], run_id="previous", success="level_completed")
+
+    client = _FakeClient([])
+    metrics = _run_live_without_starting_routine(
+        _LevelCompleteEnv(), tmp_path / "cached-level", client, game_id="fixture",
+        max_actions=1, state_dir=state_dir,
+    )
+    assert metrics["cached_solution_actions"] == 1
+    assert metrics["review_count"] == 0
+    assert metrics["review_skipped_cached_success_count"] == 1
+    assert client.calls == []
+    skipped = _review_rows(tmp_path / "cached-level")[0]
+    assert skipped["status"] == "skipped_verified_route_replay"
+    assert skipped["checkpoint_saved"] is True
+    checkpoint_memory = GameMemory(
+        tmp_path / "cached-level", store_dir=store_dir,
+        run_id=metrics["run_id"], game_id="fixture",
+    )
+    assert checkpoint_memory.reviewed_event_count("fixture") == skipped["covered_event_count"]
+
+    # Final WIN always gets consolidation, even when the winning move was cached.
+    win_start = _LevelCompleteEnv(terminal=True, start_completed=4).observe()
+    win_frame = win_start["frame"].copy()
+    win_frame[0, 1] = 1
+    win_finish = {
+        **win_start, "frame": win_frame, "level": 5, "levels_completed": 5,
+        "terminal": True, "game_state": "WIN",
+    }
+    win_store = LevelSolutionStore(store_dir / "level_solutions.jsonl", "fixture")
+    win_edge = win_store.record_transition(win_start, "ACTION1", {}, win_finish, run_id="previous-win")
+    win_store.record_successful_trajectory(win_start, [win_edge], run_id="previous-win", success="win")
+    win_client = _FakeClient([], review_responses=[_VALID_REVIEW])
+    win_metrics = _run_live_without_starting_routine(
+        _LevelCompleteEnv(terminal=True, start_completed=4), tmp_path / "cached-win",
+        win_client, game_id="fixture", max_actions=1, state_dir=state_dir,
+    )
+    assert win_metrics["won"] is True
+    assert win_metrics["review_count"] == 1
+    assert win_metrics["review_skipped_cached_success_count"] == 0
+    assert _review_rows(tmp_path / "cached-win")[0]["trigger_reasons"] == ["level_completed", "win"]
 
 
 def _review_rows(run_dir: Path) -> list[dict]:
@@ -820,7 +974,7 @@ def test_ez01_fixture_review_writes_model_markdown_without_state_or_evidence_noi
     assert "145" in client.calls[0][0]  # raw evidence is review input, not saved prose
 
 
-def test_equivalent_verified_routes_keep_level_scope_and_stay_out_of_markdown(tmp_path: Path) -> None:
+def test_equivalent_verified_routes_keep_level_scope_and_stay_out_of_review_prose(tmp_path: Path) -> None:
     from v10.tools.solutions import LevelSolutionStore
 
     state_root = tmp_path / "state"
@@ -859,9 +1013,40 @@ def test_equivalent_verified_routes_keep_level_scope_and_stay_out_of_markdown(tm
     prompt = client.calls[0][0]
     assert result["row"]["verified_routes_supplied"] == 2
     assert '"level":0' in prompt and '"level":1' in prompt
-    assert '"actions":["up","up"]' in prompt
+    assert '"actions":["up","up"]' not in prompt
+    assert '"step_count":2' not in prompt
     assert (store_dir / "MEMORY.md").read_text() == game_text + "\n"
     assert '["up","up"]' not in (store_dir / "MEMORY.md").read_text()
+
+
+def test_review_route_summaries_omit_routes_but_store_retains_them_for_planning(tmp_path: Path) -> None:
+    from v10.tools.solutions import LevelSolutionStore
+
+    store = LevelSolutionStore(tmp_path / "level_solutions.jsonl", "fixture")
+    start = {
+        "frame": np.zeros((2, 2), dtype=np.int64),
+        "legal_actions": [{"id": "ACTION1"}],
+        "game_state": "NOT_FINISHED", "level": 2, "levels_completed": 2,
+        "terminal": False,
+    }
+    finish = {
+        **start, "frame": np.ones((2, 2), dtype=np.int64),
+        "game_state": "WIN", "terminal": True,
+    }
+    edge = store.record_transition(start, "ACTION1", {}, finish, run_id="successful")
+    store.record_successful_trajectory(start, [edge], run_id="successful", success="win")
+
+    summaries = _verified_route_summaries(store)
+    assert summaries == [{
+        "scope": {"level": 2, "levels_completed": 2},
+        "environment_recorded_success": "win",
+    }]
+    assert "actions" not in summaries[0]
+    assert "step_count" not in summaries[0]
+
+    replay = store.shortest_known_solution(start)
+    assert replay is not None
+    assert [step["action"] for step in replay] == ["ACTION1"]
 
 def test_incremental_review_prompt_contains_only_uncovered_observations(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
@@ -1117,8 +1302,48 @@ def test_changed_transition_resets_stagnation_streak(tmp_path: Path) -> None:
     )
 
     assert metrics["review_count"] == 1
-    assert _review_rows(tmp_path / "run")[0]["through_action"] == 3
+    assert _review_rows(tmp_path / "run")[0]["through_action"] == 4
     assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["stagnation"]
+
+
+def test_stale_stagnation_states_from_previous_level_do_not_retrigger(tmp_path: Path) -> None:
+    class NoopsThenNewLevel(_FakeEnv):
+        def __init__(self):
+            super().__init__(change_every_action=False)
+            self.level = 0
+            self.levels_completed = 0
+
+        def observe(self):
+            result = super().observe()
+            result["level"] = self.level
+            result["levels_completed"] = self.levels_completed
+            return result
+
+        def act(self, action, args):
+            self.actions.append((action, dict(args)))
+            if len(self.actions) == 3:
+                self.level = 1
+                self.levels_completed = 1
+                self.frame[0, 0] = 3
+            elif len(self.actions) > 3:
+                self.frame[0, len(self.actions) % self.frame.shape[1]] = len(self.actions)
+            return {}
+
+    client = _FakeClient(
+        [
+            _decision([_action("up"), _action("up"), _action("up")]),
+            _decision([_action("up")] * 3),
+        ],
+        review_responses=[_VALID_REVIEW],
+    )
+    metrics = _run_live_without_starting_routine(
+        NoopsThenNewLevel(), tmp_path / "run", client,
+        game_id="fixture", max_actions=6, plan_horizon=4, review_interval=50,
+    )
+
+    assert metrics["review_count"] == 1
+    assert [row["trigger_reasons"] for row in _review_rows(tmp_path / "run")] == [["level_completed"]]
+    assert _review_rows(tmp_path / "run")[0]["through_action"] == 3
 
 
 def test_global_and_game_markdown_persist_across_sessions_without_duplicates(tmp_path: Path) -> None:

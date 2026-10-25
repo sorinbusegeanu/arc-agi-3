@@ -9,7 +9,7 @@ import shutil
 import sys
 import time
 import uuid
-from collections import Counter, deque
+from collections import deque
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -192,7 +192,9 @@ Routes are supplied only when the environment recorded level completion or WIN. 
 
 Global memory is at most a few bullets and contains only methods that transfer to unrelated games. Do not mention this game's colors, objects, directions, levels, pixel values, or specific rule. Generalize a reusable method (for example: “Compare each object's position before and after one action to infer action effects.”); if no transferable lesson was learned, retain only prior reusable guidance. Remove game-specific details from existing global memory rather than carrying them forward.
 
-Separate observations from explanations. Unchanged pixels show only that an action had no visible effect in that state; do not infer walls, total reachability, or completion rules from proximity. Distinguish lasting mechanics from historical positions. Follow current observations when they conflict with prior memory. Do not put current run state in durable memory. Return complete replacement Markdown, retaining only concise findings that can change a future decision."""
+Separate observations from explanations. Unchanged pixels show only that an action had no visible effect in that state; do not infer walls, total reachability, or completion rules from proximity. Distinguish lasting mechanics from historical positions. Follow current observations when they conflict with prior memory. Do not put current run state in durable memory. Return complete replacement Markdown, retaining only concise findings that can change a future decision.
+
+The review context labels the active level and each transition's pre-action and post-action level. A transition that changes levels completed the PRE-action level; its post-action frame is the start of the next level. Never describe the new level as solved or assign its completion strategy based on that boundary transition. Claim a successful strategy only for level scopes listed in verified successful routes. If movement was observed but the level did not complete, describe it only as an observation or tentative approach. State only that an obstacle was encountered when the observations show one; never claim that an entire level has no obstacles based only on a successful route."""
 
 
 def _validate_review_payload(
@@ -229,18 +231,24 @@ def _review_repair_prompt(base_prompt: str, errors: Any) -> str:
 
 def _review_events(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
+    by_id = {
+        str(row.get("evidence_id")): row
+        for row in records if row.get("evidence_id") is not None
+    }
     for row in records:
         kind = row.get("type")
         if kind == "state":
             events.append({
                 "type": "initial_state",
-                "level": row.get("level"), "levels_completed": row.get("levels_completed"),
+                "level_index_zero_based": row.get("level"),
+                "levels_completed": row.get("levels_completed"),
                 "reset_generation": row.get("reset_generation"), "game_state": row.get("game_state"),
             })
         elif kind == "reset":
             events.append({
                 "type": "reset_boundary",
-                "level": row.get("level"), "levels_completed": row.get("levels_completed"),
+                "level_index_zero_based": row.get("level"),
+                "levels_completed": row.get("levels_completed"),
                 "reset_generation": row.get("reset_generation"),
                 "justification": row.get("justification"),
             })
@@ -260,11 +268,19 @@ def _review_events(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
                     "error": row.get("error"), "reset_generation": row.get("reset_generation"),
                 })
         elif kind == "transition":
+            before = by_id.get(str(row.get("pre_evidence_id")), {})
             events.append({
                 "type": "transition",
                 "action": model_action_name(row.get("action")), "args": row.get("args", {}),
                 "measurements": row.get("measurements"), "result": row.get("result"),
-                "level": row.get("level"), "levels_completed": row.get("levels_completed"),
+                "level_index_before_action_zero_based": before.get("level"),
+                "level_index_after_action_zero_based": row.get("level"),
+                "levels_completed_before_action": before.get("levels_completed"),
+                "levels_completed_after_action": row.get("levels_completed"),
+                "crossed_level_boundary": (
+                    before.get("level") != row.get("level")
+                    or before.get("levels_completed") != row.get("levels_completed")
+                ),
                 "game_state": row.get("game_state"), "terminal": row.get("terminal"),
                 "reset_generation": row.get("reset_generation"),
             })
@@ -374,11 +390,11 @@ def _action_screen_sequence(
 ) -> tuple[list[Path], list[str], list[dict[str, Any]]]:
     """Return every observed screen in action order, including intermediate frames."""
     entries = {entry["frame_id"]: entry for entry in frames.entries()}
-    ordered: list[tuple[str, str | None, str]] = []
+    ordered: list[tuple[str, str | None, str, bool]] = []
 
-    def add(image_id: Any, action: str | None, stage: str) -> None:
+    def add(image_id: Any, action: str | None, stage: str, *, is_current: bool = False) -> None:
         if image_id is not None:
-            ordered.append((str(image_id), action, stage))
+            ordered.append((str(image_id), action, stage, is_current))
 
     if transitions:
         first_action = str(model_action_name(transitions[0].get("action")))
@@ -395,14 +411,20 @@ def _action_screen_sequence(
             for index, image_id in enumerate(intermediate_ids, start=1):
                 add(image_id, action, f"during {action}, intermediate screen {index}/{len(intermediate_ids)}")
             add(row.get("post_frame_image_id"), action, f"after {action}")
-    add(current_image_id, None, current_label)
+    add(current_image_id, None, current_label, is_current=True)
 
     image_paths: list[Path] = []
     image_labels: list[str] = []
     sequence: list[dict[str, Any]] = []
     last_image_id: str | None = None
-    for image_id, action, stage in ordered:
+    for image_id, action, stage, is_current in ordered:
         if image_id == last_image_id:
+            if is_current and sequence:
+                previous = sequence[-1]
+                previous["is_current_screen"] = True
+                previous["stage"] = f"CURRENT SCREEN ({previous['stage']})"
+                previous["label"] = f"{label_prefix} screen {previous['screen']}: {previous['stage']}"
+                image_labels[-1] = previous["label"]
             continue
         entry = entries.get(image_id)
         if entry is None or entry.get("kind") != IMAGE_KIND:
@@ -412,10 +434,48 @@ def _action_screen_sequence(
         image_labels.append(label)
         sequence.append({
             "screen": len(sequence) + 1, "action": action,
-            "stage": stage, "label": label,
+            "stage": f"CURRENT SCREEN ({stage})" if is_current else stage,
+            "label": label, "is_current_screen": is_current,
         })
+        if is_current:
+            label = f"{label_prefix} screen {len(sequence)}: {sequence[-1]['stage']}"
+            image_labels[-1] = label
+            sequence[-1]["label"] = label
         last_image_id = image_id
     return image_paths, image_labels, sequence
+
+
+def _active_level_transitions(
+    records: Sequence[Mapping[str, Any]], current: Mapping[str, Any], reset_generation: int,
+) -> list[Mapping[str, Any]]:
+    """Return actions whose pre-action state belongs to the current level.
+
+    Transition metadata describes the post-action state, so the action that
+    completed the prior level is deliberately excluded even though its
+    post-action level number is the new level.
+    """
+    current_level = current.get("level")
+    current_completed = current.get("levels_completed")
+    if current_level is None and current_completed is None:
+        return [
+            row for row in records
+            if row.get("type") == "transition"
+            and int(row.get("reset_generation", 0)) == int(reset_generation)
+        ][-12:]
+
+    by_id = {str(row.get("evidence_id")): row for row in records if row.get("evidence_id") is not None}
+    selected: list[Mapping[str, Any]] = []
+    for row in records:
+        if row.get("type") != "transition" or int(row.get("reset_generation", 0)) != int(reset_generation):
+            continue
+        pre_state = by_id.get(str(row.get("pre_evidence_id")))
+        if pre_state is None or int(pre_state.get("reset_generation", 0)) != int(reset_generation):
+            continue
+        level_matches = current_level is None or pre_state.get("level") == current_level
+        completed_matches = current_completed is None or pre_state.get("levels_completed") == current_completed
+        if level_matches and completed_matches:
+            selected.append(row)
+    return selected[-12:]
 
 
 def _verified_route_summaries(solution_store: LevelSolutionStore) -> list[dict[str, Any]]:
@@ -429,8 +489,6 @@ def _verified_route_summaries(solution_store: LevelSolutionStore) -> list[dict[s
         summaries.append({
             "scope": scope,
             "environment_recorded_success": route.get("success"),
-            "actions": [model_action_name(step.get("action")) for step in route.get("steps", [])],
-            "step_count": len(route.get("steps", [])),
         })
     return summaries
 
@@ -560,17 +618,24 @@ def _perform_review(
             new_transitions, frames,
             initial_completed=int(initial_completed) if initial_completed is not None else None,
         )
+        active_state = tools.observe()
+        active_level = active_state.get("level")
+        active_level_number = int(active_level) + 1 if isinstance(active_level, int) else None
         solution_store = LevelSolutionStore(memory_store_dir / "level_solutions.jsonl", game_id)
         verified_routes = _verified_route_summaries(solution_store)
         success_triggered = any(reason in {"level_completed", "win"} for reason in trigger_reasons)
         success_instruction = (
-            "An environment-confirmed level completion or WIN triggered this review. Add concise strategy guidance only when it is supported by the corresponding verified route and its scope; exact actions stay in the route store. "
+            "An environment-confirmed level completion or WIN triggered this review. Add concise strategy guidance only for the level scopes present in verified routes; exact actions stay in the route store. The active level may be the newly started level after the completion boundary and is not solved by that boundary. "
             if success_triggered else
             "No level completion or WIN triggered this review. Do not present the current exploration as a successful strategy; retain prior verified strategy guidance only when still useful. "
         )
         user_prompt = (
             f"Consolidate memory for game {game_id} after action {tools.action_count}. "
             f"Review trigger: {', '.join(trigger_reasons)}. Current progress belongs only in observation context, not either memory file. "
+            + f"Current environment state: active level index {active_level} (zero-based)"
+            + (f", displayed as level {active_level_number}" if active_level_number is not None else "")
+            + f", levels completed {active_state.get('levels_completed')}, game state {active_state.get('game_state')}. "
+            + "Transition level fields describe the state before and after each action; a level boundary's post-action screen starts the next level. "
             + success_instruction
             + "Preserve level/state scope when summarizing successful approaches. Existing game MEMORY.md:\n"
             + (existing_memory or "(none)")
@@ -579,7 +644,7 @@ def _perform_review(
             + "\n\nNew ordered observations since the last successful review checkpoint:\n"
             + json.dumps(new_events, ensure_ascii=False, separators=(",", ":"))
             + "\n\nRepeated states and ineffective state/action summary:\n"
-            + json.dumps(_repeated_outcome_summary(transitions, tools.frames), ensure_ascii=False, separators=(",", ":"))
+            + json.dumps(_repeated_outcome_summary(new_transitions, tools.frames), ensure_ascii=False, separators=(",", ":"))
             + "\n\nVerified successful routes (outcomes and scope are environment facts; summarize strategies without copying routes):\n"
             + json.dumps(verified_routes, ensure_ascii=False, separators=(",", ":"))
             + f"\n\nLength limits: game Markdown at most {int(game_memory_max_chars)} characters; "
@@ -684,11 +749,9 @@ def _live_context(
     saved_route_guidance: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     records = tools.history.records()
-    transitions = [
-        row for row in records
-        if row.get("type") == "transition"
-        and int(row.get("reset_generation", 0)) == int(tools.reset_generation)
-    ][-12:]
+    transitions = _active_level_transitions(records, current, tools.reset_generation)
+    level_index = current.get("level")
+    level_number = int(level_index) + 1 if isinstance(level_index, int) else None
     legal_actions = _public_actions(current.get("legal_actions", []))
     if tools.reset_count < tools.max_resets:
         legal_actions.append({
@@ -713,11 +776,16 @@ def _live_context(
             "terminal": current.get("terminal", False),
             "legal_actions": legal_actions,
         },
+        "active_level": {
+            "index_zero_based": level_index,
+            "display_number_one_based": level_number,
+            "levels_completed": current.get("levels_completed"),
+        },
         "recent_transitions": [
             {
                 "action": row.get("action"), "args": row.get("args", {}),
                 "measurements": _compact_transition_measurements(row.get("measurements")),
-                "level": row.get("level"),
+                "resulting_level_index_zero_based": row.get("level"),
                 "levels_completed": row.get("levels_completed"), "game_state": row.get("game_state"),
             }
             for row in transitions
@@ -749,13 +817,14 @@ def _live_context(
     if starting_routine and bootstrap_observations:
         action_images, image_labels, screen_sequence = _action_screen_sequence(
             bootstrap_observations, current.get("frame_image_id"), frames,
-            label_prefix="Bootstrap", current_label="restored initial screen after reset",
+            label_prefix=f"Bootstrap for level index {level_index}",
+            current_label=f"restored initial screen after reset for level index {level_index}",
         )
     else:
         action_images, image_labels, screen_sequence = _action_screen_sequence(
             transitions, current.get("frame_image_id"), frames,
-            label_prefix="Action context",
-            current_label="Current actual game frame",
+            label_prefix=f"Level index {level_index} action context",
+            current_label=f"current actual game frame for level index {level_index}",
         )
     image_paths = action_images
     context["screen_sequence"] = screen_sequence
@@ -777,8 +846,13 @@ def _live_context(
     )
     prompt = (
         start_instruction
-        + f"Choose up to {horizon} legal actions from the current state, recent outcomes, and read-only memory. "
-        "The supplied screen images are in chronological order. Labels identify the action before/after which each screen was observed; include every intermediate screen in that order. "
+        + f"The active level has zero-based index {level_index}"
+        + (f" (displayed as level {level_number})" if level_number is not None else "")
+        + f"; {current.get('levels_completed')} levels are completed. The `level` field is zero-based. "
+        "For normal action planning, recent transitions and screenshots include only actions whose pre-action state belongs to this active level; screenshots from earlier levels are omitted. "
+        "The final image is explicitly marked CURRENT SCREEN: the next action starts from that exact screen. "
+        "Within this level, images are chronological and labels identify the action before/after which each screen was observed; every intermediate frame is included in order. "
+        f"Choose up to {horizon} legal actions from this current screen, its level-local outcomes, and read-only memory. "
         "Use game memory first for this game's established mechanics and strategies. Use global memory only as reusable exploration guidance; it must not override game-specific observations. "
         "Use saved_route_guidance as a demonstrated sequence for this level, but check whether its starting screen matches and adapt it to the current image instead of blindly replaying a mismatched route. "
         "Prefer applicable demonstrated strategies, but follow the current image and outcomes if memory conflicts. Distinguish lasting mechanics from historical positions. "
@@ -918,15 +992,17 @@ def run_live(
     review_latency = 0.0
     review_model_calls = 0
     review_count = 0
+    review_skipped_cached_success_count = 0
     pattern_predictions = 0
     pattern_prediction_matches = 0
     pattern_prediction_contradictions = 0
     pattern_prediction_inconclusive = 0
     actions_since_review = 0
-    consecutive_unchanged_actions = 0
     no_progress_actions = 0
     fresh_actions_since_review = 0
     recent_state_actions: deque[tuple[str, str, str]] = deque(maxlen=16)
+    level_action_count = 0
+    level_all_actions_cached = True
     interrupted_plans = 0
     stop_reason = "running"
     decisions_path = destination / "decisions.jsonl"
@@ -945,6 +1021,7 @@ def run_live(
             "model_calls": model_calls, "usage": dict(total_usage),
             "action_usage": dict(action_usage), "review_usage": dict(review_usage),
             "review_model_calls": review_model_calls, "review_count": review_count,
+            "review_skipped_cached_success_count": review_skipped_cached_success_count,
             "pattern_predictions": pattern_predictions,
             "pattern_prediction_matches": pattern_prediction_matches,
             "pattern_prediction_contradictions": pattern_prediction_contradictions,
@@ -979,10 +1056,55 @@ def run_live(
             file=sys.stderr, flush=True,
         )
 
-    def perform_triggered_review(reasons: Sequence[str]) -> None:
+    def perform_triggered_review(
+        reasons: Sequence[str], *, skip_cached_success: bool = False,
+    ) -> None:
+        nonlocal review_skipped_cached_success_count
         nonlocal review_count, actions_since_review, fresh_actions_since_review
-        nonlocal consecutive_unchanged_actions, review_model_calls, model_calls
+        nonlocal no_progress_actions, review_model_calls, model_calls
         nonlocal review_latency, total_latency
+        view_path = memory_store_dir / "MEMORY.md"
+        try:
+            saved_memory_exists = view_path.is_file() and bool(view_path.read_text(encoding="utf-8").strip())
+        except OSError:
+            saved_memory_exists = False
+        if (
+            skip_cached_success and list(reasons) == ["level_completed"]
+            and saved_memory_exists
+        ):
+            review_skipped_cached_success_count += 1
+            covered_event_count = len(_review_events(tools.history.records()))
+            checkpoint_error = None
+            try:
+                checkpoint_saved = GameMemory(
+                    tools.run_dir, store_dir=memory_store_dir, run_id=run_id, game_id=game_id,
+                ).record_review_checkpoint(
+                    game_id=game_id, current_step=tools.action_count,
+                    covered_event_count=covered_event_count,
+                )
+            except Exception as exc:
+                checkpoint_saved = False
+                checkpoint_error = f"{type(exc).__name__}: {exc}"
+            row = {
+                "schema": "v10.live_review/3", "status": "skipped_verified_route_replay",
+                "trigger_reasons": list(reasons), "through_action": tools.action_count,
+                "covered_transition_count": sum(
+                    event.get("type") == "transition"
+                    for event in _review_events(tools.history.records())
+                ),
+                "covered_event_count": covered_event_count,
+                "checkpoint_saved": checkpoint_saved,
+                "checkpoint_error": checkpoint_error,
+                "selected_image_labels": [], "request_attempts": 0,
+                "usage": {}, "latency_seconds": 0.0,
+                "skip_reason": "The completed level exactly replayed a verified route; route and existing memory remain authoritative.",
+            }
+            append_jsonl(tools.run_dir / "reviews.jsonl", row)
+            fresh_actions_since_review = 0
+            no_progress_actions = 0
+            recent_state_actions.clear()
+            progress("review skipped; exact verified route already has persistent guidance")
+            return
         review_count += 1
         progress(f"review starting; triggers={list(reasons)}")
         result = _perform_review(
@@ -993,7 +1115,8 @@ def run_live(
         )
         actions_since_review = 0
         fresh_actions_since_review = 0
-        consecutive_unchanged_actions = 0
+        no_progress_actions = 0
+        recent_state_actions.clear()
         attempts = int(result["attempts"])
         review_model_calls += attempts
         model_calls += attempts
@@ -1006,6 +1129,30 @@ def run_live(
                 total_usage[key] += int(value)
                 review_usage[key] += int(value)
         progress(f"review {result['row']['status']}")
+
+    def update_stagnation_state(
+        before: Mapping[str, Any], after: Mapping[str, Any], edge: Mapping[str, Any], action_name: str,
+    ) -> None:
+        """Count only repeated states within the current level and review window."""
+        nonlocal no_progress_actions
+        changed_level = (
+            before.get("level") != after.get("level")
+            or before.get("levels_completed") != after.get("levels_completed")
+        )
+        if changed_level or str(after.get("game_state", "")).upper() == "WIN":
+            recent_state_actions.clear()
+            no_progress_actions = 0
+            return
+
+        source = str(edge["source_state"])
+        target = str(edge["target_state"])
+        prior_states = {
+            state for old_source, _old_action, old_target in recent_state_actions
+            for state in (old_source, old_target)
+        }
+        repeated_state = source == target or target in prior_states
+        no_progress_actions = no_progress_actions + 1 if repeated_state else 0
+        recent_state_actions.append((source, action_name, target))
 
     def learn_transition(
         before: Mapping[str, Any], action: Mapping[str, Any], result: Mapping[str, Any],
@@ -1234,6 +1381,8 @@ def run_live(
                 )
                 current = result["observation"]
                 observed_edge = learn_transition(before_observation, fallback, result)
+                level_action_count += 1
+                level_all_actions_cached = False
                 memory.record_run_state(game_id, current, step=tools.action_count)
                 append_jsonl(decisions_path, {
                     "schema": "v10.live_fallback/2", "status": "executed",
@@ -1245,32 +1394,25 @@ def run_live(
                     f"fallback action {tools.action_count}: {fallback_name} -> "
                     f"{current.get('game_state', '?')}; observation captured"
                 )
-                recent_state_actions.append((
-                    str(observed_edge["source_state"]), str(fallback["action"]),
-                    str(observed_edge["target_state"]),
-                ))
-                made_progress = (
-                    current.get("levels_completed") != previous_levels_completed
-                    or current.get("level") != previous_level
-                    or str(current.get("game_state", "")).upper() == "WIN"
+                update_stagnation_state(
+                    before_observation, current, observed_edge, fallback_name,
                 )
-                no_progress_actions = 0 if made_progress else no_progress_actions + 1
+                fallback_level_changed = (
+                    current.get("level") != previous_level
+                    or current.get("levels_completed") != previous_levels_completed
+                )
+                if fallback_level_changed:
+                    level_action_count = 0
+                    level_all_actions_cached = True
                 actions_since_review += 1
                 fresh_actions_since_review += 1
-                changed_pixels = (result.get("measurements") or {}).get("changed_pixels")
-                consecutive_unchanged_actions = consecutive_unchanged_actions + 1 if changed_pixels == 0 else 0
                 fallback_reasons = []
                 if previous_levels_completed is not None and current.get("levels_completed") is not None and int(current["levels_completed"]) > int(previous_levels_completed):
                     fallback_reasons.append("level_completed")
                 if str(current.get("game_state", "")).upper() == "WIN":
                     fallback_reasons.append("win")
-                repeated_states = Counter(
-                    state for source, _action, target in recent_state_actions for state in (source, target)
-                )
-                repeated_pairs = Counter((source, action) for source, action, _target in recent_state_actions)
                 if (
-                    no_progress_actions >= 3 and fresh_actions_since_review >= 3
-                    and (max(repeated_states.values(), default=0) >= 3 or max(repeated_pairs.values(), default=0) >= 2)
+                    no_progress_actions >= 2 and fresh_actions_since_review >= 3
                 ):
                     fallback_reasons.append("stagnation")
                 if actions_since_review >= int(review_interval):
@@ -1323,8 +1465,9 @@ def run_live(
                 starter_queue.clear()
                 level_start_observation = dict(current)
                 level_path_edges = []
+                level_action_count = 0
+                level_all_actions_cached = True
                 no_progress_actions = 0
-                consecutive_unchanged_actions = 0
                 recent_state_actions.clear()
                 actions_since_review = 0
                 fresh_actions_since_review = 0
@@ -1384,27 +1527,33 @@ def run_live(
                     break
                 current = result["observation"]
                 observed_edge = learn_transition(before_observation, action, result)
+                level_action_count += 1
+                cached_action_matched = bool(
+                    expected_cached_edge is not None
+                    and observed_edge["target_state"] == expected_cached_edge["target_state"]
+                )
+                if not cached_action_matched:
+                    level_all_actions_cached = False
                 if starter_chunk and starter_queue:
                     starter_queue.pop(0)
                 if expected_cached_edge:
                     cached_solution_actions += 1
-                    if observed_edge["target_state"] != expected_cached_edge["target_state"]:
+                    if not cached_action_matched:
                         interruption = "solution_diverged"
                         progress("cached path observation differed; returning to model decisions")
-                source_state = str(observed_edge["source_state"])
-                target_state = str(observed_edge["target_state"])
-                recent_state_actions.append((source_state, str(action["action"]), target_state))
-                made_progress = (
-                    current.get("levels_completed") != previous_levels_completed
-                    or current.get("level") != previous_level
-                    or str(current.get("game_state", "")).upper() == "WIN"
+                update_stagnation_state(
+                    before_observation, current, observed_edge, str(action["action"]),
                 )
-                no_progress_actions = 0 if made_progress else no_progress_actions + 1
-                changed_pixels = (result.get("measurements") or {}).get("changed_pixels")
-                if changed_pixels == 0:
-                    consecutive_unchanged_actions += 1
-                else:
-                    consecutive_unchanged_actions = 0
+                level_changed = (
+                    current.get("level") != previous_level
+                    or current.get("levels_completed") != previous_levels_completed
+                )
+                completed_level_was_fully_cached = (
+                    level_changed and level_action_count > 0 and level_all_actions_cached
+                )
+                if level_changed:
+                    level_action_count = 0
+                    level_all_actions_cached = True
                 memory = GameMemory(
                     destination, store_dir=memory_store_dir, run_id=run_id, game_id=game_id,
                 )
@@ -1467,26 +1616,19 @@ def run_live(
                     trigger_reasons.append("level_completed")
                 if str(current.get("game_state", "")).upper() == "WIN":
                     trigger_reasons.append("win")
-                repeated_state_count = Counter(
-                    state for source, _action, target in recent_state_actions for state in (source, target)
-                )
-                repeated_pair_count = Counter(
-                    (source, action_name) for source, action_name, _target in recent_state_actions
-                )
                 repeated_without_progress = (
-                    no_progress_actions >= 3
+                    no_progress_actions >= 2
                     and fresh_actions_since_review >= 3
-                    and (
-                        max(repeated_state_count.values(), default=0) >= 3
-                        or max(repeated_pair_count.values(), default=0) >= 2
-                    )
                 )
                 if repeated_without_progress:
                     trigger_reasons.append("stagnation")
                 if actions_since_review >= int(review_interval):
                     trigger_reasons.append("action_interval")
                 if trigger_reasons and not bootstrap_probe_active:
-                    perform_triggered_review(trigger_reasons)
+                    perform_triggered_review(
+                        trigger_reasons,
+                        skip_cached_success=completed_level_was_fully_cached,
+                    )
                 if current.get("terminal"):
                     interruption = "terminal_state"
                 elif current.get("level") != previous_level or current.get("levels_completed") != previous_levels_completed:
@@ -1533,8 +1675,9 @@ def run_live(
                 starter_queue.clear()
                 level_start_observation = dict(current)
                 level_path_edges = []
+                level_action_count = 0
+                level_all_actions_cached = True
                 no_progress_actions = 0
-                consecutive_unchanged_actions = 0
                 recent_state_actions.clear()
                 append_jsonl(decisions_path, {
                     "schema": "v10.live_bootstrap_reset/1", "status": "reset",

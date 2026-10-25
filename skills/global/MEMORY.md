@@ -1,6 +1,6 @@
-- Compare before/after frames to identify which object responds to input; roles may change between levels.
-- When an action produces no pixel change, treat it as blocked for that state and try a different direction immediately.
-- If the direct path is blocked, explore perpendicular axes rather than oscillating.
-- When two objects are adjacent but overlap isn't achieved, try moving along a perpendicular axis.
-- After one failed action in a state, avoid repeating it; diversify attempts to escape stagnation.
-- When a new level's first action produces an unexpected large displacement of multiple objects, treat the level as having different mechanics and re-derive movement rules from scratch.
+## Reusable Methods
+- Compare which object's pixels shift after an action to identify which entity responds; if only a corner/HUD element changes, the main game field is not yet active.
+- Repeated identical states signal stagnation—try a different input type or interaction model rather than repeating the same action.
+- Before reusing a verified strategy, check whether the new layout matches the original scope.
+- When an entity is adjacent to a target but movement toward it produces no visible change, try approaching from a different direction or angle rather than repeating the same input.
+- Prior memory claims about specific input effects can be wrong; when current observations contradict stored notes, trust the current evidence and update.
