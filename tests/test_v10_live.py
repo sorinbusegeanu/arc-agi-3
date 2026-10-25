@@ -9,11 +9,11 @@ import numpy as np
 import pytest
 
 from v10.arcade_env import ArcadeGameEnv
-from v10.live import _perform_review, run_live
+from v10.live import _live_context, _perform_review, _review_frame_selection, run_live
 from v10.tools.game import GameTools
 from v10.tools.game import ActionError
 from v10.tools.history import History
-from v10.tools.memory import GameMemory, global_memory_path
+from v10.tools.memory import GameMemory, game_memory_dir, global_memory_path, shared_skill_path
 
 
 @pytest.fixture(autouse=True)
@@ -101,6 +101,117 @@ class _FakeEnv:
         self.resets += 1
         self.frame[:] = 0
         return self.observe()
+
+
+def test_applicable_successful_strategy_is_in_first_action_prompt(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    memory = GameMemory(
+        tmp_path / "seed", store_dir=game_memory_dir(state_dir, "fixture"),
+        run_id="seed", game_id="fixture",
+    )
+    memory.apply_review_changes([{
+        "operation": "upsert", "pattern_type": "strategy", "status": "confirmed",
+        "claim": "This route completes level zero.", "applicability_conditions": ["Level zero."],
+        "state_selector": {"level": 0, "levels_completed": 0},
+        "goal": "Complete level zero.", "preconditions": ["Start state matches."],
+        "action_policy": "Repeat up until progress changes.",
+        "success_conditions": ["Level completion is observed."],
+    }], game_id="fixture", current_step=0, covered_event_count=1)
+    tools = GameTools(_FakeEnv(), tmp_path / "prompt-run")
+    current = tools.observe()
+    inputs = _live_context(
+        tools, current, "fixture", 1, shared_skill_path(),
+        game_memory_dir(state_dir, "fixture"), "prompt-run", 0,
+    )
+    assert "Repeat up until progress changes" in inputs["user_prompt"]
+    assert inputs["context"]["applicable_successful_strategies"][0]["claim"] == "This route completes level zero."
+
+
+def test_recent_history_is_independent_of_plan_horizon(tmp_path: Path) -> None:
+    client = _FakeClient([_decision([_action()]), _decision([])])
+    run_live(_FakeEnv(), tmp_path / "run", client, game_id="fixture", max_actions=2, plan_horizon=1)
+
+    context = json.loads(client.calls[1][0].split("Visible context:\n", 1)[1])
+    assert context["budgets"]["plan_horizon"] == 1
+    assert len(context["recent_transitions"]) == 1
+
+
+def test_stagnation_reviews_require_fresh_actions_before_retrigger(tmp_path: Path) -> None:
+    client = _FakeClient(
+        [], default_decision=_decision([_action()] * 4),
+        review_responses=['{"changes": []}', '{"changes": []}'],
+    )
+    metrics = run_live(
+        _FakeEnv(change_every_action=False), tmp_path / "run", client,
+        game_id="fixture", max_actions=7, review_interval=50,
+    )
+
+    rows = _review_rows(tmp_path / "run")
+    assert metrics["review_count"] == 2
+    assert [row["through_action"] for row in rows] == [3, 6]
+
+
+def test_stagnation_retriggers_after_failed_review_and_fresh_actions(tmp_path: Path) -> None:
+    client = _FakeClient(
+        [], default_decision=_decision([_action()] * 4),
+        review_errors=[RuntimeError("temporary reviewer failure")],
+        review_responses=['{"changes": []}'],
+    )
+    metrics = run_live(
+        _FakeEnv(change_every_action=False), tmp_path / "run", client,
+        game_id="fixture", max_actions=6, review_interval=50,
+    )
+    rows = _review_rows(tmp_path / "run")
+    assert metrics["review_count"] == 2
+    assert [row["status"] for row in rows] == ["failed", "saved"]
+    assert [row["through_action"] for row in rows] == [3, 6]
+
+
+def test_review_image_selection_includes_movement_blocked_interaction_and_progress(tmp_path: Path) -> None:
+    from v10.frames import FrameStore
+
+    frames = FrameStore(tmp_path)
+    rows = []
+    for index in range(4):
+        before = frames.put(np.full((2, 2), index, dtype=np.int64), source="test")
+        after = frames.put(np.full((2, 2), index + 10, dtype=np.int64), source="test")
+        before_image = frames.put_image(np.zeros((2, 2, 3), dtype=np.uint8), f"B{index}", kind="image")
+        after_image = frames.put_image(np.ones((2, 2, 3), dtype=np.uint8), f"A{index}", kind="image")
+        rows.append({
+            "pre_frame_id": before, "post_frame_id": after,
+            "pre_frame_image_id": before_image, "post_frame_image_id": after_image,
+            "levels_completed": 1 if index == 3 else 0, "terminal": False,
+            "measurements": {
+                "changed_pixels": [10, 0, 8, 20][index],
+                "color_transitions": ([{}, {}, {}] if index == 2 else []),
+            },
+        })
+    _, labels = _review_frame_selection(rows, frames, max_images=8)
+    selected = " ".join(labels)
+    for index in range(1, 5):
+        assert f"transition {index}" in selected
+
+
+def test_keyboard_interrupt_writes_interrupted_metrics(tmp_path: Path) -> None:
+    class InterruptingClient(_FakeClient):
+        def __init__(self):
+            super().__init__([_decision([_action()])])
+            self.calls_made = 0
+
+        def complete(self, *args, **kwargs):
+            self.calls_made += 1
+            if self.calls_made == 1:
+                return super().complete(*args, **kwargs)
+            raise KeyboardInterrupt
+
+    metrics = run_live(
+        _FakeEnv(), tmp_path / "run", InterruptingClient(),
+        game_id="fixture", max_actions=4,
+    )
+    assert metrics["stop_reason"] == "interrupted"
+    assert metrics["actions"] == 1
+    assert len([row for row in History(tmp_path / "run").records() if row.get("type") == "transition"]) == 1
+    assert not (tmp_path / "run/reviews.jsonl").exists()
 
 
 def test_live_executes_action_plan_without_prediction_interrupts(tmp_path: Path) -> None:
@@ -786,7 +897,7 @@ def test_changed_transition_resets_stagnation_streak(tmp_path: Path) -> None:
     )
 
     assert metrics["review_count"] == 1
-    assert _review_rows(tmp_path / "run")[0]["through_action"] == 5
+    assert _review_rows(tmp_path / "run")[0]["through_action"] == 3
     assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["stagnation"]
 
 
@@ -832,9 +943,10 @@ def test_global_lessons_learned_in_ez01_are_loaded_for_ez02(tmp_path: Path) -> N
         tmp_path / "ez01-run", store_dir=state_dir / "games/ez01", game_id="ez01",
     )
     assert any(entry.get("claim") == "A fixture mechanic." for entry in ez01_memory.read()["entries"])
-    assert GameMemory(
+    ez02_patterns = GameMemory(
         tmp_path / "ez02-run", store_dir=state_dir / "games/ez02", game_id="ez02",
-    ).patterns("ez02") == []
+    ).patterns("ez02")
+    assert any(pattern.get("pattern_type") == "strategy" for pattern in ez02_patterns)
 
 
 def test_live_direction_words_map_to_ids_and_logs_use_direction_names(

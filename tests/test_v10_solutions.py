@@ -47,6 +47,37 @@ def test_solution_store_ignores_ambiguous_action_edges_and_deduplicates(tmp_path
     assert store.shortest_known_solution(start) is None
 
 
+def test_import_historical_ez01_win_is_complete_and_idempotent(tmp_path: Path) -> None:
+    recorded_run = Path(__file__).resolve().parents[1] / "runs/v10/ez01_20"
+    store = LevelSolutionStore(tmp_path / "solutions.jsonl", "ez01")
+
+    imported = store.import_successful_run(recorded_run)
+    assert len(imported) == 5
+    assert len(store.edges()) == 25
+    assert len(store.solutions()) == 5
+    first = store.shortest_known_solution(_recorded_start(recorded_run))
+    assert first is not None
+    assert [edge["action"] for edge in first] == ["ACTION1", "ACTION1"]
+
+    store.import_successful_run(recorded_run)
+    assert len(store.edges()) == 25
+    assert len(store.solutions()) == 5
+
+
+def _recorded_start(run_dir: Path) -> dict:
+    from v10.frames import FrameStore
+    from v10.runlog import read_jsonl
+
+    state = next(row for row in read_jsonl(run_dir / "evidence.jsonl") if row.get("type") == "state")
+    return {
+        "frame": FrameStore(run_dir).get(state["frame_id"]),
+        "game_id": "ez01", "frame_id": state["frame_id"],
+        "legal_actions": state["legal_actions"], "game_state": state["game_state"],
+        "level": state["level"], "levels_completed": state["levels_completed"],
+        "terminal": state["terminal"],
+    }
+
+
 class _CompletingEnv:
     def __init__(self):
         self.frame = np.zeros((2, 2), dtype=np.int64)
@@ -65,7 +96,7 @@ class _CompletingEnv:
         observation = {
             "frame": self.frame.copy(),
             "legal_actions": [{
-                "id": "up", "parameters": {
+                "id": "ACTION1", "parameters": {
                     "type": "object", "properties": {}, "required": [],
                     "additionalProperties": False,
                 },
@@ -113,8 +144,60 @@ def test_new_run_replays_successful_level_path_without_action_model_call(tmp_pat
 
     rows = [json.loads(line) for line in (tmp_path / "second/decisions.jsonl").read_text().splitlines()]
     plan = next(row for row in rows if row.get("schema") == "v10.live_decision/2")
-    assert second_env.actions == ["up"]
+    assert second_env.actions == ["ACTION1"]
     assert second["cached_solution_actions"] == 1
     assert second["model_calls"] == 1  # review call only; no action-decision call
     assert plan["source"] == "verified_level_path"
     assert len(second_client.calls) == 1  # completion review only
+    assert plan["decision"]["actions"] == [{"action": "up", "args": {}}]
+    from v10.tools.memory import GameMemory
+    patterns = GameMemory(
+        tmp_path / "second", store_dir=state_dir / "games/fixture", game_id="fixture",
+    ).patterns("fixture")
+    assert any(pattern.get("pattern_type") == "strategy" for pattern in patterns)
+
+
+def test_cached_route_stops_on_divergence_then_asks_model(tmp_path: Path, monkeypatch) -> None:
+    from v10.tools.memory import game_memory_dir
+
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("V10_STATE_DIR", str(state_dir))
+    start = _CompletingEnv().observe()
+    wrong_target = {
+        **start, "frame": np.full((2, 2), 99, dtype=np.int64),
+        "level": 1, "levels_completed": 1,
+    }
+    store = LevelSolutionStore(game_memory_dir(state_dir, "fixture") / "level_solutions.jsonl", "fixture")
+    edge = store.record_transition(start, "ACTION1", {}, wrong_target, run_id="seed")
+    store.record_successful_trajectory(start, [edge], run_id="seed", success="level_completed")
+    metrics = run_live(
+        _CompletingEnv(), tmp_path / "diverging", _Client(),
+        game_id="fixture", max_actions=2, state_dir=state_dir,
+    )
+
+    rows = [json.loads(line) for line in (tmp_path / "diverging/decisions.jsonl").read_text().splitlines()]
+    plans = [row for row in rows if row.get("schema") == "v10.live_decision/2"]
+    assert [row["source"] for row in plans] == ["verified_level_path", "model"]
+    assert metrics["cached_solution_actions"] == 1
+    assert metrics["actions"] == 2
+
+
+def test_illegal_cached_action_is_rejected_and_model_is_queried(tmp_path: Path, monkeypatch) -> None:
+    from v10.tools.memory import game_memory_dir
+
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("V10_STATE_DIR", str(state_dir))
+    start = _CompletingEnv().observe()
+    illegal_target = {**start, "frame": np.ones((2, 2), dtype=np.int64), "level": 1, "levels_completed": 1}
+    store = LevelSolutionStore(game_memory_dir(state_dir, "fixture") / "level_solutions.jsonl", "fixture")
+    edge = store.record_transition(start, "ACTION2", {}, illegal_target, run_id="seed")
+    store.record_successful_trajectory(start, [edge], run_id="seed", success="level_completed")
+
+    run_live(
+        _CompletingEnv(), tmp_path / "illegal", _Client(),
+        game_id="fixture", max_actions=1, state_dir=state_dir,
+    )
+    rows = [json.loads(line) for line in (tmp_path / "illegal/decisions.jsonl").read_text().splitlines()]
+    plan = next(row for row in rows if row.get("schema") == "v10.live_decision/2")
+    assert plan["source"] == "model"
+    assert "cached path is no longer valid" in plan["cached_path_error"]

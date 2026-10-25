@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from ..frames import FrameStore
 from ..runlog import append_jsonl, dumps, read_jsonl
 
 
@@ -85,6 +86,125 @@ class LevelSolutionStore:
 
     def solutions(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self._rows if row.get("kind") == "solution"]
+
+    def import_successful_run(self, run_dir: Path | str, *, run_id: str | None = None) -> list[dict[str, Any]]:
+        """Import fully evidenced completed routes from a recorded successful run.
+
+        The import accepts only a contiguous evidence chain ending in WIN. Frames,
+        legal actions, action ordering, progress counters, and level boundaries are
+        checked before any route is recorded. Reimporting the same experience is safe.
+        """
+        root = Path(run_dir)
+        records = read_jsonl(root / "evidence.jsonl")
+        states = [row for row in records if row.get("type") == "state"]
+        transitions = [row for row in records if row.get("type") == "transition"]
+        if len(states) != 1 or not transitions:
+            raise ValueError("successful-run import requires one initial state and transitions")
+        frames = FrameStore(root)
+        initial = states[0]
+        if initial.get("schema") != "v10.evidence/1":
+            raise ValueError("unsupported initial evidence schema")
+        current = self._evidence_observation(initial, frames)
+        initial_game = str(current.get("game_id") or self.game_id)
+        if initial_game != self.game_id:
+            raise ValueError(f"run game_id {initial_game} does not match {self.game_id}")
+        route_start = current
+        validated: list[tuple[dict[str, Any], str, dict[str, Any], dict[str, Any], Mapping[str, Any]]] = []
+        previous_evidence_id = str(initial.get("evidence_id", ""))
+        previous_step = 0
+        run_identity = str(run_id or f"import:{root.resolve()}")
+        saw_win = False
+        final_completed = current.get("levels_completed")
+        for row in transitions:
+            if row.get("schema") != "v10.evidence/1" or int(row.get("step", -1)) != previous_step + 1:
+                raise ValueError("recorded transitions are not a contiguous v10 evidence sequence")
+            if row.get("pre_evidence_id") != previous_evidence_id:
+                raise ValueError("recorded transition evidence chain is broken")
+            if row.get("pre_frame_id") != current.get("frame_id"):
+                raise ValueError("recorded transition frame chain is broken")
+            action = str(row.get("action", ""))
+            if action not in _action_ids(current):
+                raise ValueError(f"recorded action {action!r} was not legal in its source state")
+            before_completed = current.get("levels_completed")
+            after = self._evidence_observation(row, frames)
+            after_completed = after.get("levels_completed")
+            if before_completed is not None and after_completed is not None:
+                delta = int(after_completed) - int(before_completed)
+                if delta not in {0, 1}:
+                    raise ValueError("recorded level progress has a missing or invalid boundary")
+                if delta == 0 and after.get("level") != current.get("level"):
+                    raise ValueError("level changed without a recorded completion")
+            args = row.get("args", {})
+            if not isinstance(args, Mapping):
+                raise ValueError("recorded action arguments must be an object")
+            from .game import ActionError, _action_table, _validate_args
+            try:
+                descriptor = _action_table(current.get("legal_actions", []))[action]
+                _validate_args(action, dict(args), descriptor)
+            except (ActionError, KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"recorded action arguments are invalid for {action}") from exc
+            validated.append((current, action, dict(args), after, row))
+            completed = (
+                before_completed is not None and after_completed is not None
+                and int(after_completed) == int(before_completed) + 1
+            )
+            won = str(after.get("game_state", "")).upper() == "WIN"
+            if won:
+                if not after.get("terminal") or row is not transitions[-1]:
+                    raise ValueError("WIN must be the final terminal transition in the run")
+                saw_win = True
+            previous_evidence_id = str(row.get("evidence_id", ""))
+            previous_step = int(row["step"])
+            current = after
+            final_completed = current.get("levels_completed")
+        if not saw_win:
+            raise ValueError("recorded run does not contain a complete terminal winning trajectory")
+        metrics_path = root / "metrics.json"
+        if metrics_path.is_file():
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            if (
+                metrics.get("won") is not True
+                or int(metrics.get("actions", -1)) != len(transitions)
+                or metrics.get("levels_completed") != final_completed
+            ):
+                raise ValueError("recorded metrics do not agree with the successful evidence trajectory")
+
+        # Do not mutate the append-only store until the whole history has validated.
+        route_edges: list[dict[str, Any]] = []
+        imported: list[dict[str, Any]] = []
+        for before, action, args, after, row in validated:
+            edge = self.record_transition(before, action, args, after, run_id=run_identity)
+            route_edges.append(edge)
+            previous_completed = before.get("levels_completed")
+            current_completed = after.get("levels_completed")
+            completed = (
+                previous_completed is not None and current_completed is not None
+                and int(current_completed) == int(previous_completed) + 1
+            )
+            won = str(after.get("game_state", "")).upper() == "WIN"
+            if completed or won:
+                saved = self.record_successful_trajectory(
+                    route_start, route_edges, run_id=run_identity,
+                    success="win" if won else "level_completed",
+                )
+                if saved is not None:
+                    imported.append(saved)
+                route_start = after
+                route_edges = []
+        return imported
+
+    @staticmethod
+    def _evidence_observation(row: Mapping[str, Any], frames: FrameStore) -> dict[str, Any]:
+        frame_id = row.get("frame_id") if row.get("type") == "state" else row.get("post_frame_id")
+        if not isinstance(frame_id, str) or not frames.exists(frame_id):
+            raise ValueError("recorded evidence references a missing frame")
+        return {
+            "frame": frames.get(frame_id), "frame_id": frame_id,
+            "game_id": row.get("game_id"), "legal_actions": row.get("legal_actions", []),
+            "game_state": row.get("game_state"), "level": row.get("level"),
+            "levels_completed": row.get("levels_completed"), "win_levels": row.get("win_levels"),
+            "terminal": row.get("terminal", False),
+        }
 
     def record_transition(
         self,

@@ -1,26 +1,50 @@
 # Game Memory
 
-## 1. Current State
-- level 0; 0/5 completed; state NOT_FINISHED.
 
 ## 2. Confirmed Mechanics
-- confirmed: A stationary blue square (color 11) serves as the level goal and acts as a physical obstacle. The player cannot move into the blue square (blocked). The level completes when the player is adjacent to the blue square and takes a directional action that separates them. The blue square is positioned in the bottom-left corner of the level.
-  Applies: level 0 of ez01
-- confirmed: Level progress is tracked by a row of small squares in the top-left corner; completed levels turn yellow.
-- confirmed: The player (yellow square, color 9) moves exactly 8 pixels per directional action. From center: up is open, left is blocked, down succeeds once then blocked, right is open. The player successfully navigated right→right→up→left→down→left, proving a path exists around obstacles. From center, left and down are both blocked (confirmed across multiple attempts including 3 additional consecutive blocked tries). The player is stuck at center with only up and right available; the blue goal in the bottom-left corner is not adjacent to the player at this position.
-  Applies: level 0 of ez01
+- confirmed: In the recorded ez01 run, up moved the player upward by one 8-pixel cell when the destination was open.
+  Applies: Observed ez01 states where an upward move changes the player sprite.
 
 ## 3. Successful Strategies
-- none
-
-## 4. Known Exceptions
-- none
-
-## 5. Active Hypotheses
-- none
-
-## 6. Failed Approaches
-- none
-
-## 7. Next Actions
-- none
+- confirmed: On level 2 (2 completed), this observed route succeeded: up → up → up → up → up → up.
+  Applies: Current level is 2 with 2 levels completed.; Use only from the recorded visible start state; cached replay verifies the full frame.
+  State: level=2, levels_completed=2
+  Goal: Complete level 2.
+  Preconditions: ["Current level is 2 with 2 levels completed.", "Use only from the recorded visible start state; cached replay verifies the full frame."]
+  Policy: Use the saved exact-state route (up → up → up → up → up → up) only when the visible start state matches; stop when progress changes or WIN appears.
+  Success: ["levels_completed increases, or game_state becomes WIN."]
+- confirmed: On level 0 (0 completed), this observed route succeeded: up → up.
+  Applies: Current level is 0 with 0 levels completed.; Use only from the recorded visible start state; cached replay verifies the full frame.
+  State: level=0, levels_completed=0
+  Goal: Complete level 0.
+  Preconditions: ["Current level is 0 with 0 levels completed.", "Use only from the recorded visible start state; cached replay verifies the full frame."]
+  Policy: Use the saved exact-state route (up → up) only when the visible start state matches; stop when progress changes or WIN appears.
+  Success: ["levels_completed increases, or game_state becomes WIN."]
+- confirmed: On level 3 (3 completed), this observed route succeeded: up → up → up → up → up → up.
+  Applies: Current level is 3 with 3 levels completed.; Use only from the recorded visible start state; cached replay verifies the full frame.
+  State: level=3, levels_completed=3
+  Goal: Complete level 3.
+  Preconditions: ["Current level is 3 with 3 levels completed.", "Use only from the recorded visible start state; cached replay verifies the full frame."]
+  Policy: Use the saved exact-state route (up → up → up → up → up → up) only when the visible start state matches; stop when progress changes or WIN appears.
+  Success: ["levels_completed increases, or game_state becomes WIN."]
+- confirmed: Repeated up completed all five levels and reached WIN in the recorded 25-action ez01 run.
+  Applies: ez01 levels beginning in one of the five recorded level-start states.; Cached replay is allowed only when the full current state matches a recorded route start.
+  State: game_state=NOT_FINISHED
+  Goal: Complete ez01.
+  Preconditions: ["Start at a previously observed ez01 level state."]
+  Policy: Repeat up while the observed state continues to progress; stop when levels_completed advances or WIN appears.
+  Success: ["The environment reports game_state WIN."]
+- confirmed: On level 4 (4 completed), this observed route succeeded: up → up → up → up → up → up → up.
+  Applies: Current level is 4 with 4 levels completed.; Use only from the recorded visible start state; cached replay verifies the full frame.
+  State: level=4, levels_completed=4
+  Goal: Complete level 4.
+  Preconditions: ["Current level is 4 with 4 levels completed.", "Use only from the recorded visible start state; cached replay verifies the full frame."]
+  Policy: Use the saved exact-state route (up → up → up → up → up → up → up) only when the visible start state matches; stop when progress changes or WIN appears.
+  Success: ["levels_completed increases, or game_state becomes WIN."]
+- confirmed: On level 1 (1 completed), this observed route succeeded: up → up → up → up.
+  Applies: Current level is 1 with 1 levels completed.; Use only from the recorded visible start state; cached replay verifies the full frame.
+  State: level=1, levels_completed=1
+  Goal: Complete level 1.
+  Preconditions: ["Current level is 1 with 1 levels completed.", "Use only from the recorded visible start state; cached replay verifies the full frame."]
+  Policy: Use the saved exact-state route (up → up → up → up) only when the visible start state matches; stop when progress changes or WIN appears.
+  Success: ["levels_completed increases, or game_state becomes WIN."]

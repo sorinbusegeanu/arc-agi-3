@@ -33,13 +33,23 @@ def test_global_memory_is_bounded_markdown_and_replacement_is_atomic(tmp_path) -
     assert read_global_memory(tmp_path) == memory_text
     assert save_global_memory(tmp_path, memory_text) is False
 
-    with pytest.raises(ValueError, match="exceeds"):
-        save_global_memory(tmp_path, "# Global Memory\n\n" + "x" * MAX_GLOBAL_MEMORY_MARKDOWN_CHARS)
-    assert path.read_text() == memory_text + "\n"
+    save_global_memory(tmp_path, "# Global Memory\n\n" + "x" * MAX_GLOBAL_MEMORY_MARKDOWN_CHARS)
+    assert len(path.read_text()) <= MAX_GLOBAL_MEMORY_MARKDOWN_CHARS
+    assert path.read_text().startswith("# Global Memory")
 
     path.write_text("# Global Memory\n\n" + "x" * MAX_GLOBAL_MEMORY_MARKDOWN_CHARS)
     assert len(read_global_memory(tmp_path)) <= MAX_GLOBAL_MEMORY_MARKDOWN_CHARS
     assert "truncated for prompt budget" in read_global_memory(tmp_path)
+
+
+def test_global_memory_deduplicates_repeated_lessons(tmp_path) -> None:
+    save_global_memory(
+        tmp_path,
+        "# Global Memory\n\n- Compare objects before and after each action.\n"
+        "- Compare objects before and after each action.",
+    )
+    rendered = global_memory_path(tmp_path).read_text()
+    assert rendered.count("Compare objects") == 1
 
 
 def test_model_cannot_author_prediction_verdict_or_evidence_metadata(tmp_path) -> None:
@@ -97,6 +107,72 @@ def test_pattern_updates_do_not_store_prediction_evidence(tmp_path) -> None:
 
     assert result["accepted"][0]["id"] == "M1"
     assert "verified_by" not in result["accepted"][0]
+
+
+def test_memory_renders_state_scoped_strategies_failures_and_experiments_without_empty_sections(tmp_path) -> None:
+    memory = GameMemory(tmp_path, store_dir=tmp_path / "persistent", run_id="r1", game_id="fixture")
+    memory.apply_review_changes([
+        {
+            "operation": "upsert", "pattern_type": "strategy", "status": "confirmed",
+            "claim": "A demonstrated route works.", "applicability_conditions": ["Start at level zero."],
+            "state_selector": {"level": 0, "levels_completed": 0}, "goal": "Complete level zero.",
+            "preconditions": ["Recorded start frame matches."], "action_policy": "Repeat up twice.",
+            "success_conditions": ["Progress advances."],
+        },
+        {
+            "operation": "upsert", "pattern_type": "hypothesis", "status": "candidate",
+            "claim": "A left action may reveal the target response.",
+            "applicability_conditions": ["When repeated up no longer changes the level."],
+            "state_selector": {"levels_completed": 0}, "action_policy": "Try left once and compare frames.",
+        },
+        {
+            "operation": "upsert", "pattern_type": "failure", "status": "confirmed",
+            "claim": "Repeating right from the same blocked state made no progress.",
+            "applicability_conditions": ["At the recorded blocked state."],
+            "state_selector": {"level": 0}, "action_policy": "Do not repeat right without a state change.",
+        },
+    ], game_id="fixture", current_step=2, covered_event_count=3)
+    text = memory.write_view().read_text()
+
+    assert "## 3. Successful Strategies" in text
+    assert "State: level=0, levels_completed=0" in text
+    assert "## 5. Active Hypotheses" in text
+    assert "## 6. Failed Approaches" in text
+    assert "## 7. Next Actions" in text
+    assert "none" not in text
+    assert "Legacy review retained" not in text
+
+
+def test_review_revision_replaces_conflicting_claim_instead_of_accumulating_it(tmp_path) -> None:
+    memory = GameMemory(tmp_path, run_id="r1", game_id="fixture")
+    memory.apply_review_changes([{
+        "operation": "upsert", "pattern_type": "mechanic", "status": "confirmed",
+        "claim": "The target cannot move.", "applicability_conditions": [], "state_selector": {},
+    }], game_id="fixture", current_step=1, covered_event_count=1)
+    old = memory.patterns("fixture")[0]
+    memory.apply_review_changes([{
+        "operation": "upsert", "pattern_id": old["id"], "pattern_type": "mechanic",
+        "status": "candidate", "claim": "The target remained still in the observed frame sequence.",
+        "applicability_conditions": ["Only in the recorded level-zero states."],
+        "state_selector": {"level": 0},
+    }], game_id="fixture", current_step=4, covered_event_count=2)
+
+    patterns = memory.patterns("fixture")
+    assert len(patterns) == 1
+    assert patterns[0]["id"] == old["id"]
+    assert patterns[0]["pattern_revision"] == 2
+    assert "cannot move" not in memory.write_view().read_text()
+
+
+def test_rendered_current_state_does_not_leak_from_another_run(tmp_path) -> None:
+    prior = GameMemory(tmp_path, store_dir=tmp_path / "persistent", run_id="prior", game_id="fixture")
+    prior.record_run_state("fixture", {
+        "level": 4, "levels_completed": 3, "win_levels": 5,
+        "game_state": "NOT_FINISHED", "terminal": False,
+    }, step=20)
+    next_run = GameMemory(tmp_path, store_dir=tmp_path / "persistent", run_id="next", game_id="fixture")
+
+    assert "Current State" not in next_run.write_view().read_text()
 
 
 def test_step_bounded_read_does_not_reveal_future_revision_or_entries(tmp_path) -> None:

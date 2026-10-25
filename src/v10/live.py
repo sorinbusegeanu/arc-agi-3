@@ -9,6 +9,7 @@ import shutil
 import sys
 import time
 import uuid
+from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -183,14 +184,14 @@ _REVIEW_SYSTEM_PROMPT = """# V10 incremental memory review
 Review this game's new ordered observations against existing game patterns and shared global memory. Answer two questions: what was learned about this specific game, and what meaningful reusable technique could help solve other games? You do not control the game and must not request actions or resets. Return only a JSON object with a `changes` array, boolean `legacy_memory_migrated`, and complete `global_memory_markdown` text for the shared file. Keep that Markdown under 3000 characters. If no useful global lesson was learned, return the existing global memory unchanged. Do not add global entries for game-specific mechanics.
 
 Each change is one of:
-- An upsert with `operation`, optional existing `pattern_id`, `pattern_type` (`mechanic`, `strategy`, `exception`, or `hypothesis`), `status` (`candidate`, `confirmed`, or `contradicted`), a concise `claim`, `applicability_conditions` as a list of strings, and `state_selector` as an object.
+- An upsert with `operation`, optional existing `pattern_id`, `pattern_type` (`mechanic`, `strategy`, `exception`, `hypothesis`, or `failure`), `status` (`candidate`, `confirmed`, or `contradicted`), a concise `claim`, `applicability_conditions` as a list of strings, and `state_selector` as an object. Put conditions expressible as current state fields into `state_selector` so the harness can match them; reserve prose conditions for visible states and context.
 - A retirement with `operation: "retire"` and an existing `pattern_id`.
 
 When revising an existing pattern, reuse its ID. Use distinct conditional variants when different conditions explain different outcomes; retire or supersede a broad pattern only when justified. Choose status from the observations: use `confirmed` for a directly established rule, `candidate` when uncertain, and `contradicted` when the observations disprove the claim.
 
-For useful successful action sequences, use `pattern_type: "strategy"` and provide `goal`, `preconditions` (string list), `action_policy`, `expected_observations`, and `success_conditions` (string list). Each expected observation has `action`, optional object-valued `state_selector` over game_state/level/levels_completed/terminal, and `measurable_prediction` in this exact format: `{"all":[{"path":"measurements.changed_pixels","op":"gt","value":0}]}`. Each predicate has exactly `path`, `op`, and `value`; use only supported paths and operators. Do not use a prose `prediction` field. Do not produce strategies that are not supported by a successful transition.
+For successful action sequences, use `pattern_type: "strategy"` and provide `goal`, `preconditions` (string list), `action_policy`, and `success_conditions` (string list). Add `expected_observations` only when a specific measurable outcome is directly supported; numeric predictions are optional. Do not produce successful solutions that are not supported by a successful transition. A useful exploration tactic may be a candidate `hypothesis` with an `action_policy`; distinguish it clearly from a solved strategy. Use `pattern_type: "failure"` for repeated ineffective approaches and include a useful alternative in `action_policy` when the evidence supports one.
 
-Distinguish direct observations from explanations. Direction words name commands; infer movement from frames and measurements. Keep game claims specific and concise. Global lessons must be broadly reusable and actionable, such as tracking objects separately when they move together, testing action effects systematically, reading progress indicators, comparing frames, exploring efficiently, or accounting for tool limitations. Merge equivalent lessons, refine or correct contradictions using the new experience, and omit unsupported or trivial lessons. Global Markdown has no evidence references, scores, or per-pattern records. Return the existing global Markdown unchanged when there is no meaningful update. Return `{"changes": [], "legacy_memory_migrated": true, "global_memory_markdown": "# Global Memory\\n"}` when no useful prior game memory or global lesson exists."""
+Distinguish observations from explanations. A repeated unchanged frame means only that the action had no visible effect in that observed state; it does not establish a wall, obstacle, or total reachability. Do not infer completion rules from proximity. Treat positions and layouts as state-specific, not lasting mechanics. Revise a conflicting claim in place or retire it; do not accumulate incompatible confirmed claims. Describe one useful next experiment after unsuccessful exploration. Global lessons must be broadly reusable and actionable; merge equivalents and keep the shared Markdown short and deduplicated. Global Markdown has no evidence references, scores, or per-pattern records. Return the existing global Markdown unchanged when there is no meaningful update. Return `{"changes": [], "legacy_memory_migrated": true, "global_memory_markdown": "# Global Memory\\n"}` when no useful prior game memory or global lesson exists."""
 
 
 def _validate_review_payload(value: Any) -> tuple[list[dict[str, Any]], bool, str | None]:
@@ -274,39 +275,45 @@ def _review_frame_selection(
     frames: FrameStore,
     *,
     max_images: int = 8,
+    initial_completed: int | None = 0,
 ) -> tuple[list[Path], list[str]]:
     """Choose at most four informative before/after pairs in chronological order."""
     if max_images < 2 or not transitions:
         return [], []
     frame_entries = {entry["frame_id"]: entry for entry in frames.entries()}
     pair_limit = max_images // 2
-    scores: list[tuple[int, int]] = []
-    previous_completed: int | None = 0
+    categories: dict[str, list[int]] = {name: [] for name in ("progress", "interaction", "blocked", "movement")}
+    previous_completed = initial_completed
     for index, row in enumerate(transitions):
-        score = 0
         completed = row.get("levels_completed")
         if completed is not None:
             completed = int(completed)
             if previous_completed is not None and completed > previous_completed:
-                score += 10
+                categories["progress"].append(index)
             previous_completed = completed
-        if row.get("terminal"):
-            score += 9
         measurements = row.get("measurements")
-        if isinstance(measurements, Mapping) and measurements.get("changed_pixels") == 0:
-            score += 4
-        if index in {0, len(transitions) - 1}:
-            score += 2
-        scores.append((score, index))
-    ranked = [index for _, index in sorted(scores, key=lambda item: (-item[0], item[1]))]
-    selected = ranked[:pair_limit]
-    if len(selected) < pair_limit:
-        remaining = [index for index in range(len(transitions)) if index not in selected]
-        while remaining and len(selected) < pair_limit:
-            target = round((len(selected) + 1) * (len(transitions) - 1) / (pair_limit + 1))
-            index = min(remaining, key=lambda item: (abs(item - target), item))
-            selected.append(index)
-            remaining.remove(index)
+        changed = measurements.get("changed_pixels") if isinstance(measurements, Mapping) else None
+        if changed == 0:
+            categories["blocked"].append(index)
+        elif isinstance(changed, (int, float)) and changed > 0:
+            categories["movement"].append(index)
+        transitions_by_color = measurements.get("color_transitions", []) if isinstance(measurements, Mapping) else []
+        if isinstance(transitions_by_color, list) and len(transitions_by_color) >= 3:
+            categories["interaction"].append(index)
+    selected: list[int] = []
+    # Reserve image pairs for distinct evidence types before filling remaining slots.
+    for category in ("progress", "interaction", "blocked", "movement"):
+        options = categories[category]
+        if options and len(selected) < pair_limit:
+            selected.append(options[-1] if category == "progress" else options[0])
+    ranked = sorted(
+        set(range(len(transitions))) - set(selected),
+        key=lambda index: (
+            0 if transitions[index].get("terminal") else 1,
+            index,
+        ),
+    )
+    selected.extend(ranked[:max(0, pair_limit - len(selected))])
     selected.sort()
 
     image_paths: list[Path] = []
@@ -325,6 +332,80 @@ def _review_frame_selection(
             image_paths.append(path)
             image_labels.append(label)
     return image_paths[:max_images], image_labels[:max_images]
+
+
+def _repeated_outcome_summary(
+    transitions: Sequence[Mapping[str, Any]], frames: FrameStore,
+) -> dict[str, Any]:
+    """Summarize repeated visible states and state/action pairs with no pixel change."""
+    state_counts: dict[str, int] = {}
+    ineffective: dict[tuple[str, str], int] = {}
+    for row in transitions:
+        for field in ("pre_frame_id", "post_frame_id"):
+            frame_id = row.get(field)
+            if not isinstance(frame_id, str) or not frames.exists(frame_id):
+                continue
+            fingerprint = hashlib.sha256(frames.get(frame_id).tobytes()).hexdigest()[:12]
+            state_counts[fingerprint] = state_counts.get(fingerprint, 0) + 1
+            if field == "pre_frame_id" and (row.get("measurements") or {}).get("changed_pixels") == 0:
+                pair = (fingerprint, str(model_action_name(row.get("action"))))
+                ineffective[pair] = ineffective.get(pair, 0) + 1
+    return {
+        "repeated_states": [
+            {"frame_fingerprint": key, "observations": count}
+            for key, count in sorted(state_counts.items(), key=lambda item: (-item[1], item[0]))
+            if count > 1
+        ][:6],
+        "ineffective_actions": [
+            {"state_fingerprint": state, "action": action, "unchanged_count": count}
+            for (state, action), count in sorted(ineffective.items(), key=lambda item: (-item[1], item[0]))
+        ][:8],
+    }
+
+
+def _persist_successful_strategy(
+    memory: GameMemory, game_id: str, solution: Mapping[str, Any], *, run_id: str, step: int,
+) -> None:
+    """Persist a concise, state-scoped strategy for an already verified route."""
+    try:
+        start_key = json.loads(str(solution.get("level_key", "{}")))
+    except (TypeError, json.JSONDecodeError):
+        start_key = {}
+    actions = [str(model_action_name(item.get("action"))) for item in solution.get("steps", [])]
+    if not actions:
+        return
+    level, completed = start_key.get("level", "?"), start_key.get("levels_completed", "?")
+    sequence = " → ".join(actions)
+    claim = f"On level {level} ({completed} completed), this observed route succeeded: {sequence}."
+    conditions = [
+        f"Current level is {level} with {completed} levels completed.",
+        "Use only from the recorded visible start state; cached replay verifies the full frame.",
+    ]
+    existing = next((
+        item for item in memory.patterns(game_id)
+        if item.get("pattern_type") == "strategy" and item.get("claim") == claim
+    ), None)
+    change = {
+        "operation": "upsert", "pattern_id": existing.get("id") if existing else None,
+        "pattern_type": "strategy", "status": "confirmed", "claim": claim,
+        "applicability_conditions": conditions,
+        "state_selector": {key: start_key[key] for key in ("level", "levels_completed") if key in start_key},
+        "goal": f"Complete level {level}.", "preconditions": conditions,
+        "action_policy": (
+            f"Use the saved exact-state route ({sequence}) only when the visible start state matches; "
+            "stop when progress changes or WIN appears."
+        ),
+        "success_conditions": ["levels_completed increases, or game_state becomes WIN."],
+    }
+    if existing and all(existing.get(field) == change.get(field) for field in (
+        "status", "claim", "applicability_conditions", "state_selector", "goal",
+        "preconditions", "action_policy", "success_conditions",
+    )):
+        return
+    memory.apply_review_changes(
+        [change], game_id=game_id, current_step=step,
+        covered_event_count=0, checkpoint=False,
+    )
 
 
 def _perform_review(
@@ -371,7 +452,15 @@ def _perform_review(
         frames = FrameStore(tools.run_dir)
         previous_transition_count = sum(event.get("type") == "transition" for event in events[:prior_event_count])
         new_transitions = transitions[previous_transition_count:]
-        image_paths, image_labels = _review_frame_selection(new_transitions, frames)
+        if previous_transition_count:
+            initial_completed = transitions[previous_transition_count - 1].get("levels_completed")
+        else:
+            initial_state = next((row for row in records if row.get("type") == "state"), {})
+            initial_completed = initial_state.get("levels_completed", 0)
+        image_paths, image_labels = _review_frame_selection(
+            new_transitions, frames,
+            initial_completed=int(initial_completed) if initial_completed is not None else None,
+        )
         legacy_review_text = legacy_review_text[:4_000]
         patterns = [
             {
@@ -389,9 +478,10 @@ def _perform_review(
         user_prompt = (
             f"Review all recorded experience for game {game_id} through action {tools.action_count}. "
             f"This review was triggered by: {', '.join(trigger_reasons)}. "
-            "Update only patterns affected by observations since their last review. "
+        "Update only patterns affected by observations since their last review. Separate measured observations from explanations. "
             "When observations conflict, consider whether applicability conditions distinguish them; refine or split patterns if supported. "
-            "Use the supplied observations directly.\n\n"
+            "Use the supplied observations directly. Identify repeated effects, successful approaches, repeated failures, contradictions, and one useful next experiment. "
+            "Keep an exploration tactic separate from a demonstrated solution.\n\n"
             "Existing patterns (authoritative ledger projection):\n"
             + json.dumps(patterns, ensure_ascii=False, separators=(",", ":")) + "\n\n"
             "Existing MEMORY.md view (legacy content may be migrated into patterns):\n"
@@ -401,6 +491,8 @@ def _perform_review(
             "Prior unstructured review, if any (bounded to 4000 characters):\n" + legacy_review_text + "\n\n"
             "New ordered run observations since the last review checkpoint:\n"
             + json.dumps(new_events, ensure_ascii=False, separators=(",", ":"))
+            + "\n\nRepeated states and ineffective state/action pairs (compact recent summary):\n"
+            + json.dumps(_repeated_outcome_summary(transitions, tools.frames), ensure_ascii=False, separators=(",", ":"))
         )
         responses: list[dict[str, Any]] = []
         applied_totals = {"added": 0, "updated": 0, "retired": 0, "unchanged": 0}
@@ -530,7 +622,7 @@ def _live_context(
         row for row in records
         if row.get("type") == "transition"
         and int(row.get("reset_generation", 0)) == int(tools.reset_generation)
-    ][-horizon:]
+    ][-12:]
     legal_actions = _public_actions(current.get("legal_actions", []))
     if tools.reset_count < tools.max_resets:
         legal_actions.append({
@@ -549,6 +641,19 @@ def _live_context(
     memory_store.write_view()
     memory = memory_store.view_path.read_text(encoding="utf-8")
     global_memory = read_global_memory(memory_store_dir.parent.parent)
+    current_memory = GameMemory(
+        tools.run_dir, store_dir=memory_store_dir, run_id=run_id, game_id=game_id,
+    )
+    applicable_strategies = [
+        {
+            "claim": entry.get("claim"), "conditions": entry.get("applicability_conditions", []),
+            "state": entry.get("state_selector", {}), "goal": entry.get("goal"),
+            "preconditions": entry.get("preconditions", []), "action_policy": entry.get("action_policy"),
+            "success_conditions": entry.get("success_conditions", []),
+        }
+        for entry in current_memory.applicable_patterns(game_id, current, include_hypotheses=False)
+        if entry.get("pattern_type") == "strategy" and entry.get("status") == "confirmed"
+    ]
     context = {
         "game_id": game_id,
         "current_state": {
@@ -560,12 +665,15 @@ def _live_context(
         "recent_transitions": [
             {
                 "action": row.get("action"), "args": row.get("args", {}),
-                "measurements": row.get("measurements"), "level": row.get("level"),
+                "measurements": _compact_transition_measurements(row.get("measurements")),
+                "level": row.get("level"),
                 "levels_completed": row.get("levels_completed"), "game_state": row.get("game_state"),
             }
             for row in transitions
         ],
         "memory": memory,
+        "applicable_successful_strategies": applicable_strategies,
+        "repeated_outcomes": _repeated_outcome_summary(transitions, FrameStore(tools.run_dir)),
         "global_memory": global_memory,
         "budgets": {
             "actions_used": tools.action_count, "actions_remaining": max(0, tools.max_actions - tools.action_count),
@@ -602,9 +710,15 @@ def _live_context(
     prompt = (
         f"Choose up to {horizon} legal actions from the current state, recent outcomes, and read-only memory. "
         "Use game memory first for this game's established mechanics and strategies. Use global memory only as reusable exploration guidance; it must not override game-specific observations. "
+        "Prefer applicable demonstrated strategies, but follow the current image and outcomes if memory conflicts. Distinguish lasting mechanics from historical positions. "
+        "Avoid repeating actions that had no visible effect in the same observed state and avoid cycles. Use one action for an uncertain experiment; use a longer plan only for understood behavior. "
+        "Keep reasoning internal. "
         "Return only an actions list. Each action must contain only action and args. "
         "Do not include analysis, memory updates, predictions, goals, or narrative. "
         "If RESET is listed, use it alone and include args.justification.\n\n"
+        "Applicable demonstrated strategies (consider these first when their conditions match):\n"
+        + json.dumps(applicable_strategies, ensure_ascii=False, separators=(",", ":"))
+        + "\n\n"
         "Required response shape:\n" + json.dumps(_decision_contract_description(), ensure_ascii=False, separators=(",", ":"))
         + "\n\nVisible context:\n" + json.dumps(model_context, ensure_ascii=False, separators=(",", ":"))
     )
@@ -614,6 +728,25 @@ def _live_context(
         "legal_action_specs": legal_actions, "visible_step": visible_step,
         "skill_sha256": hashlib.sha256(skill_path.read_bytes()).hexdigest(),
     }
+
+
+def _compact_transition_measurements(value: Any) -> dict[str, Any]:
+    """Keep recent action context small while retaining directly useful effects."""
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    if "changed_pixels" in value:
+        result["changed_pixels"] = value["changed_pixels"]
+    displacement = value.get("candidate_displacement")
+    if isinstance(displacement, Mapping) and isinstance(displacement.get("best"), Mapping):
+        best = displacement["best"]
+        result["best_displacement"] = {
+            key: best[key] for key in ("dx", "dy", "score") if key in best
+        }
+    transitions = value.get("color_transitions")
+    if isinstance(transitions, list):
+        result["color_change_count"] = len(transitions)
+    return result
 
 
 def run_live(
@@ -662,6 +795,13 @@ def run_live(
     current = tools.observe()
     memory.record_run_state(game_id, current, step=tools.action_count)
     solution_store = LevelSolutionStore(memory_store_dir / "level_solutions.jsonl", game_id)
+    historical_run = Path(__file__).resolve().parents[2] / "runs" / "v10" / "ez01_20"
+    if game_id == "ez01" and (historical_run / "evidence.jsonl").is_file():
+        imported_solutions = solution_store.import_successful_run(historical_run)
+        for solution in imported_solutions:
+            _persist_successful_strategy(
+                memory, game_id, solution, run_id=run_id, step=tools.action_count,
+            )
     level_start_observation: Mapping[str, Any] = dict(current)
     level_path_edges: list[dict[str, Any]] = []
     cached_solution_plans = 0
@@ -680,6 +820,9 @@ def run_live(
     pattern_prediction_inconclusive = 0
     actions_since_review = 0
     consecutive_unchanged_actions = 0
+    no_progress_actions = 0
+    fresh_actions_since_review = 0
+    recent_state_actions: deque[tuple[str, str, str]] = deque(maxlen=16)
     interrupted_plans = 0
     stop_reason = "running"
     decisions_path = destination / "decisions.jsonl"
@@ -732,6 +875,32 @@ def run_live(
             file=sys.stderr, flush=True,
         )
 
+    def perform_triggered_review(reasons: Sequence[str]) -> None:
+        nonlocal review_count, actions_since_review, fresh_actions_since_review
+        nonlocal consecutive_unchanged_actions, review_model_calls, model_calls
+        nonlocal review_latency, total_latency
+        review_count += 1
+        progress(f"review starting; triggers={list(reasons)}")
+        result = _perform_review(
+            tools, client, game_id=game_id, run_id=run_id,
+            memory_store_dir=memory_store_dir, trigger_reasons=reasons,
+        )
+        actions_since_review = 0
+        fresh_actions_since_review = 0
+        consecutive_unchanged_actions = 0
+        attempts = int(result["attempts"])
+        review_model_calls += attempts
+        model_calls += attempts
+        elapsed = float(result["latency_seconds"])
+        review_latency += elapsed
+        total_latency += elapsed
+        for key in total_usage:
+            value = result["usage"].get(key)
+            if value is not None:
+                total_usage[key] += int(value)
+                review_usage[key] += int(value)
+        progress(f"review {result['row']['status']}")
+
     def learn_transition(
         before: Mapping[str, Any], action: Mapping[str, Any], result: Mapping[str, Any],
     ) -> dict[str, Any]:
@@ -750,10 +919,14 @@ def run_live(
         )
         won = str(after.get("game_state", "")).upper() == "WIN"
         if completed or won:
-            solution_store.record_successful_trajectory(
+            saved = solution_store.record_successful_trajectory(
                 level_start_observation, level_path_edges, run_id=run_id,
                 success="win" if won else "level_completed",
             )
+            if saved is not None:
+                _persist_successful_strategy(
+                    memory, game_id, saved, run_id=run_id, step=tools.action_count,
+                )
             level_start_observation = dict(after)
             level_path_edges = []
         elif level_key(before) != level_key(after):
@@ -779,7 +952,7 @@ def run_live(
                     "legal_action_specs": current.get("legal_actions", []),
                 }
                 cached_decision = {"actions": [
-                    {"action": edge["action"], "args": edge.get("args", {})}
+                    {"action": model_action_name(edge["action"]), "args": edge.get("args", {})}
                     for edge in solution_edges
                 ]}
                 try:
@@ -854,11 +1027,13 @@ def run_live(
                     f"{action_number}: {fallback_name}"
                 )
                 before_observation = current
+                previous_level = current.get("level")
+                previous_levels_completed = current.get("levels_completed")
                 result = tools.act(
                     fallback["action"], fallback["args"], action_name=fallback_name,
                 )
                 current = result["observation"]
-                learn_transition(before_observation, fallback, result)
+                observed_edge = learn_transition(before_observation, fallback, result)
                 memory.record_run_state(game_id, current, step=tools.action_count)
                 append_jsonl(decisions_path, {
                     "schema": "v10.live_fallback/2", "status": "executed",
@@ -870,6 +1045,38 @@ def run_live(
                     f"fallback action {tools.action_count}: {fallback_name} -> "
                     f"{current.get('game_state', '?')}; observation captured"
                 )
+                recent_state_actions.append((
+                    str(observed_edge["source_state"]), str(fallback["action"]),
+                    str(observed_edge["target_state"]),
+                ))
+                made_progress = (
+                    current.get("levels_completed") != previous_levels_completed
+                    or current.get("level") != previous_level
+                    or str(current.get("game_state", "")).upper() == "WIN"
+                )
+                no_progress_actions = 0 if made_progress else no_progress_actions + 1
+                actions_since_review += 1
+                fresh_actions_since_review += 1
+                changed_pixels = (result.get("measurements") or {}).get("changed_pixels")
+                consecutive_unchanged_actions = consecutive_unchanged_actions + 1 if changed_pixels == 0 else 0
+                fallback_reasons = []
+                if previous_levels_completed is not None and current.get("levels_completed") is not None and int(current["levels_completed"]) > int(previous_levels_completed):
+                    fallback_reasons.append("level_completed")
+                if str(current.get("game_state", "")).upper() == "WIN":
+                    fallback_reasons.append("win")
+                repeated_states = Counter(
+                    state for source, _action, target in recent_state_actions for state in (source, target)
+                )
+                repeated_pairs = Counter((source, action) for source, action, _target in recent_state_actions)
+                if (
+                    no_progress_actions >= 3 and fresh_actions_since_review >= 3
+                    and (max(repeated_states.values(), default=0) >= 3 or max(repeated_pairs.values(), default=0) >= 2)
+                ):
+                    fallback_reasons.append("stagnation")
+                if actions_since_review >= int(review_interval):
+                    fallback_reasons.append("action_interval")
+                if fallback_reasons:
+                    perform_triggered_review(fallback_reasons)
                 update_metrics()
                 continue
 
@@ -915,6 +1122,9 @@ def run_live(
                 current = reset_result["observation"]
                 level_start_observation = dict(current)
                 level_path_edges = []
+                no_progress_actions = 0
+                consecutive_unchanged_actions = 0
+                recent_state_actions.clear()
                 progress("reset executed")
                 interrupted_plans += 1
                 append_jsonl(decisions_path, {
@@ -972,6 +1182,15 @@ def run_live(
                     if observed_edge["target_state"] != expected_cached_edge["target_state"]:
                         interruption = "solution_diverged"
                         progress("cached path observation differed; returning to model decisions")
+                source_state = str(observed_edge["source_state"])
+                target_state = str(observed_edge["target_state"])
+                recent_state_actions.append((source_state, str(action["action"]), target_state))
+                made_progress = (
+                    current.get("levels_completed") != previous_levels_completed
+                    or current.get("level") != previous_level
+                    or str(current.get("game_state", "")).upper() == "WIN"
+                )
+                no_progress_actions = 0 if made_progress else no_progress_actions + 1
                 changed_pixels = (result.get("measurements") or {}).get("changed_pixels")
                 if changed_pixels == 0:
                     consecutive_unchanged_actions += 1
@@ -1026,6 +1245,7 @@ def run_live(
                     progress(f"pattern prediction {verdict}: {expected_pattern['pattern_id']}")
                 executed.append(executed_action)
                 actions_since_review += 1
+                fresh_actions_since_review += 1
                 trigger_reasons = []
                 if prediction_failed:
                     trigger_reasons.append("unexpected_transition")
@@ -1038,39 +1258,34 @@ def run_live(
                     trigger_reasons.append("level_completed")
                 if str(current.get("game_state", "")).upper() == "WIN":
                     trigger_reasons.append("win")
-                if consecutive_unchanged_actions >= 3:
+                repeated_state_count = Counter(
+                    state for source, _action, target in recent_state_actions for state in (source, target)
+                )
+                repeated_pair_count = Counter(
+                    (source, action_name) for source, action_name, _target in recent_state_actions
+                )
+                repeated_without_progress = (
+                    no_progress_actions >= 3
+                    and fresh_actions_since_review >= 3
+                    and (
+                        max(repeated_state_count.values(), default=0) >= 3
+                        or max(repeated_pair_count.values(), default=0) >= 2
+                    )
+                )
+                if repeated_without_progress:
                     trigger_reasons.append("stagnation")
                 if actions_since_review >= int(review_interval):
                     trigger_reasons.append("action_interval")
                 if trigger_reasons:
-                    review_count += 1
-                    progress(f"review starting; triggers={trigger_reasons}")
-                    review_result = _perform_review(
-                        tools, client, game_id=game_id, run_id=run_id,
-                        memory_store_dir=memory_store_dir,
-                        trigger_reasons=trigger_reasons,
-                    )
-                    # One attempt, successful or not, starts the next interval.
-                    actions_since_review = 0
-                    consecutive_unchanged_actions = 0
-                    attempts = int(review_result["attempts"])
-                    review_model_calls += attempts
-                    model_calls += attempts
-                    elapsed = float(review_result["latency_seconds"])
-                    review_latency += elapsed
-                    total_latency += elapsed
-                    for key in total_usage:
-                        value = review_result["usage"].get(key)
-                        if value is not None:
-                            total_usage[key] += int(value)
-                            review_usage[key] += int(value)
-                    progress(f"review {review_result['row']['status']}")
+                    perform_triggered_review(trigger_reasons)
                 if current.get("terminal"):
                     interruption = "terminal_state"
                 elif current.get("level") != previous_level or current.get("levels_completed") != previous_levels_completed:
                     interruption = "level_change"
                 elif trigger_reasons:
                     interruption = "review"
+                if interruption == "solution_diverged":
+                    break
                 if interruption:
                     break
             if interruption:
@@ -1096,6 +1311,14 @@ def run_live(
             "model_returned_no_actions", "action_error",
         }:
             stop_reason = "action_budget_exhausted"
+        return update_metrics()
+    except KeyboardInterrupt:
+        stop_reason = "interrupted"
+        append_jsonl(decisions_path, {
+            "schema": "v10.live_interruption/1", "stop_reason": stop_reason,
+            "actions_completed": tools.action_count,
+            "detail": "Interrupted by user; no review or route finalization was started.",
+        })
         return update_metrics()
     except (StrataRequestError, OSError, RuntimeError, ValueError) as exc:
         stop_reason = "model_or_runtime_error"
