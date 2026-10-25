@@ -22,7 +22,7 @@ from .analysis import (
     model_facing_action_specs,
     validate_model_decision,
 )
-from .frames import DELTA_KIND, IMAGE_KIND, FrameStore
+from .frames import IMAGE_KIND, FrameStore
 from .runlog import append_jsonl, write_json
 from .strata_client import StrataRequestError
 from .tools.game import ActionError, BudgetExceeded, GameTools, evaluate_prediction
@@ -364,6 +364,60 @@ def _repeated_outcome_summary(
     }
 
 
+def _action_screen_sequence(
+    transitions: Sequence[Mapping[str, Any]],
+    current_image_id: Any,
+    frames: FrameStore,
+    *,
+    label_prefix: str = "Recent",
+    current_label: str = "Current screen",
+) -> tuple[list[Path], list[str], list[dict[str, Any]]]:
+    """Return every observed screen in action order, including intermediate frames."""
+    entries = {entry["frame_id"]: entry for entry in frames.entries()}
+    ordered: list[tuple[str, str | None, str]] = []
+
+    def add(image_id: Any, action: str | None, stage: str) -> None:
+        if image_id is not None:
+            ordered.append((str(image_id), action, stage))
+
+    if transitions:
+        first_action = str(model_action_name(transitions[0].get("action")))
+        add(transitions[0].get("pre_frame_image_id"), None, f"initial before {first_action}")
+        for row in transitions:
+            action = str(model_action_name(row.get("action")))
+            result = row.get("result")
+            result = result if isinstance(result, Mapping) else {}
+            intermediate_ids = result.get("intermediate_frame_image_ids")
+            if not isinstance(intermediate_ids, list):
+                intermediate_ids = row.get("intermediate_frame_image_ids", [])
+            if not isinstance(intermediate_ids, list):
+                intermediate_ids = []
+            for index, image_id in enumerate(intermediate_ids, start=1):
+                add(image_id, action, f"during {action}, intermediate screen {index}/{len(intermediate_ids)}")
+            add(row.get("post_frame_image_id"), action, f"after {action}")
+    add(current_image_id, None, current_label)
+
+    image_paths: list[Path] = []
+    image_labels: list[str] = []
+    sequence: list[dict[str, Any]] = []
+    last_image_id: str | None = None
+    for image_id, action, stage in ordered:
+        if image_id == last_image_id:
+            continue
+        entry = entries.get(image_id)
+        if entry is None or entry.get("kind") != IMAGE_KIND:
+            continue
+        label = f"{label_prefix} screen {len(sequence) + 1}: {stage}" if transitions else stage
+        image_paths.append(frames.path_of(image_id))
+        image_labels.append(label)
+        sequence.append({
+            "screen": len(sequence) + 1, "action": action,
+            "stage": stage, "label": label,
+        })
+        last_image_id = image_id
+    return image_paths, image_labels, sequence
+
+
 def _verified_route_summaries(solution_store: LevelSolutionStore) -> list[dict[str, Any]]:
     """Provide success facts for prose consolidation; the store retains exact routes."""
     summaries: list[dict[str, Any]] = []
@@ -594,6 +648,7 @@ def _live_context(
             }
             for row in transitions
         ],
+        "screen_sequence": [],
         "memory": memory,
         "repeated_outcomes": _repeated_outcome_summary(transitions, FrameStore(tools.run_dir)),
         "global_memory": global_memory,
@@ -614,30 +669,20 @@ def _live_context(
             }
             for row in bootstrap_observations
         ]
-    image_ids: list[tuple[str, str]] = []
-    current_image_id = current.get("frame_image_id")
-    previous_image_id = transitions[-1].get("pre_frame_image_id") if transitions else None
-    if previous_image_id and previous_image_id != current_image_id:
-        image_ids.append(("Previous actual game frame", str(previous_image_id)))
-    if current_image_id:
-        image_ids.append(("Current actual game frame", str(current_image_id)))
-    if starting_routine and bootstrap_observations:
-        bootstrap_frames: list[tuple[str, str]] = []
-        if bootstrap_observations[0].get("pre_frame_image_id"):
-            bootstrap_frames.append(("Bootstrap initial frame before reset", str(bootstrap_observations[0]["pre_frame_image_id"])))
-        if bootstrap_observations[-1].get("post_frame_image_id"):
-            bootstrap_frames.append(("Bootstrap final frame before reset", str(bootstrap_observations[-1]["post_frame_image_id"])))
-        image_ids = bootstrap_frames + image_ids
     frames = FrameStore(tools.run_dir)
-    entries = {entry["frame_id"]: entry for entry in frames.entries()}
-    image_paths: list[Path] = []
-    image_labels: list[str] = []
-    for label, frame_id in image_ids:
-        entry = entries.get(frame_id)
-        if entry is None or entry.get("kind") not in {IMAGE_KIND, DELTA_KIND}:
-            continue
-        image_paths.append(frames.path_of(frame_id))
-        image_labels.append(label)
+    if starting_routine and bootstrap_observations:
+        action_images, image_labels, screen_sequence = _action_screen_sequence(
+            bootstrap_observations, current.get("frame_image_id"), frames,
+            label_prefix="Bootstrap", current_label="restored initial screen after reset",
+        )
+    else:
+        action_images, image_labels, screen_sequence = _action_screen_sequence(
+            transitions, current.get("frame_image_id"), frames,
+            label_prefix="Action context",
+            current_label="Current actual game frame",
+        )
+    image_paths = action_images
+    context["screen_sequence"] = screen_sequence
     system_prompt = skill_path.read_text(encoding="utf-8")
     model_context = dict(context)
     model_current_state = dict(context["current_state"])
@@ -650,13 +695,14 @@ def _live_context(
     start_instruction = (
         "The listed bootstrap observations came from a short exploratory sequence, and the game was then reset. "
         "The current image and current_state are the initial screen after that reset. Use the bootstrap observations and memory to choose "
-        "a useful sequence that must start from this initial screen; do not continue from the bootstrap's final screen. "
+        "a short exploratory action sequence that must start from this initial screen; do not continue from the bootstrap's final screen. "
         f"Return up to {horizon} legal lowercase directional actions. Do not reset. This instruction applies only to this one startup decision.\n\n"
         if starting_routine else ""
     )
     prompt = (
         start_instruction
         + f"Choose up to {horizon} legal actions from the current state, recent outcomes, and read-only memory. "
+        "The supplied screen images are in chronological order. Labels identify the action before/after which each screen was observed; include every intermediate screen in that order. "
         "Use game memory first for this game's established mechanics and strategies. Use global memory only as reusable exploration guidance; it must not override game-specific observations. "
         "Prefer applicable demonstrated strategies, but follow the current image and outcomes if memory conflicts. Distinguish lasting mechanics from historical positions. "
         "Avoid repeating actions that had no visible effect in the same observed state and avoid cycles. Use one action for an uncertain experiment; use a longer plan only for understood behavior. "
@@ -939,6 +985,10 @@ def run_live(
                     "image_labels": [],
                     "legal_action_specs": _public_actions(current.get("legal_actions", [])),
                 }
+            elif initial_routine_pending and solution_store.shortest_known_solution(current):
+                # Exact, level-scoped success is better startup evidence than a probe.
+                initial_routine_pending = False
+                bootstrap_probe_active = False
             elif initial_routine_pending:
                 initial_routine_pending = False
                 inputs = {"skill_sha256": skill_sha256, "image_labels": [],

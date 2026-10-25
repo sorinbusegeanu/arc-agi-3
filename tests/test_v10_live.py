@@ -193,10 +193,15 @@ def test_bootstrap_is_reset_before_single_startup_plan_from_first_screen(tmp_pat
     assert "bootstrap observations" in prompt
     assert "game was then reset" in prompt
     assert "must start from this initial screen" in prompt
-    assert len(images) == 3
+    assert "short exploratory action sequence" in prompt
+    assert len(images) == 6
     assert labels == [
-        "Bootstrap initial frame before reset", "Bootstrap final frame before reset",
-        "Current actual game frame",
+        "Bootstrap screen 1: initial before up",
+        "Bootstrap screen 2: after up",
+        "Bootstrap screen 3: after left",
+        "Bootstrap screen 4: after down",
+        "Bootstrap screen 5: after right",
+        "Bootstrap screen 6: restored initial screen after reset",
     ]
     decisions = [
         json.loads(line) for line in (tmp_path / "run/decisions.jsonl").read_text().splitlines()
@@ -672,6 +677,55 @@ def test_live_context_has_no_future_records_and_includes_current_images(tmp_path
     assert "ACTION1" not in prompt
     assert len(image_paths) == 1
     assert labels == ["Current actual game frame"]
+
+
+def test_action_context_sends_ordered_screens_and_all_intermediate_frames(tmp_path: Path) -> None:
+    class IntermediateFramesEnv(_FakeEnv):
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"].extend([
+                {"id": action, "parameters": {
+                    "type": "object", "properties": {}, "required": [], "additionalProperties": False,
+                }}
+                for action in ("ACTION3", "ACTION4")
+            ])
+            return result
+
+        def act(self, action, args):
+            super().act(action, args)
+            value = len(self.actions) * 10
+            return {"frames": [
+                np.full(self.frame.shape, value + 1, dtype=np.int64),
+                np.full(self.frame.shape, value + 2, dtype=np.int64),
+            ]}
+
+    client = _FakeClient([
+        _decision([_action("up"), _action("left"), _action("down"), _action("right")]),
+        _decision([]),
+    ])
+    _run_live_without_starting_routine(
+        IntermediateFramesEnv(), tmp_path / "run", client,
+        game_id="fixture", max_actions=5, plan_horizon=4,
+    )
+
+    prompt, paths, labels = client.calls[1]
+    context = json.loads(prompt.split("Visible context:\n", 1)[1])
+    sequence = context["screen_sequence"]
+    assert len(paths) == 13  # initial + 4 final screens + all 8 intermediate screens
+    assert len(labels) == len(sequence) == len(paths)
+    assert labels == [item["label"] for item in sequence]
+    assert [item["stage"] for item in sequence] == [
+        "initial before up",
+        "during up, intermediate screen 1/2", "during up, intermediate screen 2/2", "after up",
+        "during left, intermediate screen 1/2", "during left, intermediate screen 2/2", "after left",
+        "during down, intermediate screen 1/2", "during down, intermediate screen 2/2", "after down",
+        "during right, intermediate screen 1/2", "during right, intermediate screen 2/2", "after right",
+    ]
+    assert [item["action"] for item in sequence] == [
+        None, "up", "up", "up", "left", "left", "left",
+        "down", "down", "down", "right", "right", "right",
+    ]
+    assert all(path.suffix == ".png" for path in paths)
 
 
 class _LevelCompleteEnv(_FakeEnv):

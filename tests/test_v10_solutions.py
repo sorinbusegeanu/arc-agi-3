@@ -163,6 +163,30 @@ def test_new_run_replays_successful_level_path_without_action_model_call(tmp_pat
     assert "verified route" in (state_dir / "games/fixture/MEMORY.md").read_text()
 
 
+def test_startup_skips_bootstrap_when_exact_route_exists_for_current_level(tmp_path: Path, monkeypatch) -> None:
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("V10_STATE_DIR", str(state_dir))
+    first = _run_live_without_starting_routine(
+        _CompletingEnv(), tmp_path / "learn", _Client(),
+        game_id="fixture", max_actions=1, state_dir=state_dir,
+    )
+    assert first["available_level_solutions"] == 1
+
+    env = _CompletingEnv()
+    metrics = run_live(
+        env, tmp_path / "replay", _Client(), game_id="fixture",
+        max_actions=1, state_dir=state_dir,
+    )
+
+    rows = [json.loads(line) for line in (tmp_path / "replay/decisions.jsonl").read_text().splitlines()]
+    plan = next(row for row in rows if row.get("schema") == "v10.live_decision/2")
+    assert plan["source"] == "verified_level_path"
+    assert env.actions == ["ACTION1"]
+    assert metrics["cached_solution_actions"] == 1
+    assert metrics["resets"] == 0
+    assert not any(row.get("schema") == "v10.live_bootstrap_reset/1" for row in rows)
+
+
 def test_cached_route_stops_on_divergence_then_asks_model(tmp_path: Path, monkeypatch) -> None:
     from v10.tools.memory import game_memory_dir
 

@@ -447,10 +447,25 @@ class GameTools:
         if result_frames is not None:
             if not isinstance(result_frames, Sequence) or isinstance(result_frames, (str, bytes)):
                 raise ValueError("env.act result frames must be a sequence")
+            from PIL import Image
+            from vlm_v2.frame_writer import observation_to_image
+
             for intermediate in result_frames:
                 image = intermediate.get("frame", intermediate.get("image")) if isinstance(intermediate, Mapping) else intermediate
-                frame_id = self.frames.put(image, source="intermediate", step=pre_step)
+                grid = to_frame_array(image, "intermediate frame")
+                frame_id = self.frames.put(grid, source="intermediate", step=pre_step)
                 result.setdefault("intermediate_frame_ids", []).append(frame_id)
+                rendered = observation_to_image(grid)
+                rendered = rendered.resize(
+                    (rendered.width * 10, rendered.height * 10),
+                    resample=Image.Resampling.NEAREST,
+                )
+                image_id = f"{frame_id}_rgb"
+                self.frames.put_image(
+                    np.asarray(rendered, dtype=np.uint8), image_id,
+                    source=frame_id, step=pre_step, kind=IMAGE_KIND,
+                )
+                result.setdefault("intermediate_frame_image_ids", []).append(image_id)
         after = self._capture(self.env.observe())
         before_frame, after_frame = before["frame"], after["frame"]
         from .vision import candidate_displacement, pixel_diff
