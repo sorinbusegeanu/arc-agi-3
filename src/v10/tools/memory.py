@@ -109,12 +109,13 @@ PATCH_FIELDS = frozenset(
         "terminal",
         "game_state",
         "review_coverage",
+        "run_id",
     }
 )
 
 ENTRY_FIELDS = tuple(sorted(PATCH_FIELDS - {"op", "reason"}))
 MODEL_PATCH_OPS: tuple[str, ...] = ("upsert", "retire")
-MODEL_PATCH_FIELDS = frozenset(PATCH_FIELDS - {"reason", "step"})
+MODEL_PATCH_FIELDS = frozenset(PATCH_FIELDS - {"reason", "step", "run_id"})
 
 # Render order follows DESIGN.md section 8.2.
 VIEW_SECTIONS: tuple[tuple[str, str], ...] = (
@@ -252,6 +253,14 @@ def _short_evidence_refs(values: Sequence[Any], limit: int = 3) -> str:
     return ", ".join(visible) + suffix
 
 
+def _bound_markdown(lines: Sequence[str], maximum: int) -> str:
+    text = "\n".join(lines).rstrip() + "\n"
+    if len(text) <= maximum:
+        return text
+    suffix = "\n[Memory view truncated at configured size limit.]\n"
+    return text[: max(0, maximum - len(suffix))].rsplit("\n", 1)[0].rstrip() + suffix
+
+
 def _as_list(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -349,6 +358,7 @@ class GameMemory:
                 if field in row:
                     entry[field] = row[field]
             entry["id"] = entry_id
+            entry["ledger_revision"] = int(row.get("revision", revision))
             if entry_id not in order:
                 order.append(entry_id)
             entries[entry_id] = entry
@@ -424,6 +434,87 @@ class GameMemory:
         ))
         return selected
 
+    def expected_observation(
+        self,
+        game_id: str,
+        state: Mapping[str, Any],
+        action: str,
+    ) -> dict[str, Any] | None:
+        from ..analysis import model_action_name
+
+        matches = []
+        for pattern in self.applicable_patterns(game_id, state, include_hypotheses=False):
+            if pattern.get("status") != "confirmed" or pattern.get("pattern_type") not in {"mechanic", "strategy"}:
+                continue
+            for expected in pattern.get("expected_observations", []):
+                if not isinstance(expected, Mapping):
+                    continue
+                if model_action_name(expected.get("action")) != model_action_name(action):
+                    continue
+                selector = expected.get("state_selector", {})
+                if not isinstance(selector, Mapping) or any(state.get(key) != value for key, value in selector.items()):
+                    continue
+                matches.append((pattern, expected))
+        if not matches:
+            return None
+        signatures = {
+            json.dumps(item.get("measurable_prediction"), sort_keys=True, separators=(",", ":"))
+            for _, item in matches
+        }
+        if len(signatures) > 1:
+            return None
+        pattern, expected = max(matches, key=lambda pair: (
+            float(pair[0].get("confidence", 0.0)), str(pair[0].get("id", "")),
+        ))
+        return {
+            "pattern_id": pattern["id"],
+            "measurable_prediction": expected["measurable_prediction"],
+            "expected_observation": dict(expected),
+        }
+
+    def record_pattern_prediction(
+        self,
+        pattern_id: str,
+        transition_id: str,
+        verdict: str,
+        audit_id: str,
+        *,
+        step: int,
+    ) -> dict[str, Any] | None:
+        if verdict not in {"matched", "failed", "inconclusive"}:
+            raise MemoryValidationError(f"invalid pattern prediction verdict: {verdict}")
+        pattern = next((entry for entry in self.patterns(include_retired=True) if entry["id"] == pattern_id), None)
+        if pattern is None:
+            raise MemoryValidationError(f"unknown pattern: {pattern_id}")
+        if verdict == "inconclusive":
+            return None
+        support = list(pattern.get("supporting_evidence", []))
+        contra = list(pattern.get("contradicting_evidence", []))
+        evidence = _qualify_pattern_refs([transition_id], self.run_id or "")
+        target = support if verdict == "matched" else contra
+        if evidence[0] in target:
+            return None
+        target.extend(evidence)
+        support = list(dict.fromkeys(support))
+        contra = list(dict.fromkeys(contra))
+        updated = {
+            **pattern,
+            "supporting_evidence": support,
+            "contradicting_evidence": contra,
+            "evidence_ids": list(dict.fromkeys([*support, *contra])),
+            "confidence": pattern_confidence(support, contra),
+            "status": pattern_status(support, contra),
+            "pattern_revision": int(pattern.get("pattern_revision", 1)) + 1,
+            "verified_by": list(dict.fromkeys([*_as_list(pattern.get("verified_by")), audit_id])),
+            "step": int(step), "run_id": self.run_id,
+        }
+        revision = self.revision() + 1
+        row = {"op": "upsert", **updated, "revision": revision}
+        append_many(self.path, [row])
+        self._rows.append(row)
+        self.write_view()
+        return dict(row)
+
     def record_run_state(self, game_id: str, state: Mapping[str, Any], *, step: int) -> dict[str, Any] | None:
         """Keep the latest progress snapshot under its originating run ID."""
         if not self.run_id:
@@ -476,7 +567,7 @@ class GameMemory:
         current_ids = {str(value) for value in evidence_ids}
         coverage_id = self.review_coverage_id(game_id, self.run_id, list(evidence_ids))
         if self.has_review_coverage(game_id, evidence_ids):
-            return {"added": 0, "updated": 0, "retired": 0, "unchanged": len(changes), "rejected": [], "duplicate_review": True}
+            return {"added": 0, "updated": 0, "retired": 0, "unchanged": len(changes), "rejected": [], "duplicate_review": True, "committed": True}
 
         current_patterns = {entry["id"]: entry for entry in self.patterns(game_id, include_retired=True)}
         planned: dict[str, dict[str, Any]] = {}
@@ -492,6 +583,9 @@ class GameMemory:
                 if existing is None:
                     rejected.append({"index": index, "pattern_id": pattern_id, "reason": "unknown_pattern"})
                     continue
+                if existing.get("status") == "retired":
+                    unchanged += 1
+                    continue
                 updated = dict(existing)
                 updated["status"] = "retired"
                 updated["pattern_revision"] = int(existing.get("pattern_revision", 1)) + 1
@@ -504,16 +598,20 @@ class GameMemory:
             if operation != "upsert":
                 rejected.append({"index": index, "pattern_id": pattern_id, "reason": "unknown_operation"})
                 continue
-            pattern_type = raw.get("pattern_type")
-            claim = _without_evidence_citations(str(raw.get("claim", ""))).strip()
+            existing = current_patterns.get(str(pattern_id)) if pattern_id else None
+            if pattern_id and existing is None:
+                rejected.append({"index": index, "pattern_id": pattern_id, "reason": "unknown_pattern_id"})
+                continue
+            pattern_type = raw.get("pattern_type", (existing or {}).get("pattern_type"))
+            claim = _without_evidence_citations(str(raw.get("claim", (existing or {}).get("claim", "")))).strip()
             if pattern_type not in PATTERN_TYPES or not claim:
                 rejected.append({"index": index, "pattern_id": pattern_id, "reason": "invalid_type_or_claim"})
                 continue
-            conditions = raw.get("applicability_conditions", [])
+            conditions = raw.get("applicability_conditions", (existing or {}).get("applicability_conditions", []))
             if not isinstance(conditions, list) or any(not isinstance(value, str) for value in conditions):
                 rejected.append({"index": index, "pattern_id": pattern_id, "reason": "invalid_applicability_conditions"})
                 continue
-            selector = raw.get("state_selector", {})
+            selector = raw.get("state_selector", (existing or {}).get("state_selector", {}))
             if not isinstance(selector, Mapping) or any(not isinstance(key, str) for key in selector):
                 rejected.append({"index": index, "pattern_id": pattern_id, "reason": "invalid_state_selector"})
                 continue
@@ -524,10 +622,6 @@ class GameMemory:
                 continue
             if any(not isinstance(value, str) or value not in current_ids for value in [*new_support, *new_contra]):
                 rejected.append({"index": index, "pattern_id": pattern_id, "reason": "unknown_review_evidence"})
-                continue
-            existing = current_patterns.get(str(pattern_id)) if pattern_id else None
-            if pattern_id and existing is None:
-                rejected.append({"index": index, "pattern_id": pattern_id, "reason": "unknown_pattern_id"})
                 continue
             if existing and existing.get("game_id") != game_id:
                 rejected.append({"index": index, "pattern_id": pattern_id, "reason": "game_id_mismatch"})
@@ -562,6 +656,43 @@ class GameMemory:
             ):
                 if field in raw:
                     record[field] = raw[field]
+            if pattern_type == "strategy":
+                for field in ("goal", "action_policy"):
+                    if not isinstance(record.get(field), str) or not record[field].strip():
+                        rejected.append({"index": index, "pattern_id": stable_id, "reason": f"strategy_{field}_required"})
+                        record = None
+                        break
+                if record is None:
+                    continue
+                for field in ("preconditions", "success_conditions"):
+                    if not isinstance(record.get(field), list) or any(not isinstance(value, str) for value in record[field]):
+                        rejected.append({"index": index, "pattern_id": stable_id, "reason": f"strategy_{field}_must_be_string_list"})
+                        record = None
+                        break
+                if record is None:
+                    continue
+            expected_observations = record.get("expected_observations", [])
+            if not isinstance(expected_observations, list):
+                rejected.append({"index": index, "pattern_id": stable_id, "reason": "expected_observations_must_be_list"})
+                continue
+            invalid_prediction = False
+            for expectation in expected_observations:
+                if not isinstance(expectation, Mapping) or not isinstance(expectation.get("action"), str):
+                    invalid_prediction = True
+                    break
+                selector = expectation.get("state_selector", {})
+                if not isinstance(selector, Mapping):
+                    invalid_prediction = True
+                    break
+                try:
+                    from .game import validate_measurable_prediction
+                    validate_measurable_prediction(expectation.get("measurable_prediction"), "pattern expectation")
+                except Exception:
+                    invalid_prediction = True
+                    break
+            if invalid_prediction:
+                rejected.append({"index": index, "pattern_id": stable_id, "reason": "invalid_expected_observations"})
+                continue
             # Preserve strategy details on an update that omits them.
             planned[stable_id] = record
 
@@ -585,6 +716,12 @@ class GameMemory:
             else:
                 added += 1
 
+        if rejected and not rows:
+            return {
+                "added": 0, "updated": 0, "retired": 0, "unchanged": unchanged,
+                "rejected": rejected, "duplicate_review": False, "committed": False,
+            }
+
         revision += 1
         checkpoint = {
             "op": "checkpoint", "id": coverage_id, "type": "review_checkpoint",
@@ -597,16 +734,45 @@ class GameMemory:
         self.write_view()
         return {
             "added": added, "updated": updated_count, "retired": retired,
-            "unchanged": unchanged, "rejected": rejected, "duplicate_review": False,
+            "unchanged": unchanged, "rejected": rejected, "duplicate_review": False, "committed": True,
         }
 
-    def compact(self, max_entries: int = DEFAULT_CONTEXT_ENTRIES, through_step: int | None = None) -> dict[str, Any]:
+    def compact(
+        self,
+        max_entries: int = DEFAULT_CONTEXT_ENTRIES,
+        through_step: int | None = None,
+        *,
+        game_id: str | None = None,
+        current_state: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Select a compact prompt view without deleting or rewriting ledger entries."""
         max_entries = int(max_entries)
         if max_entries < 0:
             raise ValueError("max_entries must be non-negative")
         view = self.read(through_step=through_step)
-        all_entries = view["entries"]
+        all_entries = [
+            entry for entry in view["entries"]
+            if entry.get("type") != "state" or (
+                self.run_id is not None and entry.get("run_id") == self.run_id
+            )
+        ]
+        patterns = self.applicable_patterns(game_id or self.game_id or "", current_state)
+        if patterns:
+            selected = [dict(entry) for entry in patterns[:max_entries]]
+            for entry in selected:
+                entry["supporting_evidence_count"] = len(entry.get("supporting_evidence", []))
+                entry["contradicting_evidence_count"] = len(entry.get("contradicting_evidence", []))
+                entry.pop("supporting_evidence", None)
+                entry.pop("contradicting_evidence", None)
+                entry.pop("evidence_ids", None)
+            return {
+                **view,
+                "count": len(selected),
+                "total_count": len(patterns),
+                "context_limit": max_entries,
+                "compacted": len(selected) < len(patterns),
+                "entries": selected,
+            }
         review = next((entry for entry in reversed(all_entries) if entry.get("type") == "review"), None)
         if review is not None:
             selected = [dict(review)] if max_entries else []
@@ -890,6 +1056,12 @@ class GameMemory:
 
     def render(self, through_step: int | None = None) -> str:
         view = self.read(through_step=through_step)
+        structured = [
+            entry for entry in view["entries"]
+            if entry.get("pattern_type") in PATTERN_TYPES and entry.get("status") != "retired"
+        ]
+        if structured or any(entry.get("type") == "state" for entry in view["entries"]):
+            return self._render_structured_view(view, structured)
         review = next((entry for entry in reversed(view["entries"]) if entry.get("type") == "review"), None)
         if review is not None:
             return _without_evidence_citations(str(review.get("claim", ""))) + "\n"
@@ -913,6 +1085,110 @@ class GameMemory:
                 lines.append(self._render_entry(entry))
             lines.append("")
         return "\n".join(lines).rstrip() + "\n"
+
+    def _render_structured_view(
+        self,
+        view: Mapping[str, Any],
+        patterns: Sequence[Mapping[str, Any]],
+    ) -> str:
+        lines = ["# Game Memory", ""]
+        states = [entry for entry in view["entries"] if entry.get("type") == "state"]
+        latest_state = max(states, key=lambda entry: int(entry.get("ledger_revision", 0)), default=None)
+        lines.append("## 1. Current State")
+        if latest_state:
+            run = str(latest_state.get("run_id", "unknown"))[:8]
+            values = [
+                f"level {latest_state.get('level', '?')}",
+                f"{latest_state.get('levels_completed', '?')}/{latest_state.get('win_levels', '?')} completed",
+                f"state {latest_state.get('game_state', '?')}",
+            ]
+            if latest_state.get("terminal"):
+                values.append("terminal")
+            lines.append(f"- From run {run}: " + "; ".join(values) + ".")
+        else:
+            lines.append(_EMPTY_SECTION)
+
+        legacy = view["entries"]
+        for title, pattern_type, status in PATTERN_VIEW_SECTIONS:
+            lines.extend(["", f"## {title}"])
+            if pattern_type == "failure":
+                selected = [entry for entry in legacy if entry.get("type") == "failure"]
+                selected.extend(
+                    entry for entry in patterns
+                    if entry.get("status") == "contradicted"
+                )
+            elif pattern_type == "hypothesis":
+                selected = [
+                    entry for entry in patterns
+                    if entry.get("pattern_type") == "hypothesis"
+                    or (entry.get("pattern_type") == "mechanic" and entry.get("status") == "candidate")
+                ]
+                selected.extend(
+                    entry for entry in legacy
+                    if entry.get("type") in {"hypothesis", "pattern"} and not entry.get("pattern_type")
+                )
+            else:
+                selected = [
+                    entry for entry in patterns
+                    if entry.get("pattern_type") == pattern_type
+                    and (status is None or entry.get("status") == status)
+                ]
+                legacy_type = "strategy" if pattern_type == "strategy" else "mechanic"
+                selected.extend(
+                    entry for entry in legacy
+                    if entry.get("type") == legacy_type
+                    and entry.get("status") in {"supported", "mechanic", "confirmed"}
+                )
+            if not selected:
+                lines.append(_EMPTY_SECTION)
+            else:
+                for entry in sorted(selected, key=lambda value: str(value.get("id", ""))):
+                    lines.append(self._render_pattern(entry))
+            if pattern_type == "hypothesis":
+                legacy_review = next((entry for entry in reversed(legacy) if entry.get("type") == "review"), None)
+                if legacy_review:
+                    legacy_text = _without_evidence_citations(str(legacy_review.get("claim", "")))
+                    if legacy_text:
+                        lines.append("- Legacy review retained pending structured migration:")
+                        lines.extend(f"  {line}" for line in legacy_text.splitlines()[:12])
+
+        lines.extend(["", "## 7. Next Actions"])
+        strategies = [entry for entry in patterns if entry.get("pattern_type") == "strategy" and entry.get("status") != "contradicted"]
+        next_actions = [str(entry.get("action_policy", "")).strip() for entry in strategies if entry.get("action_policy")]
+        lines.extend(f"- {action}" for action in next_actions) if next_actions else lines.append(_EMPTY_SECTION)
+        return _bound_markdown(lines, MAX_MEMORY_MARKDOWN_CHARS)
+
+    def _render_pattern(self, entry: Mapping[str, Any]) -> str:
+        pattern_type = entry.get("pattern_type")
+        status = entry.get("status", "candidate")
+        confidence = float(entry.get("confidence", 0.5))
+        parts = [
+            f"- [{entry.get('id', '?')}] {status}, confidence {confidence:.2f}: "
+            f"{_without_evidence_citations(str(entry.get('claim', '')))}"
+        ]
+        conditions = entry.get("applicability_conditions", [])
+        if conditions:
+            parts.append("  Applies: " + "; ".join(map(str, conditions)))
+        if pattern_type == "strategy":
+            for label, field in (
+                ("Goal", "goal"), ("Preconditions", "preconditions"),
+                ("Policy", "action_policy"), ("Expected observations", "expected_observations"),
+                ("Success", "success_conditions"),
+            ):
+                value = entry.get(field)
+                if value:
+                    rendered = json.dumps(value, ensure_ascii=False, sort_keys=True) if isinstance(value, (dict, list)) else str(value)
+                    parts.append(f"  {label}: {rendered}")
+        supporting = _short_evidence_refs(entry.get("supporting_evidence", entry.get("evidence_ids", [])))
+        contradicting = _short_evidence_refs(entry.get("contradicting_evidence", []))
+        refs = []
+        if supporting:
+            refs.append(f"+ {supporting}")
+        if contradicting:
+            refs.append(f"- {contradicting}")
+        if refs:
+            parts.append("  Refs: " + "; ".join(refs))
+        return "\n".join(parts)
 
     def _render_entry(self, entry: dict[str, Any]) -> str:
         parts = [f"- `{entry['id']}`"]

@@ -169,6 +169,96 @@ def test_failed_review_view_save_rolls_back_latest_summary(tmp_path, monkeypatch
     assert memory.compact()["entries"][0]["claim"] == "## Patterns\nPrevious summary."
 
 
+def test_pattern_updates_are_independent_incremental_and_idempotent(tmp_path) -> None:
+    state_dir = game_memory_dir(tmp_path / "state", "ez01")
+    memory = GameMemory(tmp_path / "run-one", store_dir=state_dir, run_id="run-one", game_id="ez01")
+    first = memory.apply_review_changes([
+        {
+            "operation": "upsert", "pattern_type": "mechanic",
+            "claim": "Up closes the gap by moving blue upward.",
+            "applicability_conditions": ["The squares are vertically separated."],
+            "supporting_evidence": ["T2"], "contradicting_evidence": [],
+            "state_selector": {"level": 0},
+            "expected_observations": [{
+                "action": "up", "state_selector": {"level": 0},
+                "measurable_prediction": {"all": [
+                    {"path": "measurements.changed_pixels", "op": "eq", "value": 128},
+                ]},
+            }],
+        },
+        {
+            "operation": "upsert", "pattern_type": "strategy",
+            "claim": "Stack, then separate to finish a level.",
+            "applicability_conditions": ["A level uses the two-square mechanic."],
+            "supporting_evidence": ["T3"], "contradicting_evidence": [],
+            "goal": "Complete the current level.", "preconditions": ["Two squares are visible."],
+            "action_policy": "Press up until stacked, then press up once more.",
+            "success_conditions": ["levels_completed increases."],
+        },
+    ], game_id="ez01", evidence_ids=["T2", "T3"], current_step=2)
+
+    assert first["added"] == 2
+    assert first["committed"] is True
+    mechanic, strategy = memory.patterns("ez01")
+    assert mechanic["status"] == "candidate"
+    assert mechanic["confidence"] == 0.6667
+    assert mechanic["supporting_evidence"] == ["run-one:T2"]
+    assert strategy["pattern_type"] == "strategy"
+    assert strategy["goal"] == "Complete the current level."
+    assert "Refs: + run-one:T2" in memory.view_path.read_text()
+
+    prior_strategy = dict(strategy)
+    row_count = len(memory.ledger())
+    updated = memory.apply_review_changes([{
+        "operation": "upsert", "pattern_id": mechanic["id"],
+        "supporting_evidence": ["T3"], "contradicting_evidence": ["T4"],
+        "applicability_conditions": ["The squares are vertically separated, not stacked."],
+    }], game_id="ez01", evidence_ids=["T3", "T4"], current_step=4)
+    assert updated["updated"] == 1
+    current = {entry["id"]: entry for entry in memory.patterns("ez01")}
+    assert current[mechanic["id"]]["supporting_evidence"] == ["run-one:T2", "run-one:T3"]
+    assert current[mechanic["id"]]["contradicting_evidence"] == ["run-one:T4"]
+    assert current[mechanic["id"]]["status"] == "candidate"
+    assert current[strategy["id"]] == prior_strategy
+    history = [row for row in memory.ledger() if row.get("id") == mechanic["id"]]
+    assert len(history) == 2
+    assert history[-1]["pattern_revision"] == 2
+
+    before_repeat = len(memory.ledger())
+    duplicate = memory.apply_review_changes([{
+        "operation": "upsert", "pattern_id": mechanic["id"],
+        "supporting_evidence": ["T3"], "contradicting_evidence": ["T4"],
+    }], game_id="ez01", evidence_ids=["T3", "T4"], current_step=4)
+    assert duplicate["duplicate_review"] is True
+    assert len(memory.ledger()) == before_repeat
+    assert row_count < before_repeat
+
+
+def test_run_state_is_owned_by_its_run_and_second_run_reuses_patterns(tmp_path) -> None:
+    state_dir = game_memory_dir(tmp_path / "state", "ez01")
+    first = GameMemory(tmp_path / "run-one", store_dir=state_dir, run_id="run-one", game_id="ez01")
+    first.record_run_state("ez01", {
+        "level": 5, "levels_completed": 5, "win_levels": 5, "game_state": "WIN", "terminal": True,
+    }, step=25)
+    first.apply_review_changes([{
+        "operation": "upsert", "pattern_type": "mechanic", "claim": "Up moves blue upward by eight pixels.",
+        "applicability_conditions": ["Squares are vertically separated."],
+        "supporting_evidence": ["T2", "T4"], "contradicting_evidence": [], "state_selector": {},
+    }], game_id="ez01", evidence_ids=["T2", "T4"], current_step=25)
+
+    second = GameMemory(tmp_path / "run-two", store_dir=state_dir, run_id="run-two", game_id="ez01")
+    second.record_run_state("ez01", {
+        "level": 0, "levels_completed": 0, "win_levels": 5, "game_state": "NOT_FINISHED", "terminal": False,
+    }, step=0)
+    current_state = {"level": 0, "levels_completed": 0, "game_state": "NOT_FINISHED", "terminal": False}
+    prompt_memory = second.compact(game_id="ez01", current_state=current_state)
+
+    assert [entry["pattern_type"] for entry in prompt_memory["entries"]] == ["mechanic"]
+    assert prompt_memory["entries"][0]["id"] == first.patterns("ez01")[0]["id"]
+    assert all(entry.get("run_id") != "run-one" for entry in prompt_memory["entries"] if entry.get("type") == "state")
+    assert "From run run-two: level 0" in second.view_path.read_text()
+
+
 def test_legacy_run_ledger_migrates_before_run_dir_reuse(tmp_path) -> None:
     from v10.runlog import write_json
 

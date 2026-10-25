@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import random
-import re
 import shutil
 import sys
 import time
@@ -174,30 +173,30 @@ def _random_legal_action(legal_actions: Any, rng: random.Random) -> dict[str, An
     return rng.choice(candidates) if candidates else None
 
 
-_REVIEW_SYSTEM_PROMPT = """# ez01 experience review
+_REVIEW_SYSTEM_PROMPT = """# ez01 incremental memory review
 
-Review recorded game experience and consolidate useful, game-specific memory. You do not control the game and must not request actions or resets.
+Review this run's ordered observations against the existing structured patterns. You do not control the game and must not request actions or resets. Return only a JSON object with a `changes` array. Do not rewrite the whole memory.
 
-Rewrite the findings under exactly these four headings, in this order: `## Patterns`, `## Useful approaches`, `## Failures and exceptions`, and `## Uncertain ideas`. Do not copy the previous MEMORY.md layout or repeat its content verbatim; use it as source material and consolidate it with this run's observations. Include all four headings even when a section only says that evidence is insufficient.
+Each change is one of:
+- An upsert with `operation`, optional existing `pattern_id`, `pattern_type` (`mechanic`, `strategy`, `exception`, or `hypothesis`), a concise `claim`, optional `applicability_conditions`, optional `state_selector`, and only newly observed `supporting_evidence` / `contradicting_evidence` IDs from this review's events.
+- A retirement with `operation: "retire"` and an existing `pattern_id`.
 
-Distinguish directly observed effects from tentative explanations. Do not include evidence IDs, source citations, or parenthetical transition references; the harness stores provenance separately. Direction words name commands; infer actual movement only from the recorded frames and measurements. Preserve earlier findings that remain useful, qualify or remove claims contradicted by observations, and do not invent game rules or outcomes.
+When revising an existing pattern, reuse its ID. Use distinct conditional variants when different conditions explain different outcomes; retire or supersede a broad pattern only when justified. Include evidence references only in the structured evidence arrays, never in prose. Do not invent facts or confidence/status values; the harness computes confidence and status deterministically.
 
-Return only compact Markdown with those four headings. This Markdown replaces the previous memory view."""
+For useful successful action sequences, use `pattern_type: "strategy"` and provide `goal`, `preconditions` (string list), `action_policy`, `expected_observations`, and `success_conditions` (string list). Each expected observation has `action`, optional `state_selector` over game_state/level/levels_completed/terminal, and a measurable prediction in the supported all-of predicate format. Do not produce strategies that are not supported by a successful transition.
 
-_REVIEW_HEADINGS = (
-    "patterns", "useful approaches", "failures and exceptions", "uncertain ideas",
-)
+Distinguish direct observations from explanations. Direction words name commands; infer movement from frames and measurements. Keep claims game-specific and concise. Return `{"changes": []}` when this review adds no information."""
 
 
-def _validate_review_markdown(content: str) -> str:
-    """Reject reviews that did not follow the compact memory format."""
-    headings = [
-        re.sub(r"\s+#+\s*$", "", match.group(1)).strip().casefold()
-        for match in re.finditer(r"(?m)^#{1,6}\s+(.+?)\s*$", content)
-    ]
-    if tuple(headings) != _REVIEW_HEADINGS:
-        raise ValueError("review response must contain exactly the four required headings in order")
-    return content.strip()
+def _validate_review_payload(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, Mapping) or set(value) != {"changes"}:
+        raise ValueError("review response must be a JSON object containing only changes")
+    changes = value["changes"]
+    if not isinstance(changes, list):
+        raise ValueError("review changes must be a list")
+    if any(not isinstance(change, Mapping) for change in changes):
+        raise ValueError("each review change must be an object")
+    return [dict(change) for change in changes]
 
 
 def _review_events(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -317,24 +316,54 @@ def _perform_review(
         transition_ids = [str(row["evidence_id"]) for row in transitions if row.get("evidence_id")]
         first_id = transition_ids[0] if transition_ids else None
         last_id = transition_ids[-1] if transition_ids else None
-        memory = GameMemory(tools.run_dir, store_dir=memory_store_dir, run_id=run_id)
+        memory = GameMemory(tools.run_dir, store_dir=memory_store_dir, run_id=run_id, game_id=game_id)
         memory_text = memory.write_view().read_text(encoding="utf-8")
+        if memory.has_review_coverage(game_id, transition_ids):
+            row = {
+                "schema": "v10.live_review/2", "status": "skipped_duplicate_evidence",
+                "trigger_reasons": list(trigger_reasons), "through_action": tools.action_count,
+                "covered_transitions": {"count": len(transition_ids), "first": first_id, "last": last_id},
+                "selected_image_labels": [], "request_attempts": 0, "usage": {},
+                "latency_seconds": 0.0, "duplicate_review": True,
+            }
+            append_jsonl(tools.run_dir / "reviews.jsonl", row)
+            return {"row": row, "attempts": 0, "usage": {}, "latency_seconds": 0.0}
         frames = FrameStore(tools.run_dir)
         image_paths, image_labels = _review_frame_selection(transitions, frames)
         events = _review_events(records)
+        patterns = [
+            {
+                "pattern_id": entry["id"], "pattern_type": entry.get("pattern_type"),
+                "claim": entry.get("claim"), "applicability_conditions": entry.get("applicability_conditions", []),
+                "state_selector": entry.get("state_selector", {}), "status": entry.get("status"),
+                "confidence": entry.get("confidence"),
+                "support_count": len(entry.get("supporting_evidence", [])),
+                "contradiction_count": len(entry.get("contradicting_evidence", [])),
+                **{
+                    key: entry[key] for key in (
+                        "goal", "preconditions", "action_policy", "expected_observations", "success_conditions",
+                    ) if key in entry
+                },
+            }
+            for entry in memory.patterns(game_id, include_retired=True)
+        ]
         user_prompt = (
             f"Review all recorded experience for game {game_id} through action {tools.action_count}. "
             f"This review was triggered by: {', '.join(trigger_reasons)}. "
-            "Use the complete ordered transition summaries and the selected actual frames. Do not write transition IDs or citations in the memory text; the harness records provenance separately. "
-            "Return a concise consolidated replacement for the prior memory.\n\n"
-            "Previous MEMORY.md:\n" + memory_text + "\n\n"
-            "Recorded experience (ordered; no events after this review boundary):\n"
+            "Update only patterns affected by observations since their last review. Add only new evidence IDs; never repeat an ID already attached to a pattern. "
+            "When evidence conflicts, consider whether applicability conditions distinguish the observations; refine or split patterns if supported. "
+            "Keep evidence IDs in the structured evidence arrays only.\n\n"
+            "Existing patterns (authoritative ledger projection):\n"
+            + json.dumps(patterns, ensure_ascii=False, separators=(",", ":")) + "\n\n"
+            "Existing MEMORY.md view (legacy content may be migrated into patterns):\n"
+            + memory_text + "\n\n"
+            "New ordered run observations (evidence IDs are valid only in the evidence arrays):\n"
             + json.dumps(events, ensure_ascii=False, separators=(",", ":"))
         )
         attempts = 1
         response = client.complete(
             _REVIEW_SYSTEM_PROMPT, user_prompt, image_paths, image_labels,
-            response_format=None,
+            response_format="json_object",
         )
         usage = dict(response.get("usage", {}))
         latency = float(response.get("latency_seconds", 0.0))
@@ -342,31 +371,37 @@ def _perform_review(
         content = response.get("content")
         if response.get("finish_reason") == "length":
             raise ValueError("review response was truncated at the output-token limit")
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError("review response must be non-empty Markdown text")
-        content = _validate_review_markdown(content)
-        saved = memory.save_review_summary(
-            content, evidence_ids=transition_ids, current_step=tools.action_count,
+        changes = _validate_review_payload(_parse_content(content))
+        applied = memory.apply_review_changes(
+            changes, game_id=game_id, evidence_ids=transition_ids,
+            current_step=tools.action_count,
         )
-        content = str(saved["claim"])
+        if not applied.get("committed", True):
+            raise ValueError(f"review contained no valid changes: {applied['rejected']}")
+        canonical = json.dumps(changes, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         row = {
-            "schema": "v10.live_review/1", "status": "saved", "trigger_reasons": list(trigger_reasons),
+            "schema": "v10.live_review/2",
+            "status": "saved_with_rejections" if applied["rejected"] else "saved",
+            "trigger_reasons": list(trigger_reasons),
             "through_action": tools.action_count,
             "covered_transitions": {"count": len(transition_ids), "first": first_id, "last": last_id},
             "selected_image_labels": image_labels,
             "model": response.get("model", getattr(client, "model", None)),
             "request_attempts": attempts, "usage": usage,
             "latency_seconds": round(latency, 6),
-            "memory_revision": saved["revision"], "memory_path": str(memory.view_path),
-            "result_characters": len(content),
-            "result_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "memory_revision": memory.revision(), "memory_path": str(memory.view_path),
+            "patterns_added": applied["added"], "patterns_updated": applied["updated"],
+            "patterns_retired": applied["retired"], "unchanged_patterns": applied["unchanged"],
+            "rejected_changes": applied["rejected"], "duplicate_review": applied["duplicate_review"],
+            "result_characters": len(canonical),
+            "result_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
         }
     except Exception as exc:
         attempts = max(attempts, int(getattr(exc, "request_attempts", 0)))
         if getattr(exc, "latency_seconds", None) is not None:
             latency = max(latency, float(exc.latency_seconds))
         row = {
-            "schema": "v10.live_review/1", "status": "failed", "trigger_reasons": list(trigger_reasons),
+            "schema": "v10.live_review/2", "status": "failed", "trigger_reasons": list(trigger_reasons),
             "through_action": tools.action_count,
             "covered_transitions": {"count": len(transition_ids), "first": first_id, "last": last_id},
             "selected_image_labels": image_labels,
@@ -410,8 +445,11 @@ def _live_context(
             },
         })
     visible_step = int(current.get("step", max((int(row.get("step", 0)) for row in records), default=0)))
-    memory_store = GameMemory(tools.run_dir, store_dir=memory_store_dir, run_id=run_id)
-    memory = memory_store.compact(max_entries=memory_context_entries, through_step=visible_step)
+    memory_store = GameMemory(tools.run_dir, store_dir=memory_store_dir, run_id=run_id, game_id=game_id)
+    memory = memory_store.compact(
+        max_entries=memory_context_entries, through_step=visible_step,
+        game_id=game_id, current_state=current,
+    )
     for entry in memory["entries"]:
         visible_ids.update(str(value) for value in entry.get("evidence_ids", []))
     context = {
@@ -511,9 +549,8 @@ def run_live(
     # Old versions kept the only copy of knowledge inside the disposable run directory.
     GameMemory.migrate_run_ledger(destination, memory_store_dir, game_id)
     _prepare_live_run_directory(destination)
-    memory = GameMemory(destination, store_dir=memory_store_dir, run_id=run_id)
-    if not memory.view_path.exists():
-        memory.write_view()
+    memory = GameMemory(destination, store_dir=memory_store_dir, run_id=run_id, game_id=game_id)
+    memory.write_view()
     skill_sha256 = hashlib.sha256(source_skill.read_bytes()).hexdigest()
     write_json(destination / "run_manifest.json", {
         "schema": "v10.live_run/1", "run_id": run_id, "game_id": game_id,
@@ -522,6 +559,7 @@ def run_live(
     })
     tools = GameTools(env, destination, max_actions=max_actions, max_resets=max_resets)
     current = tools.observe()
+    memory.record_run_state(game_id, current, step=tools.action_count)
     model_calls = 0
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     action_usage = dict(total_usage)
@@ -556,7 +594,7 @@ def run_live(
             "game_state": state, "terminal": terminal, "won": state == "WIN",
             "interrupted_plans": interrupted_plans, "stop_reason": stop_reason,
             "memory_entries": GameMemory(
-                destination, store_dir=memory_store_dir, run_id=run_id,
+                destination, store_dir=memory_store_dir, run_id=run_id, game_id=game_id,
             ).read().get("count", 0),
             "memory_context_entries": int(memory_context_entries),
         }
@@ -645,6 +683,7 @@ def run_live(
                 )
                 result = tools.act(fallback["action"], fallback["args"])
                 current = result["observation"]
+                memory.record_run_state(game_id, current, step=tools.action_count)
                 append_jsonl(decisions_path, {
                     "schema": "v10.live_fallback/2", "status": "executed",
                     "cause": "invalid_decision", "validation_error": validation_error,

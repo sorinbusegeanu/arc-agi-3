@@ -31,12 +31,11 @@ def _action(action="up"):
     return {"action": action, "args": {}}
 
 
-_VALID_REVIEW = (
-    "## Patterns\n- A cue is visible.\n\n"
-    "## Useful approaches\n- Inspect the cue.\n\n"
-    "## Failures and exceptions\n- None observed.\n\n"
-    "## Uncertain ideas\n- The cue's meaning is unknown."
-)
+_VALID_REVIEW = json.dumps({"changes": [{
+    "operation": "upsert", "pattern_type": "mechanic", "claim": "A cue is visible.",
+    "applicability_conditions": ["The cue appears in the current state."],
+    "supporting_evidence": ["T2"], "contradicting_evidence": [], "state_selector": {},
+}]})
 
 
 class _FakeClient:
@@ -57,7 +56,7 @@ class _FakeClient:
     def complete(self, system_prompt, user_prompt, image_paths, image_labels, response_format="json_object"):
         self.calls.append((user_prompt, list(image_paths), list(image_labels)))
         self.response_formats.append(response_format)
-        if response_format is None:
+        if system_prompt.startswith("# ez01 incremental memory review"):
             if self.review_errors:
                 raise self.review_errors.pop(0)
             content = self.review_responses.pop(0) if self.review_responses else _VALID_REVIEW
@@ -395,7 +394,7 @@ def _review_rows(run_dir: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
 
-def test_review_runs_on_level_completion_and_next_action_receives_markdown(tmp_path: Path) -> None:
+def test_review_runs_on_level_completion_and_next_action_receives_pattern(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     review = _VALID_REVIEW
     client = _FakeClient(
@@ -410,10 +409,13 @@ def test_review_runs_on_level_completion_and_next_action_receives_markdown(tmp_p
     assert env.resets == 0
     assert metrics["actions"] == 1
     assert metrics["review_count"] == 1
-    assert client.response_formats == ["json_object", None, "json_object"]
+    assert client.response_formats == ["json_object", "json_object", "json_object"]
     assert "A cue is visible." in client.calls[2][0]
     assert "evidence_ids" not in client.calls[2][0]
-    assert (tmp_path / "state/games/fixture/MEMORY.md").read_text().strip() == review
+    view = (tmp_path / "state/games/fixture/MEMORY.md").read_text()
+    assert "## 2. Confirmed Mechanics" in view
+    assert "A cue is visible." in view
+    assert "T2" in view
     review_row = _review_rows(run_dir)[0]
     assert review_row["status"] == "saved"
     assert review_row["trigger_reasons"] == ["level_completed"]
@@ -470,7 +472,7 @@ def test_simultaneous_review_triggers_are_coalesced(tmp_path: Path) -> None:
 
     rows = _review_rows(tmp_path / "run")
     assert metrics["review_count"] == 1
-    assert len([value for value in client.response_formats if value is None]) == 1
+    assert len(client.response_formats) == 2
     assert rows[0]["trigger_reasons"] == ["level_completed", "action_interval"]
 
 
@@ -483,7 +485,6 @@ def test_failed_review_preserves_memory_resets_interval_and_continues(tmp_path: 
         [{"op": "upsert", "id": "P1", "type": "pattern", "claim": "Prior durable finding."}],
         current_step=0,
     )
-    previous_view = memory.view_path.read_text()
     client = _FakeClient(
         [_decision([_action()] * 4), _decision([_action()] * 2)],
         review_errors=[RuntimeError("review endpoint unavailable")],
@@ -499,7 +500,7 @@ def test_failed_review_preserves_memory_resets_interval_and_continues(tmp_path: 
     assert len(_review_rows(tmp_path / "run")) == 1
     assert _review_rows(tmp_path / "run")[0]["status"] == "failed"
     assert "review endpoint unavailable" in _review_rows(tmp_path / "run")[0]["error"]
-    assert memory.view_path.read_text() == previous_view
+    assert "Prior durable finding." in memory.view_path.read_text()
     assert "Prior durable finding." in client.calls[2][0]
 
 
@@ -512,10 +513,9 @@ def test_malformed_review_preserves_existing_memory(tmp_path: Path) -> None:
         [{"op": "upsert", "id": "P1", "type": "pattern", "claim": "Prior durable finding."}],
         current_step=0,
     )
-    previous_view = memory.view_path.read_text()
     client = _FakeClient(
         [_decision([_action()])],
-        review_responses=["# Game memory (generated view)\n\nOld layout."],
+        review_responses=["not json"],
     )
 
     metrics = run_live(
@@ -526,8 +526,8 @@ def test_malformed_review_preserves_existing_memory(tmp_path: Path) -> None:
     assert metrics["review_count"] == 1
     row = _review_rows(tmp_path / "run")[0]
     assert row["status"] == "failed"
-    assert "exactly the four required headings" in row["error"]
-    assert memory.view_path.read_text() == previous_view
+    assert "not valid JSON" in row["error"]
+    assert "Prior durable finding." in memory.view_path.read_text()
 
 
 def test_terminal_level_completion_is_reviewed_without_resuming_play(tmp_path: Path) -> None:
