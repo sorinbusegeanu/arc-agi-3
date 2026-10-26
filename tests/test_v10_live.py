@@ -680,6 +680,25 @@ def test_action_calls_append_only_observations_and_exact_assistant_responses(tmp
     assert "CURRENT SCREEN" in messages[2][-1]["content"][1]["text"]
 
 
+def test_memory_revision_updates_existing_action_conversation_without_reset(tmp_path: Path) -> None:
+    client = _FakeClient([_decision([_action("up")]), _decision([_action("up")])])
+    metrics = _run_live_without_starting_routine(
+        _FakeEnv(), tmp_path / "memory-update", client, game_id="fixture",
+        max_actions=2, plan_horizon=1, review_interval=1,
+    )
+
+    assert metrics["review_count"] == 1
+    assert len(client.message_calls) == 2
+    first, second = [call["messages"] for call in client.message_calls]
+    assert second[:-1] == [*first, {"role": "assistant", "content": client.response_contents[0]}]
+    assert client.message_calls[0]["conversation_reset_count"] == 1
+    assert client.message_calls[1]["conversation_reset_count"] == 1
+    updated_user = _message_user_text(client, 1)
+    assert "Authoritative memory update" in updated_user
+    assert _VALID_GAME_MEMORY in updated_user
+    assert _VALID_GLOBAL_MEMORY in updated_user
+
+
 def test_default_plan_horizon_runs_eight_actions(tmp_path: Path) -> None:
     client = _FakeClient([_decision([_action()] * 8)])
     metrics = _run_live_without_starting_routine(
@@ -1917,7 +1936,7 @@ def test_interval_review_waits_until_the_eight_action_plan_finishes(tmp_path: Pa
         "The next action starts from the preceding action's final produced screen.\n", 1,
     )[1].split("\n\nReview constraint:", 1)[0]
     assert len(json.loads(history_section)) == 24
-    assert "RESET restarts the whole game" in client.calls[-1][0]
+    assert '"id":"RESET"' in client.calls[-1][0]
     assert "choose RESET alone" not in client.calls[-1][0]
 
 
@@ -2024,8 +2043,18 @@ def test_model_selected_reset_restarts_startup_bootstrap_flow(tmp_path: Path) ->
         "ACTION1", "ACTION3", "ACTION2", "ACTION4", "ACTION1",
         "ACTION1", "ACTION3", "ACTION2", "ACTION4", "ACTION1",
     )]
-    bootstrap_prompts = [prompt for prompt, _paths, _labels in client.calls if "bootstrap observations below" in prompt]
+    bootstrap_prompts = [prompt for prompt, _paths, _labels in client.calls if "bootstrap" in prompt.casefold()]
     assert len(bootstrap_prompts) == 2
+    assert "Bootstrap action outcomes" in bootstrap_prompts[1]
+    messages = [call["messages"] for call in client.message_calls]
+    assert messages[2][:-1] == [*messages[1], {
+        "role": "assistant", "content": client.response_contents[1],
+    }]
+    reset_bootstrap_turn = messages[2][-1]
+    assert len([block for block in reset_bootstrap_turn["content"] if block.get("type") == "image_url"]) >= 5
+    labels = [block["text"] for block in reset_bootstrap_turn["content"] if block.get("type") == "text"]
+    assert all(any(f"Action {number} (" in label for label in labels) for number in range(1, 5))
+    assert "CURRENT SCREEN" in labels[-1]
 
 
 def test_budget_expiration_does_not_trigger_interval_review(tmp_path: Path) -> None:
@@ -2236,15 +2265,15 @@ def test_game_over_with_budget_remaining_resets_and_repeats_startup_bootstrap(
     bootstrap_prompts = [
         (prompt, paths, labels)
         for prompt, paths, labels in client.calls
-        if any("Bootstrap for level index 0" in label for label in labels)
+        if "bootstrap observations below" in prompt or any("Bootstrap Screen" in label for label in labels)
     ]
     assert len(bootstrap_prompts) == 2
     retry_prompt, retry_images, retry_labels = bootstrap_prompts[1]
-    assert "bootstrap observations" in retry_prompt
-    assert "must start from this current screen" in retry_prompt
-    assert "previous_attempt_post_mortem" in retry_prompt
+    assert "Bootstrap action outcomes" in retry_prompt
+    assert "restored CURRENT SCREEN" in retry_prompt
+    assert "New post-mortem findings" in retry_prompt
     assert "Do not repeat the ineffective path" in retry_prompt
-    assert 1 <= len(retry_images) <= 3
+    assert len(retry_images) >= 5
     assert "CURRENT SCREEN" in retry_labels[-1]
 
 

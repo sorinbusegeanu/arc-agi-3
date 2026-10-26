@@ -1649,9 +1649,16 @@ def _action_conversation_observation(
     horizon: int,
     no_progress_actions: int = 0,
     previous_plan: Mapping[str, Any] | None = None,
+    bootstrap_transitions: Sequence[Mapping[str, Any]] = (),
+    memory_update: tuple[str, str] | None = None,
+    post_mortem_update: str = "",
 ) -> tuple[str, list[Path], list[str]]:
     """Build one turn containing only unreported execution and the current screen."""
-    events = _action_observation_events(records)
+    bootstrap_ids = {str(row.get("evidence_id")) for row in bootstrap_transitions}
+    events = _action_observation_events([
+        row for row in records if str(row.get("evidence_id")) not in bootstrap_ids
+    ])
+    bootstrap_events = _action_observation_events(bootstrap_transitions)
     legal_actions = _public_actions(current.get("legal_actions", []))
     if tools.supports_reset:
         legal_actions.append({
@@ -1694,14 +1701,38 @@ def _action_conversation_observation(
         + ("\nExecution stopped: " + str(plan.get("stop_reason")) if plan.get("stop_reason") else "")
         + "\nChoose the next legal action sequence from CURRENT SCREEN. Follow the existing JSON contract."
     )
-    image_paths: list[Path] = []
-    image_labels: list[str] = []
-    image_id = current.get("frame_image_id")
-    if isinstance(image_id, str) and tools.frames.exists(image_id):
-        image_paths.append(tools.frames.path_of(image_id))
-        image_labels.append(
-            f"CURRENT SCREEN: actual game state after {len(events)} newly recorded environment events"
+    if bootstrap_transitions:
+        prompt += (
+            "\nThe following ordered directional bootstrap observations were collected, then the game was reset and restored. "
+            "Use it as probe evidence, but propose actions from the restored CURRENT SCREEN, not from its final probe screen."
+            "\nBootstrap action outcomes: "
+            + json.dumps(bootstrap_events, ensure_ascii=False, separators=(",", ":"))
         )
+    if memory_update is not None:
+        game_markdown, global_markdown = memory_update
+        prompt += (
+            "\n\nAuthoritative memory update: these current documents supersede earlier versions in this conversation. "
+            "Retain the rest of the conversation and use these documents from now on.\nGame MEMORY.md:\n"
+            + (game_markdown or "(empty)")
+            + "\n\nGlobal MEMORY.md:\n"
+            + (global_markdown or "(empty)")
+        )
+    if post_mortem_update:
+        prompt += "\n\nNew post-mortem findings from the previous attempt:\n" + post_mortem_update.strip()
+    if bootstrap_transitions:
+        image_paths, image_labels, _ = _action_screen_sequence(
+            bootstrap_transitions, current.get("frame_image_id"), tools.frames,
+            label_prefix="Bootstrap", current_label="restored starting screen",
+        )
+    else:
+        image_paths = []
+        image_labels = []
+        image_id = current.get("frame_image_id")
+        if isinstance(image_id, str) and tools.frames.exists(image_id):
+            image_paths.append(tools.frames.path_of(image_id))
+            image_labels.append(
+                f"CURRENT SCREEN: actual game state after {len(events)} newly recorded environment events"
+            )
     return prompt, image_paths, image_labels
 
 
@@ -2116,6 +2147,7 @@ def run_live(
     fallback_rng = random.Random(int(seed))
     action_conversation: list[dict[str, Any]] = []
     action_conversation_level_key: str | None = None
+    action_conversation_level_changed_since_request = False
     action_conversation_reset_generation: int | None = None
     action_conversation_memory_hash: str | None = None
     action_conversation_evidence_cursor = len(tools.history.records())
@@ -2125,6 +2157,7 @@ def run_live(
     action_conversation_last_completion_tokens: int | None = None
     action_conversation_last_reasoning: dict[str, Any] | None = None
     action_conversation_pending_feedback = ""
+    action_conversation_post_mortem_guidance = ""
     action_conversation_stats = {
         "calls": 0, "prompt_tokens": 0, "cached_prompt_tokens": 0,
         "newly_processed_prompt_tokens": 0, "prompt_processing_latency_ms": 0.0,
@@ -2211,11 +2244,15 @@ def run_live(
         records = tools.history.records()
         level_scope = level_key(current)
         memory_hash = _memory_revision_hash(memory_store_dir, state_root)
+        reset_since_previous_request = (
+            action_conversation_reset_generation is not None
+            and action_conversation_reset_generation != tools.reset_generation
+        )
+        level_changed_since_request = action_conversation_level_changed_since_request
+        same_level = action_conversation_level_key == level_scope
         same_context = bool(
             action_conversation and not force_fresh
-            and action_conversation_level_key == level_scope
-            and action_conversation_reset_generation == tools.reset_generation
-            and action_conversation_memory_hash == memory_hash
+            and (same_level or (reset_since_previous_request and not level_changed_since_request))
         )
         if same_context:
             context_limit = context_window_tokens
@@ -2233,10 +2270,23 @@ def run_live(
         cursor_for_next_request = len(records)
         if same_context:
             new_records = records[action_conversation_evidence_cursor:]
+            memory_update = None
+            if memory_hash != action_conversation_memory_hash:
+                game_memory_path = memory_store_dir / "MEMORY.md"
+                game_markdown = game_memory_path.read_text(encoding="utf-8").strip() if game_memory_path.is_file() else ""
+                global_markdown = read_global_memory(state_root)
+                memory_update = (game_markdown, global_markdown)
+            new_post_mortem = (
+                post_mortem_guidance
+                if post_mortem_guidance != action_conversation_post_mortem_guidance else ""
+            )
             prompt, image_paths, image_labels = _action_conversation_observation(
                 tools, current, new_records, horizon=horizon,
                 no_progress_actions=no_progress_actions,
                 previous_plan=action_conversation_pending_plan,
+                bootstrap_transitions=bootstrap_observations_for_prompt,
+                memory_update=memory_update,
+                post_mortem_update=new_post_mortem,
             )
             if action_conversation_pending_feedback:
                 prompt += "\nPrevious request outcome: " + action_conversation_pending_feedback
@@ -2305,10 +2355,12 @@ def run_live(
     ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str | None]:
         nonlocal model_calls, total_latency, action_conversation
         nonlocal action_conversation_level_key, action_conversation_reset_generation
+        nonlocal action_conversation_level_changed_since_request
         nonlocal action_conversation_memory_hash, action_conversation_evidence_cursor
         nonlocal action_conversation_turns, action_conversation_last_prompt_tokens
         nonlocal action_conversation_last_completion_tokens, action_conversation_last_reasoning
         nonlocal action_conversation_pending_feedback
+        nonlocal action_conversation_post_mortem_guidance
         responses: list[dict[str, Any]] = []
         request_messages = [dict(message) for message in initial_messages]
         validation_error: str | None = None
@@ -2408,8 +2460,10 @@ def run_live(
                 request_messages.append({"role": "assistant", "content": str(response.get("content", ""))})
                 action_conversation = request_messages
                 action_conversation_level_key = level_key(current)
+                action_conversation_level_changed_since_request = False
                 action_conversation_reset_generation = tools.reset_generation
                 action_conversation_memory_hash = _memory_revision_hash(memory_store_dir, state_root)
+                action_conversation_post_mortem_guidance = post_mortem_guidance
                 action_conversation_evidence_cursor = cursor_for_next_request
                 action_conversation_turns = 1 if new_conversation else action_conversation_turns + 1
                 action_conversation_last_prompt_tokens = (
@@ -2593,12 +2647,15 @@ def run_live(
         before: Mapping[str, Any], action: Mapping[str, Any], result: Mapping[str, Any],
     ) -> dict[str, Any]:
         nonlocal level_start_observation, level_path_edges
+        nonlocal action_conversation_level_changed_since_request
         after = result["observation"]
         edge = solution_store.record_transition(
             before, str(action["action"]), action.get("args", {}), after,
             run_id=run_id,
         )
         level_path_edges.append(edge)
+        if action_conversation and level_key(before) != level_key(after):
+            action_conversation_level_changed_since_request = True
         previous_completed = before.get("levels_completed")
         current_completed = after.get("levels_completed")
         completed = (
