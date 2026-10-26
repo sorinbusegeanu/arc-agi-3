@@ -2265,7 +2265,7 @@ def run_live(
                 )
                 same_context = projected < int(context_limit * 0.80)
             else:
-                same_context = action_conversation_turns < 12
+                same_context = action_conversation_turns < 24
 
         cursor_for_next_request = len(records)
         if same_context:

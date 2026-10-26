@@ -699,6 +699,26 @@ def test_memory_revision_updates_existing_action_conversation_without_reset(tmp_
     assert _VALID_GLOBAL_MEMORY in updated_user
 
 
+def test_action_conversation_without_token_usage_compacts_after_24_turns(tmp_path: Path) -> None:
+    class NoUsageClient(_FakeClient):
+        def complete(self, *args, **kwargs):
+            result = super().complete(*args, **kwargs)
+            result["usage"]["prompt_tokens"] = None
+            return result
+
+    client = NoUsageClient([_decision([_action("up")]) for _ in range(25)])
+    _run_live_without_starting_routine(
+        _FakeEnv(), tmp_path / "24-turn-conversation", client, game_id="fixture",
+        max_actions=25, plan_horizon=1, review_interval=1000,
+    )
+
+    assert len(client.message_calls) == 25
+    assert len(client.message_calls[23]["messages"]) == 48
+    assert client.message_calls[23]["conversation_reset_count"] == 1
+    assert len(client.message_calls[24]["messages"]) == 2
+    assert client.message_calls[24]["conversation_reset_count"] == 2
+
+
 def test_default_plan_horizon_runs_eight_actions(tmp_path: Path) -> None:
     client = _FakeClient([_decision([_action()] * 8)])
     metrics = _run_live_without_starting_routine(
@@ -989,18 +1009,16 @@ def test_stagnation_guidance_remains_without_triggering_reviews(tmp_path: Path) 
 
     assert metrics["review_count"] == 0
     assert _review_rows(tmp_path / "run") == []
-    action_prompts = [
-        json.loads(prompt.split("Visible context:\n", 1)[1])
-        for prompt, _images, _labels in client.calls
-        if "Visible context:\n" in prompt
+    action_contexts = [
+        _continued_context(_message_user_text(client, index))
+        for index in range(1, len(client.message_calls))
     ]
-    recovery = next(ctx["stagnation"] for ctx in action_prompts if ctx["stagnation"]["recovery_guidance"])
-    assert recovery["consecutive_repeated_or_no_progress_actions"] >= 2
-    assert "choose RESET alone" in recovery["recovery_guidance"]
     recovery_context = next(
-        ctx for ctx in action_prompts if ctx["stagnation"]["recovery_guidance"]
+        ctx for ctx in action_contexts if ctx["state"]["recovery_guidance"]
     )
-    assert recovery_context["budgets"]["plan_horizon"] == 1
+    assert recovery_context["state"]["consecutive_repeated_or_no_progress_actions"] >= 2
+    assert "RESET alone" in recovery_context["state"]["recovery_guidance"]
+    assert recovery_context["state"]["plan_horizon"] == 1
 
 
 def test_stagnation_does_not_call_the_reviewer(tmp_path: Path) -> None:
