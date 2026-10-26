@@ -15,6 +15,7 @@ from v10.analysis import (
     run_analysis,
     score_recorded_plan,
     validate_model_decision,
+    validate_reasoned_action,
 )
 from v10 import cli as cli_module
 from v10.cli import build_parser
@@ -64,10 +65,23 @@ def _valid_decision(action: str = "down", args: dict | None = None) -> dict:
     return {"actions": [{"action": action, "args": args or {}}]}
 
 
+def _reasoned_decision(action: str = "down", args: dict | None = None) -> dict:
+    return {
+        "state_assessment": {
+            "player": {"location": "unknown", "certainty": "unknown", "evidence": "not visually identifiable"},
+            "target_candidates": [], "obstacles": [], "other_relevant_changes": [],
+        },
+        "hypothesis": None,
+        "trajectory_rationale": "Test one legal action and compare the next screen.",
+        "prediction": {"visible_change": "unknown", "environment_outcome": "unknown", "description": "unknown"},
+        "actions": [{"action": action, "args": args or {}}],
+    }
+
+
 class _FakeClient:
     def __init__(self, outputs: list[str] | None = None, decision: dict | None = None):
         self.outputs = list(outputs or [])
-        self.decision = decision or _valid_decision()
+        self.decision = decision or _reasoned_decision()
         self.calls = []
 
     def complete(self, system_prompt, user_prompt, image_paths, image_labels):
@@ -176,7 +190,7 @@ def test_analysis_retries_once_for_invalid_json_and_never_scores_before_validity
     _write_trace(trace)
     run_dir = tmp_path / "run"
     replay_trace(trace, run_dir)
-    client = _FakeClient(outputs=["not-json", json.dumps(_valid_decision())])
+    client = _FakeClient(outputs=["not-json", json.dumps(_reasoned_decision())])
 
     result = run_analysis(run_dir, client, through_action=4)
 
@@ -184,6 +198,21 @@ def test_analysis_retries_once_for_invalid_json_and_never_scores_before_validity
     assert result["initial_validation_error"].startswith("response is not valid JSON")
     assert len(client.calls) == 2
     assert "FUTURE_ONLY" not in client.calls[1][1]
+
+
+def test_analysis_repairs_legacy_action_only_shape_instead_of_migrating_it(tmp_path: Path) -> None:
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run_dir = tmp_path / "run"
+    replay_trace(trace, run_dir)
+    client = _FakeClient(outputs=[json.dumps(_valid_decision()), json.dumps(_reasoned_decision())])
+
+    result = run_analysis(run_dir, client, through_action=4)
+
+    assert result["repair_attempted"] is True
+    assert "reasoned action must contain exactly" in result["initial_validation_error"]
+    assert len(client.calls) == 2
+    assert "corrected JSON object using exactly the required structured fields" in client.calls[1][1]
 
 
 def test_action_only_response_rejects_unrequested_analysis_and_memory_fields(tmp_path: Path) -> None:
@@ -233,6 +262,61 @@ def test_action_response_respects_requested_plan_horizon(tmp_path: Path) -> None
             {"actions": [{"action": "up", "args": {}}, {"action": "down", "args": {}}]},
             context["legal_action_specs"], max_actions=1,
         )
+
+
+def test_reasoned_action_contract_requires_categorical_assessment_and_single_action_list(tmp_path: Path) -> None:
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run_dir = tmp_path / "run"
+    replay_trace(trace, run_dir)
+    context = build_analysis_input(run_dir, through_action=4)
+    payload = {
+        "state_assessment": {
+            "player": {"location": "center", "certainty": "inferred", "evidence": "visible in current screen"},
+            "target_candidates": [{
+                "description": "distinct object", "location": "upper area",
+                "relevance": "may be a goal", "certainty": "inferred",
+            }],
+            "obstacles": [{
+                "description": "boundary-like element", "location": "left edge",
+                "status": "suspected_blocked", "evidence": "one attempted move had no visible effect",
+            }],
+            "other_relevant_changes": [],
+        },
+        "hypothesis": {
+            "claim": "Moving down may affect the boundary-like element.",
+            "evidence": "the current screen shows it beside the player",
+            "uncertainty": "tentative",
+        },
+        "trajectory_rationale": "Test one legal action to distinguish movement from blockage.",
+        "prediction": {"visible_change": "yes", "environment_outcome": "no_terminal", "description": "the visible board changes"},
+        "actions": [{"action": "down", "args": {}}],
+    }
+
+    normalized = validate_reasoned_action(payload, context["legal_action_specs"], max_actions=1)
+
+    assert normalized["actions"][0]["action"] == "ACTION2"
+    assert normalized["hypothesis"]["uncertainty"] == "tentative"
+    payload["state_assessment"]["player"]["certainty"] = 0.9
+    with pytest.raises(DecisionValidationError, match="certainty must be"):
+        validate_reasoned_action(payload, context["legal_action_specs"], max_actions=1)
+    with pytest.raises(DecisionValidationError, match="exactly"):
+        validate_reasoned_action({"actions": [{"action": "down", "args": {}}]}, context["legal_action_specs"])
+
+
+def test_offline_analysis_uses_same_reasoned_contract_and_records_full_decision(tmp_path: Path) -> None:
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run_dir = tmp_path / "run"
+    replay_trace(trace, run_dir)
+    client = _FakeClient()
+
+    result = run_analysis(run_dir, client, through_action=4)
+
+    assert result["decision_schema"] == "v10.reasoned_action/1"
+    assert result["decision"]["state_assessment"]["player"]["certainty"] == "unknown"
+    assert result["decision"]["actions"] == [{"action": "ACTION2", "args": {}}]
+    assert "Required response shape (`v10.reasoned_action/1`)" in client.calls[0][1]
 
 
 def test_model_memory_context_is_capped_at_five_entries(tmp_path: Path) -> None:
@@ -380,6 +464,11 @@ def test_strata_client_sends_labeled_images_and_parses_usage(tmp_path: Path) -> 
     response_record = json.loads((tmp_path / "run" / "model_responses.jsonl").read_text().splitlines()[0])
     assert request_record["payload"]["messages"][0]["content"] == "system"
     assert request_record["payload"]["messages"][1]["content"][0]["text"] == "user"
+    assert request_record["system_prompt_characters"] == len("system")
+    assert request_record["user_text_characters"] == len("user") + len("initial frame")
+    assert request_record["prompt_characters"] == len("system") + len("user") + len("initial frame")
+    assert request_record["user_prompt_characters"] == len("user")
+    assert request_record["image_count"] == 1
     assert "test-key" not in json.dumps(request_record)
     assert response_record["body"] == response_body.decode()
 
@@ -394,7 +483,9 @@ def test_model_logging_cli_flags_default_off_and_enable_independently() -> None:
     assert defaults.log_request is False
     assert defaults.log_response is False
     assert defaults.reset_memory is False
-    assert defaults.review_interval == 50
+    assert defaults.review_interval == 20
+    assert defaults.global_memory_max_chars == 6000
+    assert defaults.plan_horizon == 8
     assert enabled.log_request is True
     assert enabled.log_response is True
     reset = parser.parse_args([
@@ -405,6 +496,14 @@ def test_model_logging_cli_flags_default_off_and_enable_independently() -> None:
         "live", "--game-id", "ez01", "--run-dir", "run", "--review-interval", "12",
     ])
     assert configured.review_interval == 12
+    configured_memory = parser.parse_args([
+        "live", "--game-id", "ez01", "--run-dir", "run", "--global-memory-max-chars", "7200",
+    ])
+    assert configured_memory.global_memory_max_chars == 7200
+    configured_horizon = parser.parse_args([
+        "live", "--game-id", "ez01", "--run-dir", "run", "--plan-horizon", "8",
+    ])
+    assert configured_horizon.plan_horizon == 8
 
 
 def test_live_reset_memory_flag_clears_persistent_memory_before_run(tmp_path: Path, monkeypatch) -> None:
@@ -494,6 +593,9 @@ def test_strata_client_falls_back_when_strata_rejects_json_mode_output(tmp_path:
     logged_responses = [json.loads(line) for line in (tmp_path / "model_responses.jsonl").read_text().splitlines()]
     assert len(logged_requests) == len(logged_responses) == 2
     assert [row["status"] for row in logged_responses] == [502, 200]
+    assert result["request_ids"] == [row["request_id"] for row in logged_requests]
+    assert all(row["payload_bytes"] > 0 and row["image_count"] == 0 for row in logged_requests)
+    assert all(row["latency_seconds"] >= 0 and row["timestamp_utc"] for row in logged_responses)
 
 
 def test_strata_client_can_omit_json_response_format_for_review_markdown(monkeypatch) -> None:
@@ -536,3 +638,20 @@ def test_strata_malformed_envelope_raises_request_error(monkeypatch, body: str) 
     client = StrataClient("http://strata.example", "qwen-test")
     with pytest.raises(StrataRequestError, match="invalid Strata response"):
         client.complete("system", "user")
+
+
+def test_offline_memory_limit_changes_the_actual_prompt(tmp_path):
+    from v10.tools.memory import game_memory_dir, save_game_memory
+    trace = tmp_path / "trace.jsonl"
+    _write_trace(trace)
+    run = tmp_path / "replay"
+    replay_trace(trace, run)
+    state = tmp_path / "state"
+    save_game_memory(game_memory_dir(state, "fixture"), "First observation.\n\nSecond observation.\n\nThird observation.")
+    none = build_analysis_input(run, through_action=2, state_dir=state, memory_context_entries=0)
+    one = build_analysis_input(run, through_action=2, state_dir=state, memory_context_entries=1)
+    all_memory = build_analysis_input(run, through_action=2, state_dir=state, memory_context_entries=5)
+    assert none["context"]["memory"] == ""
+    assert one["context"]["memory"] == "First observation.\n"
+    assert "Third observation." in all_memory["context"]["memory"]
+    assert len({row["user_prompt"] for row in (none, one, all_memory)}) == 3

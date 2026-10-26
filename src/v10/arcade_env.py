@@ -43,15 +43,17 @@ class ArcadeGameEnv:
             raise RuntimeError(f"ARC environment reset returned no observation for {self.game_id}")
 
     @staticmethod
-    def _grid(frame: Any) -> np.ndarray:
+    def _frames(frame: Any) -> list[np.ndarray]:
         array = np.asarray(frame)
-        if array.ndim == 3 and (array.shape[0] == 1 or array.shape[-1] not in (3, 4)):
-            if array.shape[0] < 1:
-                raise ValueError("ARC observation contains an empty temporal frame stack")
-            array = array[-1]
-        if array.ndim != 2:
-            raise ValueError(f"ARC observation frame must reduce to a 2-D grid, got {array.shape}")
-        return array
+        if array.ndim == 2:
+            return [array]
+        if array.ndim == 3 and array.shape[0] > 0:
+            return [array[index] for index in range(array.shape[0])]
+        raise ValueError(f"ARC observation must contain 2-D grids, got {array.shape}")
+
+    @staticmethod
+    def _grid(frame: Any) -> np.ndarray:
+        return ArcadeGameEnv._frames(frame)[-1]
 
     @staticmethod
     def _action_enum() -> Any:
@@ -69,9 +71,17 @@ class ArcadeGameEnv:
         for raw_id in available:
             action_id = int(getattr(raw_id, "value", raw_id))
             action = action_enum.from_id(action_id)
+            parameters = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
+            if str(action.name) == "ACTION6":
+                height, width = self._grid(frame).shape
+                parameters["properties"] = {
+                    "x": {"type": "integer", "minimum": 0, "maximum": width - 1},
+                    "y": {"type": "integer", "minimum": 0, "maximum": height - 1},
+                }
+                parameters["required"] = ["x", "y"]
             legal_actions.append({
                 "id": str(action.name), "_environment_id": action_id,
-                "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+                "parameters": parameters,
             })
         state = _state_name(_field(raw, "state"))
         levels_completed = _field(raw, "levels_completed")
@@ -98,7 +108,8 @@ class ArcadeGameEnv:
         self._raw_observation = self._env.step(action, data=data, reasoning=None)
         if self._raw_observation is None:
             raise RuntimeError("ARC environment step returned no observation")
-        return {"state": _state_name(_field(self._raw_observation, "state"))}
+        return {"state": _state_name(_field(self._raw_observation, "state")),
+                "frames": self._frames(_field(self._raw_observation, "frame"))[:-1]}
 
     def reset(self) -> dict[str, Any]:
         self._raw_observation = self._env.reset()

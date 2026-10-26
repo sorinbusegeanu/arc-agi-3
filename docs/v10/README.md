@@ -1,6 +1,6 @@
-# Hydra Next — Replay, Analysis, and Live Runs
+# V10 — Live Runs, Replay, and Memory
 
-This package implements replay, offline analysis, bounded live play, and incremental game memory described in `DESIGN.md` v0.5. It converts traces to evidence, sends prefix-bounded multimodal context to a configured OpenAI-compatible Strata endpoint, validates JSON decisions, and executes live actions only through budgeted game tools.
+This package implements replay, offline analysis, bounded live play, and persistent game memory described in [`DESIGN.md`](DESIGN.md) v0.10. It converts traces to evidence, sends prefix-bounded multimodal context to a configured OpenAI-compatible Strata endpoint, validates JSON decisions, and executes live actions only through budgeted game tools.
 
 ## Requirements
 
@@ -11,7 +11,8 @@ Python 3.12+, `numpy`, and Pillow (provided by the ARC-AGI dependency). No MCP s
 - `GameTools(env, run_dir).observe()` / `.act(action, args)` / `.reset(justification=...)`
 - `pixel_diff(before, after)` / `delta_image(before, after)`
 - `History(run_dir).append(record)` / `.query(action=..., limit=..., through_step=...)`
-- `GameMemory(run_dir, store_dir=...).read()` / `.propose_update(patches)`
+- `save_game_memory(store_dir, markdown)` / `save_global_memory(state_dir, markdown)`
+- `GameMemory(...).record_review_checkpoint(...)` / `.record_markdown_revision(...)` (historical ledger)
 - `validate_decision(payload, legal_actions)`
 - `replay_trace(trace_path, run_dir, through_action=None)`
 - `build_analysis_input(run_dir, through_action=4)` / `run_analysis(run_dir, client, through_action=4)`
@@ -39,11 +40,11 @@ The client reads `STRATA_API_KEY` from the environment. Analysis and live runs d
 
 ## Persistent skill and game memory
 
-The shared/global action instructions are `skills/SKILL.md` and are referenced by hash in each run manifest; they are no longer copied into disposable run directories. Shared reusable lessons live in `skills/global/MEMORY.md`; game memory lives under `skills/games/<game-id>/`. Reviews return concise game and global Markdown fields; Python validates their sizes and atomically saves each file. These saved files are authoritative for action and replay guidance and are read verbatim. The append-only `memory.jsonl` ledger retains historical revisions, run state, legacy review text, and review checkpoints; it is not rendered into prompts. Exact successful routes and state compatibility remain in `level_solutions.jsonl`. Review checkpoints store covered event counts so repeated reviews remain idempotent. `V10_STATE_DIR` or `--state-dir` can override the persistent root. Project-local memory files can be versioned with Git.
+The shared/global action instructions are `skills/SKILL.md` and are referenced by hash in each run manifest; they are no longer copied into disposable run directories. Shared reusable lessons live in `skills/global/MEMORY.md`; game memory lives under `skills/games/<game-id>/`. Reviews return concise game and global Markdown fields; Python validates their sizes and atomically saves each file. These saved files are authoritative for action guidance. Live action prompts load both files in full; offline replay analysis uses the configured excerpt of game Markdown and does not currently load global Markdown. The append-only `memory.jsonl` ledger retains exact game/global Markdown revisions, run state, legacy review text, and review checkpoints; it is not rendered into prompts. Exact successful routes and state compatibility remain in `level_solutions.jsonl`. Review checkpoints store covered event counts so repeated reviews remain idempotent. `V10_STATE_DIR` or `--state-dir` can override the persistent root. Project-local memory files can be versioned with Git.
 
 ## Phase 4: ablations
 
-Compare pixels/actions with and without up to five read-only memory entries using one output-token budget and one replay cut:
+Compare pixels/actions with and without up to five complete Markdown blocks of read-only memory using one output-token budget and one replay cut:
 
 ```sh
 PYTHONPATH=src python -m v10.cli ablate --run-dir runs/v10/ez01-replay \
@@ -70,15 +71,51 @@ The Cartesian product is evaluated and appended to `optimization_runs.jsonl`. Ea
 PYTHONPATH=src:other_repos/arc-agi:other_repos/ARCEngine python -m v10.cli live \
   --game-id ez01 \
   --run-dir runs/v10/ez01-live \
-  --seed 0 --max-actions 30 --max-resets 1 --plan-horizon 4 --review-interval 50 \
+  --seed 0 --max-actions 30 --plan-horizon 8 \
   --reasoning-effort medium --timeout-seconds 300 --max-output-tokens 4096
 ```
 
-The live command clears existing contents from its `--run-dir` before starting; it refuses protected locations and symlink run directories. `--game-id` selects the game, `--max-actions` sets the total action limit, `--plan-horizon` sets how many actions the model may return at once (1–4), and `--review-interval` sets the action count between experience reviews (default: 50). `--game-memory-max-chars` and `--global-memory-max-chars` set the maximum accepted review-output sizes (defaults: 2000 and 1000). Reviews also run after level completion, `WIN`, unexpected legacy pattern predictions, or stagnation (at least three actions without progress plus repeated states/actions). Stagnation reviews require at least three fresh actions before retriggering. Simultaneous triggers produce one review. A review interrupts the remaining planned actions; the runner asks for a fresh action decision after review. Review does not advance or reset the game. It stores review triggers, transition coverage, result status, and timing in `reviews.jsonl`; `metrics.json` reports action and review usage separately. Invalid or failed reviews leave prior Markdown files intact and the game loop continues. Successful level routes are saved before review and remain available if review fails.
+The repository launcher forwards options to the same live CLI:
 
-The runner prints the current level, action count, each planned and executed action, and inference time to stderr while running. Startup checks saved success routes by level and starting screen: an exact match is replayed, while a route for the same level from a different screen skips bootstrap and is supplied as guidance to the model. Bootstrap runs only when no verified route exists for the current level. It runs the standard directional bootstrap, records its observations, resets to the initial screen, then makes one action-only model call. That call receives the complete ordered bootstrap screens and saved game/global Markdown and is told to plan from the reset initial screen, not from the bootstrap's final screen. Later action prompts also receive the complete ordered screens from recent actions, including every intermediate environment frame; review keeps its separate image selection. The default `--max-resets` is 1 to cover the bootstrap reset; setting it to 0 disables reset-based startup. All later prompts use the ordinary action prompt. Directional actions are shown as `up`, `down`, `left`, and `right` in console output and run logs; the adapter still sends the corresponding environment IDs. It stores a run manifest, rendered frames, append-only transition history, decisions and plan outcomes, and `metrics.json`; the action model receives recent outcomes and the saved game/global Markdown as read-only context, with no duplicate strategy payload. Review calls write the two Markdown files and append a JSONL checkpoint. The model returns only an `actions` array with legal action names and arguments. The four movement actions are presented as `up`, `down`, `left`, and `right`, and the model must return those exact lowercase words; the harness converts them to environment IDs `ACTION1`–`ACTION4`. Other legal actions, including `RESET`, retain their listed names. Actions are revalidated against each observation; plans stop on level changes, terminal states, action errors, budget exhaustion, or illegal next actions. Verified successful trajectories are stored per level and exact starting state; the shortest verified success for that start is replayed, and complete prior winning run logs are validated and imported at startup. Same-level routes from another start guide the model but are never replayed. Cached actions stop on divergence or illegality and return to model selection. When reset budget is available, `RESET` is listed as a legal pseudo-action and must be returned alone with a justification in `args`. If the model decision and its single repair attempt both fail validation, the runner logs the rejection, takes a seeded-random legal action when its required arguments can be generated from the action schema, records that transition, and resumes the model loop. If no safe fallback action can be generated, the run stops. On interruption, completed evidence and saved routes remain intact and `metrics.json` records `stop_reason=interrupted` without launching a shutdown review.
+```sh
+src/start_live.sh --game-id ez01 --run-dir runs/v10/ez01_100 \
+  --max-actions 100 --plan-horizon 8 --log-request --log-response
+```
 
-Pass `--reset-memory` to a live run for a clean memory restart. It removes `global/MEMORY.md` and all game-specific memory and solution stores under `<state-dir>/games/` before starting; it leaves `skills/SKILL.md`, unrelated files under `global/`, and the run directory alone.
+### Planning horizon
+
+`--plan-horizon N` sets the maximum number of actions the model may propose per call. The default is **8**, and the accepted range is **1–8**. A plan can contain fewer actions and can end early on a level change, terminal state, invalid next action, replay divergence, or a known no-op in a multi-action plan. A single-action experiment may repeat an input to test delayed effects.
+
+The horizon does not change the eight-transition history window. Each action prompt includes every screen for those recent transitions, including intermediate environment frames. Interval reviews include the full active-level history and all its screens. When the default 20-action threshold is reached during an eight-action plan, the review waits for that plan to end—for example, at action 24 after three uninterrupted plans. Budget exhaustion does not trigger a review.
+
+Live CLI defaults:
+
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `--base-url` | `http://127.0.0.1:8080` | Strata OpenAI-compatible endpoint |
+| `--model` | `qwen3.8-flash-next-iq3_s` | Deployed model identifier |
+| `--seed` | `0` | Seed for environment and safe random fallback actions |
+| `--max-actions` | `30` | Total action budget, including bootstrap and route replay |
+| `--plan-horizon` | `8` | Maximum actions per plan; accepted range is 1–8 |
+| `--review-interval` | `20` | Review after this many active-play actions without level completion |
+| `--timeout-seconds` | `300` | Per-request timeout |
+| `--max-output-tokens` | `4096` | Maximum generated tokens, including reasoning and JSON output |
+| `--reasoning-effort` | `medium` | Strata reasoning effort (`none`, `low`, `medium`, or `high`) |
+| `--reasoning-budget-tokens` | unset | Optional positive cap on reasoning tokens |
+| `--game-memory-max-chars` | `2000` | Maximum accepted game Markdown size |
+| `--global-memory-max-chars` | `6000` | Maximum accepted global Markdown size |
+| `--memory-context-entries` | `5` | Compatibility option (0–5); recorded in metrics and does not limit saved Markdown |
+| `--log-request`, `--log-response` | off | Write request and/or raw response attempts into the run directory |
+
+Requests use temperature 0. Action plans and memory reviews use JSON response mode; game-over post-mortems return plain Markdown. `--reset-memory` clears game memory, saved routes, and global memory before startup. `--state-dir` overrides the default project `skills/` persistence root; `--skill` selects another shared action-instructions file.
+
+The live command clears existing contents from its `--run-dir` before starting; it refuses protected locations, symlink run directories, and overlap with game/global persistence or the skill source. `--game-id` selects the game, `--max-actions` sets the total action limit, and `--plan-horizon` sets how many actions the model may return at once (default 8, range 1–8). `--review-interval` defaults to 20 actions. Once that many active-play actions have elapsed, review waits until the current action plan ends; it does not cut a plan short. An interval review receives the complete ordered action/outcome history from the active level's start and every available screen, including intermediate frames and the current screen. A level-completion review likewise receives every screen from the completed level's full action history, including the completion transition. A level-completion review takes precedence. Budget exhaustion does not trigger an assessment. `GAME_OVER` uses its separate post-mortem before restart when budget remains. Stagnation still guides action selection and limits plans to one action while recovering; it does not independently trigger a review. After a review, the next normal action prompt asks whether to reset or continue: continuing returns a fresh plan for the current screen; choosing reset restarts the normal startup flow. An exact verified-route match is replayed, a route for a different starting screen is provided as guidance, and bootstrap runs only when no verified route exists for the level. Startup bootstrap planning itself retains its no-reset instruction. `--game-memory-max-chars` and `--global-memory-max-chars` set the maximum accepted review-output sizes (defaults: 2000 and 6000). A nonterminal level replayed entirely from a verified route may skip its prose review when persistent game memory already exists; terminal `WIN` always receives final consolidation. Review does not advance or reset the game. It stores review triggers, transition coverage, result status, and timing in `reviews.jsonl`; `metrics.json` reports action and review usage separately. Invalid or failed reviews leave prior Markdown files intact and the game loop continues. Successful level routes are saved before review and remain available if review fails.
+
+The runner prints the current level, action count, each planned and executed action, and inference time to stderr while running. On the initial level, an exact verified-route match is replayed immediately; a route for the same level from another starting screen is supplied as guidance without replay. If no route exists, the runner bootstraps, resets, then calls the model with ordered bootstrap screens and the restored initial screen. On every later level, it also bootstraps, resets the game, replays exact verified routes for earlier solved levels, then calls the model from the restored start of the bootstrapped level. Missing routes or replay divergence stop restoration rather than presenting a mismatched screen. Bootstrap and replay actions count against `--max-actions`. Resets have no separate budget; `RESET` is available whenever the environment supports it. A `GAME_OVER` triggers a dedicated post-mortem (not a memory review) with the complete active-level action sequence and every available screen in chronological order, including intermediate environment frames, with action entries cross-referencing their source and produced screen numbers; its diagnosis is logged and supplied to the retry prompts before the game resets when budget remains. `WIN` stops without restarting. `metrics.json` includes post-mortem usage and `game_over_restarts`. Action prompts include ordered screens from recent actions, including intermediate frames. Screen and action numbers cross-reference the source screen for each action and all intermediate/result screens it produced. Interval and level-completion reviews include every available screen from the complete action sequence they review, with the corresponding full ordered action history and shared action/screen references. All later prompts use the ordinary action prompt. Directional actions are shown as `up`, `down`, `left`, and `right` in console output and run logs; the adapter still sends the corresponding environment IDs. It stores a run manifest, rendered frames, append-only transition history, decisions and plan outcomes, and `metrics.json`; the action model receives recent outcomes and the saved game/global Markdown as read-only context, with no duplicate strategy payload. Review calls write the two Markdown files and append a JSONL checkpoint. The model returns only an `actions` array with legal action names and arguments. The four movement actions are presented as `up`, `down`, `left`, and `right`, and the model must return those exact lowercase words; the harness converts them to environment IDs `ACTION1`–`ACTION4`. Other legal actions, including `RESET`, retain their listed names. Actions are revalidated against each observation; plans stop on level changes, terminal states, action errors, budget exhaustion, or illegal next actions. Verified successful trajectories are stored per level and exact starting state; the shortest verified success for that start is replayed, and complete prior winning run logs are validated and imported at startup. Same-level routes from another start guide the model but are never replayed. Cached actions stop on divergence or illegality and return to model selection. Diverged steps are suspended from ordinary route selection for the rest of the run. `RESET` is listed as a legal pseudo-action whenever the environment supports it, has no separate budget, and must be returned alone with a justification in `args`. Stagnation summaries expose repeated states and ineffective actions; after stagnation the prompt directs the model to try a different action or reset. Object roles, goal identity, and completion rules stay scoped to levels where they were tested. Before each planned action in a multi-action sequence, the harness checks the full active-level history and stops before a known same-screen no-op with the same arguments; single-action experiments can repeat inputs to test delayed effects; if model output remains invalid and every real parameterless action is a known no-op, fallback recovery resets the game. Action prompts use only the eight most recent active-level transitions, retaining all intermediate frames for those transitions. If the model decision and its single repair attempt both fail validation, the runner logs the rejection, takes a seeded-random legal action when its required arguments can be generated from the action schema, records that transition, and resumes the model loop. If no safe fallback action can be generated, the run stops. On interruption, completed evidence and saved routes remain intact and `metrics.json` records `stop_reason=interrupted` without launching a shutdown review.
+
+The eight-action horizon controls how many actions the model may plan before the next decision. The next action prompt carries up to eight recent active-level transitions, including all intermediate frames; after eight uninterrupted actions this is at least nine ordered screens (the starting screen and one after each action), plus any extra frames returned by the environment. Interval reviews attach every screen from the active level's full action history. Level changes, resets, terminal states, errors, and known no-ops can interrupt a plan earlier.
+
+Pass `--reset-memory` to a live run for a clean memory restart. Historical route import and legacy ledger migration are disabled for that run, so old logs cannot immediately restore cleared knowledge. It removes `global/MEMORY.md` and all game-specific memory and solution stores under `<state-dir>/games/` before starting; it leaves `skills/SKILL.md`, unrelated files under `global/`, and the run directory alone.
 
 Strata's per-request `reasoning_effort` defaults to `medium`, which enables the model's thinking phase. Use `--reasoning-effort none` to disable thinking, or choose `low` or `high`. Set `--reasoning-budget-tokens` to a positive value for a hard cap on thinking. `--max-output-tokens` caps reasoning plus the final JSON response. If Strata rejects a generated answer as malformed in JSON mode, the client retries once without server-side JSON validation; v10 then validates the returned text and can request its existing corrective response.
 
@@ -89,3 +126,37 @@ For an individual `live`, `analyze`, `ablate`, or `optimize` invocation, add `--
 ```sh
 PYTHONPATH=src pytest -q tests/test_v10_replay.py tests/test_v10_analysis.py tests/test_v10_memory_integrity.py tests/test_v10_live.py
 ```
+
+### Reading the sequence and logs
+
+Screens and actions are numbered separately within each supplied sequence. Each action record includes `action_number`, `starts_from_screen_number`, and `produces_screen_numbers`. The produced list contains every intermediate screen followed by the final result, so the following action starts from its last screen.
+
+| Action | Starts from | Produces, in order |
+| --- | --- | --- |
+| Action 1: `up` | Screen 1 | Screen 2 (intermediate), Screen 3 (result) |
+| Action 2: `left` | Screen 3 | Screen 4 (result/current) |
+
+After bootstrap reset and restoration, the restored CURRENT SCREEN is a separate observation. It is not presented as an output of the last bootstrap action. The next plan starts from that restored screen. If restoration reaches a different board, stale bootstrap screens are discarded.
+
+| Artifact | Contents |
+| --- | --- |
+| `run_manifest.json` | Effective model and run settings, skill hash, starting memory hashes, persistence paths |
+| `evidence.jsonl` and `frames/` | Completed transitions, resets, observations, and all persisted intermediate frames |
+| `decisions.jsonl` | Accepted/rejected decisions, replay/fallback sources, executed actions, interruptions, request IDs |
+| `reviews.jsonl` | Review triggers, coverage, image labels, save/repair status, usage, request IDs |
+| `post_mortems.jsonl` | Failed-level actions/screens, diagnosis, request IDs, usage, and retry guidance |
+| `metrics.json` | Actions, resets, progress, stop reason, and separate action/review/post-mortem costs |
+| `model_requests.jsonl` | With `--log-request`: complete payloads, payload bytes, image count, request IDs, UTC timestamps |
+| `model_responses.jsonl` | With `--log-response`: raw bodies/errors, status, request IDs, UTC timestamps, latency |
+
+Successful exact routes remain in `skills/games/<game-id>/level_solutions.jsonl`; Markdown revisions are historical records in that game's existing `memory.jsonl`. The action model receives saved Markdown and applicable route guidance, rather than raw ledgers.
+
+### Correctness and recovery
+
+The native adapter preserves every intermediate environment frame and exposes ACTION6 x/y coordinate schemas. Probe completions are saved immediately; a bootstrap WIN is retained without resetting. Restoring a later level checks its starting fingerprint, and discards stale bootstrap context when the board differs.
+
+Winning-log recovery accepts logged direction names, reset episodes, and intervening audit records while checking the complete evidence chain before writing routes. All attempt restarts share one initialization path.
+
+The existing game `memory.jsonl` archives exact previous and replacement game/global Markdown with hashes and revisions. These snapshots do not enter action prompts. Run manifests capture model settings and initial memory hashes; optional model logs record UTC timestamps, payload size, image count, request IDs, and response latency.
+
+Offline `--memory-context-entries` and optimization `--memory-limits` select complete Markdown content blocks (standalone headings do not consume the limit); zero omits memory. The live option remains a compatibility setting and does not trim saved Markdown.

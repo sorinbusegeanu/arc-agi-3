@@ -27,7 +27,7 @@ REVIEW_SUMMARY_ID = "review:latest"
 DEFAULT_MAX_ENTRIES = 60
 DEFAULT_CONTEXT_ENTRIES = 5
 MAX_MEMORY_MARKDOWN_CHARS = 2_000
-MAX_GLOBAL_MEMORY_MARKDOWN_CHARS = 1_000
+MAX_GLOBAL_MEMORY_MARKDOWN_CHARS = 6_000
 PATTERN_TYPES: tuple[str, ...] = ("mechanic", "strategy", "exception", "hypothesis", "failure")
 PATTERN_STATUSES: tuple[str, ...] = ("candidate", "confirmed", "contradicted", "retired")
 STATE_SELECTOR_FIELDS = frozenset({"game_state", "level", "levels_completed", "win_levels", "terminal"})
@@ -367,7 +367,7 @@ class GameMemory:
             if not entry_id:
                 continue
             op = row.get("op", "upsert")
-            if op == "checkpoint":
+            if op in {"checkpoint", "markdown"}:
                 continue
             if op == "retire":
                 if entries.pop(entry_id, None) is not None and entry_id in order:
@@ -526,6 +526,26 @@ class GameMemory:
         self._rows.append(row)
         return dict(row)
 
+    def record_markdown_revision(self, scope: str, markdown: str, *, step: int) -> bool:
+        """Archive authoritative prose in the existing ledger without rendering it."""
+        if scope not in {"game", "global"} or not isinstance(markdown, str) or not markdown.strip():
+            return False
+        self._rows = read_jsonl(self.path)
+        previous = next((row for row in reversed(self._rows)
+                         if row.get("op") == "markdown" and row.get("scope") == scope), None)
+        if previous and previous.get("markdown") == markdown:
+            return False
+        digest = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+        row = {
+            "op": "markdown", "id": f"markdown:{scope}:{digest[:20]}",
+            "scope": scope, "markdown": markdown, "sha256": digest,
+            "run_id": self.run_id, "game_id": self.game_id,
+            "step": int(step), "revision": self.revision() + 1,
+        }
+        append_many(self.path, [row])
+        self._rows.append(row)
+        return True
+
     def record_run_state(self, game_id: str, state: Mapping[str, Any], *, step: int) -> dict[str, Any] | None:
         """Keep the latest progress snapshot under its originating run ID."""
         if not self.run_id:
@@ -534,6 +554,7 @@ class GameMemory:
             key: state.get(key) for key in ("level", "levels_completed", "win_levels", "game_state", "terminal")
             if key in state
         }
+        self._rows = read_jsonl(self.path)
         entry_id = f"state:{self.run_id}"
         existing = self.get(entry_id)
         if existing and all(existing.get(key) == value for key, value in state_fields.items()):
@@ -564,6 +585,7 @@ class GameMemory:
         game_id: str,
         current_step: int,
         covered_event_count: int,
+        evidence_provenance: Mapping[str, Any] | None = None,
     ) -> bool:
         """Record a completed Markdown review without writing pattern records."""
         if not self.run_id:
@@ -578,6 +600,7 @@ class GameMemory:
             "id": self.review_coverage_id(game_id, self.run_id, covered_event_count),
             "type": "review_checkpoint", "game_id": str(game_id),
             "run_id": self.run_id, "covered_event_count": int(covered_event_count),
+            "evidence_provenance": dict(evidence_provenance or {}),
             "step": int(current_step), "revision": revision,
         }
         append_many(self.path, [row])

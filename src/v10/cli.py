@@ -119,14 +119,14 @@ def build_parser() -> argparse.ArgumentParser:
                       help="persistent v10 memory root; defaults to the project skills directory")
     live.add_argument(
         "--reset-memory", action="store_true",
-        help="delete shared global memory and all game memory/solution stores before starting",
+        help="clear memory and solutions, and skip historical recovery for this run",
     )
     live.add_argument("--memory-context-entries", type=int, default=DEFAULT_CONTEXT_ENTRIES,
-                      help="maximum persistent memory entries supplied to the model")
+                      help="compatibility setting (0-5); live prompts load saved Markdown in full")
     live.add_argument("--game-memory-max-chars", type=int, default=MAX_MEMORY_MARKDOWN_CHARS,
                       help="maximum characters accepted for game MEMORY.md")
     live.add_argument("--global-memory-max-chars", type=int, default=MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
-                      help="maximum characters accepted for global MEMORY.md")
+                      help="maximum characters accepted for global MEMORY.md (default: 6000)")
     live.add_argument(
         "--base-url", default=DEFAULT_STRATA_BASE_URL,
         help=f"OpenAI-compatible Strata endpoint base URL (default: {DEFAULT_STRATA_BASE_URL})",
@@ -138,12 +138,10 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--env-root", default=None, help="optional ARC environment-files root")
     live.add_argument("--seed", type=int, default=0)
     live.add_argument("--max-actions", type=int, default=30)
-    live.add_argument("--max-resets", type=int, default=1,
-                      help="maximum resets, including the startup bootstrap reset (default: 1)")
-    live.add_argument("--plan-horizon", type=int, default=4)
+    live.add_argument("--plan-horizon", type=int, default=8)
     live.add_argument(
-        "--review-interval", type=int, default=50,
-        help="review experience after this many actions without another review (default: 50)",
+        "--review-interval", type=int, default=20,
+        help="run a memory review after this many actions without a level completion (default: 20)",
     )
     live.add_argument("--timeout-seconds", type=float, default=300.0)
     live.add_argument("--max-output-tokens", type=int, default=4096)
@@ -236,7 +234,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = run_live(
                     env, args.run_dir, client, game_id=args.game_id,
                     seed=args.seed,
-                    max_actions=args.max_actions, max_resets=args.max_resets,
+                    import_historical_routes=not args.reset_memory,
+                    max_actions=args.max_actions,
                     plan_horizon=args.plan_horizon, review_interval=args.review_interval,
                     skill_path=args.skill,
                     state_dir=args.state_dir,

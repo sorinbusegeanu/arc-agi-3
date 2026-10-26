@@ -7,7 +7,9 @@ import numpy as np
 
 from v10.live import run_live
 from v10.tools.memory import save_game_memory
-from v10.tools.solutions import LevelSolutionStore, state_fingerprint
+from v10.tools.solutions import (
+    LevelSolutionStore, state_fingerprint, state_matches_fingerprint,
+)
 
 
 def _run_live_without_starting_routine(*args, **kwargs):
@@ -38,6 +40,33 @@ def test_solution_store_finds_shortest_unambiguous_success_path(tmp_path: Path) 
     assert [edge["action"] for edge in path] == ["right", "left", "right"]
     assert len(store.solutions()) == 1
     assert state_fingerprint(start) == store.edges()[0]["source_state"]
+
+
+def test_verified_route_matches_when_only_reset_availability_changes(tmp_path: Path) -> None:
+    store = LevelSolutionStore(tmp_path / "solutions.jsonl", "fixture")
+    start = {
+        **_observation(0),
+        "legal_actions": ["left", "right", "RESET"],
+    }
+    end = {**_observation(1), "legal_actions": ["left", "right", "RESET"]}
+    edge = store.record_transition(start, "left", {}, end, run_id="learn")
+    store.record_successful_trajectory(
+        start, [edge], run_id="learn", success="level_completed",
+    )
+
+    after_budget_exhaustion = {
+        **start,
+        "legal_actions": ["left", "right"],
+    }
+    route = store.shortest_known_solution(after_budget_exhaustion)
+
+    assert route is not None
+    assert route[0]["verified_success"] == "level_completed"
+    assert state_matches_fingerprint(after_budget_exhaustion, edge["source_state"])
+    assert not state_matches_fingerprint(
+        {**after_budget_exhaustion, "frame": np.full((2, 2), 99)},
+        edge["source_state"],
+    )
 
 
 def test_exact_start_replays_shortest_successful_trajectory_only(tmp_path: Path) -> None:
@@ -195,7 +224,16 @@ class _Client:
                 "global_memory_markdown": "# Global Memory\n\n- Compare objects before and after actions.",
             })
         else:
-            content = '{"actions":[{"action":"up","args":{}}]}'
+            content = json.dumps({
+                "state_assessment": {
+                    "player": {"location": "unknown", "certainty": "unknown", "evidence": "unknown"},
+                    "target_candidates": [], "obstacles": [], "other_relevant_changes": [],
+                },
+                "hypothesis": None,
+                "trajectory_rationale": "Use the legal action from the observed screen.",
+                "prediction": {"visible_change": "unknown", "environment_outcome": "unknown", "description": "unknown"},
+                "actions": [{"action": "up", "args": {}}],
+            })
         return {
             "content": content, "model": self.model,
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
@@ -220,12 +258,15 @@ def test_new_run_replays_successful_level_path_without_action_model_call(tmp_pat
     plan = next(row for row in rows if row.get("schema") == "v10.live_decision/2")
     assert second_env.actions == ["ACTION1"]
     assert second["cached_solution_actions"] == 1
-    assert second["model_calls"] == 0
-    assert second["review_skipped_cached_success_count"] == 1
+    assert second["model_calls"] == 1  # completion review only; no action-planning call
+    assert second["review_skipped_cached_success_count"] == 0
     assert plan["source"] == "verified_level_path"
-    assert second_client.calls == []
-    skipped_review = json.loads((tmp_path / "second/reviews.jsonl").read_text().splitlines()[0])
-    assert skipped_review["status"] == "skipped_verified_route_replay"
+    assert len(second_client.calls) == 1
+    assert second_client.calls[0].startswith("# V10 memory consolidation")
+    route_review = json.loads((tmp_path / "second/reviews.jsonl").read_text().splitlines()[0])
+    assert route_review["status"] == "saved"
+    assert route_review["verified_route_replayed"] is True
+    assert route_review["selected_image_labels"]
     assert plan["decision"]["actions"] == [{"action": "up", "args": {}}]
     assert "verified route" in (state_dir / "games/fixture/MEMORY.md").read_text()
 
@@ -252,8 +293,9 @@ def test_startup_skips_bootstrap_when_exact_route_exists_for_current_level(tmp_p
     assert env.actions == ["ACTION1"]
     assert metrics["cached_solution_actions"] == 1
     assert metrics["resets"] == 0
-    assert client.calls == []
-    assert metrics["review_skipped_cached_success_count"] == 1
+    assert len(client.calls) == 1
+    assert client.calls[0].startswith("# V10 memory consolidation")
+    assert metrics["review_skipped_cached_success_count"] == 0
     assert not any(row.get("schema") == "v10.live_bootstrap_reset/1" for row in rows)
 
 
@@ -310,7 +352,15 @@ def test_level_route_with_different_start_skips_bootstrap_and_guides_model(tmp_p
             if system_prompt.startswith("# V10 memory consolidation"):
                 return super().complete(system_prompt, user_prompt, image_paths, image_labels, response_format)
             return {
-                "content": '{"actions":[{"action":"down","args":{}}]}',
+                "content": json.dumps({
+                    "state_assessment": {
+                        "player": {"location": "unknown", "certainty": "unknown", "evidence": "unknown"},
+                        "target_candidates": [], "obstacles": [], "other_relevant_changes": [],
+                    },
+                    "hypothesis": None, "trajectory_rationale": "Test the current screen.",
+                    "prediction": {"visible_change": "unknown", "environment_outcome": "unknown", "description": "unknown"},
+                    "actions": [{"action": "down", "args": {}}],
+                }),
                 "model": self.model, "usage": {}, "latency_seconds": 0,
                 "request_attempts": 1, "finish_reason": "stop",
             }

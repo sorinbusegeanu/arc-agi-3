@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import types
 from pathlib import Path
@@ -10,7 +11,8 @@ import pytest
 
 from v10.arcade_env import ArcadeGameEnv
 from v10.live import (
-    _live_context, _perform_review, _review_events, _review_frame_selection,
+    _active_level_transitions, _live_context, _perform_game_over_post_mortem, _perform_review,
+    _perceptual_state_equivalence, _review_events,
     _verified_route_summaries, run_live,
 )
 from v10.tools.game import GameTools
@@ -19,6 +21,54 @@ from v10.tools.history import History
 from v10.tools.memory import (
     GameMemory, game_memory_dir, global_memory_path, save_game_memory, shared_skill_path,
 )
+
+
+def test_perceptual_equivalence_is_sparse_exploration_signal_only() -> None:
+    base = np.zeros((64, 64), dtype=np.uint8)
+    flicker = base.copy()
+    flicker[0, 0] = 1
+    moved_object = base.copy()
+    moved_object[10:14, 10:14] = 2
+
+    signal = _perceptual_state_equivalence(base, flicker)
+    assert signal["equivalent"] is True
+    assert signal["certainty"] == "low"
+    assert "hidden state is unknown" in signal["reason"]
+    assert _perceptual_state_equivalence(base, moved_object)["equivalent"] is False
+    assert _perceptual_state_equivalence(np.zeros((8, 8)), np.zeros((8, 8)))["certainty"] == "unreliable"
+
+
+def test_perceptual_state_similarity_is_logged_and_never_resets_game(tmp_path: Path) -> None:
+    class HiddenStateEnv(_FakeEnv):
+        def __init__(self):
+            super().__init__(change_every_action=False)
+            self.frame = np.zeros((64, 64), dtype=np.int64)
+            self.up_count = 0
+
+        def act(self, action, args):
+            self.actions.append((action, dict(args)))
+            if action == "ACTION1":
+                self.up_count += 1
+                self.frame[0, :self.up_count] = self.up_count
+            elif action == "ACTION2":
+                self.frame[:] = 0
+            return {}
+
+    env = HiddenStateEnv()
+    client = _FakeClient([_decision([_action("up"), _action("down"), _action("up")])])
+    run_dir = tmp_path / "perceptual-signal"
+    metrics = _run_live_without_starting_routine(
+        env, run_dir, client, game_id="fixture", max_actions=3, plan_horizon=3,
+        review_interval=99,
+    )
+
+    rows = [json.loads(line) for line in (run_dir / "state_equivalence.jsonl").read_text().splitlines()]
+    assert any(row["status"] == "candidate" for row in rows)
+    false_rows = [row for row in rows if row["status"] == "validated_false"]
+    assert false_rows and "different exact target states" in false_rows[0]["reason"]
+    assert all(row["safety_effect"].startswith("none;") for row in rows)
+    assert metrics["actions"] == 3
+    assert env.resets == 0
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +92,21 @@ def _action(action="up"):
     return {"action": action, "args": {}}
 
 
+def _reasoned(decision, *, hypothesis=None, prediction=None):
+    return {
+        "state_assessment": {
+            "player": {"location": "center", "certainty": "inferred", "evidence": "visible in CURRENT SCREEN"},
+            "target_candidates": [], "obstacles": [], "other_relevant_changes": [],
+        },
+        "hypothesis": hypothesis,
+        "trajectory_rationale": "Test one legal action from the current screen.",
+        "prediction": prediction or {
+            "visible_change": "unknown", "environment_outcome": "unknown", "description": "unknown",
+        },
+        "actions": list(decision.get("actions", [])),
+    }
+
+
 _VALID_GAME_MEMORY = "# Game Memory\n\n- A cue is visible in this game."
 _VALID_GLOBAL_MEMORY = "# Global Memory\n\n- Compare each object before and after an action."
 _VALID_REVIEW = json.dumps({
@@ -55,27 +120,43 @@ class _FakeClient:
 
     def __init__(
         self, decisions, *, request_attempts=1, review_responses=None,
-        review_errors=None, default_decision=None,
+        post_mortem_responses=None, review_errors=None, reasoning_responses=None,
+        default_decision=None,
     ):
         self.decisions = list(decisions)
         self.calls = []
+        self.system_prompts = []
         self.response_formats = []
         self.request_attempts = request_attempts
         self.review_responses = list(review_responses or [])
+        self.post_mortem_responses = list(post_mortem_responses or [])
         self.review_errors = list(review_errors or [])
+        self.reasoning_responses = list(reasoning_responses or [])
         self.default_decision = default_decision
 
     def complete(self, system_prompt, user_prompt, image_paths, image_labels, response_format="json_object"):
         self.calls.append((user_prompt, list(image_paths), list(image_labels)))
+        self.system_prompts.append(system_prompt)
         self.response_formats.append(response_format)
         if system_prompt.startswith("# V10 memory consolidation"):
             if self.review_errors:
                 raise self.review_errors.pop(0)
             content = self.review_responses.pop(0) if self.review_responses else _VALID_REVIEW
+        elif system_prompt.startswith("# V10 game-over post-mortem"):
+            content = self.post_mortem_responses.pop(0) if self.post_mortem_responses else "Post-mortem unavailable."
+        elif system_prompt.startswith("# V10 uncertain action assessment"):
+            content = self.reasoning_responses.pop(0) if self.reasoning_responses else json.dumps({
+                "hypothesis_being_tested": "The action may change the visible state.",
+                "expected_visible_change": "A visible object or position changes.",
+                "actual_observed_change": "The before and after screens differ.",
+                "hypothesis_remains_viable": "yes: a visible change occurred.",
+            })
         else:
             decision = self.decisions.pop(0) if self.decisions else self.default_decision
             if decision is None:
                 decision = _decision([])
+            if isinstance(decision, dict) and set(decision) == {"actions"}:
+                decision = _reasoned(decision)
             content = json.dumps(decision)
         return {
             "content": content, "model": self.model,
@@ -115,6 +196,20 @@ class _FakeEnv:
         return self.observe()
 
 
+class _OscillatingEnv(_FakeEnv):
+    """Visibly alternates between two states to exercise cycle detection."""
+
+    def __init__(self):
+        super().__init__(change_every_action=False)
+        self.toggle = False
+
+    def act(self, action, args):
+        self.actions.append((action, dict(args)))
+        self.toggle = not self.toggle
+        self.frame[:] = int(self.toggle)
+        return {}
+
+
 def test_applicable_successful_strategy_is_in_first_action_prompt(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     saved = "# Game Memory\n\n## Successful strategies\n- On level zero, repeat up until progress changes."
@@ -138,6 +233,146 @@ def test_applicable_successful_strategy_is_in_first_action_prompt(tmp_path: Path
     assert "applicable_successful_strategies" not in inputs["context"]
     assert inputs["user_prompt"].count("repeat up until progress changes") == 1
     assert "LEDGER_ONLY_STRATEGY_MUST_NOT_BE_IN_ACTION_PROMPT" not in inputs["user_prompt"]
+
+
+def test_live_action_prompt_keeps_reasoning_in_skill_and_dynamic_constraints_in_user_prompt(tmp_path: Path) -> None:
+    tools = GameTools(_FakeEnv(), tmp_path / "prompt-ownership")
+    current = tools.observe()
+    inputs = _live_context(
+        tools, current, "fixture", 3, shared_skill_path(), tmp_path / "state/fixture", "run", 0,
+    )
+
+    skill = inputs["system_prompt"]
+    prompt = inputs["user_prompt"]
+    for section in ("Observe", "Hypothesize", "Evaluate", "Experiment", "Act"):
+        assert f"**{section}:**" in skill
+    assert "completing the level" in skill and "understanding it" in skill
+    assert "Level index 0 (0 completed)" in prompt
+    assert "final CURRENT SCREEN as authoritative" in prompt
+    assert "up to 3 legal actions" in prompt
+    assert "current_state.legal_actions" in prompt
+    assert "RESET restarts the whole game" in prompt
+    assert "Required response contract (`v10.reasoned_action/1`):" in prompt
+    from v10.analysis import reasoned_action_contract_description
+    contract_text = prompt.split("Required response contract (`v10.reasoned_action/1`):\n", 1)[1].split("\nString limits:", 1)[0]
+    assert json.loads(contract_text) == reasoned_action_contract_description()
+    assert "player location 120/evidence 180" in prompt
+    assert "Prefer a demonstrated strategy when its stated conditions match" not in prompt
+    assert "Avoid repeating an action that had no visible effect" not in prompt
+
+
+def test_review_consolidates_scoped_hypotheses_and_feasible_experiment(tmp_path: Path) -> None:
+    env = _FakeEnv()
+    run_dir = tmp_path / "review-investigation"
+    tools = GameTools(env, run_dir)
+    tools.observe()
+    tools.act("ACTION1")
+    game_memory = (
+        "## Established mechanics\n- On the first level, the player moves one visible region per UP input.\n\n"
+        "## Failed hypotheses\n- On the first level, entering the green region from above does not produce the expected completion.\n\n"
+        "## Unresolved hypotheses\n- On the first level, completion may depend on an adjacent trigger rather than overlap.\n\n"
+        "## Next experiment\n- On the first level, test one legal approach from the side to distinguish overlap from adjacency; purpose: identify the completion condition."
+    )
+    global_memory = "## Exploration method\n- Compare the same object's position before and after one action."
+    client = _FakeClient([], review_responses=[json.dumps({
+        "game_memory_markdown": game_memory,
+        "global_memory_markdown": global_memory,
+    })])
+    store_dir = game_memory_dir(tmp_path / "state", "fixture")
+
+    result = _perform_review(
+        tools, client, game_id="fixture", run_id="investigation",
+        memory_store_dir=store_dir, trigger_reasons=["stagnation"],
+    )
+
+    assert result["row"]["status"] == "saved"
+    system_prompt = client.system_prompts[0]
+    review_prompt = client.calls[0][0]
+    for heading in ("Established mechanics", "Failed hypotheses", "Unresolved hypotheses", "Next experiment"):
+        assert heading in system_prompt
+    for instruction in (
+        "most important unresolved question", "competing explanations",
+        "best distinguishes those explanations", "purpose in game-specific memory",
+    ):
+        assert instruction in review_prompt
+    assert "Legal actions available from the current active screen" in review_prompt
+    assert '"id":"up"' in review_prompt
+    assert "exactly two non-empty Markdown strings" in system_prompt
+    from v10.live import _validate_review_payload
+    assert _validate_review_payload({
+        "game_memory_markdown": game_memory,
+        "global_memory_markdown": global_memory,
+    }) == (game_memory, global_memory)
+    with pytest.raises(ValueError, match="exactly game_memory_markdown and global_memory_markdown"):
+        _validate_review_payload({
+            "game_memory_markdown": game_memory,
+            "global_memory_markdown": global_memory,
+            "extra": "unexpected",
+        })
+
+    saved = (store_dir / "MEMORY.md").read_text(encoding="utf-8")
+    assert saved == game_memory + "\n"
+    assert (tmp_path / "state/global/MEMORY.md").read_text(encoding="utf-8") == global_memory + "\n"
+    action_context = _live_context(
+        tools, tools.observe(), "fixture", 2, shared_skill_path(), store_dir, "next-run", 0,
+    )
+    assert action_context["context"]["memory"] == saved
+    assert "test one legal approach from the side" in action_context["user_prompt"]
+
+
+def test_action_prompt_scopes_prior_level_mechanics_to_their_conditions(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    store_dir = game_memory_dir(state_dir, "fixture")
+    save_game_memory(
+        store_dir,
+        "# Game Memory\n\n- Gray is the goal on levels zero through two.",
+    )
+    tools = GameTools(_FakeEnv(), tmp_path / "scope-prompt")
+    current = tools.observe()
+    current["level"] = 3
+    current["levels_completed"] = 3
+
+    inputs = _live_context(
+        tools, current, "fixture", 4, shared_skill_path(), store_dir, "run", 0,
+    )
+
+    assert "Level index 3 (3 completed)" in inputs["user_prompt"]
+    assert "Memory applies only to its stated level/conditions" in inputs["user_prompt"]
+    assert "Gray is the goal on levels zero through two" in inputs["user_prompt"]
+
+
+def test_normal_and_bootstrap_prompts_keep_only_applicable_reset_constraints(tmp_path: Path) -> None:
+    tools = GameTools(_FakeEnv(), tmp_path / "reset-question")
+    current = tools.observe()
+    normal = _live_context(
+        tools, current, "fixture", 2, shared_skill_path(), tmp_path / "state/fixture", "run", 0,
+    )
+    assert "RESET restarts the whole game" in normal["user_prompt"]
+    assert "return it alone with the required justification" in normal["user_prompt"]
+    assert '"actions"' in normal["user_prompt"]
+
+    bootstrap = _live_context(
+        tools, current, "fixture", 2, shared_skill_path(), tmp_path / "state/fixture", "run", 0,
+        starting_routine=True,
+    )
+    assert "do not RESET" in bootstrap["user_prompt"]
+    assert "RESET\",\"parameters" not in bootstrap["user_prompt"]
+
+
+def test_default_global_memory_limit_accepts_six_thousand_characters(tmp_path: Path) -> None:
+    from v10.live import _validate_review_payload
+    from v10.tools.memory import MAX_GLOBAL_MEMORY_MARKDOWN_CHARS
+
+    assert MAX_GLOBAL_MEMORY_MARKDOWN_CHARS == 6_000
+    _validate_review_payload({
+        "game_memory_markdown": _VALID_GAME_MEMORY,
+        "global_memory_markdown": "g" * 6_000,
+    })
+    with pytest.raises(ValueError, match="6000 character limit"):
+        _validate_review_payload({
+            "game_memory_markdown": _VALID_GAME_MEMORY,
+            "global_memory_markdown": "g" * 6_001,
+        })
 
 
 def _seed_game_mechanic(state_dir: Path, game_id: str = "fixture") -> None:
@@ -195,17 +430,13 @@ def test_bootstrap_is_reset_before_single_startup_plan_from_first_screen(tmp_pat
     prompt, images, labels = client.calls[0]
     assert "bootstrap observations" in prompt
     assert "game was then reset" in prompt
-    assert "must start from this initial screen" in prompt
+    assert "must start from this current screen" in prompt
     assert "short exploratory action sequence" in prompt
-    assert len(images) == 6
-    assert labels == [
-        "Bootstrap for level index 0 screen 1: initial before up",
-        "Bootstrap for level index 0 screen 2: after up",
-        "Bootstrap for level index 0 screen 3: after left",
-        "Bootstrap for level index 0 screen 4: after down",
-        "Bootstrap for level index 0 screen 5: after right",
-        "Bootstrap for level index 0 screen 6: CURRENT SCREEN (restored initial screen after reset for level index 0)",
-    ]
+    assert 1 <= len(images) <= 3
+    assert len(labels) == len(images)
+    assert "CURRENT SCREEN" in labels[-1]
+    assert '"bootstrap_observations"' in prompt
+    assert "1 up:" in prompt and "2 left:" in prompt and "3 down:" in prompt and "4 right:" in prompt
     decisions = [
         json.loads(line) for line in (tmp_path / "run/decisions.jsonl").read_text().splitlines()
     ]
@@ -214,6 +445,94 @@ def test_bootstrap_is_reset_before_single_startup_plan_from_first_screen(tmp_pat
     plans = [row for row in decisions if row.get("schema") == "v10.live_decision/2"]
     assert plans[0]["source"] == "bootstrap_probe"
     assert plans[-1]["source"] == "bootstrap_model_start"
+
+
+def test_each_new_level_bootstraps_then_resets_replays_prior_route_and_calls_model(
+    tmp_path: Path,
+) -> None:
+    class TwoLevelEnv:
+        def __init__(self):
+            self.frame = np.zeros((3, 4), dtype=np.int64)
+            self.level = 0
+            self.levels_completed = 0
+            self.resets = 0
+            self.actions = []
+            self.terminal = False
+
+        def observe(self):
+            return {
+                "frame": self.frame.copy(),
+                "legal_actions": [{"id": f"ACTION{i}", "parameters": {
+                    "type": "object", "properties": {}, "required": [],
+                    "additionalProperties": False,
+                }} for i in range(1, 5)],
+                "game_state": "WIN" if self.terminal else "NOT_FINISHED",
+                "level": self.level, "levels_completed": self.levels_completed,
+                "win_levels": 2, "terminal": self.terminal,
+            }
+
+        def act(self, action, args):
+            self.actions.append((action, self.level))
+            self.frame[0, 1] += 1
+            if self.level == 0 and action == "ACTION1" and self.resets >= 1:
+                self.level = 1
+                self.levels_completed = 1
+                self.frame[:] = 10
+            elif self.level == 1 and action == "ACTION2" and self.resets >= 2:
+                self.levels_completed = 2
+                self.terminal = True
+            return {}
+
+        def reset(self):
+            self.resets += 1
+            self.frame[:] = 0
+            self.level = 0
+            self.levels_completed = 0
+            self.terminal = False
+            return self.observe()
+
+    env = TwoLevelEnv()
+    client = _FakeClient([
+        _decision([_action("up")]),
+        _decision([_action("down")]),
+    ])
+    metrics = run_live(
+        env, tmp_path / "per-level-bootstrap", client, game_id="fixture",
+        max_actions=11,
+    )
+
+    assert env.resets == 2
+    assert metrics["resets"] == 2
+    assert metrics["won"] is True
+    assert metrics["available_level_solutions"] == 2
+    # Initial probe, solve level 0, level-1 probe, replay level 0, solve level 1.
+    assert [action for action, _level in env.actions] == [
+        "ACTION1", "ACTION3", "ACTION2", "ACTION4", "ACTION1",
+        "ACTION1", "ACTION3", "ACTION2", "ACTION4", "ACTION1", "ACTION2",
+    ]
+    records = [json.loads(line) for line in (tmp_path / "per-level-bootstrap/decisions.jsonl").read_text().splitlines()]
+    probes = [row for row in records if row.get("source") == "bootstrap_probe"]
+    replays = [row for row in records if row.get("source") == "bootstrap_replay"]
+    model_starts = [row for row in records if row.get("source") == "bootstrap_model_start"]
+    resets = [row for row in records if row.get("schema") == "v10.live_bootstrap_reset/1"]
+    assert len(probes) == 2
+    assert len(replays) == 1
+    assert len(model_starts) == 2
+    assert resets[1]["return_target_level_key"] == '{"level":1,"levels_completed":1}'
+
+    level_one_prompts = []
+    for prompt, images, labels in client.calls:
+        if any("Bootstrap for level index 1" in label for label in labels):
+            level_one_prompts.append((prompt, images, labels))
+    assert len(level_one_prompts) == 1
+    prompt, images, labels = level_one_prompts[0]
+    context = json.loads(prompt.split("Visible context:\n", 1)[1])
+    assert context["current_state"]["level"] == 1
+    assert "solved routes replayed" in prompt
+    assert 1 <= len(images) <= 3
+    assert labels[-1].startswith("Bootstrap for level index 1")
+    assert "CURRENT SCREEN" in labels[-1]
+    assert '"bootstrap_observations"' in prompt
 
 
 def test_standard_start_routine_respects_plan_horizon_and_action_budget(tmp_path: Path) -> None:
@@ -289,60 +608,324 @@ def test_recent_history_is_independent_of_plan_horizon(tmp_path: Path) -> None:
     assert len(context["recent_transitions"]) == 1
 
 
-def test_stagnation_reviews_require_fresh_actions_before_retrigger(tmp_path: Path) -> None:
+def test_default_plan_horizon_runs_eight_actions(tmp_path: Path) -> None:
+    client = _FakeClient([_decision([_action()] * 8)])
+    metrics = _run_live_without_starting_routine(
+        _FakeEnv(), tmp_path / "horizon-eight", client,
+        game_id="fixture", max_actions=8, review_interval=20,
+    )
+
+    assert metrics["actions"] == 8
+    assert len(client.calls) == 1
+    assert "up to 8 legal actions" in client.calls[0][0]
+
+
+def test_action_context_uses_only_eight_recent_transitions_and_anchors_current_screen(tmp_path: Path) -> None:
+    tools = GameTools(_FakeEnv(), tmp_path / "short-context")
+    current = tools.observe()
+    for _ in range(10):
+        current = tools.act("ACTION1")["observation"]
+
+    transitions = _active_level_transitions(
+        tools.history.records(), current, tools.reset_generation,
+    )
+    assert len(transitions) == 8
+    inputs = _live_context(
+        tools, current, "fixture", 4, shared_skill_path(), tmp_path / "state/fixture",
+        "run", 0,
+    )
+    assert len(inputs["context"]["recent_transitions"]) == 8
+    assert "CURRENT SCREEN" in inputs["image_labels"][-1]
+    assert "final CURRENT SCREEN as authoritative" in inputs["user_prompt"]
+    assert inputs["image_count"] <= 3
+    assert inputs["prompt_characters"] <= 4_000
+    prompt_context = json.loads(inputs["user_prompt"].split("Visible context:\n", 1)[1])
+    summaries = prompt_context["recent_transitions"]
+    assert len(summaries) == 8
+    assert all(len(summary) <= 200 for summary in summaries)
+    assert [summary.split(":", 1)[0].split()[0] for summary in summaries] == [
+        str(index) for index in range(1, 9)
+    ]
+    assert all("changed_pixels" not in summary for summary in summaries)
+    assert any("visible" in summary for summary in summaries)
+
+
+def test_compact_action_prompt_preserves_noop_and_failed_action_details(tmp_path: Path) -> None:
+    tools = GameTools(_FakeEnv(change_every_action=False), tmp_path / "compact-action-failures")
+    current = tools.observe()
+    tools.act("ACTION1")
+    tools.history.append({
+        "type": "audit", "kind": "action_error", "action": "ACTION2",
+        "error": "RuntimeError: environment rejected input", "reset_generation": 0,
+    })
+    inputs = _live_context(
+        tools, tools.observe(), "fixture", 4, shared_skill_path(),
+        tmp_path / "state/fixture", "run", 0,
+    )
+    context = json.loads(inputs["user_prompt"].split("Visible context:\n", 1)[1])
+    assert context["ineffective_attempts_at_current_screen"] == [{"action": "up", "args": {}}]
+    assert context["recent_action_errors"] == ["down: RuntimeError: environment rejected input"]
+    assert "no visible change" in context["recent_transitions"][0]
+
+
+def test_compact_action_prompt_marks_recorded_unexpected_outcome(tmp_path: Path) -> None:
+    tools = GameTools(_FakeEnv(), tmp_path / "unexpected-outcome")
+    tools.observe()
+    result = tools.act("ACTION1")
+    (tools.run_dir / "reasoning.jsonl").write_text(json.dumps({
+        "action_number": 1, "level": 0, "reset_generation": 0,
+        "comparison": "contradicted",
+        "prediction": {"description": "player should move toward the target"},
+        "actual_observed_change": {"visible_change_any_frame": False, "environment_outcome": "no_terminal"},
+    }) + "\n", encoding="utf-8")
+    inputs = _live_context(
+        tools, result["observation"], "fixture", 4, shared_skill_path(),
+        tmp_path / "state/fixture", "run", 0,
+    )
+    context = json.loads(inputs["user_prompt"].split("Visible context:\n", 1)[1])
+    assert "unexpected: predicted player should move toward the target" in context["recent_transitions"][0]
+
+
+def test_noop_knowledge_survives_beyond_recent_visual_history(tmp_path: Path) -> None:
+    class VariedFrames(_FakeEnv):
+        def __init__(self):
+            super().__init__(change_every_action=False)
+
+        def act(self, action, args):
+            self.actions.append((action, dict(args)))
+            count = len(self.actions)
+            if count == 1:
+                return {}  # up is ineffective from the initial all-zero screen
+            self.frame[:] = 0 if count == 11 else count
+            return {}
+
+    env = VariedFrames()
+    tools = GameTools(env, tmp_path / "persistent-noop")
+    current = tools.observe()
+    tools.act("ACTION1")
+    for _ in range(10):
+        current = tools.act("ACTION2")["observation"]
+
+    transitions = _active_level_transitions(
+        tools.history.records(), current, tools.reset_generation,
+    )
+    assert len(transitions) == 8
+    inputs = _live_context(
+        tools, current, "fixture", 4, shared_skill_path(), tmp_path / "state/fixture",
+        "run", 0,
+    )
+    assert inputs["context"]["ineffective_actions_at_current_screen"] == ["up"]
+    assert len(inputs["context"]["recent_transitions"]) == 8
+
+
+def test_known_noop_later_in_plan_is_blocked_using_full_level_history(tmp_path: Path) -> None:
+    class ReturnToOldStateEnv(_FakeEnv):
+        def __init__(self):
+            super().__init__(change_every_action=False)
+            self.state = 0
+
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"].append({
+                "id": "ACTION3", "parameters": {
+                    "type": "object", "properties": {}, "required": [],
+                    "additionalProperties": False,
+                },
+            })
+            result["frame"][:] = self.state
+            self.frame[:] = self.state
+            return result
+
+        def act(self, action, args):
+            self.actions.append((action, dict(args)))
+            if self.state == 0 and action == "ACTION1":
+                return {}  # Record an old up no-op at state zero.
+            if action == "ACTION2":
+                self.state += 1
+            elif action == "ACTION3" and self.state == 9:
+                self.state = 0
+            self.frame[:] = self.state
+            return {}
+
+    client = _FakeClient([
+        _decision([_action("up")]),
+        _decision([_action("down")] * 4),
+        _decision([_action("down")] * 4),
+        _decision([_action("down")]),
+        _decision([_action("left"), _action("up")]),
+    ])
+    env = ReturnToOldStateEnv()
+    metrics = _run_live_without_starting_routine(
+        env, tmp_path / "old-noop-in-plan", client,
+        game_id="fixture", max_actions=20, plan_horizon=4, review_interval=50,
+    )
+
+    assert metrics["actions"] == 11
+    assert [action for action, _args in env.actions] == [
+        "ACTION1", *(["ACTION2"] * 9), "ACTION3",
+    ]
+    rows = [json.loads(line) for line in (tmp_path / "old-noop-in-plan/decisions.jsonl").read_text().splitlines()]
+    assert any(
+        row.get("interrupt_reason") == "known_ineffective_action"
+        for row in rows if row.get("schema") == "v10.live_plan_result/2"
+    )
+
+
+def test_context_reports_grounded_native_pixel_regions_and_motion(tmp_path: Path) -> None:
+    class MovingRegionEnv:
+        def __init__(self):
+            self.frame = np.zeros((8, 8), dtype=np.int64)
+            self.frame[2:4, 1:3] = 9
+            self.moved = False
+
+        def observe(self):
+            return {
+                "frame": self.frame.copy(),
+                "legal_actions": [{"id": "ACTION4", "parameters": {
+                    "type": "object", "properties": {}, "required": [],
+                    "additionalProperties": False,
+                }}],
+                "game_state": "NOT_FINISHED", "level": 0, "levels_completed": 0,
+                "win_levels": 5, "terminal": False,
+            }
+
+        def act(self, action, args):
+            self.frame[:] = 0
+            self.frame[2:4, 3:5] = 9
+            self.moved = True
+            return {}
+
+    env = MovingRegionEnv()
+    tools = GameTools(env, tmp_path / "region-motion")
+    current = tools.observe()
+    tools.act("ACTION4")
+    current = tools.observe()
+    inputs = _live_context(
+        tools, current, "fixture", 1, shared_skill_path(), tmp_path / "state/fixture",
+        "run", 0,
+    )
+    assert inputs["context"]["visible_regions_current_screen"][9] == [
+        {"x_min": 3, "y_min": 2, "x_max": 4, "y_max": 3, "pixels": 4},
+    ]
+    motion = inputs["context"]["recent_transitions"][0]["observed_pixel_region_motion"]
+    assert motion == [{
+        "pixel_class": 9,
+        "from_bbox_native_pixels": [1, 2, 2, 3],
+        "to_bbox_native_pixels": [3, 2, 4, 3],
+        "shift_native_pixels": {"dx": 2, "dy": 0},
+    }]
+
+
+def test_review_prompt_classifies_repeated_same_state_noops_as_failures(tmp_path: Path) -> None:
+    env = _FakeEnv(change_every_action=False)
+    tools = GameTools(env, tmp_path / "review-noop")
+    tools.observe()
+    tools.act("ACTION1")
+    client = _FakeClient([], review_responses=[_VALID_REVIEW])
+
+    result = _perform_review(
+        tools, client, game_id="fixture", run_id="review-run",
+        memory_store_dir=game_memory_dir(tmp_path / "state", "fixture"),
+        trigger_reasons=["stagnation"],
+    )
+
+    assert result["row"]["status"] == "saved"
+    prompt = client.calls[0][0]
+    assert "no pixel change from the same visible state is a failed/ineffective approach" in prompt
+    assert '"unchanged_count":1' in prompt
+    assert "remove or correct that wording" in prompt
+    assert "failed or ineffective approaches" in client.system_prompts[0]
+    assert "Scope object roles, goal identity, and completion rules" in client.system_prompts[0]
+
+
+def test_known_ineffective_action_is_rejected_and_plan_reasks_after_noop(tmp_path: Path) -> None:
+    class ThreeActionNoopEnv(_FakeEnv):
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"].append({
+                "id": "ACTION3", "parameters": {
+                    "type": "object", "properties": {}, "required": [],
+                    "additionalProperties": False,
+                },
+            })
+            return result
+
+    env = ThreeActionNoopEnv(change_every_action=False)
+    client = _FakeClient([
+        _decision([_action("up"), _action("down")]),
+        _decision([_action("up"), _action("down")]),
+        _decision([_action("left")]),
+    ])
+
+    metrics = _run_live_without_starting_routine(
+        env, tmp_path / "ineffective-action", client, game_id="fixture", max_actions=2,
+    )
+
+    assert [action for action, _args in env.actions] == ["ACTION1", "ACTION3"]
+    assert metrics["actions"] == 2
+    action_contexts = [
+        json.JSONDecoder().raw_decode(prompt.split("Visible context:\n", 1)[1])[0]
+        for prompt, _images, _labels in client.calls if "Visible context:\n" in prompt
+    ]
+    assert action_contexts[1]["ineffective_actions_at_current_screen"] == ["up"]
+    assert "first action 'up' already caused no visible change" in client.calls[2][0]
+
+
+def test_all_ineffective_legal_actions_trigger_unbudgeted_reset(tmp_path: Path) -> None:
+    env = _FakeEnv(change_every_action=False)
+    client = _FakeClient([], default_decision={"invalid": True})
+
+    metrics = _run_live_without_starting_routine(
+        env, tmp_path / "automatic-recovery", client, game_id="fixture", max_actions=3,
+    )
+
+    assert env.resets == 1
+    assert metrics["resets"] == 1
+    assert metrics["actions"] == 3
+    decisions = [
+        json.loads(line) for line in (tmp_path / "automatic-recovery/decisions.jsonl").read_text().splitlines()
+    ]
+    assert any(row.get("status") == "auto_reset" for row in decisions)
+
+
+def test_stagnation_guidance_remains_without_triggering_reviews(tmp_path: Path) -> None:
     client = _FakeClient(
-        [], default_decision=_decision([_action()] * 4),
-        review_responses=[_VALID_REVIEW, _VALID_REVIEW],
+        [], default_decision=_decision([_action()]),
     )
     metrics = _run_live_without_starting_routine(
-        _FakeEnv(change_every_action=False), tmp_path / "run", client,
-        game_id="fixture", max_actions=7, review_interval=50,
+        _OscillatingEnv(), tmp_path / "run", client,
+        game_id="fixture", max_actions=16, review_interval=50,
     )
 
-    rows = _review_rows(tmp_path / "run")
-    assert metrics["review_count"] == 2
-    assert [row["through_action"] for row in rows] == [3, 6]
+    assert metrics["review_count"] == 0
+    assert _review_rows(tmp_path / "run") == []
+    action_prompts = [
+        json.loads(prompt.split("Visible context:\n", 1)[1])
+        for prompt, _images, _labels in client.calls
+        if "Visible context:\n" in prompt
+    ]
+    recovery = next(ctx["stagnation"] for ctx in action_prompts if ctx["stagnation"]["recovery_guidance"])
+    assert recovery["consecutive_repeated_or_no_progress_actions"] >= 2
+    assert "choose RESET alone" in recovery["recovery_guidance"]
+    recovery_context = next(
+        ctx for ctx in action_prompts if ctx["stagnation"]["recovery_guidance"]
+    )
+    assert recovery_context["budgets"]["plan_horizon"] == 1
 
 
-def test_stagnation_retriggers_after_failed_review_and_fresh_actions(tmp_path: Path) -> None:
+def test_stagnation_does_not_call_the_reviewer(tmp_path: Path) -> None:
     client = _FakeClient(
-        [], default_decision=_decision([_action()] * 4),
+        [], default_decision=_decision([_action()]),
         review_errors=[RuntimeError("temporary reviewer failure")],
-        review_responses=[_VALID_REVIEW],
     )
     metrics = _run_live_without_starting_routine(
-        _FakeEnv(change_every_action=False), tmp_path / "run", client,
-        game_id="fixture", max_actions=6, review_interval=50,
+        _OscillatingEnv(), tmp_path / "run", client,
+        game_id="fixture", max_actions=16, review_interval=50,
     )
-    rows = _review_rows(tmp_path / "run")
-    assert metrics["review_count"] == 2
-    assert [row["status"] for row in rows] == ["failed", "saved"]
-    assert [row["through_action"] for row in rows] == [3, 6]
-
-
-def test_review_image_selection_includes_movement_blocked_interaction_and_progress(tmp_path: Path) -> None:
-    from v10.frames import FrameStore
-
-    frames = FrameStore(tmp_path)
-    rows = []
-    for index in range(4):
-        before = frames.put(np.full((2, 2), index, dtype=np.int64), source="test")
-        after = frames.put(np.full((2, 2), index + 10, dtype=np.int64), source="test")
-        before_image = frames.put_image(np.zeros((2, 2, 3), dtype=np.uint8), f"B{index}", kind="image")
-        after_image = frames.put_image(np.ones((2, 2, 3), dtype=np.uint8), f"A{index}", kind="image")
-        rows.append({
-            "pre_frame_id": before, "post_frame_id": after,
-            "pre_frame_image_id": before_image, "post_frame_image_id": after_image,
-            "levels_completed": 1 if index == 3 else 0, "terminal": False,
-            "measurements": {
-                "changed_pixels": [10, 0, 8, 20][index],
-                "color_transitions": ([{}, {}, {}] if index == 2 else []),
-            },
-        })
-    _, labels = _review_frame_selection(rows, frames, max_images=8)
-    selected = " ".join(labels)
-    for index in range(1, 5):
-        assert f"transition {index}" in selected
+    assert metrics["review_count"] == 0
+    assert _review_rows(tmp_path / "run") == []
+    assert len(client.review_errors) == 1
+    assert str(client.review_errors[0]) == "temporary reviewer failure"
 
 
 def test_keyboard_interrupt_writes_interrupted_metrics(tmp_path: Path) -> None:
@@ -402,15 +985,32 @@ def test_live_run_clears_existing_run_directory_contents(tmp_path: Path) -> None
     assert metrics["actions"] == 0
 
 
-def test_live_executes_reset_action_only_when_budgeted(tmp_path: Path) -> None:
+def test_live_executes_reset_action_without_a_reset_budget(tmp_path: Path) -> None:
     env = _FakeEnv()
     client = _FakeClient([_decision(reset=True), _decision([])])
 
-    metrics = _run_live_without_starting_routine(env, tmp_path / "run", client, game_id="fixture", max_actions=3, max_resets=1)
+    metrics = _run_live_without_starting_routine(env, tmp_path / "run", client, game_id="fixture", max_actions=3)
 
     assert env.resets == 1
     assert metrics["stop_reason"] == "model_returned_no_actions"
     assert metrics["actions"] == 0
+
+
+def test_live_allows_more_than_ten_model_requested_resets(tmp_path: Path) -> None:
+    env = _FakeEnv()
+    client = _FakeClient([_decision(reset=True) for _ in range(12)] + [_decision([_action()])])
+
+    metrics = _run_live_without_starting_routine(
+        env, tmp_path / "unlimited-resets", client, game_id="fixture", max_actions=1,
+    )
+
+    assert env.resets == 12
+    assert metrics["resets"] == 12
+    assert "reset_budget" not in metrics
+    first_prompt = client.calls[0][0]
+    first_context = json.loads(first_prompt.split("Visible context:\n", 1)[1])
+    assert any(action["id"] == "RESET" for action in first_context["current_state"]["legal_actions"])
+    assert "resets_remaining" not in first_context["budgets"]
 
 
 def test_live_metrics_include_strata_json_recovery_attempt(tmp_path: Path) -> None:
@@ -475,7 +1075,8 @@ def test_confirmed_pattern_prediction_is_audited_and_triggers_review_on_conflict
     assert audits[0]["verdict"] == "failed"
     assert metrics["pattern_predictions"] == 1
     assert metrics["pattern_prediction_contradictions"] == 1
-    assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["unexpected_transition"]
+    assert metrics["review_count"] == 0
+    assert _review_rows(tmp_path / "run") == []
     updated = GameMemory(
         tmp_path / "run", store_dir=state_dir / "games/fixture",
         run_id=json.loads((tmp_path / "run/run_manifest.json").read_text())["run_id"], game_id="fixture",
@@ -510,14 +1111,14 @@ def test_live_repairs_response_with_extra_fields(tmp_path: Path) -> None:
     assert metrics["actions"] == 1
     assert len(client.calls) == 2
     repair_prompt = client.calls[1][0]
-    assert "Your previous JSON failed validation" in repair_prompt
-    assert "predictions" in repair_prompt
+    assert "Your previous structured JSON failed validation" in repair_prompt
+    assert "prediction" in repair_prompt
     assert '"actions"' in repair_prompt
-    assert "memory updates" in repair_prompt
+    assert "do not add prose" in repair_prompt
     rows = [json.loads(line) for line in (tmp_path / "run" / "decisions.jsonl").read_text().splitlines()]
     accepted = next(row for row in rows if row.get("status") == "accepted")
     assert accepted["repair_attempted"] is True
-    assert "only action and args" in accepted["initial_validation_error"]
+    assert "actions[0] may contain only action and args" in accepted["initial_validation_error"]
 
 
 def test_live_executes_random_fallback_after_invalid_decision_and_repair(tmp_path: Path) -> None:
@@ -674,18 +1275,17 @@ def test_live_context_has_no_future_records_and_includes_current_images(tmp_path
     assert "initial_state_evidence_id" not in prompt
     assert "measurable_prediction" not in prompt
     assert "memory_patch" not in prompt
-    assert "up to 4 legal actions" in prompt
+    assert "up to 8 legal actions" in prompt
     assert '"id":"up"' in prompt
     assert '"id":"down"' in prompt
     assert "ACTION1" not in prompt
     assert len(image_paths) == 1
     assert len(labels) == 1 and "CURRENT SCREEN" in labels[0]
-    assert '"index_zero_based":0' in prompt
-    assert '"display_number_one_based":1' in prompt
-    assert "The `level` field is zero-based" in prompt
+    assert '"level":0' in prompt
+    assert '"win_levels":5' in prompt
 
 
-def test_action_context_sends_ordered_screens_and_all_intermediate_frames(tmp_path: Path) -> None:
+def test_action_context_selects_compact_ordered_screens_but_keeps_all_frames_in_history(tmp_path: Path) -> None:
     class IntermediateFramesEnv(_FakeEnv):
         def observe(self):
             result = super().observe()
@@ -716,22 +1316,25 @@ def test_action_context_sends_ordered_screens_and_all_intermediate_frames(tmp_pa
 
     prompt, paths, labels = client.calls[1]
     context = json.loads(prompt.split("Visible context:\n", 1)[1])
-    sequence = context["screen_sequence"]
-    assert len(paths) == 13  # initial + 4 final screens + all 8 intermediate screens
-    assert len(labels) == len(sequence) == len(paths)
-    assert labels == [item["label"] for item in sequence]
-    assert [item["stage"] for item in sequence] == [
-        "initial before up",
-        "during up, intermediate screen 1/2", "during up, intermediate screen 2/2", "after up",
-        "during left, intermediate screen 1/2", "during left, intermediate screen 2/2", "after left",
-        "during down, intermediate screen 1/2", "during down, intermediate screen 2/2", "after down",
-        "during right, intermediate screen 1/2", "during right, intermediate screen 2/2", "CURRENT SCREEN (after right)",
+    assert 1 <= len(paths) <= 3
+    assert len(labels) == len(paths)
+    assert "CURRENT SCREEN" in labels[-1]
+    assert "action_screen_links" not in context
+    assert any("after Action 1 (up)" in label for label in labels)
+    assert any("after Action 4 (right)" in label for label in labels)
+    assert len(context["recent_transitions"]) == 4
+    assert [row.split(":", 1)[0] for row in context["recent_transitions"]] == [
+        "1 up", "2 left", "3 down", "4 right",
     ]
-    assert [item["action"] for item in sequence] == [
-        None, "up", "up", "up", "left", "left", "left",
-        "down", "down", "down", "right", "right", "right",
+    selected_actions = [
+        int(match.group(1)) for label in labels
+        if (match := re.search(r"after Action (\d+)", label))
     ]
+    assert selected_actions == sorted(selected_actions)
     assert all(path.suffix == ".png" for path in paths)
+    history = [json.loads(line) for line in (tmp_path / "run/evidence.jsonl").read_text().splitlines()]
+    transitions = [row for row in history if row.get("type") == "transition"]
+    assert sum(len(row.get("result", {}).get("intermediate_frame_ids", [])) for row in transitions) == 8
 
 
 def test_action_context_scopes_history_and_screens_to_active_level(tmp_path: Path) -> None:
@@ -783,9 +1386,8 @@ def test_action_context_scopes_history_and_screens_to_active_level(tmp_path: Pat
     # and action must not appear in level 1's exploration context.
     second_prompt, second_paths, second_labels = action_prompts[1]
     second_context = json.loads(second_prompt.split("Visible context:\n", 1)[1])
-    assert second_context["active_level"] == {
-        "index_zero_based": 1, "display_number_one_based": 2, "levels_completed": 1,
-    }
+    assert second_context["current_state"]["level"] == 1
+    assert second_context["current_state"]["levels_completed"] == 1
     assert second_context["recent_transitions"] == []
     assert len(second_paths) == 1
     assert "CURRENT SCREEN" in second_labels[0]
@@ -796,11 +1398,11 @@ def test_action_context_scopes_history_and_screens_to_active_level(tmp_path: Pat
     third_prompt, third_paths, third_labels = action_prompts[2]
     third_context_text = third_prompt.split("Visible context:\n", 1)[1]
     third_context, _ = json.JSONDecoder().raw_decode(third_context_text)
-    assert [row["action"] for row in third_context["recent_transitions"]] == ["right"]
-    assert len(third_paths) == 2
-    assert "initial before right" in third_labels[0]
+    assert len(third_context["recent_transitions"]) == 1
+    assert third_context["recent_transitions"][0].startswith("1 right:")
+    assert len(third_paths) <= 3
     assert "CURRENT SCREEN" in third_labels[-1]
-    assert third_context["screen_sequence"][-1]["is_current_screen"] is True
+    assert "CURRENT SCREEN" in third_labels[-1]
 
 
 class _LevelCompleteEnv(_FakeEnv):
@@ -833,6 +1435,7 @@ def test_review_context_marks_level_boundary_and_verified_scope(tmp_path: Path) 
     assert "active level index 1 (zero-based), displayed as level 2" in review_prompt
     assert "active level may be the newly started level after the completion boundary" in review_prompt
     assert "only for the level scopes present in verified routes" in review_prompt
+    assert "completed-level review: prioritize transition-supported mechanics and strategies" in review_prompt
     events = _review_events(History(tmp_path / "run").records())
     transition = next(event for event in events if event["type"] == "transition")
     assert transition["level_index_before_action_zero_based"] == 0
@@ -840,7 +1443,7 @@ def test_review_context_marks_level_boundary_and_verified_scope(tmp_path: Path) 
     assert transition["crossed_level_boundary"] is True
 
 
-def test_cached_level_success_skips_redundant_review_but_win_still_reviews(tmp_path: Path) -> None:
+def test_cached_level_success_is_reviewed_for_route_efficiency_and_win_still_reviews(tmp_path: Path) -> None:
     from v10.tools.solutions import LevelSolutionStore
 
     state_dir = tmp_path / "state"
@@ -858,23 +1461,21 @@ def test_cached_level_success_skips_redundant_review_but_win_still_reviews(tmp_p
     edge = store.record_transition(start, "ACTION1", {}, finish, run_id="previous")
     store.record_successful_trajectory(start, [edge], run_id="previous", success="level_completed")
 
-    client = _FakeClient([])
+    client = _FakeClient([], review_responses=[_VALID_REVIEW])
     metrics = _run_live_without_starting_routine(
         _LevelCompleteEnv(), tmp_path / "cached-level", client, game_id="fixture",
         max_actions=1, state_dir=state_dir,
     )
     assert metrics["cached_solution_actions"] == 1
-    assert metrics["review_count"] == 0
-    assert metrics["review_skipped_cached_success_count"] == 1
-    assert client.calls == []
-    skipped = _review_rows(tmp_path / "cached-level")[0]
-    assert skipped["status"] == "skipped_verified_route_replay"
-    assert skipped["checkpoint_saved"] is True
-    checkpoint_memory = GameMemory(
-        tmp_path / "cached-level", store_dir=store_dir,
-        run_id=metrics["run_id"], game_id="fixture",
-    )
-    assert checkpoint_memory.reviewed_event_count("fixture") == skipped["covered_event_count"]
+    assert metrics["review_count"] == 1
+    assert metrics["review_skipped_cached_success_count"] == 0
+    assert len(client.calls) == 1
+    assert "Inspect its ordered action and screen transitions for repeated states" in client.calls[0][0]
+    route_review = _review_rows(tmp_path / "cached-level")[0]
+    assert route_review["status"] == "saved"
+    assert route_review["verified_route_replayed"] is True
+    assert route_review["selected_image_labels"]
+    assert "The completed route was one up action" not in client.calls[0][0]
 
     # Final WIN always gets consolidation, even when the winning move was cached.
     win_start = _LevelCompleteEnv(terminal=True, start_completed=4).observe()
@@ -895,7 +1496,58 @@ def test_cached_level_success_skips_redundant_review_but_win_still_reviews(tmp_p
     assert win_metrics["won"] is True
     assert win_metrics["review_count"] == 1
     assert win_metrics["review_skipped_cached_success_count"] == 0
-    assert _review_rows(tmp_path / "cached-win")[0]["trigger_reasons"] == ["level_completed", "win"]
+    assert _review_rows(tmp_path / "cached-win")[0]["trigger_reasons"] == ["level_completed"]
+
+
+def test_uncertain_reasoned_action_is_joined_to_outcome_without_extra_model_call(tmp_path: Path) -> None:
+    client = _FakeClient([_reasoned(
+        _decision([_action("up")]),
+        hypothesis={"claim": "The action changes the visible board.", "evidence": "a visible player-like region", "uncertainty": "tentative"},
+        prediction={"visible_change": "yes", "environment_outcome": "no_terminal", "description": "some pixels change"},
+    )])
+    metrics = _run_live_without_starting_routine(
+        _FakeEnv(), tmp_path / "uncertain", client,
+        game_id="fixture", max_actions=1, plan_horizon=1,
+    )
+
+    rows = [json.loads(line) for line in (tmp_path / "uncertain/reasoning.jsonl").read_text().splitlines()]
+    assert metrics["reasoning_records"] == 1
+    assert metrics["model_calls"] == 1
+    assert len(rows) == 1
+    assert rows[0]["comparison"] == "supported"
+    assert rows[0]["hypothesis_status"] == "unresolved"
+    assert rows[0]["planned_first_action"] == {"action": "up", "args": {}}
+    assert rows[0]["source_screen_number"] == 1
+    assert rows[0]["produced_screen_numbers"] == [2]
+    decision = next(
+        json.loads(line) for line in (tmp_path / "uncertain/decisions.jsonl").read_text().splitlines()
+        if json.loads(line).get("schema") == "v10.live_decision/2"
+    )
+    assert decision["decision"]["actions"] == [{"action": "up", "args": {}}]
+    assert decision["decision_schema"] == "v10.reasoned_action/1"
+    assert len(client.calls) == 1
+
+
+def test_prediction_mismatch_is_logged_but_does_not_interrupt_plan(tmp_path: Path) -> None:
+    client = _FakeClient([_reasoned(
+        _decision([_action("up"), _action("down")]),
+        hypothesis={"claim": "The action does not alter the board.", "evidence": "same visible region", "uncertainty": "uncertain"},
+        prediction={"visible_change": "no", "environment_outcome": "no_terminal", "description": "board remains visually unchanged"},
+    )])
+    env = _FakeEnv()
+    metrics = _run_live_without_starting_routine(
+        env, tmp_path / "prediction-mismatch", client,
+        game_id="fixture", max_actions=2, plan_horizon=2,
+    )
+    row = json.loads((tmp_path / "prediction-mismatch/reasoning.jsonl").read_text().splitlines()[0])
+    result = next(
+        json.loads(line) for line in (tmp_path / "prediction-mismatch/decisions.jsonl").read_text().splitlines()
+        if json.loads(line).get("schema") == "v10.live_plan_result/2"
+    )
+    assert row["comparison"] == "contradicted"
+    assert metrics["actions"] == 2
+    assert len(result["executed"]) == 2
+    assert row["remaining_plan_aborted_due_to_prediction"] is False
 
 
 def _review_rows(run_dir: Path) -> list[dict]:
@@ -1133,24 +1785,184 @@ def test_rejected_markdown_review_preserves_both_previous_files(
     assert global_memory_path(state_dir).read_text() == previous_global + "\n"
     assert result["row"]["review_checkpoint_saved"] is False
 
-def test_review_interval_defaults_to_50_and_runs_after_fiftieth_action(tmp_path: Path) -> None:
+def test_periodic_review_runs_each_interval_during_unfinished_play(tmp_path: Path) -> None:
     client = _FakeClient(
         [], default_decision=_decision([_action()] * 4),
-        review_responses=[_VALID_REVIEW],
     )
 
-    metrics = _run_live_without_starting_routine(_FakeEnv(), tmp_path / "run", client, game_id="fixture", max_actions=50)
+    metrics = _run_live_without_starting_routine(
+        _FakeEnv(), tmp_path / "run", client, game_id="fixture",
+        max_actions=45, review_interval=20,
+    )
 
-    assert metrics["actions"] == 50
-    assert metrics["review_interval"] == 50
+    assert metrics["actions"] == 45
+    assert metrics["review_interval"] == 20
+    rows = _review_rows(tmp_path / "run")
+    assert metrics["review_count"] == 2
+    assert [row["through_action"] for row in rows] == [20, 40]
+    assert [row["trigger_reasons"] for row in rows] == [
+        ["action_interval"], ["action_interval"],
+    ]
+    assert [len(row["selected_image_labels"]) for row in rows] == [21, 41]
+    review_prompts = [
+        prompt for prompt, _paths, _labels in client.calls
+        if "Complete ordered action history for the active level" in prompt
+    ]
+    assert len(review_prompts) == 2
+    second_history_text = review_prompts[1].split(
+        "Complete ordered action history for the active level since it began, through the end of the latest action plan. "
+        "Use this full sequence to assess progress and reset-versus-continue. Screens are numbered chronologically. "
+        "Each numbered action below names its source screen and all screens it produced; intermediate frames and the "
+        "resulting screen are attached in that order. The next action starts from the preceding action's final produced screen.\n", 1,
+    )[1].split("\n\nReview constraint:", 1)[0]
+    second_history = json.loads(second_history_text)
+    assert len(second_history) == 40
+    assert second_history[0]["sequence_index"] == 1
+    assert second_history[-1]["sequence_index"] == 40
+
+
+def test_interval_review_waits_until_the_eight_action_plan_finishes(tmp_path: Path) -> None:
+    client = _FakeClient(
+        [_decision([_action()] * 8) for _ in range(3)] + [_decision([_action()])],
+        review_responses=[_VALID_REVIEW],
+    )
+    metrics = _run_live_without_starting_routine(
+        _FakeEnv(), tmp_path / "deferred-review", client,
+        game_id="fixture", max_actions=25, plan_horizon=8, review_interval=20,
+    )
+
+    rows = _review_rows(tmp_path / "deferred-review")
+    assert metrics["actions"] == 25
     assert metrics["review_count"] == 1
-    review_row = _review_rows(tmp_path / "run")[0]
-    assert review_row["trigger_reasons"] == ["action_interval"]
-    assert review_row["covered_transition_count"] == 50
-    assert len(review_row["selected_image_labels"]) <= 8
+    assert rows[0]["through_action"] == 24
+    assert rows[0]["trigger_reasons"] == ["action_interval"]
+    review_call = next(
+        call for call in client.calls
+        if "Complete ordered action history for the active level" in call[0]
+    )
+    assert len(review_call[1]) == 25
+    assert "initial state before Action 1 (up)" in review_call[2][0]
+    assert "CURRENT SCREEN: result of Action 24 (up)" in review_call[2][-1]
+    review_prompt = next(
+        prompt for prompt, _paths, _labels in client.calls
+        if "Complete ordered action history for the active level" in prompt
+    )
+    history_section = review_prompt.split(
+        "The next action starts from the preceding action's final produced screen.\n", 1,
+    )[1].split("\n\nReview constraint:", 1)[0]
+    assert len(json.loads(history_section)) == 24
+    assert "RESET restarts the whole game" in client.calls[-1][0]
+    assert "choose RESET alone" not in client.calls[-1][0]
 
 
-def test_configured_review_interval_interrupts_remaining_plan(tmp_path: Path) -> None:
+def test_interval_review_attaches_every_intermediate_screen_in_order(tmp_path: Path) -> None:
+    class IntermediateFrameEnv(_FakeEnv):
+        def act(self, action, args):
+            super().act(action, args)
+            intermediate = self.frame.copy()
+            intermediate[2, 3] = 99 + len(self.actions)
+            return {"frames": [intermediate]}
+
+    run_dir = tmp_path / "all-review-screens"
+    tools = GameTools(IntermediateFrameEnv(), run_dir)
+    tools.observe()
+    tools.act("ACTION1", {})
+    tools.act("ACTION2", {})
+    client = _FakeClient([])
+
+    result = _perform_review(
+        tools, client, game_id="fixture", run_id="all-screens",
+        memory_store_dir=tmp_path / "state/games/fixture",
+        trigger_reasons=["action_interval"],
+    )
+
+    assert result["row"]["status"] == "saved"
+    _prompt, image_paths, image_labels = client.calls[0]
+    assert len(image_paths) == 5  # Initial, intermediate/after for both actions; current is the last screen.
+    assert len(image_labels) == 5
+    assert "initial state before Action 1 (up)" in image_labels[0]
+    assert "intermediate 1/1 during Action 1 (up)" in image_labels[1]
+    assert "result of Action 1 (up)" in image_labels[2]
+    assert "intermediate 1/1 during Action 2 (down)" in image_labels[3]
+    assert "CURRENT SCREEN: result of Action 2 (down)" in image_labels[4]
+
+
+def test_level_completion_review_attaches_the_complete_solved_level(tmp_path: Path) -> None:
+    class CompleteOnTenthAction(_FakeEnv):
+        def observe(self):
+            result = super().observe()
+            if len(self.actions) >= 10:
+                result["level"] = 1
+                result["levels_completed"] = 1
+            return result
+
+    tools = GameTools(CompleteOnTenthAction(), tmp_path / "complete-level-screens")
+    tools.observe()
+    for index in range(10):
+        tools.act("ACTION1" if index % 2 == 0 else "ACTION2", {})
+    client = _FakeClient([])
+
+    result = _perform_review(
+        tools, client, game_id="fixture", run_id="complete-level",
+        memory_store_dir=tmp_path / "state/games/fixture",
+        trigger_reasons=["level_completed"],
+    )
+
+    assert result["row"]["status"] == "saved"
+    _prompt, image_paths, image_labels = client.calls[0]
+    assert len(image_paths) == 11  # Starting screen, every post-action screen, current screen deduplicated.
+    assert "initial state before Action 1 (up)" in image_labels[0]
+    assert "CURRENT SCREEN: result of Action 10 (down)" in image_labels[-1]
+    history_text = client.calls[0][0].split(
+        "Complete ordered action history for the level that just completed. "
+        "Use this full sequence to identify its demonstrated strategy and observed outcomes. "
+        "Screens are numbered chronologically. Each numbered action below names its source screen and all screens it produced; "
+        "intermediate frames and the resulting screen are attached in that order. The next action starts from the preceding action's final produced screen.\n", 1,
+    )[1].split("\n\nReview constraint:", 1)[0]
+    history = json.loads(history_text)
+    assert len(history) == 10
+    assert [row["sequence_index"] for row in history] == list(range(1, 11))
+    assert history[0]["starts_from_screen_number"] == 1
+    assert history[0]["produces_screen_numbers"] == [2]
+    assert history[1]["starts_from_screen_number"] == 2
+    assert history[-1]["starts_from_screen_number"] == 10
+
+
+def test_model_selected_reset_restarts_startup_bootstrap_flow(tmp_path: Path) -> None:
+    class FourDirections(_FakeEnv):
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"].extend([
+                {"id": action, "parameters": {
+                    "type": "object", "properties": {}, "required": [],
+                    "additionalProperties": False,
+                }}
+                for action in ("ACTION3", "ACTION4")
+            ])
+            return result
+
+    env = FourDirections()
+    client = _FakeClient([
+        _decision([_action()]),  # Initial bootstrap-informed plan.
+        _decision(reset=True),  # Choose to restart after seeing an ineffective attempt.
+        _decision([_action()]),  # Plan from the post-reset bootstrap screens.
+    ])
+
+    metrics = run_live(
+        env, tmp_path / "reset-bootstrap", client,
+        game_id="fixture", max_actions=11, plan_horizon=8,
+    )
+
+    assert metrics["resets"] == 3  # Initial bootstrap, requested reset, second bootstrap reset.
+    assert env.actions == [(action, {}) for action in (
+        "ACTION1", "ACTION3", "ACTION2", "ACTION4", "ACTION1",
+        "ACTION1", "ACTION3", "ACTION2", "ACTION4", "ACTION1",
+    )]
+    bootstrap_prompts = [prompt for prompt, _paths, _labels in client.calls if "bootstrap observations below" in prompt]
+    assert len(bootstrap_prompts) == 2
+
+
+def test_budget_expiration_does_not_trigger_interval_review(tmp_path: Path) -> None:
     client = _FakeClient(
         [_decision([_action()] * 4)],
         review_responses=[_VALID_REVIEW],
@@ -1162,17 +1974,17 @@ def test_configured_review_interval_interrupts_remaining_plan(tmp_path: Path) ->
     )
 
     assert metrics["actions"] == 2
-    assert metrics["review_count"] == 1
-    assert len(client.calls) == 2
+    assert metrics["review_count"] == 0
+    assert len(client.calls) == 1
     plan_rows = [
         json.loads(line) for line in (tmp_path / "run/decisions.jsonl").read_text().splitlines()
         if json.loads(line).get("schema") == "v10.live_plan_result/2"
     ]
-    assert plan_rows[-1]["interrupt_reason"] == "review"
-    assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["action_interval"]
+    assert plan_rows[-1]["interrupt_reason"] == "action_budget_exhausted"
+    assert _review_rows(tmp_path / "run") == []
 
 
-def test_simultaneous_review_triggers_are_coalesced(tmp_path: Path) -> None:
+def test_level_completion_review_takes_precedence_over_interval(tmp_path: Path) -> None:
     client = _FakeClient(
         [_decision([_action()] * 4)], review_responses=[_VALID_REVIEW],
     )
@@ -1184,10 +1996,32 @@ def test_simultaneous_review_triggers_are_coalesced(tmp_path: Path) -> None:
     rows = _review_rows(tmp_path / "run")
     assert metrics["review_count"] == 1
     assert len(client.response_formats) == 2
-    assert rows[0]["trigger_reasons"] == ["level_completed", "action_interval"]
+    assert rows[0]["trigger_reasons"] == ["level_completed"]
 
 
-def test_failed_review_preserves_memory_resets_interval_and_continues(tmp_path: Path) -> None:
+def test_completion_at_interval_boundary_produces_one_review(tmp_path: Path) -> None:
+    class CompletesAtTwenty(_FakeEnv):
+        def observe(self):
+            result = super().observe()
+            completed = int(len(self.actions) >= 20)
+            result["levels_completed"] = completed
+            result["level"] = completed
+            return result
+
+    client = _FakeClient([], default_decision=_decision([_action()] * 4))
+    metrics = _run_live_without_starting_routine(
+        CompletesAtTwenty(), tmp_path / "run", client, game_id="fixture",
+        max_actions=21, review_interval=20,
+    )
+
+    assert metrics["actions"] == 21
+    rows = _review_rows(tmp_path / "run")
+    assert len(rows) == 1
+    assert rows[0]["through_action"] == 20
+    assert rows[0]["trigger_reasons"] == ["level_completed"]
+
+
+def test_failed_level_completion_review_preserves_memory_and_continues(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     store_dir = game_memory_dir(state_dir, "fixture")
     before = "# Game Memory\n\n- Prior durable finding."
@@ -1198,17 +2032,16 @@ def test_failed_review_preserves_memory_resets_interval_and_continues(tmp_path: 
     )
 
     metrics = _run_live_without_starting_routine(
-        _FakeEnv(), tmp_path / "run", client, game_id="fixture", max_actions=3,
-        review_interval=2, state_dir=state_dir,
+        _LevelCompleteEnv(), tmp_path / "run", client, game_id="fixture", max_actions=2,
+        state_dir=state_dir,
     )
 
-    assert metrics["actions"] == 3
-    assert metrics["review_count"] == 1
-    assert len(_review_rows(tmp_path / "run")) == 1
-    assert _review_rows(tmp_path / "run")[0]["status"] == "failed"
+    assert metrics["actions"] == 2
+    assert metrics["review_count"] == 2
+    assert [row["status"] for row in _review_rows(tmp_path / "run")] == ["failed", "saved"]
     assert "review endpoint unavailable" in _review_rows(tmp_path / "run")[0]["error"]
-    assert (store_dir / "MEMORY.md").read_text() == before + "\n"
-    assert "Prior durable finding." in client.calls[2][0]
+    assert (store_dir / "MEMORY.md").read_text() == _VALID_GAME_MEMORY + "\n"
+    assert "Prior durable finding." in client.calls[1][0]
 
 def test_malformed_review_preserves_existing_memory(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
@@ -1247,10 +2080,189 @@ def test_terminal_level_completion_is_reviewed_without_resuming_play(tmp_path: P
     assert metrics["review_count"] == 1
     assert len(client.calls) == 2
     assert _review_rows(tmp_path / "run")[0]["status"] == "saved"
-    assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["level_completed", "win"]
+    assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["level_completed"]
 
 
-def test_win_without_level_counter_change_triggers_review(tmp_path: Path) -> None:
+def test_game_over_with_budget_remaining_resets_and_repeats_startup_bootstrap(
+    tmp_path: Path,
+) -> None:
+    class FourDirections(_FakeEnv):
+        def __init__(self):
+            super().__init__()
+            self.actions_since_reset = 0
+            self.did_game_over = False
+            self.game_over = False
+
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"].extend([
+                {"id": action, "parameters": {
+                    "type": "object", "properties": {}, "required": [],
+                    "additionalProperties": False,
+                }}
+                for action in ("ACTION3", "ACTION4")
+            ])
+            result["game_state"] = "GAME_OVER" if self.game_over else "NOT_FINISHED"
+            result["terminal"] = self.game_over
+            return result
+
+        def act(self, action, args):
+            super().act(action, args)
+            self.actions_since_reset += 1
+            if self.resets == 1 and self.actions_since_reset == 1 and not self.did_game_over:
+                self.game_over = True
+                self.did_game_over = True
+            return {}
+
+        def reset(self):
+            self.resets += 1
+            self.actions_since_reset = 0
+            self.game_over = False
+            self.frame[:] = 0
+            return self.observe()
+
+    env = FourDirections()
+    client = _FakeClient([
+        _decision([_action("left")]),  # First attempt ends in GAME_OVER.
+        _decision([_action("up")]),    # Bootstrap-informed plan after retry bootstrap.
+        _decision([_action("down")]),
+    ], post_mortem_responses=[
+        "## What happened\nThe last left action ended the attempt.\n\n"
+        "## Choices to change\nDo not repeat the ineffective path.\n\n"
+        "## Retry experiment\nTest one different action and inspect the result."
+    ])
+
+    metrics = run_live(env, tmp_path / "game-over-retry", client, game_id="fixture", max_actions=11)
+
+    assert metrics["actions"] == 11
+    assert metrics["resets"] == 3  # Initial bootstrap, game-over restart, retry bootstrap.
+    assert metrics["game_over_restarts"] == 1
+    assert metrics["stop_reason"] == "action_budget_exhausted"
+    assert env.did_game_over is True
+    assert [action for action, _ in env.actions] == [
+        "ACTION1", "ACTION3", "ACTION2", "ACTION4", "ACTION3",
+        "ACTION1", "ACTION3", "ACTION2", "ACTION4", "ACTION1", "ACTION2",
+    ]
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "game-over-retry" / "decisions.jsonl").read_text().splitlines()
+    ]
+    restarts = [row for row in records if row.get("schema") == "v10.live_game_over_restart/1"]
+    bootstrap_resets = [row for row in records if row.get("schema") == "v10.live_bootstrap_reset/1"]
+    assert len(restarts) == 1
+    assert restarts[0]["actions_remaining"] == 6
+    assert restarts[0]["bootstrap_pending"] is True
+    assert len(bootstrap_resets) == 2
+    assert _review_rows(tmp_path / "game-over-retry") == []
+    assert metrics["review_count"] == 0
+    post_mortem_rows = [
+        json.loads(line)
+        for line in (tmp_path / "game-over-retry" / "post_mortems.jsonl").read_text().splitlines()
+    ]
+    assert post_mortem_rows[0]["status"] == "saved"
+    assert post_mortem_rows[0]["action_sequence"] == [{
+        "action_number": 1, "action": "left", "level_index": 0,
+        "levels_completed": 0, "resulting_game_state": "GAME_OVER",
+        "starts_from_screen_number": 1, "produces_screen_numbers": [2],
+    }]
+
+    bootstrap_prompts = [
+        (prompt, paths, labels)
+        for prompt, paths, labels in client.calls
+        if any("Bootstrap for level index 0" in label for label in labels)
+    ]
+    assert len(bootstrap_prompts) == 2
+    retry_prompt, retry_images, retry_labels = bootstrap_prompts[1]
+    assert "bootstrap observations" in retry_prompt
+    assert "must start from this current screen" in retry_prompt
+    assert "previous_attempt_post_mortem" in retry_prompt
+    assert "Do not repeat the ineffective path" in retry_prompt
+    assert 1 <= len(retry_images) <= 3
+    assert "CURRENT SCREEN" in retry_labels[-1]
+
+
+def test_post_mortem_sends_every_action_and_screen_in_order(tmp_path: Path) -> None:
+    class FourDirections(_FakeEnv):
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"].extend([
+                {"id": action, "parameters": {
+                    "type": "object", "properties": {}, "required": [],
+                    "additionalProperties": False,
+                }}
+                for action in ("ACTION3", "ACTION4")
+            ])
+            return result
+
+        def act(self, action, args):
+            super().act(action, args)
+            intermediate = self.frame.copy()
+            intermediate[2, 3] = 99 + len(self.actions)
+            return {"frames": [intermediate]}
+
+    tools = GameTools(FourDirections(), tmp_path / "post-mortem-images")
+    tools.observe()
+    for index in range(12):
+        tools.act(f"ACTION{index % 4 + 1}", {})
+    client = _FakeClient([], post_mortem_responses=["The sequence shows no supported cause."])
+
+    result = _perform_game_over_post_mortem(
+        tools, client, game_id="fixture", guidance_memory="", global_memory="",
+    )
+
+    prompt, paths, labels = client.calls[0]
+    assert result["row"]["status"] == "saved"
+    assert len(result["row"]["action_sequence"]) == 12
+    assert len(paths) == len(labels) == result["row"]["image_count"] == 25
+    expected_labels = ["Post-mortem Screen 1: initial state before Action 1 (up)"]
+    directions = ("up", "down", "left", "right")
+    for index in range(12):
+        direction = directions[index % len(directions)]
+        expected_labels.extend([
+            f"Post-mortem Screen {index * 2 + 2}: intermediate 1/1 during Action {index + 1} ({direction}); "
+            f"produced by Action {index + 1} ({direction}) from Screen {index * 2 + 1}",
+            f"Post-mortem Screen {index * 2 + 3}: result of Action {index + 1} ({direction}); "
+            f"produced by Action {index + 1} ({direction}) from Screen {index * 2 + 1}",
+        ])
+    expected_labels[-1] = "Post-mortem Screen 25: CURRENT SCREEN: result of Action 12 (right)"
+    assert labels == expected_labels
+    action_json = prompt.split("Complete active-level action sequence:\n", 1)[1].split("\n\nGame MEMORY.md", 1)[0]
+    assert len(json.loads(action_json)) == 12
+
+
+def test_game_over_at_action_budget_does_not_restart(tmp_path: Path) -> None:
+    class TerminalAfterOneAction(_FakeEnv):
+        def __init__(self):
+            super().__init__()
+            self.game_over = False
+
+        def observe(self):
+            result = super().observe()
+            result["game_state"] = "GAME_OVER" if self.game_over else "NOT_FINISHED"
+            result["terminal"] = self.game_over
+            return result
+
+        def act(self, action, args):
+            super().act(action, args)
+            self.game_over = True
+            return {}
+
+    env = TerminalAfterOneAction()
+    metrics = _run_live_without_starting_routine(
+        env, tmp_path / "game-over-budget", _FakeClient([_decision([_action()])]),
+        game_id="fixture", max_actions=1, review_interval=1,
+    )
+
+    assert metrics["actions"] == 1
+    assert metrics["resets"] == 0
+    assert metrics["game_over_restarts"] == 0
+    assert metrics["stop_reason"] == "game_over"
+    assert _review_rows(tmp_path / "game-over-budget") == []
+    assert metrics["review_count"] == 0
+
+
+def test_win_without_level_counter_change_is_treated_as_level_completion(tmp_path: Path) -> None:
     class WinWithoutLevelChange(_FakeEnv):
         def observe(self):
             result = super().observe()
@@ -1262,20 +2274,20 @@ def test_win_without_level_counter_change_triggers_review(tmp_path: Path) -> Non
     metrics = _run_live_without_starting_routine(WinWithoutLevelChange(), tmp_path / "run", client, game_id="fixture", max_actions=2)
 
     assert metrics["stop_reason"] == "win"
-    assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["win"]
+    assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["level_completed"]
 
 
-def test_three_consecutive_unchanged_actions_trigger_stagnation_review(tmp_path: Path) -> None:
+def test_stagnation_never_triggers_a_review(tmp_path: Path) -> None:
     client = _FakeClient(
-        [_decision([_action()] * 4), _decision([])], review_responses=[_VALID_REVIEW],
+        [], default_decision=_decision([_action()] * 4),
     )
     metrics = _run_live_without_starting_routine(
-        _FakeEnv(change_every_action=False), tmp_path / "run", client,
-        game_id="fixture", max_actions=4, review_interval=50,
+        _OscillatingEnv(), tmp_path / "run", client,
+        game_id="fixture", max_actions=8, review_interval=50,
     )
 
-    assert metrics["review_count"] == 1
-    assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["stagnation"]
+    assert metrics["review_count"] == 0
+    assert _review_rows(tmp_path / "run") == []
 
 
 def test_changed_transition_resets_stagnation_streak(tmp_path: Path) -> None:
@@ -1283,16 +2295,29 @@ def test_changed_transition_resets_stagnation_streak(tmp_path: Path) -> None:
         def __init__(self):
             super().__init__(change_every_action=False)
 
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"].append({
+                "id": "ACTION3", "parameters": {
+                    "type": "object", "properties": {}, "required": [],
+                    "additionalProperties": False,
+                },
+            })
+            return result
+
         def act(self, action, args):
             super().act(action, args)
-            if action == "ACTION2":
+            if action == "ACTION3":
                 self.frame[0, 0] = 9
             return {}
 
     client = _FakeClient(
         [
-            _decision([_action("up"), _action("down"), _action("up"), _action("up")]),
             _decision([_action("up")]),
+            _decision([_action("down")]),
+            _decision([_action("left")]),
+            _decision([_action("up")]),
+            _decision([_action("down")]),
         ],
         review_responses=[_VALID_REVIEW],
     )
@@ -1301,9 +2326,13 @@ def test_changed_transition_resets_stagnation_streak(tmp_path: Path) -> None:
         game_id="fixture", max_actions=5, plan_horizon=4, review_interval=50,
     )
 
-    assert metrics["review_count"] == 1
-    assert _review_rows(tmp_path / "run")[0]["through_action"] == 4
-    assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["stagnation"]
+    assert metrics["review_count"] == 0
+    action_contexts = [
+        json.JSONDecoder().raw_decode(prompt.split("Visible context:\n", 1)[1])[0]
+        for prompt, _images, _labels in client.calls if "Visible context:\n" in prompt
+    ]
+    after_change = next(ctx for ctx in action_contexts if ctx["budgets"]["actions_used"] == 3)
+    assert after_change["stagnation"]["consecutive_repeated_or_no_progress_actions"] == 0
 
 
 def test_stale_stagnation_states_from_previous_level_do_not_retrigger(tmp_path: Path) -> None:
@@ -1321,12 +2350,11 @@ def test_stale_stagnation_states_from_previous_level_do_not_retrigger(tmp_path: 
 
         def act(self, action, args):
             self.actions.append((action, dict(args)))
+            self.frame[:] = 0 if int(self.frame[0, 0]) else 1
             if len(self.actions) == 3:
                 self.level = 1
                 self.levels_completed = 1
                 self.frame[0, 0] = 3
-            elif len(self.actions) > 3:
-                self.frame[0, len(self.actions) % self.frame.shape[1]] = len(self.actions)
             return {}
 
     client = _FakeClient(
@@ -1421,3 +2449,249 @@ def test_live_direction_words_map_to_ids_and_logs_use_direction_names(
     assert "planned=['ACTION" not in output
     assert "taking action 1: ACTION4" not in output
     assert metrics["actions"] == 4
+
+
+class _RegressionWinningEnv(_FakeEnv):
+    def __init__(self, actions_to_win=1):
+        super().__init__()
+        self.actions_to_win = actions_to_win
+        self.attempt_actions = 0
+
+    def observe(self):
+        result = super().observe()
+        won = self.attempt_actions >= self.actions_to_win
+        result.update(game_state="WIN" if won else "NOT_FINISHED", terminal=won,
+                      level=int(won), levels_completed=int(won))
+        return result
+
+    def act(self, action, args):
+        super().act(action, args)
+        self.attempt_actions += 1
+        return {}
+
+    def reset(self):
+        super().reset()
+        self.attempt_actions = 0
+        return self.observe()
+
+
+def test_native_adapter_preserves_temporal_frames_and_validates_click_coordinates(tmp_path, monkeypatch):
+    from v10.analysis import validate_model_decision, DecisionValidationError
+
+    class Native:
+        def reset(self):
+            return types.SimpleNamespace(frame=np.zeros((1, 8, 8), dtype=np.int64),
+                available_actions=[6], state="NOT_FINISHED", levels_completed=0, win_levels=1)
+
+        def step(self, action, data, reasoning):
+            self.data = data
+            return types.SimpleNamespace(frame=np.stack([np.full((8, 8), n) for n in (1, 2, 3)]),
+                available_actions=[6], state="NOT_FINISHED", levels_completed=0, win_levels=1)
+
+    class Actions:
+        @staticmethod
+        def from_id(value):
+            return types.SimpleNamespace(name=f"ACTION{value}", value=value)
+
+    monkeypatch.setitem(sys.modules, "arcengine", types.SimpleNamespace(GameAction=Actions))
+    native = Native()
+    adapter = ArcadeGameEnv("fixture", env_factory=lambda *args, **kwargs: native)
+    tools = GameTools(adapter, tmp_path / "native")
+    start = tools.observe()
+    decision = validate_model_decision({"actions": [{"action": "ACTION6", "args": {"x": 7, "y": 4}}]}, start["legal_actions"])
+    with pytest.raises(DecisionValidationError, match="maximum"):
+        validate_model_decision({"actions": [{"action": "ACTION6", "args": {"x": 8, "y": 0}}]}, start["legal_actions"])
+    result = tools.act(**{"action": decision["actions"][0]["action"], "args": decision["actions"][0]["args"]})
+    assert native.data["x"] == 7
+    assert len(result["result"]["intermediate_frame_ids"]) == 2
+    assert [int(tools.frames.get(frame)[0, 0]) for frame in result["result"]["intermediate_frame_ids"]] == [1, 2]
+    assert int(result["observation"]["frame"][0, 0]) == 3
+    inputs = _live_context(tools, result["observation"], "fixture", 8, shared_skill_path(),
+                           tmp_path / "state/games/fixture", "r", 5)
+    assert len(inputs["image_paths"]) <= 3
+    assert "CURRENT SCREEN" in inputs["image_labels"][-1]
+
+
+def test_bootstrap_win_is_preserved_and_saved_without_reset(tmp_path):
+    env = _RegressionWinningEnv()
+    metrics = run_live(env, tmp_path / "probe-win", _FakeClient([]), game_id="fixture", max_actions=1)
+    assert metrics["won"] is True
+    assert metrics["stop_reason"] == "win"
+    assert metrics["available_level_solutions"] == 1
+    assert env.resets == 0
+
+
+def test_live_winning_log_with_bootstrap_reset_imports_directions_idempotently(tmp_path):
+    from v10.tools.solutions import LevelSolutionStore
+    env = _RegressionWinningEnv(actions_to_win=3)
+    client = _FakeClient([_decision([_action()] * 3)])
+    run_dir = tmp_path / "winning-log"
+    metrics = run_live(env, run_dir, client, game_id="fixture", max_actions=5)
+    assert metrics["won"]
+    assert env.resets == 1
+    store = LevelSolutionStore(tmp_path / "recovered.jsonl", "fixture")
+    assert len(store.import_successful_run(run_dir)) == 1
+    assert [step["action"] for step in store.solutions()[0]["steps"]] == ["ACTION1"] * 3
+    assert store.import_successful_run(run_dir) == []
+    assert len(store.solutions()) == 1
+
+
+def test_diverged_route_at_same_screen_is_suspended_and_model_runs(tmp_path):
+    from v10.tools.solutions import LevelSolutionStore
+    state = tmp_path / "state"
+    env = _FakeEnv(change_every_action=False)
+    start = env.observe()
+    target = {**start, "frame": np.ones_like(start["frame"]), "level": 1, "levels_completed": 1}
+    store = LevelSolutionStore(game_memory_dir(state, "fixture") / "level_solutions.jsonl", "fixture")
+    edge = store.record_transition(start, "ACTION1", {}, target, run_id="old")
+    store.record_successful_trajectory(start, [edge], run_id="old", success="level_completed")
+    client = _FakeClient([_decision([_action("down")])])
+    metrics = run_live(env, tmp_path / "diverged", client, game_id="fixture", max_actions=2,
+                       state_dir=state, starting_routine=False)
+    assert metrics["cached_solution_actions"] == 1
+    assert metrics["model_calls"] == 1
+    assert [action for action, _ in env.actions] == ["ACTION1", "ACTION2"]
+
+
+def test_failed_click_does_not_block_other_coordinates(tmp_path):
+    class ClickEnv(_FakeEnv):
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"] = [{"id": "ACTION6", "parameters": {
+                "type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}},
+                "required": ["x", "y"], "additionalProperties": False}}]
+            return result
+
+        def act(self, action, args):
+            self.actions.append((action, args))
+            if args["x"]:
+                self.frame[0, 0] = 1
+            return {}
+
+    client = _FakeClient([_decision([{"action": "ACTION6", "args": {"x": x, "y": 0}}]) for x in (0, 1)])
+    env = ClickEnv()
+    metrics = run_live(env, tmp_path / "clicks", client, game_id="fixture", max_actions=2, starting_routine=False)
+    assert [args["x"] for _, args in env.actions] == [0, 1]
+    assert metrics["model_calls"] == 2
+    context = json.loads(client.calls[1][0].split("Visible context:\n", 1)[1])
+    assert context["ineffective_actions_at_current_screen"] == []
+    assert context["ineffective_attempts_at_current_screen"] == [{"action": "ACTION6", "args": {"x": 0, "y": 0}}]
+
+
+def test_reset_memory_cli_does_not_reimport_historical_route_or_ledger(tmp_path, monkeypatch):
+    from v10 import cli, arcade_env
+    from v10.runlog import write_json
+    root = tmp_path / "state"
+    old = tmp_path / "old-run"
+    tools = GameTools(_RegressionWinningEnv(), old)
+    tools.observe()
+    tools.act("ACTION1")  # Old canonical evidence remains importable.
+    write_json(old / "run_manifest.json", {"game_id": "fixture", "run_id": "old"})
+    write_json(old / "metrics.json", {"won": True, "actions": 1, "levels_completed": 1})
+    (old / "memory.jsonl").write_text(json.dumps({"id": "old-marker", "type": "mechanic", "claim": "stale"}) + "\n")
+    save_game_memory(game_memory_dir(root, "fixture"), "Old memory")
+    env = _RegressionWinningEnv()
+    env.close = lambda: None
+    monkeypatch.setattr(arcade_env, "ArcadeGameEnv", lambda *args, **kwargs: env)
+    monkeypatch.setattr(cli, "StrataClient", lambda **kwargs: _FakeClient([]))
+    assert cli.main(["live", "--game-id", "fixture", "--run-dir", str(old), "--state-dir", str(root),
+                     "--max-actions", "1", "--reset-memory"]) == 0
+    metrics = json.loads((old / "metrics.json").read_text())
+    manifest = json.loads((old / "run_manifest.json").read_text())
+    assert metrics["cached_solution_actions"] == 0
+    assert manifest["configuration"]["import_historical_routes"] is False
+    assert "old-marker" not in (game_memory_dir(root, "fixture") / "memory.jsonl").read_text()
+
+
+def test_bootstrap_restoration_rejects_different_start_screen(tmp_path):
+    from v10.tools.solutions import LevelSolutionStore
+    class DifferentReturn(_FakeEnv):
+        def __init__(self):
+            super().__init__()
+            self.level = 0
+
+        def observe(self):
+            result = super().observe()
+            result.update(level=self.level, levels_completed=self.level)
+            return result
+
+        def act(self, action, args):
+            self.actions.append((action, args))
+            if self.level == 0:
+                self.level = 1
+                self.frame[:] = 20 if self.resets == 0 else 10
+            else:
+                self.frame[0, 0] += 1
+            return {}
+
+        def reset(self):
+            super().reset()
+            self.level = 0
+            return self.observe()
+
+    env = DifferentReturn()
+    state = tmp_path / "state"
+    start = env.observe()
+    target = {**start, "frame": np.full_like(start["frame"], 10), "level": 1, "levels_completed": 1}
+    store = LevelSolutionStore(game_memory_dir(state, "fixture") / "level_solutions.jsonl", "fixture")
+    edge = store.record_transition(start, "ACTION1", {}, target, run_id="old")
+    store.record_successful_trajectory(start, [edge], run_id="old", success="level_completed")
+    client = _FakeClient([_decision([])])
+    metrics = run_live(env, tmp_path / "mismatch", client, game_id="fixture", max_actions=8, state_dir=state)
+    action_prompts = [prompt for prompt, _, _ in client.calls if "Visible context:\n" in prompt]
+    assert len(action_prompts) == 1
+    assert "bootstrap observations below" not in action_prompts[0]
+    context = json.loads(action_prompts[0].split("Visible context:\n", 1)[1])
+    assert "bootstrap_observations" not in context
+    assert context["current_state"]["level"] == 1
+    assert metrics["stop_reason"] == "model_returned_no_actions"
+
+
+def test_review_archives_previous_and_new_prose_and_manifest_records_settings(tmp_path):
+    state = tmp_path / "state"
+    game = game_memory_dir(state, "fixture")
+    save_game_memory(game, "Previous game lesson")
+    from v10.tools.memory import save_global_memory
+    save_global_memory(state, "Previous reusable method")
+    client = _FakeClient([_decision([_action()])])
+    client.max_output_tokens = 4096
+    client.reasoning_effort = "medium"
+    client.timeout_seconds = 300
+    run = tmp_path / "archive"
+    metrics = run_live(_RegressionWinningEnv(), run, client, game_id="fixture", max_actions=1,
+                       starting_routine=False, state_dir=state)
+    assert metrics["won"]
+    rows = [row for row in GameMemory(run, store_dir=game).ledger() if row.get("op") == "markdown"]
+    assert [row["markdown"] for row in rows if row["scope"] == "game"] == ["Previous game lesson\n", _VALID_GAME_MEMORY + "\n"]
+    assert [row["markdown"] for row in rows if row["scope"] == "global"] == ["Previous reusable method\n", _VALID_GLOBAL_MEMORY + "\n"]
+    manifest = json.loads((run / "run_manifest.json").read_text())
+    assert manifest["configuration"]["max_output_tokens"] == 4096
+    assert manifest["configuration"]["reasoning_effort"] == "medium"
+    assert manifest["starting_memory_sha256"]["game"] == next(row["sha256"] for row in rows if row["scope"] == "game")
+
+
+def test_run_directory_cannot_clear_persistent_state(tmp_path):
+    from v10.live import _prepare_live_run_directory
+    root = tmp_path / "skills"
+    root.mkdir()
+    sentinel = root / "SKILL.md"
+    sentinel.write_text("keep")
+    with pytest.raises(ValueError, match="overlaps"):
+        _prepare_live_run_directory(root, (root, sentinel))
+    assert sentinel.read_text() == "keep"
+
+
+def test_single_action_experiment_can_discover_hidden_effect_after_repeated_input(tmp_path):
+    class DelayedWin(_RegressionWinningEnv):
+        def act(self, action, args):
+            self.actions.append((action, args))
+            self.attempt_actions += 1
+            return {}  # Only the third input changes terminal/progress metadata.
+
+    env = DelayedWin(actions_to_win=3)
+    client = _FakeClient([_decision([_action()])] * 3)
+    metrics = run_live(env, tmp_path / "hidden-effect", client, game_id="fixture",
+                       max_actions=3, starting_routine=False)
+    assert metrics["won"]
+    assert metrics["actions"] == 3
+    assert env.resets == 0

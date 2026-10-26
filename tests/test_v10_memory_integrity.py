@@ -444,3 +444,17 @@ def test_partial_review_rejections_do_not_checkpoint_unreviewed_evidence(tmp_pat
     assert repaired["checkpointed"] is True
     assert memory.has_review_coverage("ez01", 2)
     assert len(memory.patterns("ez01")) == 2
+
+
+def test_markdown_revisions_use_existing_ledger_without_entering_action_patterns(tmp_path):
+    from v10.tools.memory import GameMemory
+    memory = GameMemory(tmp_path / "run", store_dir=tmp_path / "game", run_id="r", game_id="fixture")
+    assert memory.record_markdown_revision("game", "Original observation", step=1)
+    assert memory.record_markdown_revision("game", "Corrected observation", step=2)
+    assert not memory.record_markdown_revision("game", "Corrected observation", step=3)
+    assert memory.record_markdown_revision("global", "Compare objects separately", step=3)
+    restored = GameMemory(tmp_path / "run", store_dir=tmp_path / "game", run_id="r", game_id="fixture")
+    assert restored.patterns() == []
+    assert [row["markdown"] for row in restored.ledger()] == [
+        "Original observation", "Corrected observation", "Compare objects separately",
+    ]

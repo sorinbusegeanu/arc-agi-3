@@ -363,14 +363,13 @@ def evaluate_prediction(
 
 
 class GameTools:
-    """Environment adapter with action/reset budgets and append-only evidence."""
+    """Environment adapter with an action budget and append-only evidence."""
 
     def __init__(
         self,
         env: Any,
         run_dir: Path | str,
         max_actions: int = 1000,
-        max_resets: int = 10,
     ) -> None:
         if not callable(getattr(env, "observe", None)) or not callable(getattr(env, "act", None)):
             raise TypeError("env must implement observe() and act(action, args)")
@@ -380,11 +379,14 @@ class GameTools:
         self.frames = FrameStore(self.run_dir)
         self.history = History(self.run_dir)
         self.max_actions = int(max_actions)
-        self.max_resets = int(max_resets)
         self.action_count = sum(record.get("type") == "transition" for record in self.history.records())
         self.reset_count = sum(record.get("type") == "reset" for record in self.history.records())
         self.reset_generation = max((int(record.get("reset_generation", 0)) for record in self.history.records()), default=0)
         self._current: dict[str, Any] | None = None
+
+    @property
+    def supports_reset(self) -> bool:
+        return callable(getattr(self.env, "reset", None))
 
     def _capture(self, raw: Any) -> dict[str, Any]:
         observation = _mapping(raw, "observe")
@@ -413,6 +415,8 @@ class GameTools:
             "level": current.get("level"), "levels_completed": current.get("levels_completed"),
             "terminal": current.get("terminal"), "game_state": current.get("game_state"),
             "reset_generation": self.reset_generation,
+            "game_state": current.get("game_state"), "win_levels": current.get("win_levels"),
+            "game_id": current.get("game_id"),
         })
         current["evidence_id"] = evidence["evidence_id"]
         self._current = current
@@ -509,8 +513,6 @@ class GameTools:
     def reset(self, justification: str) -> dict[str, Any]:
         if not isinstance(justification, str) or not justification.strip():
             raise ActionError("reset requires a non-empty justification")
-        if self.reset_count >= self.max_resets:
-            raise BudgetExceeded(f"reset budget exhausted ({self.max_resets})")
         reset_method = getattr(self.env, "reset", None)
         if not callable(reset_method):
             raise ActionError("environment does not support reset")
@@ -524,6 +526,8 @@ class GameTools:
             "frame_image_id": current["frame_image_id"],
             "legal_actions": current["legal_actions"], "level": current.get("level"),
             "levels_completed": current.get("levels_completed"), "terminal": current.get("terminal"),
+            "game_state": current.get("game_state"), "win_levels": current.get("win_levels"),
+            "game_id": current.get("game_id"),
             "reset_generation": self.reset_generation,
         })
         current["evidence_id"] = evidence["evidence_id"]

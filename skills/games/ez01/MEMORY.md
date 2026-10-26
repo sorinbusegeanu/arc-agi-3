@@ -1,6 +1,6 @@
-## Core Mechanic
-- Move the player square into contact with the goal square; contact completes the level. No obstacle interrupted the verified routes.
+## Established Mechanics
+- Blue square is controllable; directional actions move it in the corresponding direction.
+- Yellow square is the goal; reaching it completes the level (confirmed on levels zero through four).
 
-## Verified Approach
-- Direct movement toward the goal (matching the relative direction) completed every level through WIN. Use the verified route when the starting state matches.
-- The game is fully solved; no unresolved experiments remain.
+## Verified Strategy (levels zero through four)
+- Move the blue square directly toward the yellow square until they meet. When the goal is directly above the player, moving straight up is sufficient and efficient; lateral exploration is unnecessary. Confirmed across all five levels with no obstacles encountered.

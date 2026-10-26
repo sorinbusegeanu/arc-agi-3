@@ -1,4 +1,0 @@
-{"game_id": "gp01", "game_state": "NOT_FINISHED", "id": "state:92d7fcf8973745f595b3a75644b4a568", "level": 0, "levels_completed": 0, "op": "upsert", "revision": 1, "run_id": "92d7fcf8973745f595b3a75644b4a568", "step": 0, "terminal": false, "type": "state", "win_levels": 5}
-{"covered_event_count": 8, "game_id": "gp01", "id": "review-checkpoint:379501927e3dd42c2b3f", "op": "checkpoint", "revision": 2, "run_id": "92d7fcf8973745f595b3a75644b4a568", "step": 6, "type": "review_checkpoint"}
-{"covered_event_count": 11, "game_id": "gp01", "id": "review-checkpoint:7d5ff0d9f77de7c72a29", "op": "checkpoint", "revision": 3, "run_id": "92d7fcf8973745f595b3a75644b4a568", "step": 9, "type": "review_checkpoint"}
-{"covered_event_count": 14, "game_id": "gp01", "id": "review-checkpoint:80a1f450338964ccf488", "op": "checkpoint", "revision": 4, "run_id": "92d7fcf8973745f595b3a75644b4a568", "step": 12, "type": "review_checkpoint"}

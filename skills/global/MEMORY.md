@@ -1,6 +1,6 @@
-## Reusable Methods
-- Compare which object's pixels shift after an action to identify which entity responds; if only a corner/HUD element changes, the main game field is not yet active.
-- Repeated identical states signal stagnation—try a different input type or interaction model rather than repeating the same action.
-- Before reusing a verified strategy, check whether the new layout matches the original scope.
-- When an entity is adjacent to a target but movement toward it produces no visible change, try approaching from a different direction or angle rather than repeating the same input.
-- Prior memory claims about specific input effects can be wrong; when current observations contradict stored notes, trust the current evidence and update.
+## Reusable Exploration Methods
+- Compare each object's position before and after a single action to infer which object the action controls and how it moves.
+- When two objects appear to have a target-reach relationship, move the controllable object toward the other and watch for a state change that signals completion.
+- A single changed frame is insufficient to confirm a mechanic; seek consistent effects across multiple actions or levels before generalizing a rule.
+- Classify repeated actions that produce no visible change from the same state as ineffective for that state, not as successful strategies.
+- Once a goal's direction is clear from the starting layout, move directly toward it rather than exploring unrelated directions first.

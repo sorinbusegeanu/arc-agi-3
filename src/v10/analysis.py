@@ -17,6 +17,7 @@ from .tools.memory import (
 
 
 DECISION_SCHEMA = "v10.action_set/2"
+REASONED_ACTION_SCHEMA = "v10.reasoned_action/1"
 
 _DIRECTION_BY_ACTION = {
     "ACTION1": "up",
@@ -97,6 +98,139 @@ def validate_model_decision(
         )
     except ActionError as exc:
         raise DecisionValidationError(str(exc)) from exc
+
+
+_REASONED_TOP_LEVEL = {
+    "state_assessment", "hypothesis", "trajectory_rationale", "prediction", "actions",
+}
+_CERTAINTY_LABELS = {"observed", "inferred", "unknown"}
+_PREDICTED_VISUAL_CHANGE = {"yes", "no", "unknown"}
+_PREDICTED_OUTCOMES = {"level_change", "GAME_OVER", "WIN", "no_terminal", "unknown"}
+
+
+def _bounded_text(value: Any, field: str, limit: int, *, empty_ok: bool = False) -> str:
+    if not isinstance(value, str) or (not empty_ok and not value.strip()):
+        raise DecisionValidationError(f"{field} must be a non-empty string")
+    if len(value) > limit:
+        raise DecisionValidationError(f"{field} exceeds the {limit}-character limit")
+    return value.strip()
+
+
+def _require_keys(value: Any, expected: set[str], field: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise DecisionValidationError(f"{field} must contain exactly: {', '.join(sorted(expected))}")
+    return value
+
+
+def validate_reasoned_action(
+    payload: Any,
+    legal_action_specs: Sequence[Mapping[str, Any]],
+    max_actions: int = 8,
+) -> dict[str, Any]:
+    """Validate structured reasoning, then apply the unchanged legal-action validator."""
+    response = _require_keys(payload, _REASONED_TOP_LEVEL, "reasoned action")
+
+    assessment = _require_keys(
+        response["state_assessment"],
+        {"player", "target_candidates", "obstacles", "other_relevant_changes"},
+        "state_assessment",
+    )
+    player = _require_keys(assessment["player"], {"location", "certainty", "evidence"}, "player")
+    _bounded_text(player["location"], "player.location", 120)
+    if not isinstance(player["certainty"], str) or player["certainty"] not in _CERTAINTY_LABELS:
+        raise DecisionValidationError("player.certainty must be observed, inferred, or unknown")
+    _bounded_text(player["evidence"], "player.evidence", 180)
+
+    candidates = assessment["target_candidates"]
+    if not isinstance(candidates, list) or len(candidates) > 5:
+        raise DecisionValidationError("state_assessment.target_candidates must be a list of at most five candidates")
+    for index, raw in enumerate(candidates):
+        candidate = _require_keys(raw, {"description", "location", "relevance", "certainty"}, f"target_candidates[{index}]")
+        for key, limit in (("description", 100), ("location", 100), ("relevance", 140)):
+            _bounded_text(candidate[key], f"target_candidates[{index}].{key}", limit)
+        if not isinstance(candidate["certainty"], str) or candidate["certainty"] not in _CERTAINTY_LABELS:
+            raise DecisionValidationError(f"target_candidates[{index}].certainty must be observed, inferred, or unknown")
+
+    obstacles = assessment["obstacles"]
+    if not isinstance(obstacles, list) or len(obstacles) > 8:
+        raise DecisionValidationError("state_assessment.obstacles must be a list of at most eight obstacles")
+    for index, raw in enumerate(obstacles):
+        obstacle = _require_keys(raw, {"description", "location", "status", "evidence"}, f"obstacles[{index}]")
+        for key, limit in (("description", 100), ("location", 100), ("evidence", 160)):
+            _bounded_text(obstacle[key], f"obstacles[{index}].{key}", limit)
+        if not isinstance(obstacle["status"], str) or obstacle["status"] not in {"observed_blocked", "suspected_blocked", "unknown"}:
+            raise DecisionValidationError(f"obstacles[{index}].status is not a supported categorical label")
+
+    changes = assessment["other_relevant_changes"]
+    if not isinstance(changes, list) or len(changes) > 5:
+        raise DecisionValidationError("state_assessment.other_relevant_changes must have at most five entries")
+    for index, change in enumerate(changes):
+        _bounded_text(change, f"other_relevant_changes[{index}]", 180)
+
+    hypothesis = response["hypothesis"]
+    if hypothesis is not None:
+        hypothesis = _require_keys(hypothesis, {"claim", "evidence", "uncertainty"}, "hypothesis")
+        _bounded_text(hypothesis["claim"], "hypothesis.claim", 240)
+        _bounded_text(hypothesis["evidence"], "hypothesis.evidence", 180)
+        if not isinstance(hypothesis["uncertainty"], str) or hypothesis["uncertainty"] not in {"tentative", "uncertain"}:
+            raise DecisionValidationError("hypothesis.uncertainty must be tentative or uncertain")
+
+    _bounded_text(response["trajectory_rationale"], "trajectory_rationale", 420)
+    prediction = _require_keys(
+        response["prediction"], {"visible_change", "environment_outcome", "description"}, "prediction",
+    )
+    if not isinstance(prediction["visible_change"], str) or prediction["visible_change"] not in _PREDICTED_VISUAL_CHANGE:
+        raise DecisionValidationError("prediction.visible_change must be yes, no, or unknown")
+    if not isinstance(prediction["environment_outcome"], str) or prediction["environment_outcome"] not in _PREDICTED_OUTCOMES:
+        raise DecisionValidationError("prediction.environment_outcome is not a supported outcome")
+    _bounded_text(prediction["description"], "prediction.description", 240)
+
+    try:
+        validated = validate_decision(
+            _canonicalize_model_actions({"actions": response["actions"]}, legal_action_specs),
+            legal_action_specs, max_actions=max_actions,
+        )
+    except ActionError as exc:
+        raise DecisionValidationError(str(exc)) from exc
+    return {
+        "state_assessment": dict(assessment), "hypothesis": dict(hypothesis) if hypothesis else None,
+        "trajectory_rationale": response["trajectory_rationale"],
+        "prediction": dict(prediction), "actions": validated["actions"],
+    }
+
+
+def reasoned_action_contract_description() -> dict[str, Any]:
+    """Single canonical model response contract; ``actions`` is the only action list."""
+    return {
+        "state_assessment": {
+            "player": {"location": "visual region or unknown", "certainty": "observed | inferred | unknown", "evidence": "brief visual basis"},
+            "target_candidates": [{"description": "visual candidate", "location": "visual region", "relevance": "why it may matter", "certainty": "observed | inferred | unknown"}],
+            "obstacles": [{"description": "visual element", "location": "visual region", "status": "observed_blocked | suspected_blocked | unknown", "evidence": "brief basis"}],
+            "other_relevant_changes": ["brief observation"],
+        },
+        "hypothesis": None,
+        "trajectory_rationale": "one to three concise sentences; no chain-of-thought",
+        "prediction": {"visible_change": "yes | no | unknown", "environment_outcome": "level_change | GAME_OVER | WIN | no_terminal | unknown", "description": "brief, testable visible effect or unknown"},
+        "actions": [{"action": "up | down | left | right | RESET", "args": {}}],
+    }
+
+
+def reasoned_action_limits_description() -> str:
+    """Compact field caps shown to the model so valid output does not need repair."""
+    return (
+        "String limits: player location 120/evidence 180; target description 100, location 100, relevance 140; "
+        "obstacle description 100, location 100, evidence 160; each observed change 180; "
+        "hypothesis claim 240/evidence 180; trajectory rationale 420; prediction description 240 characters. "
+        "Maximum lists: five targets, eight obstacles, five observed changes, and eight actions."
+    )
+
+
+def reasoned_action_repair_prompt(user_prompt: str, validation_error: str) -> str:
+    return (
+        user_prompt + "\n\nYour previous structured JSON failed validation: " + validation_error
+        + "\nReturn one corrected JSON object using exactly the required structured fields. "
+        + "Keep actions as the only action sequence, obey the categorical labels and field limits, and do not add prose."
+    )
 
 
 def _action_specs(transitions: Sequence[dict[str, Any]], current: dict[str, Any]) -> list[dict[str, Any]]:
@@ -192,8 +326,20 @@ def build_analysis_input(
     )
     # Replay decisions consume the same model-authored Markdown as live runs.
     memory = memory_store.view_path.read_text(encoding="utf-8") if memory_store.view_path.is_file() else ""
-    if conditioning == "pixels_actions":
+    if conditioning == "pixels_actions" or int(memory_context_entries) == 0:
         memory = ""
+    elif memory:
+        # Offline experiments select whole Markdown blocks, never partial sentences.
+        blocks = memory.strip().split("\n\n")
+        selected: list[str] = []
+        entries = 0
+        for block in blocks:
+            if entries >= int(memory_context_entries):
+                break
+            selected.append(block)
+            if not all(line.lstrip().startswith("#") for line in block.splitlines() if line.strip()):
+                entries += 1
+        memory = "\n\n".join(selected) + "\n"
     context = {
         "current_state": {
             "level": last.get("levels_completed"),
@@ -233,11 +379,11 @@ def build_analysis_input(
     system_prompt = skill_file.read_text(encoding="utf-8")
     skill_digest = hashlib.sha256(skill_file.read_bytes()).hexdigest()
     prompt = (
-        f"Choose up to {horizon} legal actions from the visible replay and return only the action list. "
-        "Each action must contain only action and args. Do not include analysis, memory updates, predictions, "
-        "goals, or narrative. If RESET is listed, use it alone and include args.justification.\n\n"
-        "Required response shape:\n"
-        + json.dumps(_decision_contract_description(), ensure_ascii=False, indent=2)
+        f"Choose up to {horizon} legal actions from the visible replay and return the structured reasoned-action JSON. "
+        "Do not provide chain-of-thought. Keep actions as the only action list. If RESET is listed, use it alone and include args.justification.\n\n"
+        "Required response shape (`v10.reasoned_action/1`):\n"
+        + json.dumps(reasoned_action_contract_description(), ensure_ascii=False, indent=2)
+        + "\n\n" + reasoned_action_limits_description()
         + "\n\nVisible replay context:\n"
         + json.dumps(context, ensure_ascii=False, indent=2)
     )
@@ -261,25 +407,16 @@ def build_analysis_input(
 
 
 def _decision_contract_description() -> dict[str, Any]:
-    return {
-        "actions": [{
-            "action": "up | down | left | right | RESET",
-            "args": {},
-        }],
-    }
+    """Compatibility name for the current structured action response shape."""
+    return reasoned_action_contract_description()
 
 
 def _decision_repair_prompt(
     user_prompt: str,
     validation_error: str,
 ) -> str:
-    """Append concise repair guidance for the action-list contract."""
-    return (
-        user_prompt
-        + "\n\nYour previous JSON failed validation: " + validation_error
-        + "\nReturn only a corrected JSON object shaped as {\"actions\":[...]}."
-        + " Each action must contain only action and args. Do not include analysis, memory updates, predictions, goals, prose, or markdown."
-    )
+    """Compatibility wrapper for repairing the single reasoned-action schema."""
+    return reasoned_action_repair_prompt(user_prompt, validation_error)
 
 
 def score_recorded_plan(
@@ -362,7 +499,7 @@ def run_analysis(
     responses = [first]
     repair_error = None
     try:
-        decision = validate_model_decision(
+        decision = validate_reasoned_action(
             _parse_model_content(first["content"]),
             inputs["legal_action_specs"],
             max_actions=horizon,
@@ -376,7 +513,7 @@ def run_analysis(
             inputs["system_prompt"], repair_prompt, inputs["image_paths"], inputs["image_labels"],
         )
         responses.append(repaired)
-        decision = validate_model_decision(
+        decision = validate_reasoned_action(
             _parse_model_content(repaired["content"]),
             inputs["legal_action_specs"],
             max_actions=horizon,
@@ -394,7 +531,7 @@ def run_analysis(
     action_matches = score_recorded_plan(decision, future, initial_state=prefix_last)
     record = {
         "schema": "v10.analysis_run/2",
-        "decision_schema": DECISION_SCHEMA,
+        "decision_schema": REASONED_ACTION_SCHEMA,
         "prompt_version": "v10.analysis_prompt/2",
         "source_trace_sha256": inputs["manifest"].get("source_sha256"),
         "skill_sha256": inputs["skill_sha256"],
@@ -406,7 +543,7 @@ def run_analysis(
         "visible_transition_ids": [row["evidence_id"] for row in inputs["prefix_transitions"]],
         "input_frame_image_ids": [Path(path).stem for path in inputs["image_paths"]],
         "input_image_labels": inputs["image_labels"],
-        "decision": {"actions": decision["actions"]},
+        "decision": decision,
         "action_matches": action_matches,
         "repair_attempted": len(responses) > 1,
         "initial_validation_error": repair_error,
@@ -427,6 +564,7 @@ def _sum_usage(responses: Sequence[Mapping[str, Any]]) -> dict[str, int | None]:
 
 
 __all__ = [
-    "DECISION_SCHEMA", "DecisionValidationError", "build_analysis_input",
-    "run_analysis", "score_recorded_plan", "validate_model_decision",
+    "DECISION_SCHEMA", "REASONED_ACTION_SCHEMA", "DecisionValidationError", "build_analysis_input",
+    "reasoned_action_contract_description", "reasoned_action_limits_description", "reasoned_action_repair_prompt",
+    "run_analysis", "score_recorded_plan", "validate_model_decision", "validate_reasoned_action",
 ]

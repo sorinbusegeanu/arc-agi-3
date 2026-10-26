@@ -7,6 +7,7 @@ import json
 import os
 import time
 import uuid
+from datetime import datetime, timezone
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -72,6 +73,7 @@ class StrataClient:
         if (self.log_request or self.log_response) and self.log_dir is None:
             raise ValueError("log_dir is required when request or response logging is enabled")
         self._request_sequence = 0
+        self._request_ids: list[str] = []
 
     @property
     def endpoint(self) -> str:
@@ -89,6 +91,7 @@ class StrataClient:
         image_labels: Sequence[str] = (),
         response_format: str | None = "json_object",
     ) -> dict[str, Any]:
+        self._request_ids = []
         content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
         for index, path in enumerate(image_paths):
             label = image_labels[index] if index < len(image_labels) else f"Image {index + 1}"
@@ -163,11 +166,13 @@ class StrataClient:
             },
             "latency_seconds": round(total_latency, 6),
             "request_attempts": request_attempts,
+            "request_ids": list(self._request_ids),
         }
 
     def _post_json(self, payload: dict[str, Any]) -> tuple[str, float]:
         self._request_sequence += 1
         request_id = uuid.uuid4().hex
+        self._request_ids.append(request_id)
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -178,10 +183,44 @@ class StrataClient:
             method="POST",
         )
         if self.log_request:
+            text_lengths = [
+                (
+                    len(message.get("content", ""))
+                    if isinstance(message.get("content"), str)
+                    else sum(
+                        len(block.get("text", ""))
+                        for block in message.get("content", [])
+                        if isinstance(block, dict) and block.get("type") == "text"
+                    )
+                )
+                for message in payload.get("messages", [])
+            ]
+            prompt_characters = sum(text_lengths)
+            messages = payload.get("messages", [])
+            user_content = messages[1].get("content", []) if len(messages) > 1 else []
+            if isinstance(user_content, list):
+                user_prompt_characters = next((
+                    len(block.get("text", "")) for block in user_content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ), 0)
+            else:
+                user_prompt_characters = len(user_content) if isinstance(user_content, str) else 0
             append_jsonl(self.log_dir / "model_requests.jsonl", {
                 "request_id": request_id,
                 "sequence": self._request_sequence,
                 "endpoint": self.endpoint,
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "payload_bytes": len(request.data or b""),
+                "prompt_characters": prompt_characters,
+                "system_prompt_characters": text_lengths[0] if text_lengths else 0,
+                "user_prompt_characters": user_prompt_characters,
+                "user_text_characters": text_lengths[1] if len(text_lengths) > 1 else 0,
+                "image_count": sum(
+                    block.get("type") == "image_url"
+                    for message in payload.get("messages", [])
+                    if isinstance(message.get("content"), list)
+                    for block in message["content"] if isinstance(block, dict)
+                ),
                 "payload": payload,
             })
         started = time.monotonic()
@@ -189,11 +228,11 @@ class StrataClient:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 response_body = response.read().decode("utf-8")
                 status = getattr(response, "status", None)
-            self._log_response(request_id, status, response_body)
+            self._log_response(request_id, status, response_body, latency_seconds=time.monotonic() - started)
         except urllib.error.HTTPError as exc:
             elapsed = time.monotonic() - started
             raw_detail = exc.read().decode("utf-8", errors="replace")
-            self._log_response(request_id, exc.code, raw_detail)
+            self._log_response(request_id, exc.code, raw_detail, latency_seconds=elapsed)
             detail = raw_detail[:2000]
             try:
                 error_data = json.loads(detail).get("error", {})
@@ -210,7 +249,7 @@ class StrataClient:
             ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             elapsed = time.monotonic() - started
-            self._log_response(request_id, None, None, error=str(exc))
+            self._log_response(request_id, None, None, error=str(exc), latency_seconds=elapsed)
             raise StrataRequestError(
                 f"Strata request failed: {exc}", latency_seconds=elapsed,
             ) from exc
@@ -223,6 +262,7 @@ class StrataClient:
         body: str | None,
         *,
         error: str | None = None,
+        latency_seconds: float | None = None,
     ) -> None:
         if not self.log_response:
             return
@@ -230,6 +270,8 @@ class StrataClient:
             "request_id": request_id,
             "sequence": self._request_sequence,
             "status": status,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "latency_seconds": latency_seconds,
             "body": body,
             "error": error,
         })

@@ -59,6 +59,44 @@ def state_fingerprint(observation: Mapping[str, Any]) -> str:
     return digest.hexdigest()
 
 
+def state_matches_fingerprint(observation: Mapping[str, Any], expected: str) -> bool:
+    """Match a state while ignoring reset-action availability.
+
+    RESET is a harness pseudo-action and does not change the game screen or route
+    movement effects. Support fingerprints written before or after reset support
+    was exposed by an environment.
+    """
+    if state_fingerprint(observation) == expected:
+        return True
+    legal = observation.get("legal_actions", [])
+    if isinstance(legal, Mapping):
+        actions = dict(legal)
+        if "RESET" in actions:
+            actions.pop("RESET", None)
+        else:
+            actions["RESET"] = {"type": "object", "properties": {}, "required": []}
+    elif isinstance(legal, Sequence) and not isinstance(legal, (str, bytes)):
+        actions = list(legal)
+        has_reset = any(
+            str(item if isinstance(item, str) else item.get("id", item.get("action", ""))) == "RESET"
+            for item in actions if isinstance(item, (str, Mapping))
+        )
+        if has_reset:
+            actions = [
+                item for item in actions
+                if str(item if isinstance(item, str) else item.get("id", item.get("action", ""))) != "RESET"
+            ]
+        else:
+            actions.append({"id": "RESET", "parameters": {
+                "type": "object", "properties": {}, "required": [],
+            }})
+    else:
+        return False
+    compatible = dict(observation)
+    compatible["legal_actions"] = actions
+    return state_fingerprint(compatible) == expected
+
+
 def _action_ids(observation: Mapping[str, Any]) -> list[str]:
     actions = observation.get("legal_actions", [])
     if isinstance(actions, Mapping):
@@ -138,20 +176,36 @@ class LevelSolutionStore:
         if initial_game != self.game_id:
             raise ValueError(f"run game_id {initial_game} does not match {self.game_id}")
         route_start = current
-        validated: list[tuple[dict[str, Any], str, dict[str, Any], dict[str, Any], Mapping[str, Any]]] = []
+        validated: list[tuple[dict[str, Any], str, dict[str, Any], dict[str, Any], Mapping[str, Any], bool]] = []
         previous_evidence_id = str(initial.get("evidence_id", ""))
-        previous_step = 0
+        previous_step = int(initial.get("step", 0))
+        segment_start = True
         run_identity = str(run_id or f"import:{root.resolve()}")
         saw_win = False
         final_completed = current.get("levels_completed")
-        for row in transitions:
+        for row in records[records.index(initial) + 1:]:
             if row.get("schema") != "v10.evidence/1" or int(row.get("step", -1)) != previous_step + 1:
                 raise ValueError("recorded transitions are not a contiguous v10 evidence sequence")
+            previous_step = int(row["step"])
+            if row.get("type") == "audit":
+                continue
+            if row.get("type") == "reset":
+                current = self._evidence_observation(row, frames)
+                previous_evidence_id = str(row.get("evidence_id", ""))
+                segment_start = True
+                continue
+            if row.get("type") != "transition":
+                raise ValueError("unexpected state within recorded trajectory")
+            if current.get("terminal"):
+                raise ValueError("a terminal state must be reset before another action")
             if row.get("pre_evidence_id") != previous_evidence_id:
                 raise ValueError("recorded transition evidence chain is broken")
             if row.get("pre_frame_id") != current.get("frame_id"):
                 raise ValueError("recorded transition frame chain is broken")
             action = str(row.get("action", ""))
+            from ..analysis import model_action_aliases
+            specs = [{"id": name} for name in _action_ids(current)]
+            action = model_action_aliases(specs).get(action, action)
             if action not in _action_ids(current):
                 raise ValueError(f"recorded action {action!r} was not legal in its source state")
             before_completed = current.get("levels_completed")
@@ -172,16 +226,18 @@ class LevelSolutionStore:
                 _validate_args(action, dict(args), descriptor)
             except (ActionError, KeyError, TypeError, ValueError) as exc:
                 raise ValueError(f"recorded action arguments are invalid for {action}") from exc
-            validated.append((current, action, dict(args), after, row))
+            validated.append((current, action, dict(args), after, row, segment_start))
+            segment_start = False
             completed = (
                 before_completed is not None and after_completed is not None
                 and int(after_completed) == int(before_completed) + 1
             )
             won = str(after.get("game_state", "")).upper() == "WIN"
             if won:
-                if not after.get("terminal") or row is not transitions[-1]:
-                    raise ValueError("WIN must be the final terminal transition in the run")
-                saw_win = True
+                if not after.get("terminal"):
+                    raise ValueError("WIN must be a terminal transition")
+            if row is transitions[-1]:
+                saw_win = won and bool(after.get("terminal"))
             previous_evidence_id = str(row.get("evidence_id", ""))
             previous_step = int(row["step"])
             current = after
@@ -202,7 +258,10 @@ class LevelSolutionStore:
         route_edges: list[dict[str, Any]] = []
         imported: list[dict[str, Any]] = []
         known_solution_ids = set(self._solution_ids)
-        for before, action, args, after, row in validated:
+        for before, action, args, after, row, starts_segment in validated:
+            if starts_segment:
+                route_start = before
+                route_edges = []
             edge = self.record_transition(before, action, args, after, run_id=run_identity)
             route_edges.append(edge)
             previous_completed = before.get("levels_completed")
@@ -226,7 +285,7 @@ class LevelSolutionStore:
 
     @staticmethod
     def _evidence_observation(row: Mapping[str, Any], frames: FrameStore) -> dict[str, Any]:
-        frame_id = row.get("frame_id") if row.get("type") == "state" else row.get("post_frame_id")
+        frame_id = row.get("frame_id") if row.get("type") in {"state", "reset"} else row.get("post_frame_id")
         if not isinstance(frame_id, str) or not frames.exists(frame_id):
             raise ValueError("recorded evidence references a missing frame")
         return {
@@ -295,7 +354,7 @@ class LevelSolutionStore:
             row for row in self._rows
             if row.get("kind") == "solution"
             and row.get("level_key") == body["level_key"]
-            and row.get("start_state") == body["start_state"]
+            and state_matches_fingerprint(start, str(row.get("start_state", "")))
             and isinstance(row.get("steps"), list)
         ]
         if prior:
@@ -327,7 +386,8 @@ class LevelSolutionStore:
         wanted_level = level_key(observation)
         exact_routes = [
             route for route in self.solutions()
-            if route.get("level_key") == wanted_level and route.get("start_state") == start_state
+            if route.get("level_key") == wanted_level
+            and state_matches_fingerprint(observation, str(route.get("start_state", "")))
         ]
         if exact_routes:
             route = min(
@@ -383,4 +443,7 @@ class LevelSolutionStore:
         return None
 
 
-__all__ = ["LEVEL_SOLUTIONS_SCHEMA", "LevelSolutionStore", "level_key", "state_fingerprint"]
+__all__ = [
+    "LEVEL_SOLUTIONS_SCHEMA", "LevelSolutionStore", "level_key",
+    "state_fingerprint", "state_matches_fingerprint",
+]
