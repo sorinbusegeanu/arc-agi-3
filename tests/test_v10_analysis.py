@@ -473,6 +473,67 @@ def test_strata_client_sends_labeled_images_and_parses_usage(tmp_path: Path) -> 
     assert response_record["body"] == response_body.decode()
 
 
+def test_strata_client_preserves_multimodal_conversation_and_logs_cache_usage(tmp_path: Path) -> None:
+    from v10.strata_client import user_message
+
+    image_path = tmp_path / "conversation.png"
+    image_path.write_bytes(png_bytes(np.zeros((1, 1, 3), dtype=np.uint8)))
+    initial = [
+        {"role": "system", "content": "stable system"},
+        user_message("first observation", [image_path], ["screen 0"]),
+        {"role": "assistant", "content": '{"actions":[{"action":"up","args":{}}]}'},
+    ]
+    calls = []
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "choices": [{"message": {"content": "{}"}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 2,
+                          "prompt_tokens_details": {"cached_tokens": 72}},
+                "timings": {"prompt_ms": 14.5},
+            }).encode()
+
+    def fake_urlopen(request, timeout):
+        calls.append(json.loads(request.data)["messages"])
+        return FakeResponse()
+
+    client = StrataClient(
+        "http://strata.example", "qwen-test", log_request=True, log_response=True,
+        log_dir=tmp_path / "conversation-run",
+    )
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        first = client.complete("", "", messages=initial, conversation_reset_count=1)
+        second_messages = [*initial, {"role": "user", "content": "actual outcome and current screen"}]
+        client.complete("", "", messages=second_messages, conversation_reset_count=1)
+        third_messages = [*second_messages, {"role": "assistant", "content": "second accepted response"},
+                          {"role": "user", "content": "next actual outcome"}]
+        client.complete("", "", messages=third_messages, conversation_reset_count=1)
+
+    assert calls[0] == initial
+    assert calls[1][:-1] == calls[0]
+    assert calls[2][:-2] == calls[1]
+    assert calls[0][1]["content"][2] == initial[1]["content"][2]
+    assert first["usage"]["cached_prompt_tokens"] == 72
+    assert first["usage"]["newly_processed_prompt_tokens"] == 28
+    assert first["usage"]["prompt_processing_latency_ms"] == 14.5
+    request_rows = [json.loads(row) for row in (tmp_path / "conversation-run/model_requests.jsonl").read_text().splitlines()]
+    response_rows = [json.loads(row) for row in (tmp_path / "conversation-run/model_responses.jsonl").read_text().splitlines()]
+    assert [row["conversation_message_count"] for row in request_rows] == [3, 4, 6]
+    assert [row["conversation_reset_count"] for row in request_rows] == [1, 1, 1]
+    assert response_rows[0]["cached_prompt_tokens"] == 72
+    assert response_rows[0]["newly_processed_prompt_tokens"] == 28
+    assert response_rows[0]["prompt_processing_latency_ms"] == 14.5
+
+
 def test_model_logging_cli_flags_default_off_and_enable_independently() -> None:
     parser = build_parser()
     defaults = parser.parse_args(["live", "--game-id", "ez01", "--run-dir", "run"])
@@ -504,6 +565,42 @@ def test_model_logging_cli_flags_default_off_and_enable_independently() -> None:
         "live", "--game-id", "ez01", "--run-dir", "run", "--plan-horizon", "8",
     ])
     assert configured_horizon.plan_horizon == 8
+
+
+def test_cli_reports_v10_patch_version_and_context_override(capsys) -> None:
+    parser = build_parser()
+    with pytest.raises(SystemExit) as version_exit:
+        parser.parse_args(["--version"])
+    assert version_exit.value.code == 0
+    assert capsys.readouterr().out.strip() == "v10 10.0.1"
+
+    configured = parser.parse_args([
+        "live", "--game-id", "ez01", "--run-dir", "run", "--context-window-tokens", "32768",
+    ])
+    assert configured.context_window_tokens == 32768
+
+
+def test_strata_context_window_is_discovered_from_model_metadata(monkeypatch) -> None:
+    body = json.dumps({"data": [{"id": "qwen-test", "meta": {"n_ctx": 32768}}]}).encode()
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return body
+
+    def fake_urlopen(request, timeout):
+        assert request.full_url == "http://strata.example/v1/models"
+        return FakeResponse()
+
+    client = StrataClient("http://strata.example", "qwen-test")
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        assert client.discover_context_window_tokens() == 32768
+    assert client.context_window_tokens == 32768
 
 
 def test_live_reset_memory_flag_clears_persistent_memory_before_run(tmp_path: Path, monkeypatch) -> None:
@@ -581,14 +678,22 @@ def test_strata_client_falls_back_when_strata_rejects_json_mode_output(tmp_path:
         "http://strata.example", "qwen-test", api_key="test-key",
         log_request=True, log_response=True, log_dir=tmp_path,
     )
+    conversation = [
+        {"role": "system", "content": "stable system"},
+        {"role": "user", "content": "return JSON"},
+    ]
     with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-        result = client.complete("system", "return JSON", (), ())
+        result = client.complete("system", "return JSON", (), (), messages=conversation)
 
     assert result["request_attempts"] == 2
     assert "response_format" in payloads[0]
     assert "response_format" not in payloads[1]
-    retry_text = "\n".join(block["text"] for block in payloads[1]["messages"][1]["content"])
+    retry_content = payloads[1]["messages"][1]["content"]
+    retry_text = retry_content if isinstance(retry_content, str) else "\n".join(
+        block["text"] for block in retry_content if isinstance(block, dict) and block.get("type") == "text"
+    )
     assert "previous generation did not produce valid JSON" in retry_text
+    assert result["submitted_messages"] == payloads[1]["messages"]
     logged_requests = [json.loads(line) for line in (tmp_path / "model_requests.jsonl").read_text().splitlines()]
     logged_responses = [json.loads(line) for line in (tmp_path / "model_responses.jsonl").read_text().splitlines()]
     assert len(logged_requests) == len(logged_responses) == 2

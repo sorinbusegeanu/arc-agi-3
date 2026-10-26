@@ -23,13 +23,12 @@ from .analysis import (
     model_facing_action_specs,
     reasoned_action_contract_description,
     reasoned_action_limits_description,
-    reasoned_action_repair_prompt,
     validate_model_decision,
     validate_reasoned_action,
 )
 from .frames import IMAGE_KIND, FrameStore
 from .runlog import append_jsonl, read_jsonl, write_json
-from .strata_client import StrataRequestError
+from .strata_client import StrataRequestError, V10_VERSION, user_message
 from .tools.game import ActionError, BudgetExceeded, GameTools, evaluate_prediction
 from .tools.history import History
 from .tools.memory import (
@@ -1276,6 +1275,9 @@ def _live_context(
     saved_route_guidance: Sequence[Mapping[str, Any]] = (),
     no_progress_actions: int = 0,
     post_mortem_guidance: str = "",
+    compact_current_only: bool = False,
+    harness_activity: Sequence[Mapping[str, Any]] = (),
+    carry_forward: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     records = tools.history.records()
     evidence_by_id = {
@@ -1285,7 +1287,7 @@ def _live_context(
     all_level_transitions = _active_level_transitions(
         records, current, tools.reset_generation, limit=None,
     )
-    transitions = all_level_transitions[-8:]
+    transitions = [] if compact_current_only else all_level_transitions[-8:]
     contradicted_outcomes = _contradicted_action_outcomes(
         tools.run_dir, records, current.get("level"), tools.reset_generation,
     )
@@ -1382,14 +1384,14 @@ def _live_context(
     if post_mortem_guidance.strip():
         context["previous_attempt_post_mortem"] = post_mortem_guidance.strip()
     frames = tools.frames
-    transition_source = bootstrap_observations if starting_routine and bootstrap_observations else [
+    transition_source = bootstrap_observations if starting_routine and bootstrap_observations else ([] if compact_current_only else [
         {
             **row,
             **({"unexpected_result": contradicted_outcomes[str(row.get("evidence_id"))]}
                if str(row.get("evidence_id")) in contradicted_outcomes else {}),
         }
         for row in transitions
-    ]
+    ])
     if starting_routine and bootstrap_observations:
         _, _, full_screen_sequence = _action_screen_sequence(
             bootstrap_observations, current.get("frame_image_id"), frames,
@@ -1410,6 +1412,8 @@ def _live_context(
         for screen in screen_sequence
     ]
     context["screen_sequence_guide"] = (
+        "Only the current screen is attached after a conversation boundary; prior verified findings are in memory."
+        if compact_current_only and not starting_routine else
         "Attached screens are a chronological selected subset: the current screen, the prior distinct screen, and an optional "
         "older informative screen. Labels identify associated actions. Full transitions and intermediate frames remain in evidence.jsonl."
     )
@@ -1491,6 +1495,10 @@ def _live_context(
         ]
     if saved_route_guidance:
         model_context["saved_route_guidance"] = [dict(route) for route in saved_route_guidance]
+    if harness_activity:
+        model_context["harness_activity_since_previous_action_request"] = [dict(row) for row in harness_activity]
+    if carry_forward:
+        model_context["unresolved_reasoning_carried_forward"] = dict(carry_forward)
     if post_mortem_guidance.strip():
         model_context["previous_attempt_post_mortem"] = post_mortem_guidance.strip()[:700]
     start_instruction = (
@@ -1623,6 +1631,118 @@ def _action_transition_summary(
         if len(candidate) <= 200:
             summary = candidate
     return summary
+
+
+def _memory_revision_hash(memory_store_dir: Path, state_root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in (memory_store_dir / "MEMORY.md", global_memory_path(state_root)):
+        digest.update(path.read_bytes() if path.is_file() else b"")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _action_conversation_observation(
+    tools: GameTools,
+    current: Mapping[str, Any],
+    records: Sequence[Mapping[str, Any]],
+    *,
+    horizon: int,
+    no_progress_actions: int = 0,
+    previous_plan: Mapping[str, Any] | None = None,
+) -> tuple[str, list[Path], list[str]]:
+    """Build one turn containing only unreported execution and the current screen."""
+    events = _action_observation_events(records)
+    legal_actions = _public_actions(current.get("legal_actions", []))
+    if tools.supports_reset:
+        legal_actions.append({
+            "id": "RESET",
+            "description": "Reset the whole game; verified solutions can be replayed.",
+            "parameters": {
+                "type": "object", "properties": {"justification": {"type": "string"}},
+                "required": ["justification"], "additionalProperties": False,
+            },
+        })
+    active_transitions = _active_level_transitions(
+        tools.history.records(), current, tools.reset_generation, limit=None,
+    )
+    ineffective_keys = _ineffective_action_keys(active_transitions, current, tools.frames)
+    state = {
+        "game_state": current.get("game_state"), "level": current.get("level"),
+        "levels_completed": current.get("levels_completed"),
+        "legal_actions": model_facing_action_specs(legal_actions),
+        "actions_used": tools.action_count,
+        "actions_remaining": max(0, tools.max_actions - tools.action_count),
+        "plan_horizon": int(horizon),
+        "ineffective_attempts_at_current_screen": [
+            {"action": model_action_name(action), "args": json.loads(args)}
+            for action, args in sorted(ineffective_keys)
+        ][:8],
+        "consecutive_repeated_or_no_progress_actions": int(no_progress_actions),
+        "recovery_guidance": (
+            "Repeated states without progress; choose a different experiment or RESET alone."
+            if no_progress_actions >= 2 else None
+        ),
+    }
+    plan = dict(previous_plan or {})
+    execution_note = (
+        "The preceding assistant message proposed a plan. Only the actions listed under newly observed execution actually ran."
+    )
+    prompt = (
+        execution_note + "\nCURRENT SCREEN is the actual latest environment state.\n"
+        + json.dumps({"state": state, "new_observations_since_previous_action_request": events},
+                     ensure_ascii=False, separators=(",", ":"))
+        + ("\nExecution stopped: " + str(plan.get("stop_reason")) if plan.get("stop_reason") else "")
+        + "\nChoose the next legal action sequence from CURRENT SCREEN. Follow the existing JSON contract."
+    )
+    image_paths: list[Path] = []
+    image_labels: list[str] = []
+    image_id = current.get("frame_image_id")
+    if isinstance(image_id, str) and tools.frames.exists(image_id):
+        image_paths.append(tools.frames.path_of(image_id))
+        image_labels.append(
+            f"CURRENT SCREEN: actual game state after {len(events)} newly recorded environment events"
+        )
+    return prompt, image_paths, image_labels
+
+
+def _action_observation_events(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Summarize actual environment events without including planned actions."""
+    evidence_by_id = {
+        str(row.get("evidence_id")): row for row in records
+        if row.get("evidence_id") is not None
+    }
+    events: list[dict[str, Any]] = []
+    action_number = 0
+    for row in records:
+        kind = row.get("type")
+        if kind == "transition":
+            try:
+                action_number = max(action_number + 1, int(row.get("step", action_number + 1)))
+            except (TypeError, ValueError):
+                action_number += 1
+            pre = evidence_by_id.get(str(row.get("pre_evidence_id")), {})
+            summary_row = dict(row)
+            summary_row["levels_completed_before_action"] = pre.get("levels_completed")
+            events.append({
+                "action_number": action_number,
+                "action": model_action_name(row.get("action")),
+                "observed_result": _action_transition_summary(summary_row, action_number),
+                "intermediate_screens": len(
+                    (row.get("result") or {}).get("intermediate_frame_image_ids", [])
+                    if isinstance(row.get("result"), Mapping) else []
+                ),
+                "level_after": row.get("level"),
+                "levels_completed_after": row.get("levels_completed"),
+                "game_state_after": row.get("game_state"),
+            })
+        elif kind == "reset":
+            events.append({"reset": True, "reason": str(row.get("justification", ""))[:180]})
+        elif kind == "audit" and row.get("kind") == "action_error":
+            events.append({
+                "action_error": model_action_name(row.get("action")),
+                "error": str(row.get("error", ""))[:180],
+            })
+    return events
 
 
 def _memory_prompt_excerpt(markdown: str, limit: int, *, level_index: int | None = None) -> str:
@@ -1902,8 +2022,13 @@ def run_live(
     _prepare_live_run_directory(destination, (state_root / "games", state_root / "global", source_skill))
     memory = GameMemory(destination, store_dir=memory_store_dir, run_id=run_id, game_id=game_id)
     skill_sha256 = hashlib.sha256(source_skill.read_bytes()).hexdigest()
+    context_discovery = getattr(client, "discover_context_window_tokens", None)
+    if callable(context_discovery):
+        context_discovery()
+    context_window_tokens = getattr(client, "context_window_tokens", None)
     write_json(destination / "run_manifest.json", {
-        "schema": "v10.live_run/1", "decision_schema": REASONED_ACTION_SCHEMA,
+        "schema": "v10.live_run/1", "v10_version": V10_VERSION,
+        "decision_schema": REASONED_ACTION_SCHEMA,
         "run_id": run_id, "game_id": game_id,
         "seed": int(seed), "skill_sha256": skill_sha256,
         "persistent_memory_dir": str(memory_store_dir),
@@ -1919,6 +2044,7 @@ def run_live(
                 "model", "base_url", "max_output_tokens", "reasoning_effort",
                 "reasoning_budget_tokens", "timeout_seconds",
             )},
+            "context_window_tokens": context_window_tokens,
         },
         "starting_memory_sha256": {
             "game": hashlib.sha256((memory_store_dir / "MEMORY.md").read_bytes()).hexdigest()
@@ -1988,6 +2114,23 @@ def run_live(
     decisions_path = destination / "decisions.jsonl"
     start_time = time.monotonic()
     fallback_rng = random.Random(int(seed))
+    action_conversation: list[dict[str, Any]] = []
+    action_conversation_level_key: str | None = None
+    action_conversation_reset_generation: int | None = None
+    action_conversation_memory_hash: str | None = None
+    action_conversation_evidence_cursor = len(tools.history.records())
+    action_conversation_reset_count = 0
+    action_conversation_turns = 0
+    action_conversation_last_prompt_tokens: int | None = None
+    action_conversation_last_completion_tokens: int | None = None
+    action_conversation_last_reasoning: dict[str, Any] | None = None
+    action_conversation_pending_feedback = ""
+    action_conversation_stats = {
+        "calls": 0, "prompt_tokens": 0, "cached_prompt_tokens": 0,
+        "newly_processed_prompt_tokens": 0, "prompt_processing_latency_ms": 0.0,
+        "conversation_reset_count": 0, "last_message_count": 0,
+    }
+    action_conversation_pending_plan: dict[str, Any] | None = None
 
 
     def update_metrics() -> dict[str, Any]:
@@ -1995,7 +2138,8 @@ def run_live(
         terminal = bool(current.get("terminal"))
         state = current.get("game_state")
         result = {
-            "schema": "v10.live_metrics/2", "game_id": game_id, "model": getattr(client, "model", None),
+            "schema": "v10.live_metrics/2", "v10_version": V10_VERSION,
+            "game_id": game_id, "model": getattr(client, "model", None),
             "run_id": run_id, "seed": int(seed),
             "actions": tools.action_count, "action_budget": tools.max_actions,
             "resets": tools.reset_count,
@@ -2030,6 +2174,14 @@ def run_live(
                 destination, store_dir=memory_store_dir, run_id=run_id, game_id=game_id,
             ).read().get("count", 0),
             "memory_context_entries": int(memory_context_entries),
+            "action_conversation": {
+                **action_conversation_stats,
+                "current_message_count": len(action_conversation),
+                "context_window_tokens": context_window_tokens,
+                "context_compaction_threshold_tokens": (
+                    int(context_window_tokens * 0.8) if context_window_tokens else None
+                ),
+            },
         }
         write_json(destination / "metrics.json", result)
         return result
@@ -2046,6 +2198,244 @@ def run_live(
             f"actions={tools.action_count}/{tools.max_actions} | {message}",
             file=sys.stderr, flush=True,
         )
+
+    def prepare_action_turn(
+        horizon: int,
+        *,
+        starting_routine: bool,
+        bootstrap_observations_for_prompt: Sequence[Mapping[str, Any]] = (),
+        force_fresh: bool = False,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], int, bool]:
+        """Continue the exact accepted conversation, or initialize a compact turn."""
+        nonlocal action_conversation_reset_count
+        records = tools.history.records()
+        level_scope = level_key(current)
+        memory_hash = _memory_revision_hash(memory_store_dir, state_root)
+        same_context = bool(
+            action_conversation and not force_fresh
+            and action_conversation_level_key == level_scope
+            and action_conversation_reset_generation == tools.reset_generation
+            and action_conversation_memory_hash == memory_hash
+        )
+        if same_context:
+            context_limit = context_window_tokens
+            if context_limit and action_conversation_last_prompt_tokens is not None:
+                reserve_tokens = max(1024, int(context_limit * 0.20))
+                projected = (
+                    action_conversation_last_prompt_tokens
+                    + int(action_conversation_last_completion_tokens or 0)
+                    + reserve_tokens + int(getattr(client, "max_output_tokens", 0) or 0)
+                )
+                same_context = projected < int(context_limit * 0.80)
+            else:
+                same_context = action_conversation_turns < 12
+
+        cursor_for_next_request = len(records)
+        if same_context:
+            new_records = records[action_conversation_evidence_cursor:]
+            prompt, image_paths, image_labels = _action_conversation_observation(
+                tools, current, new_records, horizon=horizon,
+                no_progress_actions=no_progress_actions,
+                previous_plan=action_conversation_pending_plan,
+            )
+            if action_conversation_pending_feedback:
+                prompt += "\nPrevious request outcome: " + action_conversation_pending_feedback
+            legal_actions = _public_actions(current.get("legal_actions", []))
+            if tools.supports_reset:
+                legal_actions.append({
+                    "id": "RESET", "description": "Reset the whole game.",
+                    "parameters": {
+                        "type": "object", "properties": {"justification": {"type": "string"}},
+                        "required": ["justification"], "additionalProperties": False,
+                    },
+                })
+            active_transitions = _active_level_transitions(
+                records, current, tools.reset_generation, limit=None,
+            )
+            ineffective_keys = _ineffective_action_keys(active_transitions, current, tools.frames)
+            inputs = {
+                "system_prompt": "", "user_prompt": prompt,
+                "image_paths": image_paths, "image_labels": image_labels,
+                "legal_action_specs": legal_actions,
+                "ineffective_action_keys": ineffective_keys,
+                "ineffective_action_ids": {action for action, args in ineffective_keys if args == "{}"},
+                "skill_sha256": skill_sha256,
+            }
+            messages = [*action_conversation, user_message(prompt, image_paths, image_labels)]
+            return inputs, messages, cursor_for_next_request, False
+
+        harness_activity = (
+            _action_observation_events(records[action_conversation_evidence_cursor:])
+            if action_conversation else []
+        )
+        preserve_reasoning = bool(
+            action_conversation
+            and action_conversation_level_key == level_scope
+            and action_conversation_last_reasoning
+        )
+        inputs = _live_context(
+            tools, current, game_id, horizon, source_skill,
+            memory_store_dir, run_id, int(memory_context_entries),
+            starting_routine=starting_routine,
+            bootstrap_observations=bootstrap_observations_for_prompt,
+            saved_route_guidance=_saved_route_guidance(solution_store, current),
+            no_progress_actions=no_progress_actions,
+            post_mortem_guidance=post_mortem_guidance,
+            compact_current_only=bool(action_conversation and not starting_routine),
+            harness_activity=harness_activity,
+            carry_forward=action_conversation_last_reasoning if preserve_reasoning else None,
+        )
+        if action_conversation_pending_feedback:
+            inputs["user_prompt"] += "\n\nPrevious request outcome: " + action_conversation_pending_feedback
+        messages = [
+            {"role": "system", "content": inputs["system_prompt"]},
+            user_message(inputs["user_prompt"], inputs["image_paths"], inputs["image_labels"]),
+        ]
+        action_conversation_reset_count += 1
+        return inputs, messages, cursor_for_next_request, True
+
+    def request_action_plan(
+        inputs: Mapping[str, Any],
+        initial_messages: Sequence[dict[str, Any]],
+        horizon: int,
+        *,
+        cursor_for_next_request: int,
+        new_conversation: bool,
+        directional_only: bool = False,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str | None]:
+        nonlocal model_calls, total_latency, action_conversation
+        nonlocal action_conversation_level_key, action_conversation_reset_generation
+        nonlocal action_conversation_memory_hash, action_conversation_evidence_cursor
+        nonlocal action_conversation_turns, action_conversation_last_prompt_tokens
+        nonlocal action_conversation_last_completion_tokens, action_conversation_last_reasoning
+        nonlocal action_conversation_pending_feedback
+        responses: list[dict[str, Any]] = []
+        request_messages = [dict(message) for message in initial_messages]
+        validation_error: str | None = None
+        accepted: dict[str, Any] | None = None
+
+        def with_error(messages: Sequence[dict[str, Any]], error: str) -> list[dict[str, Any]]:
+            repaired = [dict(message) for message in messages]
+            last_user_index = next(
+                (index for index in range(len(repaired) - 1, -1, -1)
+                 if repaired[index].get("role") == "user"),
+                None,
+            )
+            if last_user_index is None:
+                raise ValueError("action conversation repair requires a user message")
+            content = repaired[last_user_index].get("content")
+            note = "\n\nValidation error: " + error + " Return one corrected JSON object with the same schema. Do not add prose."
+            if isinstance(content, str):
+                repaired[last_user_index]["content"] = content + note
+            elif isinstance(content, list):
+                copied = [dict(block) if isinstance(block, dict) else block for block in content]
+                text_block = next((block for block in copied if isinstance(block, dict) and block.get("type") == "text"), None)
+                if text_block is None:
+                    copied.insert(0, {"type": "text", "text": note.strip()})
+                else:
+                    text_block["text"] = str(text_block.get("text", "")) + note
+                repaired[last_user_index]["content"] = copied
+            else:
+                raise ValueError("action conversation user content must be text or multimodal content")
+            return repaired
+
+        for attempt in range(2):
+            model_calls += 1
+            try:
+                response = client.complete(
+                    inputs.get("system_prompt", ""), inputs.get("user_prompt", ""),
+                    inputs.get("image_paths", ()), inputs.get("image_labels", ()),
+                    messages=request_messages,
+                    conversation_reset_count=action_conversation_reset_count,
+                )
+            except StrataRequestError as exc:
+                model_calls += max(0, int(getattr(exc, "request_attempts", 1)) - 1)
+                total_latency += float(getattr(exc, "latency_seconds", 0.0))
+                raise
+            model_calls += max(0, int(response.get("request_attempts", 1)) - 1)
+            responses.append(response)
+            usage = response.get("usage", {}) if isinstance(response.get("usage"), Mapping) else {}
+            for key in total_usage:
+                value = usage.get(key)
+                if value is not None:
+                    total_usage[key] += int(value)
+                    action_usage[key] += int(value)
+            total_latency += float(response.get("latency_seconds", 0.0))
+            action_conversation_stats["calls"] += 1
+            for source, target in (
+                ("prompt_tokens", "prompt_tokens"),
+                ("cached_prompt_tokens", "cached_prompt_tokens"),
+                ("newly_processed_prompt_tokens", "newly_processed_prompt_tokens"),
+            ):
+                value = usage.get(source)
+                if value is not None:
+                    action_conversation_stats[target] += int(value)
+            prefill_ms = usage.get("prompt_processing_latency_ms")
+            if prefill_ms is not None:
+                action_conversation_stats["prompt_processing_latency_ms"] += float(prefill_ms)
+            action_conversation_stats["last_message_count"] = len(request_messages)
+            action_conversation_stats["conversation_reset_count"] = action_conversation_reset_count
+            submitted_messages = response.get("submitted_messages")
+            if isinstance(submitted_messages, list):
+                request_messages = [dict(message) for message in submitted_messages]
+            try:
+                candidate = validate_reasoned_action(
+                    _parse_content(response.get("content")),
+                    inputs["legal_action_specs"], max_actions=horizon,
+                )
+                directions = {"up", "left", "down", "right"}
+                if directional_only and (
+                    not candidate["actions"] or any(
+                        str(model_action_name(item["action"])) not in directions
+                        for item in candidate["actions"]
+                    )
+                ):
+                    raise DecisionValidationError(
+                        "bootstrap plan must contain legal lowercase directional actions"
+                    )
+                if (
+                    not directional_only and len(candidate["actions"]) > 1
+                    and (
+                        str(candidate["actions"][0]["action"]),
+                        json.dumps(candidate["actions"][0].get("args", {}), sort_keys=True),
+                    ) in inputs.get("ineffective_action_keys", set())
+                ):
+                    blocked = model_action_name(candidate["actions"][0]["action"])
+                    raise ActionError(
+                        f"first action {blocked!r} already caused no visible change from this exact state"
+                    )
+                accepted = candidate
+                request_messages.append({"role": "assistant", "content": str(response.get("content", ""))})
+                action_conversation = request_messages
+                action_conversation_level_key = level_key(current)
+                action_conversation_reset_generation = tools.reset_generation
+                action_conversation_memory_hash = _memory_revision_hash(memory_store_dir, state_root)
+                action_conversation_evidence_cursor = cursor_for_next_request
+                action_conversation_turns = 1 if new_conversation else action_conversation_turns + 1
+                action_conversation_last_prompt_tokens = (
+                    int(usage["prompt_tokens"]) if usage.get("prompt_tokens") is not None else None
+                )
+                action_conversation_last_completion_tokens = (
+                    int(usage["completion_tokens"]) if usage.get("completion_tokens") is not None else None
+                )
+                action_conversation_last_reasoning = {
+                    key: candidate.get(key) for key in (
+                        "state_assessment", "hypothesis", "trajectory_rationale", "prediction",
+                    ) if candidate.get(key) is not None
+                }
+                action_conversation_pending_feedback = ""
+                return accepted, responses, validation_error
+            except (DecisionValidationError, ActionError) as exc:
+                validation_error = str(exc)
+                if attempt == 0:
+                    request_messages = with_error(request_messages, validation_error)
+
+        # The invalid response is not appended. Preserve the last accepted prefix.
+        action_conversation_pending_feedback = (
+            "the previous request failed validation; the harness used a legal fallback. "
+            + str(validation_error or "unknown validation error")
+        )[:500]
+        return None, responses, validation_error
 
     def perform_triggered_review(
         reasons: Sequence[str], *, verified_route_replayed: bool = False,
@@ -2409,60 +2799,22 @@ def run_live(
                 bootstrap_plan_pending = False
                 bootstrap_target_level_key = None
                 bootstrap_target_observation = None
-                inputs = _live_context(
-                    tools, current, game_id, int(plan_horizon), source_skill,
-                    memory_store_dir, run_id, int(memory_context_entries),
-                    starting_routine=True, bootstrap_observations=bootstrap_observations,
-                    saved_route_guidance=_saved_route_guidance(solution_store, current),
-                    no_progress_actions=no_progress_actions,
-                    post_mortem_guidance=post_mortem_guidance,
+                inputs, pending_messages, cursor_for_next_request, new_conversation = prepare_action_turn(
+                    int(plan_horizon), starting_routine=True,
+                    bootstrap_observations_for_prompt=bootstrap_observations,
                 )
-                for attempt in range(2):
-                    model_calls += 1
-                    try:
-                        response = client.complete(
-                            inputs["system_prompt"], inputs["user_prompt"],
-                            inputs["image_paths"], inputs["image_labels"],
-                        )
-                    except StrataRequestError as exc:
-                        model_calls += max(0, int(getattr(exc, "request_attempts", 1)) - 1)
-                        total_latency += float(getattr(exc, "latency_seconds", 0.0))
-                        validation_error = f"bootstrap planning request failed: {exc}"
-                        break
-                    model_calls += max(0, int(response.get("request_attempts", 1)) - 1)
-                    responses.append(response)
-                    for key in total_usage:
-                        value = response.get("usage", {}).get(key)
-                        if value is not None:
-                            total_usage[key] += int(value)
-                            action_usage[key] += int(value)
-                    total_latency += float(response.get("latency_seconds", 0.0))
-                    try:
-                        candidate = validate_reasoned_action(
-                            _parse_content(response.get("content")),
-                            inputs["legal_action_specs"], max_actions=plan_horizon,
-                        )
-                        directions = {"up", "left", "down", "right"}
-                        if not candidate["actions"] or any(
-                            str(model_action_name(item["action"])) not in directions
-                            for item in candidate["actions"]
-                        ):
-                            raise DecisionValidationError(
-                                "bootstrap plan must contain legal lowercase directional actions"
-                            )
-                        decision = candidate
-                        reasoned_decision = candidate
-                        starter_queue_source = "bootstrap_model_start"
-                        break
-                    except (DecisionValidationError, ActionError) as exc:
-                        decision = None
-                        validation_error = str(exc)
-                        if attempt == 0:
-                            inputs["user_prompt"] = reasoned_action_repair_prompt(
-                                inputs["user_prompt"], validation_error,
-                            )
+                try:
+                    decision, responses, validation_error = request_action_plan(
+                        inputs, pending_messages, int(plan_horizon),
+                        cursor_for_next_request=cursor_for_next_request,
+                        new_conversation=new_conversation, directional_only=True,
+                    )
+                except StrataRequestError as exc:
+                    validation_error = f"bootstrap planning request failed: {exc}"
                 if decision is not None:
+                    reasoned_decision = decision
                     starter_queue = list(decision["actions"])
+                    starter_queue_source = "bootstrap_model_start"
                 else:
                     starter_queue = _standard_start_routine(inputs["legal_action_specs"])
                     starter_queue_source = "bootstrap_start_fallback"
@@ -2503,59 +2855,16 @@ def run_live(
                 validation_error = None
                 if no_progress_actions >= 2:
                     decision_horizon = 1
-                inputs = _live_context(
-                    tools, current, game_id, decision_horizon, source_skill,
-                    memory_store_dir, run_id, int(memory_context_entries),
-                    saved_route_guidance=_saved_route_guidance(solution_store, current),
-                    no_progress_actions=no_progress_actions,
-                    post_mortem_guidance=post_mortem_guidance,
+                inputs, pending_messages, cursor_for_next_request, new_conversation = prepare_action_turn(
+                    decision_horizon, starting_routine=False,
                 )
-                for attempt in range(2):
-                    model_calls += 1
-                    try:
-                        response = client.complete(
-                            inputs["system_prompt"], inputs["user_prompt"],
-                            inputs["image_paths"], inputs["image_labels"],
-                        )
-                    except StrataRequestError as exc:
-                        model_calls += max(0, int(getattr(exc, "request_attempts", 1)) - 1)
-                        total_latency += float(getattr(exc, "latency_seconds", 0.0))
-                        raise
-                    model_calls += max(0, int(response.get("request_attempts", 1)) - 1)
-                    responses.append(response)
-                    for key in total_usage:
-                        value = response.get("usage", {}).get(key)
-                        if value is not None:
-                            total_usage[key] += int(value)
-                            action_usage[key] += int(value)
-                    total_latency += float(response.get("latency_seconds", 0.0))
-                    try:
-                        candidate = validate_reasoned_action(
-                            _parse_content(response.get("content")), inputs["legal_action_specs"],
-                            max_actions=decision_horizon,
-                        )
-                        if (
-                            len(candidate["actions"]) > 1
-                            and (
-                                str(candidate["actions"][0]["action"]),
-                                json.dumps(candidate["actions"][0].get("args", {}), sort_keys=True),
-                            ) in inputs.get("ineffective_action_keys", set())
-                        ):
-                            blocked = model_action_name(candidate["actions"][0]["action"])
-                            raise ActionError(
-                                f"first action {blocked!r} already caused no visible change from this exact state"
-                            )
-                        decision = candidate
-                        reasoned_decision = candidate
-                        break
-                    except (DecisionValidationError, ActionError) as exc:
-                        # Never retain a partially accepted candidate across repair.
-                        decision = None
-                        validation_error = str(exc)
-                        if attempt == 0:
-                            inputs["user_prompt"] = reasoned_action_repair_prompt(
-                                inputs["user_prompt"], validation_error,
-                            )
+                decision, responses, validation_error = request_action_plan(
+                    inputs, pending_messages, decision_horizon,
+                    cursor_for_next_request=cursor_for_next_request,
+                    new_conversation=new_conversation,
+                )
+                if decision is not None:
+                    reasoned_decision = decision
             if starter_chunk:
                 progress(f"using {decision_source} ({len(starter_queue)} starter actions queued)")
             if decision is None:
@@ -2673,7 +2982,7 @@ def run_live(
             decision_row = {
                 "schema": "v10.live_decision/2", "status": "accepted",
                 "game_id": game_id, "decision_schema": REASONED_ACTION_SCHEMA,
-                "prompt_version": "v10.live_prompt/3", "skill_sha256": inputs["skill_sha256"],
+                "prompt_version": "v10.live_prompt/4", "skill_sha256": inputs["skill_sha256"],
                 "model": responses[-1].get("model") if responses else None,
                 "decision_id": decision_id,
                 "source": (
@@ -2687,6 +2996,8 @@ def run_live(
                 "initial_validation_error": validation_error, "usage": _sum_usage(responses),
                 "request_attempts": sum(int(item.get("request_attempts", 1)) for item in responses),
                 "request_ids": decision_request_ids,
+                "conversation_message_count": action_conversation_stats["last_message_count"],
+                "conversation_reset_count": action_conversation_reset_count,
                 "latency_seconds": round(sum(float(item.get("latency_seconds", 0.0)) for item in responses), 6),
             }
             if solution_edges:
@@ -2932,6 +3243,11 @@ def run_live(
                 "schema": "v10.live_plan_result/2", "status": "interrupted" if interruption else "completed",
                 "executed": executed, "interrupt_reason": interruption,
             })
+            if decision_source in {"model", "bootstrap_model_start"} and reasoned_decision is not None:
+                action_conversation_pending_plan = {
+                    "planned_count": len(actions), "executed_count": len(executed),
+                    "stop_reason": interruption or "all planned actions executed",
+                }
             if (
                 interval_review_pending
                 and not current.get("terminal")

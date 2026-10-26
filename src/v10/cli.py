@@ -24,6 +24,7 @@ from .strata_client import (
     DEFAULT_STRATA_BASE_URL,
     DEFAULT_STRATA_MODEL,
     StrataClient,
+    V10_VERSION,
 )
 
 
@@ -46,6 +47,7 @@ def _add_model_logging_options(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="v10", description="Offline Hydra Next replay and analysis")
+    parser.add_argument("--version", action="version", version=f"v10 {V10_VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     replay = subparsers.add_parser("replay", help="convert a recorded JSONL trace to v10 evidence")
@@ -150,6 +152,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_REASONING_EFFORT,
     )
     live.add_argument("--reasoning-budget-tokens", type=int, default=None)
+    live.add_argument(
+        "--context-window-tokens", type=int, default=None,
+        help="override Strata's discovered model context window for action conversation compaction",
+    )
     live.add_argument("--skill", type=Path, default=None, help="override the general v10 SKILL.md")
     _add_model_logging_options(live)
     return parser
@@ -226,6 +232,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reasoning_budget_tokens=args.reasoning_budget_tokens,
                 log_request=args.log_request, log_response=args.log_response,
                 log_dir=args.run_dir,
+                context_window_tokens=args.context_window_tokens,
             )
             env = ArcadeGameEnv(
                 args.game_id, seed=args.seed, env_root=args.env_root,

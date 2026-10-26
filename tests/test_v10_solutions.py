@@ -216,7 +216,7 @@ class _Client:
     def __init__(self):
         self.calls = []
 
-    def complete(self, system_prompt, user_prompt, image_paths, image_labels, response_format="json_object"):
+    def complete(self, system_prompt, user_prompt, image_paths, image_labels, response_format="json_object", *, messages=None, conversation_reset_count=None):
         self.calls.append(system_prompt)
         if system_prompt.startswith("# V10 memory consolidation"):
             content = json.dumps({
@@ -347,7 +347,7 @@ def test_level_route_with_different_start_skips_bootstrap_and_guides_model(tmp_p
             super().__init__()
             self.user_prompts = []
 
-        def complete(self, system_prompt, user_prompt, image_paths, image_labels, response_format="json_object"):
+        def complete(self, system_prompt, user_prompt, image_paths, image_labels, response_format="json_object", *, messages=None, conversation_reset_count=None):
             self.user_prompts.append(user_prompt)
             if system_prompt.startswith("# V10 memory consolidation"):
                 return super().complete(system_prompt, user_prompt, image_paths, image_labels, response_format)
@@ -499,7 +499,7 @@ def test_successful_route_is_saved_and_replayed_even_when_review_fails(tmp_path:
     monkeypatch.setenv("V10_STATE_DIR", str(state_dir))
 
     class InvalidReviewClient(_Client):
-        def complete(self, system_prompt, user_prompt, image_paths, image_labels, response_format="json_object"):
+        def complete(self, system_prompt, user_prompt, image_paths, image_labels, response_format="json_object", *, messages=None, conversation_reset_count=None):
             if system_prompt.startswith("# V10 memory consolidation"):
                 self.calls.append(system_prompt)
                 return {"content": "not JSON", "model": self.model, "usage": {},

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import os
 import time
@@ -19,6 +20,22 @@ from .runlog import append_jsonl
 DEFAULT_STRATA_BASE_URL = "http://127.0.0.1:8080"
 DEFAULT_STRATA_MODEL = "qwen3.8-flash-next-iq3_s"
 DEFAULT_REASONING_EFFORT = "medium"
+V10_VERSION = "10.0.1"
+
+
+def user_message(
+    text: str,
+    image_paths: Sequence[Path] = (),
+    image_labels: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Build one immutable multimodal user turn in the format sent to Strata."""
+    content: list[dict[str, Any]] = [{"type": "text", "text": str(text)}]
+    for index, path in enumerate(image_paths):
+        label = image_labels[index] if index < len(image_labels) else f"Image {index + 1}"
+        encoded = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+        content.append({"type": "text", "text": str(label)})
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}})
+    return {"role": "user", "content": content}
 
 
 class StrataRequestError(RuntimeError):
@@ -51,6 +68,7 @@ class StrataClient:
         log_request: bool = False,
         log_response: bool = False,
         log_dir: str | Path | None = None,
+        context_window_tokens: int | None = None,
     ) -> None:
         self.base_url = str(base_url).rstrip("/")
         self.model = str(model).strip()
@@ -67,6 +85,9 @@ class StrataClient:
         self.reasoning_budget_tokens = (
             int(reasoning_budget_tokens) if reasoning_budget_tokens is not None else None
         )
+        if context_window_tokens is not None and int(context_window_tokens) < 1:
+            raise ValueError("context_window_tokens must be positive when specified")
+        self.context_window_tokens = int(context_window_tokens) if context_window_tokens is not None else None
         self.log_request = bool(log_request)
         self.log_response = bool(log_response)
         self.log_dir = Path(log_dir) if log_dir is not None else None
@@ -90,20 +111,30 @@ class StrataClient:
         image_paths: Sequence[Path] = (),
         image_labels: Sequence[str] = (),
         response_format: str | None = "json_object",
+        *,
+        messages: Sequence[dict[str, Any]] | None = None,
+        conversation_reset_count: int | None = None,
     ) -> dict[str, Any]:
         self._request_ids = []
-        content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
-        for index, path in enumerate(image_paths):
-            label = image_labels[index] if index < len(image_labels) else f"Image {index + 1}"
-            payload = base64.b64encode(Path(path).read_bytes()).decode("ascii")
-            content.append({"type": "text", "text": label})
-            content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{payload}"}})
+        if messages is None:
+            request_messages = [
+                {"role": "system", "content": system_prompt},
+                user_message(user_prompt, image_paths, image_labels),
+            ]
+        else:
+            request_messages = copy.deepcopy(list(messages))
+            if not request_messages:
+                raise ValueError("messages must not be empty")
+            if any(
+                not isinstance(message, dict)
+                or message.get("role") not in {"system", "user", "assistant"}
+                or not isinstance(message.get("content"), (str, list))
+                for message in request_messages
+            ):
+                raise ValueError("messages must contain system, user, or assistant messages with text or multimodal content")
         payload = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content},
-            ],
+            "messages": request_messages,
             "max_tokens": self.max_output_tokens,
             "temperature": 0,
             "reasoning_effort": self.reasoning_effort,
@@ -112,18 +143,29 @@ class StrataClient:
             payload["response_format"] = {"type": str(response_format)}
         if self.reasoning_budget_tokens is not None:
             payload["reasoning_budget_tokens"] = self.reasoning_budget_tokens
+        conversation_message_count = len(request_messages) if messages is not None else None
         request_attempts = 1
         total_latency = 0.0
+        submitted_messages = request_messages
+        plain_json_fallback_used = False
         try:
-            response_body, total_latency = self._post_json(payload)
+            response_body, total_latency = self._post_json(
+                payload, conversation_message_count=conversation_message_count,
+                conversation_reset_count=conversation_reset_count,
+            )
         except StrataRequestError as exc:
             if not exc.structured_output_failed:
                 raise
             request_attempts = 2
             total_latency = exc.latency_seconds
             fallback_payload = self._plain_json_fallback(payload)
+            submitted_messages = fallback_payload["messages"]
+            plain_json_fallback_used = True
             try:
-                response_body, fallback_latency = self._post_json(fallback_payload)
+                response_body, fallback_latency = self._post_json(
+                    fallback_payload, conversation_message_count=conversation_message_count,
+                    conversation_reset_count=conversation_reset_count,
+                )
                 total_latency += fallback_latency
             except StrataRequestError as fallback_error:
                 total_latency += fallback_error.latency_seconds
@@ -155,6 +197,11 @@ class StrataClient:
                 latency_seconds=total_latency,
             ) from exc
         usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        prompt_tokens = usage.get("prompt_tokens")
+        prompt_details = usage.get("prompt_tokens_details")
+        prompt_details = prompt_details if isinstance(prompt_details, dict) else {}
+        cached_prompt_tokens = prompt_details.get("cached_tokens")
+        timings = result.get("timings") if isinstance(result.get("timings"), dict) else {}
         return {
             "content": content_text,
             "model": result.get("model", self.model),
@@ -163,13 +210,52 @@ class StrataClient:
                 "prompt_tokens": usage.get("prompt_tokens"),
                 "completion_tokens": usage.get("completion_tokens"),
                 "total_tokens": usage.get("total_tokens"),
+                "cached_prompt_tokens": cached_prompt_tokens,
+                "newly_processed_prompt_tokens": (
+                    max(0, int(prompt_tokens) - int(cached_prompt_tokens))
+                    if prompt_tokens is not None and cached_prompt_tokens is not None else None
+                ),
+                "prompt_processing_latency_ms": timings.get("prompt_ms"),
             },
             "latency_seconds": round(total_latency, 6),
             "request_attempts": request_attempts,
             "request_ids": list(self._request_ids),
+            **({"submitted_messages": copy.deepcopy(submitted_messages)}
+               if messages is not None and plain_json_fallback_used else {}),
         }
 
-    def _post_json(self, payload: dict[str, Any]) -> tuple[str, float]:
+    def discover_context_window_tokens(self) -> int | None:
+        """Read the loaded model's effective context from Strata's model list."""
+        if self.context_window_tokens is not None:
+            return self.context_window_tokens
+        models_url = self.base_url if self.base_url.endswith("/v1") else self.base_url + "/v1"
+        request = urllib.request.Request(models_url + "/models", method="GET")
+        if self.api_key:
+            request.add_header("Authorization", f"Bearer {self.api_key}")
+        try:
+            with urllib.request.urlopen(request, timeout=min(self.timeout_seconds, 5.0)) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            models = data.get("data", []) if isinstance(data, dict) else []
+            if isinstance(models, list):
+                for model in models:
+                    if not isinstance(model, dict):
+                        continue
+                    meta = model.get("meta") if isinstance(model.get("meta"), dict) else {}
+                    limit = meta.get("n_ctx")
+                    if limit is not None and int(limit) > 0:
+                        self.context_window_tokens = int(limit)
+                        return self.context_window_tokens
+        except (OSError, ValueError, TypeError, urllib.error.URLError):
+            pass
+        return None
+
+    def _post_json(
+        self,
+        payload: dict[str, Any],
+        *,
+        conversation_message_count: int | None = None,
+        conversation_reset_count: int | None = None,
+    ) -> tuple[str, float]:
         self._request_sequence += 1
         request_id = uuid.uuid4().hex
         self._request_ids.append(request_id)
@@ -183,21 +269,20 @@ class StrataClient:
             method="POST",
         )
         if self.log_request:
-            text_lengths = [
-                (
-                    len(message.get("content", ""))
-                    if isinstance(message.get("content"), str)
-                    else sum(
-                        len(block.get("text", ""))
-                        for block in message.get("content", [])
-                        if isinstance(block, dict) and block.get("type") == "text"
-                    )
-                )
-                for message in payload.get("messages", [])
-            ]
-            prompt_characters = sum(text_lengths)
             messages = payload.get("messages", [])
-            user_content = messages[1].get("content", []) if len(messages) > 1 else []
+            def text_length(message: dict[str, Any]) -> int:
+                content = message.get("content", "")
+                if isinstance(content, str):
+                    return len(content)
+                return sum(
+                    len(block.get("text", ""))
+                    for block in content if isinstance(block, dict) and block.get("type") == "text"
+                ) if isinstance(content, list) else 0
+
+            text_lengths = [text_length(message) for message in messages]
+            prompt_characters = sum(text_lengths)
+            latest_user = next((message for message in reversed(messages) if message.get("role") == "user"), {})
+            user_content = latest_user.get("content", "")
             if isinstance(user_content, list):
                 user_prompt_characters = next((
                     len(block.get("text", "")) for block in user_content
@@ -212,15 +297,21 @@ class StrataClient:
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "payload_bytes": len(request.data or b""),
                 "prompt_characters": prompt_characters,
-                "system_prompt_characters": text_lengths[0] if text_lengths else 0,
+                "system_prompt_characters": sum(
+                    text_length(message) for message in messages if message.get("role") == "system"
+                ),
                 "user_prompt_characters": user_prompt_characters,
-                "user_text_characters": text_lengths[1] if len(text_lengths) > 1 else 0,
+                "user_text_characters": sum(
+                    text_length(message) for message in messages if message.get("role") == "user"
+                ),
                 "image_count": sum(
                     block.get("type") == "image_url"
                     for message in payload.get("messages", [])
                     if isinstance(message.get("content"), list)
                     for block in message["content"] if isinstance(block, dict)
                 ),
+                "conversation_message_count": conversation_message_count,
+                "conversation_reset_count": conversation_reset_count,
                 "payload": payload,
             })
         started = time.monotonic()
@@ -228,11 +319,19 @@ class StrataClient:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 response_body = response.read().decode("utf-8")
                 status = getattr(response, "status", None)
-            self._log_response(request_id, status, response_body, latency_seconds=time.monotonic() - started)
+            self._log_response(
+                request_id, status, response_body, latency_seconds=time.monotonic() - started,
+                conversation_message_count=conversation_message_count,
+                conversation_reset_count=conversation_reset_count,
+            )
         except urllib.error.HTTPError as exc:
             elapsed = time.monotonic() - started
             raw_detail = exc.read().decode("utf-8", errors="replace")
-            self._log_response(request_id, exc.code, raw_detail, latency_seconds=elapsed)
+            self._log_response(
+                request_id, exc.code, raw_detail, latency_seconds=elapsed,
+                conversation_message_count=conversation_message_count,
+                conversation_reset_count=conversation_reset_count,
+            )
             detail = raw_detail[:2000]
             try:
                 error_data = json.loads(detail).get("error", {})
@@ -249,7 +348,11 @@ class StrataClient:
             ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             elapsed = time.monotonic() - started
-            self._log_response(request_id, None, None, error=str(exc), latency_seconds=elapsed)
+            self._log_response(
+                request_id, None, None, error=str(exc), latency_seconds=elapsed,
+                conversation_message_count=conversation_message_count,
+                conversation_reset_count=conversation_reset_count,
+            )
             raise StrataRequestError(
                 f"Strata request failed: {exc}", latency_seconds=elapsed,
             ) from exc
@@ -263,9 +366,36 @@ class StrataClient:
         *,
         error: str | None = None,
         latency_seconds: float | None = None,
+        conversation_message_count: int | None = None,
+        conversation_reset_count: int | None = None,
     ) -> None:
         if not self.log_response:
             return
+        diagnostics: dict[str, Any] = {
+            "conversation_message_count": conversation_message_count,
+            "conversation_reset_count": conversation_reset_count,
+        }
+        try:
+            parsed = json.loads(body) if body else {}
+            usage = parsed.get("usage", {}) if isinstance(parsed, dict) else {}
+            usage = usage if isinstance(usage, dict) else {}
+            prompt_tokens = usage.get("prompt_tokens")
+            details = usage.get("prompt_tokens_details", {})
+            details = details if isinstance(details, dict) else {}
+            cached = details.get("cached_tokens")
+            timings = parsed.get("timings", {}) if isinstance(parsed, dict) else {}
+            timings = timings if isinstance(timings, dict) else {}
+            diagnostics.update({
+                "prompt_tokens": prompt_tokens,
+                "cached_prompt_tokens": cached,
+                "newly_processed_prompt_tokens": (
+                    max(0, int(prompt_tokens) - int(cached))
+                    if prompt_tokens is not None and cached is not None else None
+                ),
+                "prompt_processing_latency_ms": timings.get("prompt_ms"),
+            })
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
         append_jsonl(self.log_dir / "model_responses.jsonl", {
             "request_id": request_id,
             "sequence": self._request_sequence,
@@ -274,6 +404,7 @@ class StrataClient:
             "latency_seconds": latency_seconds,
             "body": body,
             "error": error,
+            **diagnostics,
         })
 
     @staticmethod
@@ -302,5 +433,5 @@ class StrataClient:
 
 __all__ = [
     "DEFAULT_REASONING_EFFORT", "DEFAULT_STRATA_BASE_URL", "DEFAULT_STRATA_MODEL",
-    "StrataClient", "StrataRequestError",
+    "StrataClient", "StrataRequestError", "V10_VERSION", "user_message",
 ]

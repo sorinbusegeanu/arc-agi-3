@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import re
 import sys
 import types
@@ -133,8 +134,27 @@ class _FakeClient:
         self.review_errors = list(review_errors or [])
         self.reasoning_responses = list(reasoning_responses or [])
         self.default_decision = default_decision
+        self.message_calls = []
+        self.response_contents = []
 
-    def complete(self, system_prompt, user_prompt, image_paths, image_labels, response_format="json_object"):
+    def complete(
+        self, system_prompt, user_prompt, image_paths, image_labels,
+        response_format="json_object", *, messages=None, conversation_reset_count=None,
+    ):
+        if messages is not None:
+            self.message_calls.append({
+                "messages": copy.deepcopy(messages),
+                "conversation_reset_count": conversation_reset_count,
+            })
+            last_user = next((message for message in reversed(messages) if message.get("role") == "user"), {})
+            content = last_user.get("content", "")
+            if isinstance(content, list):
+                user_prompt = next((
+                    str(block.get("text", "")) for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ), "")
+            elif isinstance(content, str):
+                user_prompt = content
         self.calls.append((user_prompt, list(image_paths), list(image_labels)))
         self.system_prompts.append(system_prompt)
         self.response_formats.append(response_format)
@@ -158,12 +178,30 @@ class _FakeClient:
             if isinstance(decision, dict) and set(decision) == {"actions"}:
                 decision = _reasoned(decision)
             content = json.dumps(decision)
+        self.response_contents.append(content)
         return {
             "content": content, "model": self.model,
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
             "latency_seconds": 0.01, "request_attempts": self.request_attempts,
             "finish_reason": "stop",
         }
+
+
+def _message_user_text(client: _FakeClient, call_index: int) -> str:
+    messages = client.message_calls[call_index]["messages"]
+    user = next(message for message in reversed(messages) if message.get("role") == "user")
+    content = user.get("content")
+    if isinstance(content, str):
+        return content
+    return next(
+        str(block.get("text", "")) for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def _continued_context(prompt: str) -> dict:
+    marker = "CURRENT SCREEN is the actual latest environment state.\n"
+    return json.JSONDecoder().raw_decode(prompt.split(marker, 1)[1])[0]
 
 
 class _FakeEnv:
@@ -603,9 +641,43 @@ def test_recent_history_is_independent_of_plan_horizon(tmp_path: Path) -> None:
     client = _FakeClient([_decision([_action()]), _decision([])])
     _run_live_without_starting_routine(_FakeEnv(), tmp_path / "run", client, game_id="fixture", max_actions=2, plan_horizon=1)
 
-    context = json.loads(client.calls[1][0].split("Visible context:\n", 1)[1])
-    assert context["budgets"]["plan_horizon"] == 1
-    assert len(context["recent_transitions"]) == 1
+    context = _continued_context(_message_user_text(client, 1))
+    assert context["state"]["plan_horizon"] == 1
+    observations = context["new_observations_since_previous_action_request"]
+    assert [row["action"] for row in observations] == ["up"]
+    assert "recent_transitions" not in context
+
+
+def test_action_calls_append_only_observations_and_exact_assistant_responses(tmp_path: Path) -> None:
+    decisions = [_decision([_action("up")]) for _ in range(3)]
+    client = _FakeClient(decisions)
+    _run_live_without_starting_routine(
+        _FakeEnv(), tmp_path / "conversation", client, game_id="fixture",
+        max_actions=3, plan_horizon=1,
+    )
+
+    assert len(client.message_calls) == 3
+    messages = [call["messages"] for call in client.message_calls]
+    assert len(messages[0]) == 2
+    assert messages[1][:-1] == [*messages[0], {
+        "role": "assistant", "content": client.response_contents[0],
+    }]
+    assert messages[2][:-1] == [*messages[1], {
+        "role": "assistant", "content": client.response_contents[1],
+    }]
+    assert messages[1][-2] == {"role": "assistant", "content": client.response_contents[0]}
+    assert messages[2][-2] == {"role": "assistant", "content": client.response_contents[1]}
+
+    second_update = _message_user_text(client, 1)
+    third_update = _message_user_text(client, 2)
+    second_context = _continued_context(second_update)
+    third_context = _continued_context(third_update)
+    assert [event["action"] for event in second_context["new_observations_since_previous_action_request"]] == ["up"]
+    assert [event["action"] for event in third_context["new_observations_since_previous_action_request"]] == ["up"]
+    assert second_context["new_observations_since_previous_action_request"][0]["action_number"] == 1
+    assert third_context["new_observations_since_previous_action_request"][0]["action_number"] == 2
+    assert "CURRENT SCREEN" in messages[1][-1]["content"][1]["text"]
+    assert "CURRENT SCREEN" in messages[2][-1]["content"][1]["text"]
 
 
 def test_default_plan_horizon_runs_eight_actions(tmp_path: Path) -> None:
@@ -863,12 +935,11 @@ def test_known_ineffective_action_is_rejected_and_plan_reasks_after_noop(tmp_pat
 
     assert [action for action, _args in env.actions] == ["ACTION1", "ACTION3"]
     assert metrics["actions"] == 2
-    action_contexts = [
-        json.JSONDecoder().raw_decode(prompt.split("Visible context:\n", 1)[1])[0]
-        for prompt, _images, _labels in client.calls if "Visible context:\n" in prompt
+    repair_context = _continued_context(_message_user_text(client, 1))
+    assert repair_context["state"]["ineffective_attempts_at_current_screen"] == [
+        {"action": "up", "args": {}}
     ]
-    assert action_contexts[1]["ineffective_actions_at_current_screen"] == ["up"]
-    assert "first action 'up' already caused no visible change" in client.calls[2][0]
+    assert "first action 'up' already caused no visible change" in client.message_calls[2]["messages"][-1]["content"][0]["text"]
 
 
 def test_all_ineffective_legal_actions_trigger_unbudgeted_reset(tmp_path: Path) -> None:
@@ -1111,10 +1182,13 @@ def test_live_repairs_response_with_extra_fields(tmp_path: Path) -> None:
     assert metrics["actions"] == 1
     assert len(client.calls) == 2
     repair_prompt = client.calls[1][0]
-    assert "Your previous structured JSON failed validation" in repair_prompt
-    assert "prediction" in repair_prompt
-    assert '"actions"' in repair_prompt
-    assert "do not add prose" in repair_prompt
+    assert "Validation error:" in repair_prompt
+    initial_messages = client.message_calls[0]["messages"]
+    repair_messages = client.message_calls[1]["messages"]
+    assert repair_messages[:-1] == initial_messages[:-1]
+    assert repair_messages[-1]["content"][1:] == initial_messages[-1]["content"][1:]
+    assert "may contain only action and args" in repair_prompt
+    assert "Do not add prose." in repair_prompt
     rows = [json.loads(line) for line in (tmp_path / "run" / "decisions.jsonl").read_text().splitlines()]
     accepted = next(row for row in rows if row.get("status") == "accepted")
     assert accepted["repair_attempted"] is True
@@ -1314,24 +1388,17 @@ def test_action_context_selects_compact_ordered_screens_but_keeps_all_frames_in_
         game_id="fixture", max_actions=5, plan_horizon=4,
     )
 
-    prompt, paths, labels = client.calls[1]
-    context = json.loads(prompt.split("Visible context:\n", 1)[1])
-    assert 1 <= len(paths) <= 3
-    assert len(labels) == len(paths)
-    assert "CURRENT SCREEN" in labels[-1]
-    assert "action_screen_links" not in context
-    assert any("after Action 1 (up)" in label for label in labels)
-    assert any("after Action 4 (right)" in label for label in labels)
-    assert len(context["recent_transitions"]) == 4
-    assert [row.split(":", 1)[0] for row in context["recent_transitions"]] == [
-        "1 up", "2 left", "3 down", "4 right",
-    ]
-    selected_actions = [
-        int(match.group(1)) for label in labels
-        if (match := re.search(r"after Action (\d+)", label))
-    ]
-    assert selected_actions == sorted(selected_actions)
-    assert all(path.suffix == ".png" for path in paths)
+    first_user = client.message_calls[0]["messages"][-1]["content"]
+    assert len([block for block in first_user if block.get("type") == "image_url"]) == 1
+    assert "CURRENT SCREEN" in first_user[1]["text"]
+    update_user = client.message_calls[1]["messages"][-1]["content"]
+    update_prompt = next(block["text"] for block in update_user if block.get("type") == "text")
+    context = _continued_context(update_prompt)
+    events = context["new_observations_since_previous_action_request"]
+    assert [row["action"] for row in events] == ["up", "left", "down", "right"]
+    assert [row["intermediate_screens"] for row in events] == [2, 2, 2, 2]
+    assert len([block for block in update_user if block.get("type") == "image_url"]) == 1
+    assert "CURRENT SCREEN" in update_user[1]["text"]
     history = [json.loads(line) for line in (tmp_path / "run/evidence.jsonl").read_text().splitlines()]
     transitions = [row for row in history if row.get("type") == "transition"]
     assert sum(len(row.get("result", {}).get("intermediate_frame_ids", [])) for row in transitions) == 8
@@ -1376,33 +1443,27 @@ def test_action_context_scopes_history_and_screens_to_active_level(tmp_path: Pat
         max_actions=3, plan_horizon=1,
     )
 
-    action_prompts = [
-        (prompt, paths, labels) for prompt, paths, labels in client.calls
-        if "Visible context:\n" in prompt
-    ]
-    assert len(action_prompts) == 3
+    assert len(client.message_calls) == 3
 
     # The first action in level 1 completed level 0. Its old-level pre-frame
     # and action must not appear in level 1's exploration context.
-    second_prompt, second_paths, second_labels = action_prompts[1]
+    second_prompt = _message_user_text(client, 1)
     second_context = json.loads(second_prompt.split("Visible context:\n", 1)[1])
     assert second_context["current_state"]["level"] == 1
     assert second_context["current_state"]["levels_completed"] == 1
     assert second_context["recent_transitions"] == []
-    assert len(second_paths) == 1
-    assert "CURRENT SCREEN" in second_labels[0]
+    assert len([block for block in client.message_calls[1]["messages"][-1]["content"] if block.get("type") == "image_url"]) == 1
     assert "earlier levels are omitted" in second_prompt
 
     # Once level 1 has an action, its own start, transition, and current image
     # are aligned; the level 0 completion action remains excluded.
-    third_prompt, third_paths, third_labels = action_prompts[2]
-    third_context_text = third_prompt.split("Visible context:\n", 1)[1]
-    third_context, _ = json.JSONDecoder().raw_decode(third_context_text)
-    assert len(third_context["recent_transitions"]) == 1
-    assert third_context["recent_transitions"][0].startswith("1 right:")
-    assert len(third_paths) <= 3
-    assert "CURRENT SCREEN" in third_labels[-1]
-    assert "CURRENT SCREEN" in third_labels[-1]
+    third_prompt = _message_user_text(client, 2)
+    third_context = _continued_context(third_prompt)
+    events = third_context["new_observations_since_previous_action_request"]
+    assert [row["action"] for row in events] == ["right"]
+    assert all(row["level_after"] == 1 for row in events)
+    assert [row["action"] for row in third_context["new_observations_since_previous_action_request"]] == ["right"]
+    assert "CURRENT SCREEN" in client.message_calls[2]["messages"][-1]["content"][1]["text"]
 
 
 class _LevelCompleteEnv(_FakeEnv):
@@ -1572,6 +1633,11 @@ def test_review_saves_model_markdown_and_next_action_reads_it_verbatim(tmp_path:
     assert "A cue is visible in this game." in client.calls[2][0]
     assert client.calls[2][0].count("A cue is visible in this game.") == 1
     assert "applicable_successful_strategies" not in client.calls[2][0]
+    assert len(client.message_calls) == 2
+    assert len(client.message_calls[0]["messages"]) == 2
+    assert len(client.message_calls[1]["messages"]) == 2
+    assert client.message_calls[1]["messages"][0] == client.message_calls[0]["messages"][0]
+    assert "A cue is visible in this game." in client.message_calls[1]["messages"][1]["content"][0]["text"]
     view = (tmp_path / "state/games/fixture/MEMORY.md").read_text()
     assert view == _VALID_GAME_MEMORY + "\n"
     row = _review_rows(run_dir)[0]
@@ -2327,12 +2393,8 @@ def test_changed_transition_resets_stagnation_streak(tmp_path: Path) -> None:
     )
 
     assert metrics["review_count"] == 0
-    action_contexts = [
-        json.JSONDecoder().raw_decode(prompt.split("Visible context:\n", 1)[1])[0]
-        for prompt, _images, _labels in client.calls if "Visible context:\n" in prompt
-    ]
-    after_change = next(ctx for ctx in action_contexts if ctx["budgets"]["actions_used"] == 3)
-    assert after_change["stagnation"]["consecutive_repeated_or_no_progress_actions"] == 0
+    after_change = _continued_context(_message_user_text(client, 3))
+    assert after_change["state"]["consecutive_repeated_or_no_progress_actions"] == 0
 
 
 def test_stale_stagnation_states_from_previous_level_do_not_retrigger(tmp_path: Path) -> None:
@@ -2573,9 +2635,10 @@ def test_failed_click_does_not_block_other_coordinates(tmp_path):
     metrics = run_live(env, tmp_path / "clicks", client, game_id="fixture", max_actions=2, starting_routine=False)
     assert [args["x"] for _, args in env.actions] == [0, 1]
     assert metrics["model_calls"] == 2
-    context = json.loads(client.calls[1][0].split("Visible context:\n", 1)[1])
-    assert context["ineffective_actions_at_current_screen"] == []
-    assert context["ineffective_attempts_at_current_screen"] == [{"action": "ACTION6", "args": {"x": 0, "y": 0}}]
+    context = _continued_context(_message_user_text(client, 1))
+    assert context["state"]["ineffective_attempts_at_current_screen"] == [
+        {"action": "ACTION6", "args": {"x": 0, "y": 0}}
+    ]
 
 
 def test_reset_memory_cli_does_not_reimport_historical_route_or_ledger(tmp_path, monkeypatch):
