@@ -1,23 +1,7 @@
-- Compare the screen before and after one legal action. Motion identifies a controlled object; unchanged pixels do not establish an object's role or a universal rule. Treat large changes as interaction clues and verify them.
-
+- Compare the screen before and after one legal action. Motion identifies a controlled object; large changes are interaction clues to verify. Confirm disappearance or relocation in later frames before calling it a lasting mechanic—a one-frame change may be transient.
 - Treat visual interpretations as hypotheses. Choose a legal action that distinguishes plausible explanations, change one factor at a time, and compare both the visible state and environment status.
-
-- Confirm completion from an environment level change or WIN. Adjacency and a single visual effect are clues, not proof of the completion condition.
-
-- When evidence suggests an interaction, distinguish player entry, object movement, collection, and object-to-object effects with targeted tests. Test multiple-object conditions only when simpler tests leave them plausible.
-
-- Verify disappearance or relocation in later frames before calling it collection, teleportation, or a lasting mechanic; a one-frame change may be transient.
-
+- Confirm completion from an environment-level change or WIN. Adjacency and a single visual effect are clues, not proof of the completion condition.
 - A no-op establishes only that the tested action had no visible effect from that state. Do not infer a wall, blocked target, or general reachability from it; try a safe discriminating action when useful.
-
-- For a suspected opening, test whether the player and a moved object can each pass through it. Align an object before pushing through, and avoid pinning movable objects against boundaries until the consequence is understood.
-
-- Treat trail and path color changes as visual evidence, not proof of safety or danger. Test one move onto the changed region before planning a route that depends on it.
-
-- A hazard may depend on the destination and starting state, not just the action direction. Compare the same action from meaningfully different safe states before generalizing.
-
-- If an exact state/action repeat produces no useful change, stop repeating it and choose a targeted untried action or hypothesis instead of cycling.
-
-- Repeated layouts can suggest a strategy, but verify the first relevant transition before reusing it. Keep object roles and completion rules scoped to the states where they were tested.
-
-- Track collection or progress changes as possible sub-goals. If they do not complete a level, test a separate plausible completion condition rather than assuming proximity or collection is sufficient.
+- Startup probe for unfamiliar games: inspect visually distinct objects, barriers, regions, and progress indicators. When a cue suggests a possible interaction, gap, hazard, or coverage condition, test that hypothesis with one informative legal action and compare the before/after state. Do not infer a mechanic from appearance alone.
+- If an exact state/action repeat produces no useful change, stop and choose a targeted untried action or hypothesis. Repeated layouts can suggest a strategy, but verify the first relevant transition before reusing it.
+- When visual features or observed transitions suggest them, consider conditional hypotheses: whether an object is collectible or interactive, whether an apparent barrier has a gap, whether a region's coverage matters, or whether a special object may act as a portal, switch, or hazard. Phrase these only as possibilities to test with a targeted legal action; never imply the mechanic exists before evidence supports it.

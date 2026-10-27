@@ -1,6 +1,6 @@
 # V10 discovery tools
 
-Status: implemented in v10.0.18; available by default in model-driven action-selection calls, including bootstrap. Each selection allows at most three tool-call planning rounds, four candidate branch-test cases, and ten model completions total. After three tool-call rounds or four test cases, tools are withheld and the harness explicitly requires an action-decision JSON object. Bootstrap allows at most three invalid plan attempts; if they produce no valid action, the harness executes one legal directional or wait fallback, counts it as an ordinary game action, and resumes model selection. Use `--no-discovery-tools` to disable.
+Status: implemented in v10.0.19; available by default in model-driven action-selection calls, including bootstrap. Each selection allows at most three tool-call planning rounds, four newly executed branch outcomes, and ten model completions total. Cached outcomes do not consume the branch limit. After three tool-call rounds or four newly executed branches, tools are withheld and the harness explicitly requires an action-decision JSON object. Bootstrap allows at most three invalid plan attempts; if they produce no valid action, the harness executes one legal directional or wait fallback, counts it as an ordinary game action, and resumes model selection. Use `--no-discovery-tools` to disable.
 
 ## Scope
 
@@ -20,9 +20,16 @@ Examine an area of a recorded frame or transition.
 {"evidence_id":"T42","region":[10,10,20,20]}
 ```
 
+Branch transition evidence is inspected with both identifiers returned in `evidence_refs`:
+
+```json
+{"evidence_id":"T2","branch_id":"a1b2c3d4e5f60718","region":[0,0,5,5]}
+```
+
 - `region` is required and uses original grid coordinates: `[y0,x0,y1,x1]`, excluding the end coordinates.
 - Each crop is limited to 10 rows by 10 columns. Choose the smallest useful region; full-frame inspection is not supported. Pixel arrays are returned as structured data.
 - A state returns its current crop; a transition returns before/after crops and measurements.
+- When `branch_id` is supplied, both IDs must resolve within that branch. Branch references never fall back to live history.
 - Return changed pixels, color transitions, and candidate displacement with its score and margin.
 - Missing measurements are `null`. Displacement is an estimate, not an identified object's movement.
 
@@ -75,6 +82,8 @@ MVP predicates use exact pixel-difference fields and environment outcomes: `meas
 One match with all other alternatives failed distinguishes the submitted alternatives. Multiple matches indicate overlapping predictions; all failures require revised explanations. A match supports the measured prediction; broader conclusions go to review.
 
 Candidate actions cannot request RESET. Request IDs prevent duplicate dispatch: return a recorded result on retry and reject changed arguments under the same ID. Observable replay mismatch prevents candidate execution. Hidden state not exposed through observations cannot be certified by this check.
+
+Completed outcomes are cached by exact base evidence ID, canonical action, and normalized arguments. Repeated cases reuse the branch transition and evaluate their own predictions against its measured outcome. `discovery.jsonl` records reuse, and live metrics report `discovery_branch_reuses`. Replay mismatches, branch errors, and incomplete outcomes are never cached.
 
 ## 4. game_memory
 

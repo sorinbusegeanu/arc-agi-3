@@ -61,6 +61,7 @@ DISCOVERY_TOOLS = [
                 "type": "object",
                 "properties": {
                     "evidence_id": {"type": "string"},
+                    "branch_id": {"type": "string"},
                     "region": {
                         "description": "Required half-open [y0,x0,y1,x1] raw-grid crop, at most 10 rows by 10 columns.",
                         "type": "array", "items": {"type": "integer"},
@@ -157,6 +158,8 @@ class Discovery:
         self.branch_resets = sum(row.get("event") == "branch_reset" for row in self.events)
         self.branch_replay_actions = 0
         self.branch_test_actions = 0
+        self.branch_reuses = sum(row.get("event") == "branch_reused" for row in self.events)
+        self._outcomes: dict[str, dict[str, Any]] = {}
         self.seen: dict[str, tuple[str, dict[str, Any]]] = {}
         for row in self.events:
             if row.get("request_id") and row.get("status") in {"prepared", "completed", "rejected", "unknown_execution"}:
@@ -165,6 +168,10 @@ class Discovery:
                           if isinstance(row.get("response"), Mapping)
                           and isinstance(row["response"].get("data"), Mapping)
                           and row["response"]["data"].get("status") == "queued"]
+        for row in self.events:
+            for case in row.get("cases", []):
+                if case.get("status") == "completed" and case.get("cache_key") and "actual" in case:
+                    self._outcomes[case["cache_key"]] = dict(case)
         started = {row.get("request_id") for row in self.events if row.get("status") == "started"}
         finished = {row.get("request_id") for row in self.events
                     if row.get("status") in {"completed", "rejected", "unknown_execution"}}
@@ -176,8 +183,12 @@ class Discovery:
         return row
 
     def _result(self, request_id: str, status: str, data: Any = None, code: str | None = None, message: str | None = None) -> dict[str, Any]:
+        refs = ([{"branch_id": case["branch_id"], "evidence_id": case["evidence_id"]}
+                 for case in data.get("cases", []) if case.get("status") == "completed"
+                 and case.get("branch_id") and case.get("evidence_id")]
+                if isinstance(data, Mapping) else [])
         return {"request_id": request_id, "status": status, "game_id": self.game_id,
-                "run_id": self.run_id, "evidence_refs": [], "data": data,
+                "run_id": self.run_id, "evidence_refs": refs, "data": data,
                 **({"error": {"code": code, "message": message}} if code else {})}
 
     def dispatch(self, request: Any) -> dict[str, Any]:
@@ -216,11 +227,22 @@ class Discovery:
     def _dispatch(self, tool: str, args: dict[str, Any], *, request_id: str) -> Any:
         if tool == "inspect_region":
             eid = args.get("evidence_id")
-            record = self.history.get(eid) if isinstance(eid, str) else None
-            if record is None: raise ActionError("unknown evidence_id")
+            branch_id = args.get("branch_id")
+            if branch_id is not None:
+                if not isinstance(branch_id, str) or not branch_id or any(c not in "0123456789abcdef" for c in branch_id):
+                    raise ActionError("invalid branch_id")
+                branch_dir = self.game.run_dir / "discovery_branches" / branch_id
+                branch_records = read_jsonl(branch_dir / "evidence.jsonl")
+                record = next((r for r in reversed(branch_records) if r.get("evidence_id") == eid), None)
+                if record is None: raise ActionError("unknown branch evidence_id")
+                frames = FrameStore(branch_dir)
+            else:
+                record = self.history.get(eid) if isinstance(eid, str) else None
+                frames = self.frames
+                if record is None: raise ActionError("unknown evidence_id")
             region = args.get("region")
             if record.get("type") == "transition":
-                before = self.frames.get(record["pre_frame_id"]); after = self.frames.get(record["post_frame_id"])
+                before = frames.get(record["pre_frame_id"]); after = frames.get(record["post_frame_id"])
                 y0,x0,y1,x1 = _region(region, before.shape)
                 crop_before, crop_after = before[y0:y1,x0:x1], after[y0:y1,x0:x1]
                 measurements = pixel_diff(before, after, [y0,x0,y1,x1])
@@ -230,7 +252,7 @@ class Discovery:
                 return {"evidence_id": eid, "measurements": measurements,
                         "region":[y0,x0,y1,x1], "before": crop_before.tolist(), "after": crop_after.tolist()}
             frame_id = record.get("frame_id")
-            frame = self.frames.get(frame_id)
+            frame = frames.get(frame_id)
             y0,x0,y1,x1 = _region(region, frame.shape)
             return {"evidence_id": eid, "region": [y0,x0,y1,x1], "pixels": frame[y0:y1,x0:x1].tolist()}
         if tool == "search_history":
@@ -288,6 +310,29 @@ class Discovery:
         if tool == "test_hypotheses":
             return self._experiment(args, request_id=request_id)
         raise ActionError("unsupported tool")
+
+    def new_branch_count(self, args: Mapping[str, Any]) -> int:
+        """Estimate unique uncached branch outcomes for live-loop budgeting."""
+        base_id = args.get("base_evidence_id")
+        records = self.history.records()
+        base = next((row for row in records if row.get("evidence_id") == base_id), None)
+        if base is None:
+            return 0
+        initial = next((row for row in records if row.get("type") == "state"), base)
+        target = self._row_observation(base, initial)
+        cases = args.get("cases") or [{"action": args.get("action")}]
+        aliases = _model_action_aliases(target["legal_actions"])
+        keys = set()
+        for case in cases:
+            action = case.get("action", {}) if isinstance(case, Mapping) else {}
+            name = action.get("action")
+            canonical = aliases.get(name, name)
+            key = hashlib.sha256(json.dumps({"base_evidence_id": base_id,
+                "action": canonical, "args": action.get("args", {})},
+                sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+            if key not in self._outcomes:
+                keys.add(key)
+        return len(keys)
 
     def _experiment(self, args: dict[str, Any], *, request_id: str) -> dict[str, Any]:
         base_id = args.get("base_evidence_id")
@@ -357,7 +402,22 @@ class Discovery:
             raise ActionError("environment does not support isolated discovery branches")
         replay_action_count = sum(row.get("type") == "transition" for row in replay_events)
         results = []
+        executed_this_request = 0
         for case in normalized_cases:
+            cache_key = hashlib.sha256(json.dumps({"base_evidence_id": base_id,
+                "action": case["action"]["action"], "args": case["action"].get("args", {})},
+                sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+            cached = self._outcomes.get(cache_key)
+            if cached is not None:
+                verdicts = [{"id": h.get("id"), **evaluate_prediction(h["prediction"], cached["actual"])}
+                            for h in case["hypotheses"]]
+                self.branch_reuses += 1
+                results.append({**{k: cached[k] for k in ("branch_id", "base_evidence_id", "action", "evidence_id", "measurements")},
+                                "case_id": case["case_id"], "status": "completed", "reused": True,
+                                "cache_key": cache_key, "hypotheses": verdicts})
+                self._save({"request_id": request_id, "event": "branch_reused", "branch_id": cached["branch_id"],
+                            "evidence_id": cached["evidence_id"], "cache_key": cache_key, "case_id": case["case_id"]})
+                continue
             branch_id = hashlib.sha256(f"{request_id}:{base_id}:{case['case_id']}".encode()).hexdigest()[:16]
             branch_dir = self.game.run_dir / "discovery_branches" / branch_id
             self._save({"request_id": request_id, "event": "branch_started",
@@ -395,6 +455,7 @@ class Discovery:
                     continue
                 branch_game.action_budget_category = "discovery_test"
                 self.branch_test_actions += 1
+                executed_this_request += 1
                 transition = branch_game.act(case["action"]["action"], case["action"].get("args", {}),
                                             action_name=case["action"]["action"])
                 actual = dict(transition["evidence"])
@@ -403,11 +464,14 @@ class Discovery:
                     actual.pop("measurements", None)
                 verdicts = [{"id": h.get("id"), **evaluate_prediction(h["prediction"], actual)}
                             for h in case["hypotheses"]]
-                results.append({"case_id": case["case_id"], "status": "completed",
+                completed = {"case_id": case["case_id"], "status": "completed",
                                 "branch_id": branch_id, "base_evidence_id": base_id,
                                 "action": case["action"],
                                 "evidence_id": transition["evidence"].get("evidence_id"),
-                                "measurements": transition["measurements"], "hypotheses": verdicts})
+                                "measurements": transition["measurements"], "hypotheses": verdicts,
+                                "actual": actual, "cache_key": cache_key}
+                results.append(completed)
+                self._outcomes[cache_key] = completed
             except Exception as exc:
                 results.append({"case_id": case["case_id"], "status": "branch_error",
                                 "branch_id": branch_id,
@@ -420,6 +484,8 @@ class Discovery:
                   "branch_resets": self.branch_resets,
                   "branch_replay_actions": self.branch_replay_actions,
                   "branch_test_actions": self.branch_test_actions}
+        result["branch_reuses"] = self.branch_reuses
+        result["executed_branches"] = executed_this_request
         self._save({"status": "experiment_scored", "base_evidence_id": base_id,
                     "cases": results})
         return result

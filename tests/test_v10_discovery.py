@@ -118,6 +118,52 @@ def test_experiment_runs_in_isolated_branch_and_retry_returns_scored_result(tmp_
     assert any(row.get("event") == "branch_started" for row in rows)
 
 
+def test_completed_branch_outcome_is_reused_and_branch_frames_are_scoped(tmp_path):
+    game = GameTools(Env(), tmp_path, max_actions=3)
+    state = game.observe()
+    game.env.frame[2, 2] = 7
+    live_collision = game.act("up")
+    discovery = Discovery(game, "r", "g", tmp_path / "memory")
+    changed = {"all": [{"path": "measurements.changed_pixels", "op": "gt", "value": 0}]}
+    unchanged = {"all": [{"path": "measurements.changed_pixels", "op": "eq", "value": 0}]}
+    first = discovery.dispatch({"request_id": "first", "tool": "test_hypotheses", "arguments": {
+        "base_evidence_id": state["evidence_id"], "cases": [
+            {"case_id": "one", "action": {"action": "up"}, "hypotheses": [{"id": "yes", "prediction": changed}]},
+            {"case_id": "same", "action": {"action": "up", "args": {}}, "hypotheses": [{"id": "no", "prediction": unchanged}]},
+        ]}})
+    cases = first["data"]["cases"]
+    assert cases[0]["status"] == cases[1]["status"] == "completed"
+    assert cases[1]["reused"] is True
+    assert cases[0]["branch_id"] == cases[1]["branch_id"]
+    assert cases[1]["hypotheses"][0]["verdict"] == "failed"
+    assert first["evidence_refs"] == [{"branch_id": cases[0]["branch_id"], "evidence_id": cases[0]["evidence_id"]},
+                                      {"branch_id": cases[1]["branch_id"], "evidence_id": cases[1]["evidence_id"]}]
+    assert discovery.branch_test_actions == 1
+    branch_inspection = discovery.dispatch({"request_id": "branch-read", "tool": "inspect_region", "arguments": {
+        "evidence_id": cases[0]["evidence_id"], "branch_id": cases[0]["branch_id"], "region": [2, 2, 3, 3]}})
+    assert branch_inspection["data"]["after"] == [[1]]
+    assert live_collision["evidence"]["evidence_id"] == cases[0]["evidence_id"]
+    live_inspection = discovery.dispatch({"request_id": "live-read", "tool": "inspect_region", "arguments": {
+        "evidence_id": live_collision["evidence"]["evidence_id"], "region": [2, 2, 3, 3]}})
+    assert live_inspection["data"]["after"] == [[8]]
+    invalid = discovery.dispatch({"request_id": "bad-branch", "tool": "inspect_region", "arguments": {
+        "evidence_id": cases[0]["evidence_id"], "branch_id": "badbranch", "region": [0, 0, 1, 1]}})
+    assert invalid["status"] == "rejected"
+    assert "invalid branch_id" in invalid["error"]["message"]
+    missing_branch = discovery.dispatch({"request_id": "missing-branch", "tool": "inspect_region", "arguments": {
+        "evidence_id": live_collision["evidence"]["evidence_id"], "branch_id": "a" * 16, "region": [2, 2, 3, 3]}})
+    assert missing_branch["status"] == "rejected"
+    assert "unknown branch evidence_id" in missing_branch["error"]["message"]
+    second_discovery = Discovery(game, "r", "g", tmp_path / "memory")
+    second = second_discovery.dispatch({"request_id": "second", "tool": "test_hypotheses", "arguments": {
+        "base_evidence_id": state["evidence_id"], "action": {"action": "up"},
+        "hypotheses": [{"prediction": unchanged}]}})
+    assert second["status"] == "completed", second.get("error")
+    assert second["data"]["cases"][0]["reused"] is True
+    assert second_discovery.branch_test_actions == 0
+    assert second_discovery.branch_reuses == 2
+
+
 def test_hypothesis_prediction_contract_is_advertised_and_matches_runtime(tmp_path):
     from v10.tools.discovery import DISCOVERY_TOOLS
 
@@ -205,7 +251,7 @@ def test_multiple_candidate_cases_use_independent_branches_from_same_base(tmp_pa
     assert len(result["data"]["cases"]) == 10
     assert {case["case_id"] for case in result["data"]["cases"]} == {f"candidate-{index}" for index in range(10)}
     assert game.action_budget.used == 0
-    assert discovery.branch_test_actions == 10
+    assert discovery.branch_test_actions == 2
     assert discovery.branch_replay_actions == 0
     assert game.env.actions == []
     repeated = discovery.dispatch({"request_id": "D2", "tool": "test_hypotheses", "arguments": {
@@ -213,7 +259,8 @@ def test_multiple_candidate_cases_use_independent_branches_from_same_base(tmp_pa
         "hypotheses": hypotheses,
     }})
     assert repeated["status"] == "completed"
-    assert discovery.branch_test_actions == 11
+    assert discovery.branch_test_actions == 2
+    assert repeated["data"]["cases"][0]["reused"] is True
 
 
 def test_replay_mismatch_does_not_execute_candidate(tmp_path):
@@ -470,7 +517,7 @@ def test_four_hypothesis_cases_force_action_completion(tmp_path, monkeypatch):
         "actions": [{"action": "right", "args": {}}],
     }
     cases = [{
-        "case_id": f"case-{index}", "action": {"action": "up" if index % 2 else "right", "args": {}},
+        "case_id": f"case-{index}", "action": {"action": ["up", "right", "left", "down"][index - 1], "args": {}},
         "hypotheses": [{"prediction": {"all": [{"path": "measurements.changed_pixels", "op": "gte", "value": index}]}}],
     } for index in range(1, 5)]
 
@@ -489,9 +536,15 @@ def test_four_hypothesis_cases_force_action_completion(tmp_path, monkeypatch):
             return {"content": json.dumps(action_decision), "usage": {}, "latency_seconds": 0.0,
                     "request_attempts": 1, "model": "test"}
 
+    class FourActionEnv(Env):
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"] = ["up", "right", "left", "down"]
+            return result
+
     client = Client()
     run_dir = tmp_path / "four-tests"
-    metrics = run_live(Env(), run_dir, client, game_id="fixture", max_actions=1, starting_routine=False)
+    metrics = run_live(FourActionEnv(), run_dir, client, game_id="fixture", max_actions=1, starting_routine=False)
     assert client.calls[0]["tools"]
     assert client.calls[1]["tools"] is None
     assert any(message.get("role") == "user" and "ACTION DECISION REQUIRED" in message.get("content", "")
@@ -500,7 +553,7 @@ def test_four_hypothesis_cases_force_action_completion(tmp_path, monkeypatch):
     assert metrics["model_calls"] == 2
 
 
-def test_same_hypothesis_test_is_rejected_from_same_evidence_state(tmp_path, monkeypatch):
+def test_same_hypothesis_test_reuses_outcome_from_same_evidence_state(tmp_path, monkeypatch):
     monkeypatch.setenv("V10_STATE_DIR", str(tmp_path / "state"))
     decision = {
         "state_assessment": {"player": {"location": "unknown", "certainty": "unknown", "evidence": "unknown"},
@@ -532,5 +585,5 @@ def test_same_hypothesis_test_is_rejected_from_same_evidence_state(tmp_path, mon
     metrics = run_live(Env(), run_dir, Client(), game_id="fixture", max_actions=1, starting_routine=False)
     assert metrics["discovery_test_actions"] == 1
     rows = [json.loads(line) for line in (run_dir / "discovery.jsonl").read_text().splitlines()]
-    assert any(row.get("status") == "rejected" and "duplicate hypothesis test" in row.get("error", {}).get("message", "")
-               for row in rows)
+    assert any(row.get("event") == "branch_reused" for row in rows)
+    assert metrics["discovery_branch_reuses"] == 1

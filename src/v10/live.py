@@ -2299,6 +2299,7 @@ def run_live(
             "action_budget_remaining": tools.actions_remaining,
             "discovery_replay_actions": discovery.branch_replay_actions if discovery is not None else 0,
             "discovery_test_actions": discovery.branch_test_actions if discovery is not None else 0,
+            "discovery_branch_reuses": discovery.branch_reuses if discovery is not None else 0,
             "discovery_branch_resets": discovery.branch_resets if discovery is not None else 0,
             "resets": tools.reset_count,
             "model_calls": model_calls, "usage": dict(total_usage),
@@ -2546,7 +2547,7 @@ def run_live(
                 if selection_budget["planning_rounds"] >= MAX_DISCOVERY_PLANNING_ROUNDS:
                     unavailable_reasons.append("the three tool-call planning rounds have been used")
                 if selection_budget["test_cases"] >= MAX_DISCOVERY_TEST_CASES:
-                    unavailable_reasons.append("the four branch-test cases have been used")
+                    unavailable_reasons.append("the four newly executed branch outcomes have been used")
                 if remaining <= 1:
                     unavailable_reasons.append("only one model completion remains")
                 request_messages.append({
@@ -2627,28 +2628,12 @@ def run_live(
                                     case_rows = [{"action": args.get("action"), "hypotheses": args.get("hypotheses", [])}]
                                 else:
                                     case_rows = []
-                                signatures = []
-                                base_id = args.get("base_evidence_id")
-                                for case in case_rows:
-                                    if not isinstance(case, Mapping):
-                                        continue
-                                    signature_payload = {
-                                        "base_evidence_id": base_id,
-                                        "action": case.get("action"),
-                                        "predictions": sorted(
-                                            (h.get("prediction") for h in case.get("hypotheses", []) if isinstance(h, Mapping)),
-                                            key=lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")),
-                                        ),
-                                    }
-                                    signatures.append(hashlib.sha256(json.dumps(signature_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
-                                if not case_rows or selection_budget["test_cases"] + len(case_rows) > MAX_DISCOVERY_TEST_CASES:
-                                    raise ValueError(f"test_hypotheses exceeds the remaining branch-test budget ({max(0, MAX_DISCOVERY_TEST_CASES - int(selection_budget['test_cases']))} cases)")
-                                if not repeated_provider_call and (len(set(signatures)) != len(signatures) or any(sig in selection_budget["test_signatures"] for sig in signatures)):
-                                    raise ValueError("duplicate hypothesis test from the same evidence state; change the action or predictions")
+                                new_branches = discovery.new_branch_count(args)
+                                if not case_rows or selection_budget["test_cases"] + new_branches > MAX_DISCOVERY_TEST_CASES:
+                                    raise ValueError(f"test_hypotheses exceeds the remaining branch-test budget ({max(0, MAX_DISCOVERY_TEST_CASES - int(selection_budget['test_cases']))} new branches)")
                             result = discovery.dispatch({"request_id": call_id, "tool": name, "arguments": dict(args)})
                             if name == "test_hypotheses" and result.get("status") == "completed" and not repeated_provider_call:
-                                selection_budget["test_cases"] += len(case_rows)
-                                selection_budget["test_signatures"].update(signatures)
+                                selection_budget["test_cases"] += int(result.get("data", {}).get("executed_branches", 0))
                         except Exception as exc:
                             result = {"request_id": call_id, "status": "rejected", "game_id": game_id,
                                       "run_id": run_id, "error": {"code": "invalid_request", "message": f"{type(exc).__name__}: {exc}"}}
