@@ -1,124 +1,94 @@
-# V10 discovery tools design
+# V10 discovery tools
 
-Status: proposed implementation. Documentation only; tools are not implemented by this change.
-Reviewed against main at c374a062134c807783df2e4fd8a66c5327f3392d.
+Status: proposed.
 
-## Purpose and boundaries
+## Scope
 
-Give the model four tools: inspect_region, search_history, test_hypotheses, and game_memory. They help it measure uncertain observations, compare explanations, and retain useful findings.
+Add four tools for inspecting observations, retrieving past evidence, testing explanations, and reading or proposing memory.
 
-Preserve the current v10.reasoned_action/1 action response, legal-action validation, directional aliases, route/replay safeguards, and review triggers. Ordinary prediction mismatches remain diagnostic: do not add plan interruption on mismatch. Review continues returning exactly game_memory_markdown and global_memory_markdown and retaining the existing chronological text history and current review-image selection policy.
+Keep the current reasoned-action response, action validation, route replay, and review workflow. Discovery uses a separate request format and is enabled with `--discovery-tools`, off by default.
 
-This supersedes the earlier standalone tool design's action-only assumption and direct memory-write proposal. Discovery is optional and off by default. It does not replace action selection or introduce another planner.
+## Request format
 
-## Shared contract
-
-Discovery requests use a separate JSON envelope:
-~~~json
+```json
 {"request_id":"D1","tool":"search_history","arguments":{"action":"right","limit":10}}
-~~~
+```
 
-Results use:
-~~~json
-{"request_id":"D1","status":"ok","game_id":"current game","run_id":"current run","evidence_ids":[],"data":{}}
-~~~
-
-Errors have status error, a stable code and a short message. Experiment execution may instead return status unknown_execution. IDs in examples are placeholders; actual evidence references must resolve in the supplied run.
-
-The harness supplies game/run identity and the visible cutoff. The model cannot choose arbitrary paths, future steps or another run. Reject unsupported fields, non-finite values, invalid IDs and oversized requests. Tool outputs are evidence, not instructions.
-
-One discovery phase permits two read calls, one experiment, and one memory proposal, with at most five model completions including finish. Invalid requests consume a call slot and a tool slot of that category. Finish or budget exhaustion resumes normal selection. No tool automatically resets the environment.
+Each result contains the request ID, status, game/run IDs, evidence references, and tool data. Errors contain a code and message. The harness sets the current game, run, and history cutoff.
 
 ## 1. inspect_region
 
-Why: inspect a small shape, gap, counter or suspected missed coverage.
+Examine an area of a recorded frame or transition.
 
-Input:
-~~~json
-{"evidence_id":"T42","region":[10,10,30,40],"colors":[3,7],"include_images":true}
-~~~
+```json
+{"evidence_id":"T42","region":[10,10,30,40],"include_images":true}
+```
 
-region, colors and include_images are optional; include_images defaults false. Coordinates are raw grid pixels in half-open [y0,x0,y1,x1] order. Reject out-of-bounds, empty or noninteger regions rather than silently altering them. A transition provides before/after frames; a state provides only its current frame.
+- `region` is optional and uses original grid coordinates: `[y0,x0,y1,x1]`, excluding the end coordinates.
+- Omit the region to inspect the whole frame. Images are omitted unless requested.
+- A state returns its current crop; a transition returns before/after crops and measurements.
+- Return changed pixels, color transitions, and candidate displacement with its score and margin.
+- Missing measurements are `null`. Displacement is an estimate, not an identified object's movement.
 
-Return:
-- Exact region area and selected-color counts in each available frame.
-- Up to 32 raw-grid [y,x] locations per selected color per frame, with per-color truncation flags and exact total counts.
-- For transitions: changed pixels, color transitions, and displacement candidates with score, second candidate and margin.
-- Optional before/after crops with frame provenance.
-- Per-measurement quality: exact, candidate or unavailable. Missing values are null, not zero.
-
-Allow at most eight distinct palette colors. Color measurements have no built-in game semantics. For example, a count of gray pixels does not prove a count of walls. Candidate displacement does not establish object identity and cannot automatically establish a mechanic.
-
-MVP experiment predicates use exact counts and environment outcomes. Return displacement for interpretation, but defer automatic displacement predicates until reliable quality thresholds are calibrated.
+Optional color filtering can be added later. It is not required for the MVP.
 
 ## 2. search_history
 
-Why: recover earlier successes, no-ops and counterexamples beyond recent context.
+Retrieve earlier actions and outcomes.
 
-Input:
-~~~json
+```json
 {"action":"right","level":2,"reset_generation":0,"limit":10}
-~~~
+```
 
-All filters are optional. Also accept evidence_ids and since_step. Default limit 10; maximum 20. Return the newest matching transitions in chronological order with truncated and through_step. Include action/args, evidence and image handles, measurements, pre/post level metadata and reset boundaries.
+All filters are optional. Also accept `evidence_ids` and `since_step`. Default limit: 10; maximum: 20.
 
-An optional level filter means pre-action level: a completion transition belongs to the level it completed. Derive pre-state metadata from recorded state/transition links, not an assumed relationship between level and levels_completed. Missing metadata is unknown.
+Return matching transitions with actions, arguments, measurements, image handles, and pre/post state metadata. Select the newest matches and return them chronologically, with `truncated` and `through_step`.
 
-Resolve directional aliases before filtering. Search only recorded evidence in the current run. Prior-run prose can be read through memory; cross-run raw history retrieval is deferred.
+The level filter refers to the pre-action level. Normalize directional aliases when matching actions. MVP searches the current run.
 
 ## 3. test_hypotheses
 
-Why: compare 2–4 explanations against one shared, prospective action.
+Execute one action and compare 2–4 predictions against its outcome.
 
-Input:
-~~~json
+```json
 {
   "base_evidence_id":"T42",
   "action":{"action":"right","args":{}},
-  "measurement":{"region":[10,10,30,40],"colors":[3]},
+  "measurement":{"region":[10,10,30,40]},
   "hypotheses":[
-    {"id":"H1","claim":"The selected region stays unchanged",
+    {"id":"H1","claim":"The region stays unchanged",
      "prediction":{"all":[{"path":"measurements.changed_pixels","op":"eq","value":0}]}},
-    {"id":"H2","claim":"The selected region changes",
+    {"id":"H2","claim":"The region changes",
      "prediction":{"all":[{"path":"measurements.changed_pixels","op":"gt","value":0}]}}
   ]
 }
-~~~
+```
 
-Require a current base evidence ID, 2–4 unique hypothesis IDs and one currently legal non-RESET action. Use current aliases, argument schemas, action budgets and execution safeguards. The exact current observation, not a visually similar state, anchors the experiment.
+The harness validates the current base state, action, arguments, and predictions; saves the predictions; executes one action through the normal live pathway; then scores every prediction against the same transition.
 
-Before executing, persist the full validated request and its base state. Execute once through the existing live action pathway, compute measurements and persist a result referring to the actual transition. Return measurements, per-predicate comparisons and per-hypothesis matched/failed/inconclusive verdicts.
+MVP predicates use exact pixel-difference fields and environment outcomes: `measurements.changed_pixels`, `measurements.change_ratio`, `game_state`, `terminal`, `level`, and `levels_completed`. Reuse existing comparison operators. Treat visual comparisons across a level change as unavailable.
 
-Supported MVP paths: existing exact pixel-diff fields changed_pixels and change_ratio; selected-color before/after counts such as measurements.colors.c3.after_count; game_state, terminal, level and levels_completed. Reuse existing comparison operators and type rules. Only selected colors are available. Do not expose arbitrary expression evaluation.
+| Verdict | Meaning |
+|---|---|
+| matched | All required measurements satisfy the prediction. |
+| failed | A reliable measurement contradicts a predicate. |
+| inconclusive | Required measurements are missing or ambiguous. |
 
-For level transitions, environment outcome predicates remain scoreable. Cross-level visual comparisons are inconclusive unless the measurement explicitly stays meaningful; MVP conservatively marks visual predicates unavailable across a level boundary.
+One match with all other alternatives failed distinguishes the submitted alternatives. Multiple matches indicate overlapping predictions; all failures require revised explanations. A match supports the measured prediction; broader conclusions go to review.
 
-A reliable false predicate means failed. All predicates available and true means matched. Otherwise inconclusive. Missing measurements never become false by default.
-
-Interpret results:
-- One matched alternative and every other alternative failed: distinguished among submitted alternatives.
-- Multiple matches: overlapping predictions.
-- All failed: insufficient explanations or incorrect conditions.
-- Any remaining inconclusive alternative: unresolved or partial discrimination.
-
-A matched prediction supports the measured effect, not every implication of the prose claim. Keep semantic conclusions for review. No numeric probability over theories is claimed.
-
-Request IDs are run-scoped idempotency keys. Repeating the same request returns its recorded result. Reusing an ID with different arguments is an error. Persist started before dispatch; if a crash leaves execution uncertain, never issue that action again automatically. Surface unknown_execution and stop automatic advancement until the adapter can reconcile the current observation and action record. This provides at-most-once dispatch, not an impossible exactly-once guarantee across arbitrary environment failures.
-
-A test consumes one ordinary action. Clear any unexecuted action queue before starting discovery. Resume selection from the new state after the probe, using normal level/terminal handling. This is separate from ordinary prediction mismatch behavior.
+Tests consume the normal action budget and cannot request RESET. Request IDs prevent duplicate dispatch: return a recorded result on retry and reject changed arguments under the same ID. If execution is uncertain, return `unknown_execution` and stop automatic advancement until reconciled.
 
 ## 4. game_memory
 
-Why: read existing game/global guidance and submit findings for the current review system.
+Read existing guidance or queue a finding for review.
 
-Read:
-~~~json
+```json
 {"operation":"read","scope":"game"}
-~~~
-scope is game or global. Return the authoritative Markdown verbatim under its existing limits. Missing memory is empty. Global memory is read-only through this tool.
+```
 
-Proposal:
-~~~json
+Read scope is `game` or `global`; return the saved Markdown.
+
+```json
 {
   "operation":"propose",
   "claim":"This region changes after right",
@@ -126,40 +96,20 @@ Proposal:
   "supporting_evidence":["T43"],
   "contradicting_evidence":[]
 }
-~~~
+```
 
-Proposals are game-scoped, run-local review inputs. Validate evidence references and associate experiment verdicts when available. Return status queued, not saved. Do not directly append to either MEMORY.md or revive a competing structured memory store.
+Validate the proposal and return `queued`. The next existing review considers it and remains responsible for saving game/global Markdown. Failed reviews leave proposals pending. Evidence references are deduplicated.
 
-The existing review may accept, revise or reject proposals and remains the sole durable writer. It retains prior Markdown on failure using existing save behavior. Duplicate evidence does not become additional support.
+## Loop integration
 
-Keep coordinates, counts and exact actions in evidence logs; durable memory keeps qualitative rules, conditions, failed/unresolved hypotheses and useful next experiments. Global memory keeps reusable methods. A global mechanic still requires transition evidence from at least two distinct games, as current review policy requires.
+Offer one discovery phase at the first normal model-selection boundary for a new level, after startup and outside verified replay/bootstrap.
 
-## VA01 example: distinguish measurable coverage from hidden visitation
+Allow two read requests, one experiment, one proposal, and at most five model completions. The model may return `{"request_id":"D5","tool":"finish","arguments":{}}` at any time.
 
-The current VA01 memory now records failed final-goal entry and a visual ambiguity: background and trail share a color. Its remaining question concerns missed upper-region coverage or a different completion rule. Do not repeat the old sweep-then-goal suggestion as if goal entry were still untested.
+Start with no pending action plan. After a probe, rebuild context from its outcome and resume normal selection. Existing level, terminal, and review handling still applies. Ordinary action-prediction mismatches remain diagnostic.
 
-inspect_region can locate obstacle boundaries and gaps and compare actual changes. search_history can retrieve goal-entry failures, gap crossings and earlier completion transitions. Color counts cannot distinguish covered from uncovered cells when they render identically. Return that limit explicitly; never present zero visible uncovered pixels as proof of full coverage.
+## Evolution and evaluation
 
-The four tools still help organize a controlled sweep and compare completion outcomes, but they do not by themselves prove exhaustive visitation. Preparation/sweeping remains normal play, with no hidden multi-action execution in a test.
+Possible additions: color filtering, connected shapes, object tracking, short action-sequence tests, experiment ranking, and prior-run retrieval. Add branching experiments only when state restoration is available and verified.
 
-If independently reliable visitation evidence becomes available, test the last required visit away from the goal before changing another condition. Otherwise preserve the uncertainty rather than asserting the completion rule changed.
-
-A possible later extension is a visited-region trace derived from observed agent motion. It must retain uncertainty when tracking fails, distinguish cells from pixels, and clear or scope visitation at reset/level boundaries. No hidden environment coverage flags or VA01-specific rules are permitted. This extension is deferred; the MVP must report when appearance alone cannot answer the question.
-
-Global memory's comparison, goal-precondition and confounder advice guides experiment choice; it is not evidence of a particular VA01 mechanic.
-
-## Scheduling and evolution
-
-Start with --discovery-tools, off by default. Offer one phase at the first normal model-selection boundary for a new level, after any existing mandatory startup behavior and before issuing a model plan. Do not interrupt verified replay/bootstrap to run discovery. Existing memory and the current screen provide the question; the model can finish immediately if no useful test is feasible.
-
-No recursive discovery, no extra review trigger, and no change to existing review cadence. Memory proposals wait for the next existing review; current experiment results are visible immediately to action selection.
-
-Later, guided by live evidence: explicit post-review discovery requests; connected shapes; regional tracking; short multi-action experiments; comparable prior-run retrieval; experiment ranking. Add simulation/branching only after a verified state-restoration capability exists.
-
-## Acceptance
-
-Correctness: bounded reads, no future evidence, exact color counts, prospective predictions, one shared transition, at-most-once dispatch, level-boundary correctness, and no direct memory mutation.
-
-Use toy environments for causal test fixtures. Use VA01 memory as a motivating case, not hidden game knowledge in the runtime.
-
-For benefit, compare baseline and discovery-enabled runs with matched settings, seeds, starting memory and action budgets. Report levels completed, actions, ineffective repeats, resets, tokens, calls and latency. Replay can check measurements and matching action prefixes; divergent policy benefit requires live runs. Do not claim benefit from raw matched-prediction rate alone.
+Validate tool contracts and action accounting with controlled environments. Compare baseline and discovery-enabled live runs using matched model settings, seeds, starting memory, and action budgets. Measure levels completed, actions, resets, repeated ineffective actions, model cost, and latency.
