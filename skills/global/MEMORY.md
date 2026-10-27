@@ -9,3 +9,5 @@
 - When a prior level's completion condition is known, carry it forward as a hypothesis for later levels but verify it independently; do not assume the same rule applies without a transition confirming it.
 - When an object disappears after being pushed into another object, treat the disappearance as a possible absorption or consumption mechanic and test whether the absorbing object's state changes or new objects appear as a result.
 - When extensive free movement in one region produces no progress, redirect effort toward a targeted interaction with a specific object rather than continuing to explore the same area.
+- When an object appears to sit on or overlap another object without the expected interaction (e.g., no absorption), consider that the interaction may require the object to be pushed further into the target's interior or from a different direction; test with an additional push before concluding the mechanic failed.
+- When an object is pushed onto a target and then moved off, the completion condition may require the object to remain on the target; test leaving it in place before concluding the interaction failed.

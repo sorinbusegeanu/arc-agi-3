@@ -2816,6 +2816,20 @@ def test_stagnation_never_triggers_a_review(tmp_path: Path) -> None:
     assert _review_rows(tmp_path / "run") == []
 
 
+def test_repeated_state_cycle_interrupts_remaining_model_plan(tmp_path: Path) -> None:
+    client = _FakeClient([_decision([_action()] * 8)])
+    metrics = _run_live_without_starting_routine(
+        _OscillatingEnv(), tmp_path / "cycle-interruption", client,
+        game_id="fixture", max_actions=3, plan_horizon=8,
+    )
+
+    rows = [json.loads(line) for line in (tmp_path / "cycle-interruption/decisions.jsonl").read_text().splitlines()]
+    interrupted = next(row for row in rows if row.get("interrupt_reason") == "repeated_state_stagnation")
+    assert len(interrupted["executed"]) == 3
+    assert metrics["actions"] == 3
+    assert metrics["interrupted_plans"] == 1
+
+
 def test_changed_transition_resets_stagnation_streak(tmp_path: Path) -> None:
     class OneChangedAction(_FakeEnv):
         def __init__(self):

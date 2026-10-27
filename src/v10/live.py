@@ -3493,6 +3493,14 @@ def run_live(
                 update_stagnation_state(
                     before_observation, current, observed_edge, str(action["action"]),
                 )
+                if (
+                    decision_source == "model"
+                    and not bootstrap_probe_active
+                    and no_progress_actions >= 2
+                    and action_index + 1 < len(actions)
+                ):
+                    interruption = "repeated_state_stagnation"
+                    progress("stopping model plan after repeated states; replanning from the current screen")
                 level_changed = (
                     current.get("level") != previous_level
                     or current.get("levels_completed") != previous_levels_completed
@@ -3596,7 +3604,7 @@ def run_live(
                     and int((result.get("measurements") or {}).get("changed_pixels", -1)) == 0
                     and action_index + 1 < len(actions)
                 ):
-                    interruption = "no_visible_change"
+                    interruption = interruption or "no_visible_change"
                 if starter_chunk and interruption in {
                     "terminal_state", "level_change", "planned_action_no_longer_legal",
                     "action_error", "solution_diverged",

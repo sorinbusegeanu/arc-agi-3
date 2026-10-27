@@ -1,6 +1,6 @@
 # V10 discovery tools
 
-Status: implemented in v10.0.20; available by default in model-driven action-selection calls, including bootstrap. Each selection allows at most three tool-call planning rounds, four newly executed branch outcomes, and ten model completions total. Cached outcomes do not consume the branch limit. After three tool-call rounds or four newly executed branches, tools are withheld and the harness explicitly requires an action-decision JSON object. Bootstrap allows at most three invalid plan attempts; if they produce no valid action, the harness executes one legal directional or wait fallback, counts it as an ordinary game action, and resumes model selection. Use `--no-discovery-tools` to disable.
+Status: implemented in v10.0.21; available by default in model-driven action-selection calls, including bootstrap. Each selection allows at most three tool-call planning rounds, four newly executed branch outcomes, and ten model completions total. Cached outcomes do not consume the branch limit. After three tool-call rounds or four newly executed branches, tools are withheld and the harness explicitly requires an action-decision JSON object. Bootstrap allows at most three invalid plan attempts; if they produce no valid action, the harness executes one legal directional or wait fallback, counts it as an ordinary game action, and resumes model selection. Use `--no-discovery-tools` to disable.
 
 ## Scope
 
