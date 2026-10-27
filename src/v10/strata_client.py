@@ -20,7 +20,7 @@ from .runlog import append_jsonl
 DEFAULT_STRATA_BASE_URL = "http://127.0.0.1:8080"
 DEFAULT_STRATA_MODEL = "qwen3.8-flash-next-iq3_s"
 DEFAULT_REASONING_EFFORT = "medium"
-V10_VERSION = "10.0.1"
+V10_VERSION = "10.0.2"
 
 
 def user_message(

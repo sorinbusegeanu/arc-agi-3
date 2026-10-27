@@ -21,12 +21,13 @@ This document records the implemented architecture and default live configuratio
 | Model | `qwen3.8-flash-next-iq3_s` |
 | Reasoning effort | `medium` |
 | Reasoning token cap | none |
-| Maximum generated tokens | `4096` |
+| Maximum generated tokens | `6144` |
 | Request timeout | `300` seconds |
 | Action budget | `30` |
 | Plan horizon (`--plan-horizon`) | `8` actions (accepted range 1–8) |
-| Interval review | every `20` active-play actions without level completion |
-| Game/global Markdown limits | `2000` / `6000` characters |
+| Action-set review | after more than `9` actions since the last review, checked at set end |
+| Game/global Markdown limits | `3000` / `6000` characters |
+| Review memory quality | Reject obvious transient progress and unqualified global no-op blockage claims; use the existing single repair |
 | Request and response logging | off |
 
 Requests use temperature zero. Action plans and memory consolidation use JSON response mode; game-over post-mortems return plain Markdown. CLI defaults can be changed with the options documented in [README.md](README.md). The offline `analyze` and `ablate` commands retain their separate horizon limit of four; the live horizon is eight. Offline memory limits select complete Markdown content blocks, retaining their standalone headings; zero omits memory. Live action prompts load both complete saved memory documents.
@@ -36,7 +37,7 @@ Requests use temperature zero. Action plans and memory consolidation use JSON re
 - The model returns only an `actions` list. Movement actions are spelled `up`, `down`, `left`, and `right`; Python maps them to environment IDs. A reset decision is a dedicated question in each normal action prompt. Bootstrap prompts say not to reset.
 - An exact saved-route match replays directly on the initial level. If no route is available, the runner bootstraps, resets, and requests an exploratory plan from the restored screen. Later levels run the same bootstrap/reset flow, then replay verified routes for completed levels before asking the model to act on the new level.
 - Live plans can contain up to eight actions. The action context is independently bounded to the eight most recent transitions in the active level and includes all intermediate frames in order. After eight uninterrupted actions, this yields at least nine ordered screens plus environment-provided intermediate frames. Execution stops on terminal or level transitions, errors, budget limits, illegal actions, and known same-screen/action/argument no-ops within multi-action plans. Single-action experiments may repeat an input. A no-visible-change action can interrupt the remaining model plan for reassessment.
-- Reviews run at level completion and on the configured action interval. An interval review waits for the current plan to finish and receives the complete ordered active-level action/outcome history with every available screen and intermediate frame; a level-completion review also receives every screen from the entire completed-level sequence. Game-over post-mortems likewise receive every screen and action from the failed level, including intermediate environment frames. Action records identify their source screen and all screens produced, using the screen labels' shared numbering. The next normal prompt asks whether to continue with a fresh plan or reset. A model-selected reset re-enters normal route handling: exact matches replay, other saved routes guide, and bootstrap runs only when the level has no verified route. `GAME_OVER` receives a separate post-mortem before an automatic restart when action budget remains. Budget exhaustion alone does not trigger an assessment.
+- Reviews run on level completion or WIN, and after more than 9 active-play actions since the previous review when an action set ends. Interval reviews do not interrupt a plan and are skipped if the budget expires. Completion reviews attach at most the latest 20 screens from the completed-level sequence. Game-over post-mortems receive every screen and action from the failed level, including intermediate environment frames. Action records identify their source screen and all screens produced, using the screen labels' shared numbering. The next normal prompt asks whether to continue with a fresh plan or reset. A model-selected reset re-enters normal route handling: exact matches replay, other saved routes guide, and bootstrap runs only when the level has no verified route. `GAME_OVER` receives a separate post-mortem before an automatic restart when action budget remains. Budget expiration alone does not trigger a review or assessment.
 - Request/response logs are opt-in with `--log-request` and `--log-response`. They record retries as well as validation repairs in the run directory, with request IDs, UTC timestamps, payload size/image counts, and response latency. IDs link calls to action decisions, reviews, and post-mortems.
 - On interruption, completed transitions and verified successes remain persisted. Metrics record `stop_reason=interrupted`; shutdown does not start a review or mark unfinished routes successful.
 

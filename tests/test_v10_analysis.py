@@ -544,19 +544,19 @@ def test_model_logging_cli_flags_default_off_and_enable_independently() -> None:
     assert defaults.log_request is False
     assert defaults.log_response is False
     assert defaults.reset_memory is False
-    assert defaults.review_interval == 20
     assert defaults.global_memory_max_chars == 6000
     assert defaults.plan_horizon == 8
+    assert defaults.max_output_tokens == 6144
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "live", "--game-id", "ez01", "--run-dir", "run", "--review-interval", "20",
+        ])
     assert enabled.log_request is True
     assert enabled.log_response is True
     reset = parser.parse_args([
         "live", "--game-id", "ez01", "--run-dir", "run", "--reset-memory",
     ])
     assert reset.reset_memory is True
-    configured = parser.parse_args([
-        "live", "--game-id", "ez01", "--run-dir", "run", "--review-interval", "12",
-    ])
-    assert configured.review_interval == 12
     configured_memory = parser.parse_args([
         "live", "--game-id", "ez01", "--run-dir", "run", "--global-memory-max-chars", "7200",
     ])
@@ -572,7 +572,7 @@ def test_cli_reports_v10_patch_version_and_context_override(capsys) -> None:
     with pytest.raises(SystemExit) as version_exit:
         parser.parse_args(["--version"])
     assert version_exit.value.code == 0
-    assert capsys.readouterr().out.strip() == "v10 10.0.1"
+    assert capsys.readouterr().out.strip() == "v10 10.0.2"
 
     configured = parser.parse_args([
         "live", "--game-id", "ez01", "--run-dir", "run", "--context-window-tokens", "32768",

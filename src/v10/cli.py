@@ -141,12 +141,8 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--seed", type=int, default=0)
     live.add_argument("--max-actions", type=int, default=30)
     live.add_argument("--plan-horizon", type=int, default=8)
-    live.add_argument(
-        "--review-interval", type=int, default=20,
-        help="run a memory review after this many actions without a level completion (default: 20)",
-    )
     live.add_argument("--timeout-seconds", type=float, default=300.0)
-    live.add_argument("--max-output-tokens", type=int, default=4096)
+    live.add_argument("--max-output-tokens", type=int, default=6144)
     live.add_argument(
         "--reasoning-effort", choices=("none", "low", "medium", "high"),
         default=DEFAULT_REASONING_EFFORT,
@@ -243,7 +239,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     seed=args.seed,
                     import_historical_routes=not args.reset_memory,
                     max_actions=args.max_actions,
-                    plan_horizon=args.plan_horizon, review_interval=args.review_interval,
+                    plan_horizon=args.plan_horizon,
                     skill_path=args.skill,
                     state_dir=args.state_dir,
                     memory_context_entries=args.memory_context_entries,

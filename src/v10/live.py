@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import shutil
 import sys
 import time
@@ -226,7 +227,9 @@ _REVIEW_SYSTEM_PROMPT = """# V10 memory consolidation
 
 Review existing game MEMORY.md and shared global MEMORY.md, new ordered observations, and verified successful routes. Return only one JSON object with exactly two non-empty Markdown strings: `game_memory_markdown` and `global_memory_markdown`.
 
-Write very concise, decision-useful guidance. Merge repetition, qualify uncertainty, correct contradictions, and preserve demonstrated strategies with level or observed-state scope. Use short prose bullets under brief headings; game memory should contain only a few bullets. Do not include any digits, tables, timelines, raw observation narration, coordinates, pixel distances, displacement values, per-level action counts, or action sequences. Do not copy route details into memory; the exact-state route store handles precise route lengths and replay.
+Write only guidance that can change a future action and remains valid after a run restarts. Merge repetition, qualify uncertainty, correct contradictions, and preserve demonstrated strategies with level or applicability scope. Use short prose bullets under brief headings; game memory should contain only a few bullets. Level identifiers may be included to scope a finding; do not include action numbers, action counts, item counts, timelines, raw observation narration, coordinates, pixel distances, displacement values, or action sequences. Do not copy route details into memory; the exact-state route store handles precise routes and replay.
+
+Game memory is durable across runs. Never store the current run's status, win state, current player position, current visible goal count or location, recent action progress, or statements such as “all levels completed” or “no further levels to solve.” Do not create a “Game status,” “Current state,” or “Level progress” section. Keep one next experiment only for an active unsolved level; describe the question and discriminating test without relying on the player's current position or a transient object count. Remove that experiment when the level is completed.
 
 For game-specific memory, distinguish these findings and retain each finding's applicable level/state scope:
 - Established mechanics: claims directly supported by environment transitions.
@@ -239,21 +242,37 @@ Routes are supplied only when the environment recorded level completion or WIN. 
 
 For a level completed by replaying a verified route, inspect the ordered transitions and screens for avoidable loops or actions that produced no useful change. Mention an efficiency improvement only when the observations support it; do not replace or weaken the verified route based on an untested alternative. Exact action sequences remain in the solution store.
 
-Global memory is at most a few bullets and contains only transferable exploration methods supported by observations. Do not mention this game's colors, objects, directions, levels, pixel values, or specific rule. Generalize a reusable method (for example: “Compare each object's position before and after one action to infer action effects.”); if no transferable lesson was learned, retain only prior reusable guidance. Remove game-specific details from existing global memory rather than carrying them forward.
+Global memory is at most a few bullets and contains only transferable exploration methods supported by observations. Merge overlapping bullets instead of appending duplicates. Do not mention this game's colors, objects, directions, levels, pixel values, or specific rules. Generalize a reusable method (for example: “Compare each object's position before and after one action to infer action effects.”); if no transferable lesson was learned, retain only prior reusable guidance. Remove game-specific details from existing global memory rather than carrying them forward.
 
 Do not promote a game mechanic or object rule into global memory unless direct transition evidence is available from at least two distinct game IDs. Repeated evidence within this game counts as one game. When only this game's evidence is available, keep the claim in game memory with its level/state scope or rewrite it as a reusable exploration method without asserting the mechanic. Record source game IDs and transition evidence IDs in review metadata, never in rendered Markdown.
 
 Promote a game-specific mechanic to established memory only when transitions directly support the same effect under a clear level/state scope. One changed frame or a model hypothesis is insufficient to identify an object or establish its mechanic. Compare new claims with existing scoped memory; resolve contradictions using observations and scope, otherwise preserve uncertainty. Never let memory prose change, replace, or broaden a verified route.
 
-Separate observations from explanations. Unchanged pixels show only that an action had no visible effect in that state; do not infer walls, total reachability, or completion rules from proximity. Explicitly classify repeated actions with no progress as failed or ineffective approaches, never as successful strategies. If existing memory recommends an action that new observations show repeatedly produces no visible change in the same state, remove or correct that recommendation. Scope object roles, goal identity, and completion rules to the levels where they were directly tested; do not generalize them to untested levels. Distinguish lasting mechanics from historical positions. Follow current observations when they conflict with prior memory. Do not put current run state in durable memory. Return complete replacement Markdown, retaining only concise findings that can change a future decision.
+Separate observations from explanations. Unchanged pixels show only that an action had no visible effect for that action and state; they do not prove a wall, a blocked target, that other directions are passable, or that the rest of a level is reachable. Describe an observed no-op as state-specific and do not generalize it into an obstacle mechanic without direct evidence. Do not infer completion rules from proximity. Explicitly classify repeated actions with no progress as failed or ineffective approaches, never as successful strategies. If existing memory recommends an action that new observations show repeatedly produces no visible change in the same state, remove or correct that recommendation. Scope object roles, goal identity, and completion rules to the levels where they were directly tested; do not generalize them to untested levels. Distinguish lasting mechanics from historical positions. Follow current observations when they conflict with prior memory. Do not put current run state in durable memory. Return complete replacement Markdown, retaining only concise findings that can change a future decision.
 
 The review context labels the active level and each transition's pre-action and post-action level. A transition that changes levels completed the PRE-action level; its post-action frame is the start of the next level. Never describe the new level as solved or assign its completion strategy based on that boundary transition. Claim a successful strategy only for level scopes listed in verified successful routes. If movement was observed but the level did not complete, describe it only as an observation or tentative approach. State only that an obstacle was encountered when the observations show one; never claim that an entire level has no obstacles based only on a successful route."""
+
+_GLOBAL_MEMORY_REVIEW_SYSTEM_PROMPT = """# V10 global memory cleanup
+
+Rewrite the complete shared global MEMORY.md as concise, transferable problem-solving guidance. The current global memory has grown too long and includes duplicate advice and narrow puzzle-specific tactics. Merge overlapping methods; remove repeated, overfit, unsupported, or game-specific rules; keep only methods likely to help across different games. The completed game's memory is context for finding general methods, not evidence that its mechanics apply elsewhere. Do not copy game rules, object names, colors, directions, level IDs, routes, counts, telemetry, or unsupported hypotheses into global memory.
+
+Do not preserve a bullet merely because it already exists. Do not state that a particular mechanic, object type, or completion condition is present or typical across games. Do not present a particular board layout or game rule as general fact. Do not recommend exhaustive testing of every direction, object, path, or combination as a default, and do not compress several narrow puzzle tactics into a long bullet.
+
+Keep useful investigation topics as conditional hypotheses when they can help at the start of an unfamiliar game. For example, when visual features or observed transitions suggest them, the model may consider whether an object is collectible or interactive, whether an apparent barrier has a gap, whether a region's coverage matters, or whether a special object may act as a portal, switch, or hazard. Phrase these only as possibilities to test with a targeted legal action; never imply that the mechanic exists before evidence supports it. Prefer methods that tell the model what evidence to look for and how to choose a discriminating experiment.
+
+Preserve a concise startup probe for unfamiliar games: inspect visually distinct objects, barriers, regions, and progress indicators; when a cue suggests a possible interaction, gap, hazard, or coverage condition, test that hypothesis with one informative legal action and compare the before/after state. Do not turn this into a blind checklist or infer a mechanic from appearance alone.
+
+Return complete replacement Markdown only, with at most seven concise actionable bullets. Prefer a few broadly reusable methods over filling the bullet allowance. Do not add an introduction, conclusion, evidence references, or metadata."""
 
 _POST_MORTEM_SYSTEM_PROMPT = """# V10 game-over post-mortem
 
 Analyze the failed attempt using its complete ordered action list, the labeled before/after screens, current game memory, and global memory. Identify which choices were ineffective or likely caused GAME_OVER, what observations support that conclusion, and one concrete change or experiment for the retry. Separate directly observed facts from hypotheses; do not infer object roles, hazards, walls, or completion rules from appearance or proximity alone. If the images do not establish a cause, say so and recommend the safest discriminating experiment. Correct stale memory claims when the sequence contradicts them.
 
 Write a concise, decision-useful Markdown note. Use the headings `What happened`, `Choices to change`, and `Retry experiment`. Refer to actions by their numbered position and lowercase direction name. Do not include chain-of-thought, raw pixel measurements, evidence IDs, or repeated narration."""
+
+MAX_REVIEW_IMAGES = 20
+REVIEW_ACTION_THRESHOLD = 9
+MAX_GLOBAL_MEMORY_REVIEW_BULLETS = 7
 
 
 def _validate_review_payload(
@@ -275,7 +294,60 @@ def _validate_review_payload(
             raise ValueError(f"{name} must be non-empty Markdown text")
         if len(markdown.strip()) > int(limit):
             raise ValueError(f"{name} exceeds the {int(limit)} character limit")
-    return game_memory.strip(), global_memory.strip()
+    game_memory = game_memory.strip()
+    global_memory = global_memory.strip()
+    quality_errors = _review_memory_quality_errors(game_memory, global_memory)
+    if quality_errors:
+        raise ValueError("review memory quality validation failed: " + "; ".join(quality_errors))
+    return game_memory, global_memory
+
+
+_TRANSIENT_GAME_MEMORY_HEADINGS = {
+    "game status", "run status", "current run", "current state", "current position",
+    "current progress", "level progress", "progress",
+}
+_NUMBER_WORD = r"(?:\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+
+
+def _review_memory_quality_errors(game_memory: str, global_memory: str) -> list[str]:
+    """Reject obvious run snapshots and overclaims before durable memory is saved."""
+    errors: list[str] = []
+    for line in game_memory.splitlines():
+        heading = line.strip().lstrip("#").strip().rstrip(":").casefold()
+        if heading in _TRANSIENT_GAME_MEMORY_HEADINGS or re.match(
+            r"^level\b.*\bprogress\b", heading,
+        ):
+            errors.append(
+                "game_memory_markdown contains a transient status/progress section; retain only durable findings"
+            )
+            break
+    if re.search(
+        r"\b(?:all\s+levels?\s+(?:are\s+)?completed|no\s+further\s+levels\s+to\s+solve|"
+        r"game\s+state\s*(?:is|:)\s*(?:WIN|GAME_OVER))\b",
+        game_memory, re.IGNORECASE,
+    ):
+        errors.append("game_memory_markdown contains run-specific completion status")
+    if re.search(r"\b(?:recently|currently|current position|the player is now)\b", game_memory, re.IGNORECASE):
+        errors.append("game_memory_markdown contains a transient current-position or recent-progress claim")
+    if re.search(r"\bactions?\s+(?:#\s*)?\d+\b", game_memory, re.IGNORECASE):
+        errors.append("game_memory_markdown contains action-numbered progress")
+    if re.search(
+        rf"\b{_NUMBER_WORD}\s+[a-z-]+\s+(?:were\s+|was\s+)?(?:collected|remaining|remains|remain|left)\b",
+        game_memory, re.IGNORECASE,
+    ):
+        errors.append("game_memory_markdown contains a transient item count")
+
+    no_op_claim = re.compile(
+        r"\b(?:zero|no) visible (?:change|effect)\b.{0,100}"
+        r"\b(?:target(?: cell)?|direction|path|area)\s+(?:is|are|was|were)\s+"
+        r"(?:blocked|impassable|unreachable|passable)\b",
+        re.IGNORECASE,
+    )
+    if any(no_op_claim.search(line) for line in global_memory.splitlines()):
+        errors.append(
+            "global_memory_markdown treats no visible change as proof of blockage or reachability"
+        )
+    return errors
 
 
 def _review_repair_prompt(base_prompt: str, errors: Any) -> str:
@@ -497,6 +569,7 @@ def _action_screen_sequence(
     *,
     label_prefix: str = "Recent",
     current_label: str = "Current screen",
+    action_numbers: Sequence[int] | None = None,
 ) -> tuple[list[Path], list[str], list[dict[str, Any]]]:
     """Return all screens in order with explicit action and source-screen links."""
     entries = {entry["frame_id"]: entry for entry in frames.entries()}
@@ -504,12 +577,18 @@ def _action_screen_sequence(
     image_labels: list[str] = []
     sequence: list[dict[str, Any]] = []
     action_names = [str(model_action_name(row.get("action"))) for row in transitions]
+    display_action_numbers = (
+        [int(number) for number in action_numbers]
+        if action_numbers is not None and len(action_numbers) == len(transitions)
+        else list(range(1, len(transitions) + 1))
+    )
 
     def add(
         image_id: Any,
         stage: str,
         *,
         action_number: int | None = None,
+        action_name: str | None = None,
         input_screen_number: int | None = None,
         is_current: bool = False,
     ) -> int | None:
@@ -521,7 +600,7 @@ def _action_screen_sequence(
             if is_current:
                 sequence[-1]["is_current_screen"] = True
                 sequence[-1]["stage"] = f"CURRENT SCREEN: {sequence[-1]['stage']}"
-                sequence[-1]["label"] = f"{label_prefix} Screen {screen_number}: {sequence[-1]['stage']}"
+                sequence[-1]["label"] = f"{sequence[-1]['label']} [CURRENT SCREEN]"
                 image_labels[-1] = sequence[-1]["label"]
             return screen_number
         entry = entries.get(image_id)
@@ -531,10 +610,13 @@ def _action_screen_sequence(
         if action_number is not None and input_screen_number is not None:
             label = (
                 f"{label_prefix} Screen {screen_number}: {stage}; produced by Action {action_number} "
-                f"({action_names[action_number - 1]}) from Screen {input_screen_number}"
+                f"({action_name}) from Screen {input_screen_number}"
             )
         elif screen_number == 1 and transitions:
-            label = f"{label_prefix} Screen 1: initial state before Action 1 ({action_names[0]})"
+            label = (
+                f"{label_prefix} Screen 1: initial state before Action "
+                f"{display_action_numbers[0]} ({action_names[0]})"
+            )
         else:
             label = f"{label_prefix} Screen {screen_number}: {stage}"
         if is_current:
@@ -546,7 +628,7 @@ def _action_screen_sequence(
             "screen": screen_number,
             "frame_image_id": image_id,
             "stage": stage,
-            "action": action_names[action_number - 1] if action_number is not None else None,
+            "action": action_name,
             "action_number": action_number,
             "input_screen_number": input_screen_number,
             "is_current_screen": is_current,
@@ -560,8 +642,9 @@ def _action_screen_sequence(
             transitions[0].get("pre_frame_image_id"),
             f"initial state before Action 1 ({action_names[0]})",
         )
-        for action_number, row in enumerate(transitions, start=1):
-            action = action_names[action_number - 1]
+        for local_action_number, row in enumerate(transitions, start=1):
+            action_number = display_action_numbers[local_action_number - 1]
+            action = action_names[local_action_number - 1]
             result = row.get("result")
             result = result if isinstance(result, Mapping) else {}
             intermediate_ids = result.get("intermediate_frame_image_ids")
@@ -574,11 +657,13 @@ def _action_screen_sequence(
                     image_id,
                     f"intermediate {index}/{len(intermediate_ids)} during Action {action_number} ({action})",
                     action_number=action_number,
+                    action_name=action,
                     input_screen_number=source_screen_number,
                 )
             result_screen = add(
                 row.get("post_frame_image_id"), f"result of Action {action_number} ({action})",
                 action_number=action_number,
+                action_name=action,
                 input_screen_number=source_screen_number,
             )
             if result_screen is not None:
@@ -660,12 +745,13 @@ def _reasoning_evidence_record(
     else:
         outcome = "no_terminal"
 
-    checks: list[bool] = []
+    check_results: dict[str, bool] = {}
     if prediction.get("visible_change") in {"yes", "no"} and visible_change is not None:
-        checks.append((prediction["visible_change"] == "yes") == visible_change)
+        check_results["visible_change"] = (prediction["visible_change"] == "yes") == visible_change
     expected_outcome = prediction.get("environment_outcome")
     if expected_outcome in {"level_change", "GAME_OVER", "WIN", "no_terminal"}:
-        checks.append(expected_outcome == outcome)
+        check_results["environment_outcome"] = expected_outcome == outcome
+    checks = list(check_results.values())
     comparison = (
         "inconclusive" if not checks else
         "contradicted" if not all(checks) else "supported"
@@ -715,6 +801,10 @@ def _reasoning_evidence_record(
             "terminal": transition.get("terminal"),
             "environment_outcome": outcome,
         },
+        "comparison_scope": "first_executed_action",
+        "comparison_basis": list(check_results),
+        "comparison_check_results": check_results,
+        "prediction_description_assessed": False,
         "comparison": comparison,
         "comparison_checks": checks,
         "trajectory_rationale": decision.get("trajectory_rationale"),
@@ -851,7 +941,6 @@ def _perform_review(
     run_id: str,
     memory_store_dir: Path,
     trigger_reasons: Sequence[str],
-    verified_route_replayed: bool = False,
     game_memory_max_chars: int = MAX_MEMORY_MARKDOWN_CHARS,
     global_memory_max_chars: int = MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
 ) -> dict[str, Any]:
@@ -893,7 +982,6 @@ def _perform_review(
         new_events = events[prior_event_count:]
         frames = tools.frames
         active_state = tools.observe()
-        interval_review = "action_interval" in trigger_reasons
         success_triggered = any(reason in {"level_completed", "win"} for reason in trigger_reasons)
         # Reviews analyze the complete current or completed level attempt.
         review_transitions: Sequence[Mapping[str, Any]] = transitions
@@ -903,11 +991,7 @@ def _perform_review(
             for row in records
             if row.get("evidence_id") is not None
         }
-        if interval_review:
-            review_transitions = _active_level_transitions(
-                records, active_state, tools.reset_generation, limit=None,
-            )
-        elif success_triggered:
+        if success_triggered:
             completion_transition = next((
                 row for row in reversed(transitions)
                 if row.get("type") == "transition"
@@ -959,8 +1043,7 @@ def _perform_review(
         image_paths, image_labels, _screen_sequence = _action_screen_sequence(
             review_transitions, active_state.get("frame_image_id"), frames,
             label_prefix=(
-                f"Interval review for level {active_state.get('level')}"
-                if interval_review else "Completed-level review"
+                "Completed-level review" if success_triggered else "Active-level review"
             ),
             current_label=f"current screen after review sequence for level {active_state.get('level')}",
         )
@@ -972,6 +1055,11 @@ def _perform_review(
                 "starts_from_screen_number": link["starts_from_screen_number"],
                 "produces_screen_numbers": link["produces_screen_numbers"],
             })
+        # Keep the complete ordered action history, but attach only its latest
+        # screens. The sequence is chronological, so this always retains the
+        # current screen and preserves ordering among the selected images.
+        image_paths = image_paths[-MAX_REVIEW_IMAGES:]
+        image_labels = image_labels[-MAX_REVIEW_IMAGES:]
         active_level = active_state.get("level")
         active_level_number = int(active_level) + 1 if isinstance(active_level, int) else None
         solution_store = LevelSolutionStore(memory_store_dir / "level_solutions.jsonl", game_id)
@@ -1009,23 +1097,18 @@ def _perform_review(
             if success_triggered else
             "This active level is unsolved. Identify its most important unresolved question, the observations relevant to it, and competing explanations consistent with those observations. Choose the next feasible experiment that best distinguishes those explanations, and preserve that experiment and its purpose in game-specific memory with the active level/state scope. Base feasibility on the current screen and the legal action schemas below. "
         )
-        route_efficiency_instruction = (
-            "The active level was completed by replaying a verified route. Inspect its ordered action and screen transitions for repeated states, ineffective moves, or clearly avoidable loops. State an efficiency finding only when supported by the observed sequence; preserve the verified route as authoritative and do not treat an untested shortcut as solved. "
-            if verified_route_replayed else ""
-        )
         review_legal_actions = model_facing_action_specs(
             _public_actions(active_state.get("legal_actions", []))
         )
         user_prompt = (
             f"Consolidate memory for game {game_id} after action {tools.action_count}. "
-            f"Review trigger: {', '.join(trigger_reasons)}. Current progress belongs only in observation context, not either memory file. "
+            f"Review trigger: {', '.join(trigger_reasons)}. Current progress belongs only in observation context, not either memory file. Memory persists across runs: omit current run status, player position, remaining-object counts, and action-indexed progress. A next experiment for an unsolved level must describe a test, not a current-screen snapshot, and must be removed after completion. "
             + f"Current environment state: active level index {active_level} (zero-based)"
             + (f", displayed as level {active_level_number}" if active_level_number is not None else "")
             + f", levels completed {active_state.get('levels_completed')}, game state {active_state.get('game_state')}. "
             + "Transition level fields describe the state before and after each action; a level boundary's post-action screen starts the next level. "
             + success_instruction
             + investigation_instruction
-            + route_efficiency_instruction
             + "Preserve level/state scope for every finding. Existing game MEMORY.md:\n"
             + (existing_memory or "(none)")
             + "\n\nExisting shared global MEMORY.md:\n"
@@ -1040,11 +1123,11 @@ def _perform_review(
             + json.dumps(evidence_provenance, ensure_ascii=False, separators=(",", ":"))
             + (
                 (
-                    "\n\nComplete ordered action history for the active level since it began, through the end of the latest action plan. Use this full sequence to assess progress and reset-versus-continue. "
-                    if interval_review else
+                    "\n\nComplete ordered action history for the active level since it began. Use this full sequence to assess observations and avoid repeating experiments. "
+                    if not success_triggered else
                     "\n\nComplete ordered action history for the level that just completed. Use this full sequence to identify its demonstrated strategy and observed outcomes. "
                 )
-                + "Screens are numbered chronologically. Each numbered action below names its source screen and all screens it produced; intermediate frames and the resulting screen are attached in that order. The next action starts from the preceding action's final produced screen.\n"
+                + f"Screens are numbered chronologically. The full action history below names each source screen and every screen produced. Attachments contain at most the latest {MAX_REVIEW_IMAGES} screens, in chronological order; older screens may appear in the history without an attached image. The current screen is included when available. The next action starts from the preceding action's final produced screen.\n"
                 + json.dumps(active_level_history, ensure_ascii=False, separators=(",", ":"))
             )
             + "\n\nReview constraint: any repeated action that produced no pixel change from the same visible state is a failed/ineffective approach for that state and those exact arguments. This does not rule out delayed or hidden effects; preserve a useful single-action test as an experiment. Do not put it under strategies or mechanics. If existing memory recommends it, remove or correct that wording. Treat other actions with no progress as exploratory or unresolved unless the environment confirmed completion.\n"
@@ -1126,7 +1209,6 @@ def _perform_review(
             "global_memory_characters": len(global_markdown),
             "verified_routes_supplied": len(verified_routes),
             "evidence_provenance": evidence_provenance,
-            "verified_route_replayed": bool(verified_route_replayed),
             "review_checkpoint_saved": True, "repair_history": repair_history,
             "result_sha256": digest,
         }
@@ -1147,6 +1229,135 @@ def _perform_review(
             "error": f"{type(exc).__name__}: {exc}",
         }
     append_jsonl(tools.run_dir / "reviews.jsonl", row)
+    return {"row": row, "attempts": attempts, "usage": usage, "latency_seconds": latency}
+
+
+def _perform_global_memory_review(
+    tools: GameTools,
+    client: Any,
+    *,
+    game_id: str,
+    run_id: str,
+    memory_store_dir: Path,
+    global_memory_max_chars: int = MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
+) -> dict[str, Any]:
+    """Run the post-WIN cleanup pass on shared global guidance only."""
+    attempts = 0
+    latency = 0.0
+    responses: list[dict[str, Any]] = []
+    repair_history: list[dict[str, Any]] = []
+    usage: dict[str, Any] = {}
+    saved = False
+    state_root = memory_store_dir.parent.parent
+    memory_path = global_memory_path(state_root)
+    prior_global_memory_file = memory_path.read_text(encoding="utf-8") if memory_path.is_file() else ""
+    prior_global_memory = prior_global_memory_file.strip()
+    game_memory_path = memory_store_dir / "MEMORY.md"
+    game_memory = game_memory_path.read_text(encoding="utf-8").strip() if game_memory_path.is_file() else ""
+    user_prompt = (
+        f"A terminal WIN was confirmed in game {game_id}. Clean up the shared global MEMORY.md after its normal game review. "
+        "The global document must guide future games, so retain reusable methods, merge duplicates, and remove the narrow or repeated tactics identified in the current draft. "
+        "Use the just-reviewed game memory only to recognize general exploration methods; do not promote any game-specific mechanic or route. "
+        f"Return no more than {MAX_GLOBAL_MEMORY_REVIEW_BULLETS} concise bullets and stay within {int(global_memory_max_chars)} characters. "
+        "Return a complete replacement, not a patch.\n\nCurrent global MEMORY.md:\n"
+        + (prior_global_memory or "(empty)")
+        + "\n\nFinal game MEMORY.md for context only:\n"
+        + (game_memory or "(empty)")
+    )
+    prompt = user_prompt
+    try:
+        cleaned_memory = ""
+        for repair_index in range(2):
+            attempts += 1
+            try:
+                response = client.complete(
+                    _GLOBAL_MEMORY_REVIEW_SYSTEM_PROMPT, prompt, (), (), response_format=None,
+                )
+            except StrataRequestError as exc:
+                attempts += max(0, int(getattr(exc, "request_attempts", 1)) - 1)
+                raise
+            responses.append(response)
+            attempts += max(0, int(response.get("request_attempts", 1)) - 1)
+            latency += float(response.get("latency_seconds", 0.0))
+            usage = _sum_usage(responses)
+            try:
+                if response.get("finish_reason") == "length":
+                    raise ValueError("global-memory cleanup was truncated at the output-token limit")
+                content = response.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError("global-memory cleanup must return non-empty Markdown")
+                cleaned_memory = content.strip()
+                if len(cleaned_memory) > int(global_memory_max_chars):
+                    raise ValueError(
+                        f"global-memory cleanup exceeds the {int(global_memory_max_chars)} character limit"
+                    )
+                bullet_count = sum(
+                    bool(re.match(r"^\s*[-*]\s+", line))
+                    for line in cleaned_memory.splitlines()
+                )
+                if not 1 <= bullet_count <= MAX_GLOBAL_MEMORY_REVIEW_BULLETS:
+                    raise ValueError(
+                        f"global-memory cleanup must contain 1 to {MAX_GLOBAL_MEMORY_REVIEW_BULLETS} bullets"
+                    )
+                break
+            except ValueError as exc:
+                repair_history.append({"attempt": repair_index + 1, "error": str(exc)})
+                if repair_index:
+                    raise
+                prompt = (
+                    user_prompt + "\n\nThe previous output was invalid: " + str(exc)
+                    + f" Return a complete replacement with 1 to {MAX_GLOBAL_MEMORY_REVIEW_BULLETS} concise bullets."
+                )
+
+        memory = GameMemory(
+            tools.run_dir, store_dir=memory_store_dir, run_id=run_id, game_id=game_id,
+        )
+        if cleaned_memory != prior_global_memory:
+            memory.record_markdown_revision("global", prior_global_memory_file, step=tools.action_count)
+            saved = save_global_memory(
+                state_root, cleaned_memory, max_characters=global_memory_max_chars,
+            )
+            if saved:
+                memory.record_markdown_revision("global", memory_path.read_text(encoding="utf-8"), step=tools.action_count)
+        row = {
+            "schema": "v10.global_memory_review/1",
+            "status": "saved" if saved else "unchanged",
+            "trigger": "game_win",
+            "game_id": game_id,
+            "through_action": tools.action_count,
+            "model": getattr(client, "model", None),
+            "request_attempts": attempts,
+            "request_ids": [request_id for item in responses for request_id in item.get("request_ids", [])],
+            "usage": usage,
+            "latency_seconds": round(latency, 6),
+            "global_memory_path": str(memory_path),
+            "global_memory_updated": saved,
+            "global_memory_characters": len(cleaned_memory),
+            "global_memory_bullets": sum(
+                bool(re.match(r"^\s*[-*]\s+", line)) for line in cleaned_memory.splitlines()
+            ),
+            "repair_history": repair_history,
+            "result_sha256": hashlib.sha256(cleaned_memory.encode("utf-8")).hexdigest(),
+        }
+    except Exception as exc:
+        attempts = max(attempts, int(getattr(exc, "request_attempts", 0)))
+        if getattr(exc, "latency_seconds", None) is not None:
+            latency = max(latency, float(exc.latency_seconds))
+        row = {
+            "schema": "v10.global_memory_review/1",
+            "status": "failed",
+            "trigger": "game_win",
+            "game_id": game_id,
+            "through_action": tools.action_count,
+            "request_attempts": attempts,
+            "usage": usage,
+            "latency_seconds": round(latency, 6),
+            "global_memory_path": str(memory_path),
+            "global_memory_updated": False,
+            "repair_history": repair_history,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    append_jsonl(tools.run_dir / "global_memory_reviews.jsonl", row)
     return {"row": row, "attempts": attempts, "usage": usage, "latency_seconds": latency}
 
 
@@ -1275,7 +1486,6 @@ def _live_context(
     saved_route_guidance: Sequence[Mapping[str, Any]] = (),
     no_progress_actions: int = 0,
     post_mortem_guidance: str = "",
-    compact_current_only: bool = False,
     harness_activity: Sequence[Mapping[str, Any]] = (),
     carry_forward: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -1287,7 +1497,9 @@ def _live_context(
     all_level_transitions = _active_level_transitions(
         records, current, tools.reset_generation, limit=None,
     )
-    transitions = [] if compact_current_only else all_level_transitions[-8:]
+    # A compacted conversation is reinitialized with the same bounded recent
+    # action history and its complete screen sequence, not just the current frame.
+    transitions = all_level_transitions[-8:]
     contradicted_outcomes = _contradicted_action_outcomes(
         tools.run_dir, records, current.get("level"), tools.reset_generation,
     )
@@ -1384,38 +1596,35 @@ def _live_context(
     if post_mortem_guidance.strip():
         context["previous_attempt_post_mortem"] = post_mortem_guidance.strip()
     frames = tools.frames
-    transition_source = bootstrap_observations if starting_routine and bootstrap_observations else ([] if compact_current_only else [
+    transition_source = bootstrap_observations if starting_routine and bootstrap_observations else [
         {
             **row,
             **({"unexpected_result": contradicted_outcomes[str(row.get("evidence_id"))]}
                if str(row.get("evidence_id")) in contradicted_outcomes else {}),
         }
         for row in transitions
-    ])
+    ]
     if starting_routine and bootstrap_observations:
-        _, _, full_screen_sequence = _action_screen_sequence(
+        # Bootstrap is an ordered experiment: keep the initial screen, every
+        # resulting/intermediate frame, and the restored current screen.
+        image_paths, image_labels, screen_sequence = _action_screen_sequence(
             bootstrap_observations, current.get("frame_image_id"), frames,
             label_prefix=f"Bootstrap for level index {level_index}",
             current_label=f"restored initial screen after reset for level index {level_index}",
         )
     else:
-        _, _, full_screen_sequence = _action_screen_sequence(
+        image_paths, image_labels, screen_sequence = _action_screen_sequence(
             transitions, current.get("frame_image_id"), frames,
             label_prefix=f"Level index {level_index} action context",
             current_label=f"current actual game frame for level index {level_index}",
         )
-    image_paths, image_labels, screen_sequence = _select_action_screens(
-        full_screen_sequence, transition_source, frames,
-    )
     context["screen_sequence"] = [
         {key: value for key, value in screen.items() if key not in {"frame_image_id", "screen"}}
         for screen in screen_sequence
     ]
     context["screen_sequence_guide"] = (
-        "Only the current screen is attached after a conversation boundary; prior verified findings are in memory."
-        if compact_current_only and not starting_routine else
-        "Attached screens are a chronological selected subset: the current screen, the prior distinct screen, and an optional "
-        "older informative screen. Labels identify associated actions. Full transitions and intermediate frames remain in evidence.jsonl."
+        "Attached screens show the complete recent action sequence in chronological order, including intermediate frames and CURRENT SCREEN. "
+        "Labels identify the source action for each transition. Full transitions and frames remain in evidence.jsonl."
     )
     action_screen_links = _action_screen_links(
         bootstrap_observations if starting_routine and bootstrap_observations else transitions,
@@ -1434,8 +1643,6 @@ def _live_context(
             "produces_screen_numbers": link["produces_screen_numbers"],
         })
     system_prompt = skill_path.read_text(encoding="utf-8")
-    memory_excerpt = _memory_prompt_excerpt(memory, 850, level_index=level_index)
-    global_memory_excerpt = _memory_prompt_excerpt(global_memory, 350)
     prompt_legal_actions = [
         action for action in legal_actions
         if not (starting_routine and model_action_name(action.get("id")) == "RESET")
@@ -1451,8 +1658,8 @@ def _live_context(
             "actions_remaining": max(0, tools.max_actions - tools.action_count),
             "plan_horizon": horizon,
         },
-        "memory": memory_excerpt,
-        "global_memory": global_memory_excerpt,
+        "memory": memory,
+        "global_memory": global_memory,
         "recent_transitions": [],
         "ineffective_actions_at_current_screen": [
             model_action_name(action) for action in sorted(ineffective_action_ids)
@@ -1719,20 +1926,25 @@ def _action_conversation_observation(
         )
     if post_mortem_update:
         prompt += "\n\nNew post-mortem findings from the previous attempt:\n" + post_mortem_update.strip()
+    newly_observed_transitions = [row for row in records if row.get("type") == "transition"]
+    recorded_action_numbers: list[int] = []
+    for index, row in enumerate(newly_observed_transitions, start=1):
+        try:
+            recorded_action_numbers.append(int(row.get("step", index)))
+        except (TypeError, ValueError):
+            recorded_action_numbers.append(index)
     if bootstrap_transitions:
         image_paths, image_labels, _ = _action_screen_sequence(
             bootstrap_transitions, current.get("frame_image_id"), tools.frames,
             label_prefix="Bootstrap", current_label="restored starting screen",
         )
     else:
-        image_paths = []
-        image_labels = []
-        image_id = current.get("frame_image_id")
-        if isinstance(image_id, str) and tools.frames.exists(image_id):
-            image_paths.append(tools.frames.path_of(image_id))
-            image_labels.append(
-                f"CURRENT SCREEN: actual game state after {len(events)} newly recorded environment events"
-            )
+        image_paths, image_labels, _ = _action_screen_sequence(
+            newly_observed_transitions, current.get("frame_image_id"), tools.frames,
+            label_prefix="New action sequence",
+            current_label="actual latest environment state",
+            action_numbers=recorded_action_numbers,
+        )
     return prompt, image_paths, image_labels
 
 
@@ -1774,181 +1986,6 @@ def _action_observation_events(records: Sequence[Mapping[str, Any]]) -> list[dic
                 "error": str(row.get("error", ""))[:180],
             })
     return events
-
-
-def _memory_prompt_excerpt(markdown: str, limit: int, *, level_index: int | None = None) -> str:
-    """Select stable whole Markdown lines for a prompt without editing stored memory."""
-    lines = markdown.strip().splitlines()
-    if not lines or limit <= 0:
-        return ""
-    prioritised = False
-    if level_index is not None:
-        sections: list[tuple[str, list[str]]] = []
-        heading = ""
-        body: list[str] = []
-        for line in lines:
-            if line.lstrip().startswith("#"):
-                if heading or body:
-                    sections.append((heading, body))
-                heading, body = line, []
-            else:
-                body.append(line)
-        if heading or body:
-            sections.append((heading, body))
-        target = None
-        for title, body_lines in sections:
-            lowered = title.casefold()
-            if f"level {level_index}" in lowered or f"index {level_index}" in lowered:
-                target = [title, *body_lines]
-                break
-            if target is None and "active level" in lowered:
-                target = [title, *body_lines]
-        if target:
-            lines = target
-            prioritised = True
-    if prioritised:
-        heading_indices = [index for index, line in enumerate(lines) if line.lstrip().startswith("#")]
-        content_indices = [index for index in range(len(lines)) if index not in heading_indices]
-        priority_words = (
-            "next experiment", "active", "unresolved", "strategy", "failed", "ineffective",
-            "hypothesis", "mechanic", "approach", "success",
-        )
-        content_indices.sort(key=lambda index: (
-            not any(word in lines[index].casefold() for word in priority_words), index,
-        ))
-        consideration_order = [*heading_indices, *content_indices]
-    else:
-        consideration_order = list(range(len(lines)))
-    selected_indices: set[int] = set()
-    size = 0
-    for index in consideration_order:
-        line = lines[index]
-        candidate_size = len(line) + (1 if selected_indices else 0)
-        if size + candidate_size > limit:
-            continue
-        selected_indices.add(index)
-        size += candidate_size
-    selected = [line for index, line in enumerate(lines) if index in selected_indices]
-    return "\n".join(selected).strip()
-
-
-def _select_action_screens(
-    sequence: Sequence[Mapping[str, Any]],
-    transitions: Sequence[Mapping[str, Any]],
-    frames: FrameStore,
-) -> tuple[list[Path], list[str], list[dict[str, Any]]]:
-    """Select current, prior-distinct, and most informative older screen in order."""
-    candidates = [dict(row) for row in sequence if frames.exists(str(row.get("frame_image_id", "")))]
-    if not candidates:
-        return [], [], []
-    image_paths = [frames.path_of(str(row["frame_image_id"])) for row in candidates]
-    hashes = [hashlib.sha256(path.read_bytes()).digest() for path in image_paths]
-    current_index = len(candidates) - 1
-    selected = {current_index}
-    current_hash = hashes[current_index]
-    previous_index = next(
-        (index for index in range(current_index - 1, -1, -1) if hashes[index] != current_hash),
-        None,
-    )
-    if previous_index is not None:
-        selected.add(previous_index)
-
-    def transition_score(index: int) -> int:
-        row = transitions[index] if 0 <= index < len(transitions) else {}
-        score = 0
-        if row.get("unexpected_result"):
-            score += 10_000
-        measurements = row.get("measurements")
-        measurements = measurements if isinstance(measurements, Mapping) else {}
-        colors = measurements.get("per_color")
-        if isinstance(colors, Mapping):
-            score += 500 * sum(
-                isinstance(value, Mapping)
-                and isinstance(value.get("before"), int)
-                and isinstance(value.get("after"), int)
-                and value.get("before") != value.get("after")
-                for value in colors.values()
-            )
-        displacement = measurements.get("candidate_displacement")
-        best = displacement.get("best") if isinstance(displacement, Mapping) else None
-        if isinstance(best, Mapping):
-            score += min(200, abs(int(best.get("dx", 0))) + abs(int(best.get("dy", 0))))
-        changed_pixels = measurements.get("changed_pixels")
-        if isinstance(changed_pixels, int):
-            score += min(50, changed_pixels // 4)
-        if measurements.get("changed_pixels") == 0:
-            score += 10
-        if str(row.get("game_state", "")).upper() in {"GAME_OVER", "WIN"}:
-            score += 2_000
-        before = row.get("levels_completed_before_action")
-        after = row.get("levels_completed_after_action", row.get("levels_completed"))
-        if isinstance(before, int) and isinstance(after, int) and after > before:
-            score += 2_000
-        return score
-
-    if len(selected) < 3:
-        eligible = [
-            index for index, row in enumerate(candidates)
-            if index < (previous_index if previous_index is not None else current_index)
-            and hashes[index] not in {hashes[item] for item in selected}
-        ]
-        if eligible:
-            def score_screen(index: int) -> tuple[int, int]:
-                row = candidates[index]
-                action_number = row.get("action_number")
-                try:
-                    action_index = int(action_number) - 1
-                except (TypeError, ValueError):
-                    action_index = -1
-                score = transition_score(action_index)
-                if str(row.get("stage", "")).startswith("intermediate"):
-                    score += 1
-                return score, index
-
-            best_older = max(eligible, key=score_screen)
-            if score_screen(best_older)[0] > 0:
-                selected.add(best_older)
-
-    ordered = sorted(selected)
-    selected_paths: list[Path] = []
-    labels: list[str] = []
-    screens: list[dict[str, Any]] = []
-    selected_screen_numbers = {
-        int(candidates[index]["screen_number"]): number
-        for number, index in enumerate(ordered, start=1)
-    }
-    for number, index in enumerate(ordered, start=1):
-        row = candidates[index]
-        image_id = str(row["frame_image_id"])
-        is_current = index == current_index
-        prior_label = str(row.get("label", ""))
-        prefix = prior_label.split(" Screen ", 1)[0] if " Screen " in prior_label else "Action context"
-        stage = str(row.get("stage", "current state"))
-        if stage.startswith("CURRENT SCREEN: "):
-            stage = stage[len("CURRENT SCREEN: "):]
-        if is_current:
-            label = f"{prefix} Screen {number}: CURRENT SCREEN ({stage})"
-        else:
-            action_number = row.get("action_number")
-            action = row.get("action")
-            if action_number is None:
-                label = f"{prefix} Screen {number}: earlier observed state"
-            else:
-                label = f"{prefix} Screen {number}: after Action {action_number} ({action})"
-        selected_paths.append(frames.path_of(image_id))
-        labels.append(label)
-        screens.append({
-            "screen_number": number,
-            "frame_image_id": image_id,
-            "label": label,
-            "action_number": row.get("action_number"),
-            "action": row.get("action"),
-            "input_screen_number": selected_screen_numbers.get(
-                int(row["input_screen_number"])
-            ) if row.get("input_screen_number") is not None else None,
-            "is_current_screen": is_current,
-        })
-    return selected_paths, labels, screens
 
 
 def _recent_action_errors(records: Sequence[Mapping[str, Any]], reset_generation: int) -> list[str]:
@@ -2015,7 +2052,6 @@ def run_live(
     seed: int = 0,
     max_actions: int = 30,
     plan_horizon: int = 8,
-    review_interval: int = 20,
     skill_path: str | Path | None = None,
     state_dir: str | Path | None = None,
     memory_context_entries: int = DEFAULT_CONTEXT_ENTRIES,
@@ -2026,15 +2062,14 @@ def run_live(
 ) -> dict[str, Any]:
     """Run a bounded live episode, persisting evidence before and after actions.
 
-    Reviews run on level completion and after ``review_interval`` active-play
-    actions without a completion. Game-over post-mortems are handled separately.
+    Memory reviews run on environment-confirmed level completion and after an
+    active-play action set ends with more than ``REVIEW_ACTION_THRESHOLD``
+    actions since the previous review. Game-over post-mortems are separate.
     """
     if not 1 <= int(plan_horizon) <= 8:
         raise ValueError("plan_horizon must be between 1 and 8")
     if int(max_actions) < 1:
         raise ValueError("action budget must be positive")
-    if int(review_interval) < 1:
-        raise ValueError("review_interval must be positive")
     if not 0 <= int(memory_context_entries) <= 5:
         raise ValueError("memory_context_entries must be between 0 and 5")
     if int(game_memory_max_chars) < 1 or int(global_memory_max_chars) < 1:
@@ -2067,7 +2102,8 @@ def run_live(
         "level_solutions_path": str(memory_store_dir / "level_solutions.jsonl"),
         "configuration": {
             "max_actions": int(max_actions), "plan_horizon": int(plan_horizon),
-            "review_interval": int(review_interval), "starting_routine": bool(starting_routine),
+            "review_action_threshold": REVIEW_ACTION_THRESHOLD,
+            "starting_routine": bool(starting_routine),
             "import_historical_routes": bool(import_historical_routes),
             "game_memory_max_chars": int(game_memory_max_chars),
             "global_memory_max_chars": int(global_memory_max_chars),
@@ -2111,15 +2147,20 @@ def run_live(
     review_latency = 0.0
     review_model_calls = 0
     review_count = 0
-    # Retained as a zero-valued compatibility metric; successful route replay
-    # now receives the normal completion review.
+    global_memory_review_count = 0
+    global_memory_review_model_calls = 0
+    global_memory_review_latency = 0.0
+    global_memory_review_usage = dict(total_usage)
+    global_memory_review_status: str | None = None
+    global_memory_review_done = False
+    # Count completion reviews intentionally skipped because a verified route
+    # replayed the entire level without new model-directed exploration.
     review_skipped_cached_success_count = 0
     reasoning_records = 0
     reasoning_supported = 0
     reasoning_contradicted = 0
     reasoning_inconclusive = 0
     actions_since_review = 0
-    interval_review_pending = False
     post_mortem_model_calls = 0
     post_mortem_count = 0
     post_mortem_latency = 0.0
@@ -2179,13 +2220,19 @@ def run_live(
             "model_calls": model_calls, "usage": dict(total_usage),
             "action_usage": dict(action_usage), "review_usage": dict(review_usage),
             "review_model_calls": review_model_calls, "review_count": review_count,
+            "global_memory_review_count": global_memory_review_count,
+            "global_memory_review_model_calls": global_memory_review_model_calls,
+            "global_memory_review_usage": dict(global_memory_review_usage),
+            "global_memory_review_latency_seconds": round(global_memory_review_latency, 6),
+            "global_memory_review_status": global_memory_review_status,
             "review_skipped_cached_success_count": review_skipped_cached_success_count,
             "reasoning_records": reasoning_records,
             "reasoning_supported": reasoning_supported,
             "reasoning_contradicted": reasoning_contradicted,
             "reasoning_inconclusive": reasoning_inconclusive,
+            "reasoning_comparison_scope": "first_executed_action_categorical_fields_only",
             "perceptual_state_equivalence_candidates": len(perceptual_equivalence_records),
-            "review_interval": int(review_interval),
+            "review_action_threshold": REVIEW_ACTION_THRESHOLD,
             "post_mortem_model_calls": post_mortem_model_calls,
             "post_mortem_count": post_mortem_count,
             "post_mortem_usage": dict(post_mortem_usage),
@@ -2331,7 +2378,6 @@ def run_live(
             saved_route_guidance=_saved_route_guidance(solution_store, current),
             no_progress_actions=no_progress_actions,
             post_mortem_guidance=post_mortem_guidance,
-            compact_current_only=bool(action_conversation and not starting_routine),
             harness_activity=harness_activity,
             carry_forward=action_conversation_last_reasoning if preserve_reasoning else None,
         )
@@ -2491,8 +2537,41 @@ def run_live(
         )[:500]
         return None, responses, validation_error
 
+    def perform_global_memory_review() -> None:
+        nonlocal global_memory_review_count, global_memory_review_model_calls
+        nonlocal global_memory_review_latency, global_memory_review_status
+        nonlocal global_memory_review_done, review_model_calls, model_calls
+        nonlocal review_latency, total_latency
+        if global_memory_review_done or str(current.get("game_state", "")).upper() != "WIN":
+            return
+        global_memory_review_done = True
+        global_memory_review_count += 1
+        progress("global-memory cleanup starting after WIN")
+        result = _perform_global_memory_review(
+            tools, client, game_id=game_id, run_id=run_id,
+            memory_store_dir=memory_store_dir,
+            global_memory_max_chars=global_memory_max_chars,
+        )
+        attempts = int(result["attempts"])
+        global_memory_review_model_calls += attempts
+        review_model_calls += attempts
+        model_calls += attempts
+        elapsed = float(result["latency_seconds"])
+        global_memory_review_latency += elapsed
+        review_latency += elapsed
+        total_latency += elapsed
+        global_memory_review_status = str(result["row"].get("status", "failed"))
+        for key in total_usage:
+            value = result["usage"].get(key)
+            if value is not None:
+                amount = int(value)
+                total_usage[key] += amount
+                review_usage[key] += amount
+                global_memory_review_usage[key] += amount
+        progress(f"global-memory cleanup {global_memory_review_status}")
+
     def perform_triggered_review(
-        reasons: Sequence[str], *, verified_route_replayed: bool = False,
+        reasons: Sequence[str],
     ) -> None:
         nonlocal actions_since_review
         nonlocal review_count, no_progress_actions, review_model_calls, model_calls
@@ -2502,7 +2581,6 @@ def run_live(
         result = _perform_review(
             tools, client, game_id=game_id, run_id=run_id,
             memory_store_dir=memory_store_dir, trigger_reasons=reasons,
-            verified_route_replayed=verified_route_replayed,
             game_memory_max_chars=game_memory_max_chars,
             global_memory_max_chars=global_memory_max_chars,
         )
@@ -2521,25 +2599,23 @@ def run_live(
                 total_usage[key] += int(value)
                 review_usage[key] += int(value)
         progress(f"review {result['row']['status']}")
+        if str(current.get("game_state", "")).upper() == "WIN":
+            perform_global_memory_review()
 
-    def interval_review_due(*, level_changed: bool) -> bool:
-        nonlocal actions_since_review, interval_review_pending
-        if level_changed:
-            actions_since_review = 0
-            interval_review_pending = False
-            return False
-        if bootstrap_probe_active or current.get("terminal"):
-            return False
-        actions_since_review += 1
-        return (
-            actions_since_review >= int(review_interval)
+    def maybe_review_after_action_set() -> None:
+        if (
+            actions_since_review > REVIEW_ACTION_THRESHOLD
+            and not bootstrap_probe_active
+            and not level_all_actions_cached
+            and not current.get("terminal")
             and tools.action_count < tools.max_actions
-        )
+        ):
+            perform_triggered_review(["action_set_interval"])
 
     def update_stagnation_state(
         before: Mapping[str, Any], after: Mapping[str, Any], edge: Mapping[str, Any], action_name: str,
     ) -> None:
-        """Count only repeated states within the current level and review window."""
+        """Count only repeated states within the current level."""
         nonlocal no_progress_actions
         changed_level = (
             before.get("level") != after.get("level")
@@ -2611,7 +2687,7 @@ def run_live(
         recent_state_actions.append((source, action_name, target))
 
     def restart_attempt(justification: str) -> dict[str, Any]:
-        nonlocal current, actions_since_review, interval_review_pending
+        nonlocal current
         nonlocal initial_routine_pending, bootstrap_probe_active, bootstrap_plan_pending
         nonlocal next_level_bootstrap_pending, bootstrap_target_level_key, bootstrap_target_observation
         nonlocal bootstrap_return_target, bootstrap_start_evidence_id, starter_queue_source
@@ -2619,8 +2695,6 @@ def run_live(
         nonlocal no_progress_actions
         result = tools.reset(justification)
         current = result["observation"]
-        actions_since_review = 0
-        interval_review_pending = False
         initial_routine_pending = bool(starting_routine and tools.supports_reset)
         bootstrap_probe_active = initial_routine_pending
         bootstrap_plan_pending = False
@@ -2773,7 +2847,9 @@ def run_live(
 
             if next_level_bootstrap_pending:
                 next_level_bootstrap_pending = False
-                if tools.supports_reset:
+                if solution_store.has_verified_route_for_level(current):
+                    progress("skipping bootstrap for level with a verified route; advancing through saved solutions")
+                elif tools.supports_reset:
                     bootstrap_target_level_key = level_key(current)
                     bootstrap_target_observation = dict(current)
                     bootstrap_start_evidence_id = current.get("evidence_id")
@@ -2980,6 +3056,8 @@ def run_live(
                 )
                 current = result["observation"]
                 observed_edge = learn_transition(before_observation, fallback, result)
+                if not bootstrap_probe_active:
+                    actions_since_review += 1
                 level_action_count += 1
                 level_all_actions_cached = False
                 memory.record_run_state(game_id, current, step=tools.action_count)
@@ -3015,8 +3093,8 @@ def run_live(
                 ) or str(current.get("game_state", "")).upper() == "WIN"
                 if fallback_level_completed and not bootstrap_probe_active:
                     perform_triggered_review(["level_completed"])
-                elif interval_review_due(level_changed=fallback_level_changed):
-                    perform_triggered_review(["action_interval"])
+                else:
+                    maybe_review_after_action_set()
                 update_metrics()
                 continue
 
@@ -3150,6 +3228,8 @@ def run_live(
                     break
                 current = result["observation"]
                 observed_edge = learn_transition(before_observation, action, result)
+                if not bootstrap_probe_active:
+                    actions_since_review += 1
                 level_action_count += 1
                 cached_action_matched = bool(
                     expected_cached_edge is not None
@@ -3265,13 +3345,12 @@ def run_live(
                         else:
                             reasoning_inconclusive += 1
                 if trigger_reasons and not bootstrap_probe_active:
-                    interval_review_pending = False
-                    perform_triggered_review(
-                        trigger_reasons,
-                        verified_route_replayed=completed_level_was_fully_cached,
-                    )
-                elif interval_review_due(level_changed=level_changed):
-                    interval_review_pending = True
+                    if completed_level_was_fully_cached:
+                        review_skipped_cached_success_count += 1
+                        actions_since_review = 0
+                        progress("skipping review for level completed entirely by verified route replay")
+                    else:
+                        perform_triggered_review(trigger_reasons)
                 if current.get("terminal"):
                     interruption = "terminal_state"
                 elif current.get("level") != previous_level or current.get("levels_completed") != previous_levels_completed:
@@ -3305,15 +3384,7 @@ def run_live(
                     "planned_count": len(actions), "executed_count": len(executed),
                     "stop_reason": interruption or "all planned actions executed",
                 }
-            if (
-                interval_review_pending
-                and not current.get("terminal")
-                and tools.action_count < tools.max_actions
-            ):
-                # Finish the current model plan before running its interval review.
-                # The next ordinary prompt then decides whether to reset or continue.
-                interval_review_pending = False
-                perform_triggered_review(["action_interval"])
+            maybe_review_after_action_set()
             if bootstrap_probe_active and str(current.get("game_state", "")).upper() == "WIN":
                 bootstrap_probe_active = False
                 perform_triggered_review(["level_completed"])
@@ -3337,7 +3408,6 @@ def run_live(
                     "Reset after collecting bootstrap observations, then replay solved earlier levels to restore the bootstrapped level."
                 )
                 current = reset_result["observation"]
-                actions_since_review = 0
                 bootstrap_probe_active = False
                 if level_key(current) == target_level_key:
                     bootstrap_plan_pending = True

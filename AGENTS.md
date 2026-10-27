@@ -6,6 +6,8 @@
 - Version behavior through Git history and design documents, not production filenames.
 
 ## Changes
+- For each V10 implementation change, increment the patch version in `pyproject.toml` and the runtime version constant; keep version references and tests in sync. Use `10.0.1` → `10.0.2` → `10.0.3` (do not increment the middle component for routine changes).
+
 Before changing code:
 1. Read the affected implementation and its callers.
 2. Search for existing fixes, overrides, wrappers, duplicate implementations, and relevant regression tests.

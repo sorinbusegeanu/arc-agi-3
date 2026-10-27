@@ -1,6 +1,5 @@
-## Established Mechanics
-- Blue square is controllable; directional actions move it in the corresponding direction.
-- Yellow square is the goal; reaching it completes the level (confirmed on levels zero through four).
+## Established mechanics
+- Levels 0–4: Moving the agent (blue) directly toward the target (yellow) until they overlap/merge completes the level. The merge is confirmed by the target disappearing in the final frame before the level boundary transition.
 
-## Verified Strategy (levels zero through four)
-- Move the blue square directly toward the yellow square until they meet. When the goal is directly above the player, moving straight up is sufficient and efficient; lateral exploration is unnecessary. Confirmed across all five levels with no obstacles encountered.
+## Verified strategies
+- Levels 0–4: When the target is directly above the agent, move up repeatedly until the objects merge. No detours or lateral moves were needed. The merge (yellow disappearing, blue occupying the target's position) triggers level completion.

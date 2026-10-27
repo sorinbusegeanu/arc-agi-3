@@ -210,7 +210,7 @@ def reasoned_action_contract_description() -> dict[str, Any]:
         },
         "hypothesis": None,
         "trajectory_rationale": "one to three concise sentences; no chain-of-thought",
-        "prediction": {"visible_change": "yes | no | unknown", "environment_outcome": "level_change | GAME_OVER | WIN | no_terminal | unknown", "description": "brief, testable visible effect or unknown"},
+        "prediction": {"visible_change": "yes | no | unknown", "environment_outcome": "level_change | GAME_OVER | WIN | no_terminal | unknown", "description": "expected result of the first action only; do not describe later actions or the whole plan"},
         "actions": [{"action": "up | down | left | right | RESET", "args": {}}],
     }
 
@@ -221,6 +221,7 @@ def reasoned_action_limits_description() -> str:
         "String limits: player location 120/evidence 180; target description 100, location 100, relevance 140; "
         "obstacle description 100, location 100, evidence 160; each observed change 180; "
         "hypothesis claim 240/evidence 180; trajectory rationale 420; prediction description 240 characters. "
+        "Prediction fields apply only to the first action in actions and are compared only with that action's observed transition. "
         "Maximum lists: five targets, eight obstacles, five observed changes, and eight actions."
     )
 
