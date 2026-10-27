@@ -21,6 +21,7 @@ from .tools.memory import (
 )
 from .strata_client import (
     DEFAULT_REASONING_EFFORT,
+    DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_STRATA_BASE_URL,
     DEFAULT_STRATA_MODEL,
     StrataClient,
@@ -74,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--include-prior-decisions", action="store_true",
                          help="include earlier structured decision summaries from this replay")
     analyze.add_argument("--timeout-seconds", type=float, default=120.0)
-    analyze.add_argument("--max-output-tokens", type=int, default=1024)
+    analyze.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
     analyze.add_argument(
         "--reasoning-effort", choices=("none", "low", "medium", "high"),
         default=DEFAULT_REASONING_EFFORT,
@@ -89,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     ablate.add_argument("--through-action", type=int, default=4)
     ablate.add_argument("--horizon", type=int, choices=(1, 2, 3, 4), default=4)
     ablate.add_argument("--memory-context-entries", type=int, default=DEFAULT_CONTEXT_ENTRIES)
-    ablate.add_argument("--max-output-tokens", type=int, default=1024)
+    ablate.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
     ablate.add_argument("--compare-prior-decisions", action=argparse.BooleanOptionalAction, default=True,
                         help="compare with and without prior structured decision summaries")
 
@@ -98,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     optimize.add_argument("--state-dir", type=Path, default=default_state_dir())
     optimize.add_argument("--through-action", type=int, default=4)
     optimize.add_argument("--horizons", default="1,2,4")
-    optimize.add_argument("--output-budgets", default="1024,4096")
+    optimize.add_argument("--output-budgets", default=str(DEFAULT_MAX_OUTPUT_TOKENS))
     optimize.add_argument("--memory-limits", default="0,5")
     optimize.add_argument("--profiles", default=",".join(CONDITIONING_PROFILES))
     optimize.add_argument("--include-prior-decisions", action="store_true")
@@ -142,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--max-actions", type=int, default=30)
     live.add_argument("--plan-horizon", type=int, default=8)
     live.add_argument("--timeout-seconds", type=float, default=300.0)
-    live.add_argument("--max-output-tokens", type=int, default=6144)
+    live.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
     live.add_argument(
         "--reasoning-effort", choices=("none", "low", "medium", "high"),
         default=DEFAULT_REASONING_EFFORT,

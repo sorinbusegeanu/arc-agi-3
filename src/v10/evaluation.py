@@ -9,6 +9,7 @@ from typing import Any, Callable, Iterable
 
 from .analysis import run_analysis
 from .runlog import append_jsonl
+from .strata_client import DEFAULT_MAX_OUTPUT_TOKENS
 
 CONDITIONING_PROFILES = ("pixels_actions", "pixels_actions_memory")
 
@@ -68,7 +69,7 @@ def run_optimization(
     *,
     through_action: int = 4,
     horizons: Iterable[int] = (1, 2, 4),
-    output_budgets: Iterable[int] = (1024, 4096),
+    output_budgets: Iterable[int] = (DEFAULT_MAX_OUTPUT_TOKENS,),
     memory_limits: Iterable[int] = (0, 5),
     profiles: Iterable[str] = CONDITIONING_PROFILES,
     state_dir: str | Path | None = None,

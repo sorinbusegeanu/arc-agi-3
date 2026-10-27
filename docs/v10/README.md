@@ -1,6 +1,6 @@
 # V10 — Live Runs, Replay, and Memory
 
-This package implements replay, offline analysis, bounded live play, and persistent game memory described in [`DESIGN.md`](DESIGN.md) v0.10. Version 10.0.2 adds an append-only action conversation for Strata-compatible prefix reuse. It converts traces to evidence, validates JSON decisions, and executes live actions only through budgeted game tools.
+This package implements replay, offline analysis, bounded live play, and persistent game memory described in [`DESIGN.md`](DESIGN.md) v0.10. Version 10.0.3 sets a 6144-token default output budget for Strata requests and retains the append-only action conversation for Strata-compatible prefix reuse. It converts traces to evidence, validates JSON decisions, and executes live actions only through budgeted game tools.
 
 ## Requirements
 

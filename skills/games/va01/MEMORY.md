@@ -11,8 +11,10 @@
 
 ## Level 3 (index 2) – observations and unresolved question
 - A gray horizontal barrier spans the middle with a narrow gap (one column wide) near the center; the gap is passable vertically only at the gap column. Agent has confirmed crossing the gap in both directions.
-- State-specific no-ops at barrier edges and screen edges are barrier-edge or edge blocks, not general walls. Do not repeat the exact no-op actions from those states.
-- The yellow goal cell remains yellow throughout all sweeping. The agent has entered/overlapped the yellow goal cell at the bottom-right and then moved away; the level has NOT completed. Repeated left-right oscillation adjacent to or overlapping the yellow goal without completion is an ineffective approach for that state.
-- Agent has swept both the upper and lower regions extensively. The orange trail appears to cover all visible open cells in both regions.
-- **Unresolved question:** Does the level complete upon full coverage of all open cells (goal irrelevant), or must the yellow goal cell be entered as the final action after full coverage? The agent entered the goal and then moved away without completion, suggesting either (a) some open cells remain uncovered, or (b) goal-entry must be the last step after coverage is complete.
-- **Next experiment:** After sweeping any remaining uncovered open cells (check corners and cells adjacent to obstacles), enter the yellow goal cell as the final action and do not move afterward. If the level completes, explanation (b) is confirmed. If it does not, explanation (a) is more likely and coverage must be re-examined.
+- A black obstacle exists in the upper-right area; black obstacles also exist in the lower-left area.
+- State-specific no-ops at barrier edges and screen edges are barrier-edge or edge blocks, not general walls.
+- The yellow goal cell remains yellow throughout all sweeping. Entering/overlapping the yellow goal and then moving away did not complete the level.
+- **Failed hypothesis:** Entering the yellow goal cell as the final action did not complete the level.
+- **Visual ambiguity:** Background color equals trail color, so uncovered cells are visually indistinguishable from covered cells.
+- **Unresolved question:** After extensive lower-region sweeping and multiple gap crossings, the level has not completed. The upper region (above the barrier) may not be fully covered, especially cells near the upper-right black obstacle and along the top edge.
+- **Next experiment:** From the gap position, move up into the upper region and systematically sweep every open cell above the barrier, paying special attention to cells adjacent to the upper-right black obstacle and along the top edge. If the level still does not complete after confirmed upper-region coverage, the completion condition for this level differs from levels 1–2.

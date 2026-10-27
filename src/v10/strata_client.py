@@ -20,7 +20,8 @@ from .runlog import append_jsonl
 DEFAULT_STRATA_BASE_URL = "http://127.0.0.1:8080"
 DEFAULT_STRATA_MODEL = "qwen3.8-flash-next-iq3_s"
 DEFAULT_REASONING_EFFORT = "medium"
-V10_VERSION = "10.0.2"
+DEFAULT_MAX_OUTPUT_TOKENS = 6144
+V10_VERSION = "10.0.3"
 
 
 def user_message(
@@ -62,7 +63,7 @@ class StrataClient:
         model: str,
         api_key: str | None = None,
         timeout_seconds: float = 120.0,
-        max_output_tokens: int = 1024,
+        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         reasoning_budget_tokens: int | None = None,
         log_request: bool = False,
@@ -433,5 +434,5 @@ class StrataClient:
 
 __all__ = [
     "DEFAULT_REASONING_EFFORT", "DEFAULT_STRATA_BASE_URL", "DEFAULT_STRATA_MODEL",
-    "StrataClient", "StrataRequestError", "V10_VERSION", "user_message",
+    "DEFAULT_MAX_OUTPUT_TOKENS", "StrataClient", "StrataRequestError", "V10_VERSION", "user_message",
 ]
