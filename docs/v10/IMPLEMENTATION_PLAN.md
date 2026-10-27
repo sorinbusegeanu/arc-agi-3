@@ -27,10 +27,10 @@ This document records the implemented architecture and default live configuratio
 | Plan horizon (`--plan-horizon`) | `8` actions (accepted range 1–8) |
 | Action-set review | after more than `9` actions since the last review, checked at set end |
 | Game/global Markdown limits | `3000` / `4500` characters |
-| Review memory quality | Reject obvious transient progress and unqualified global no-op blockage claims; use the existing single repair |
+| Review memory quality | Reject transient run status, position, action progress, and item counts; allow useful fixed level-layout counts; reject general blockage claims inferred from state-specific no-ops; repair once with error-specific guidance |
 | Request and response logging | off |
 
-Requests use temperature zero. Action plans and memory consolidation use JSON response mode; game-over post-mortems return plain Markdown. CLI defaults can be changed with the options documented in [README.md](README.md). The offline `analyze` and `ablate` commands retain their separate horizon limit of four; the live horizon is eight. Offline memory limits select complete Markdown content blocks, retaining their standalone headings; zero omits memory. Live action prompts load both complete saved memory documents.
+Requests use temperature zero. Action plans and memory consolidation use JSON response mode; game-over post-mortems return plain Markdown. CLI defaults can be changed with the options documented in [README.md](README.md). The offline `analyze` and `ablate` commands retain their separate horizon limit of four; the live horizon is eight. Offline memory limits select complete Markdown content blocks, retaining their standalone headings; zero omits memory. Live action prompts load both complete saved memory documents. Game Markdown defaults to 3000 characters. Global Markdown defaults to 4500 with a hard save-path cap of 4500; reviews target 4000 where possible.
 
 ## Implemented behavior
 
