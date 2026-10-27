@@ -1,6 +1,6 @@
 - Compare position and state before and after one action to infer effects; use displacement data to distinguish adjacency from overlap. A zero-change or terminal action is state-specific—do not repeat it from the same state, but do not generalize it as a permanent rule or proof that other directions are passable.
 
-- When reaching or overlapping a goal object does not complete the level, check whether a precondition (collecting all instances of a type, covering a region, a specific sequence) must be satisfied first. Test the goal again after the precondition is met rather than concluding the goal is wrong.
+- When reaching or overlapping a goal object does not complete the level, check whether a precondition (collecting all instances of a type, covering a region, a specific sequence, or co-locating multiple objects at the target) must be satisfied first. Test the goal again after the precondition is met rather than concluding the goal is wrong.
 
 - When one interaction with a repeated object type does not complete the level, test all remaining instances before concluding the type is irrelevant. Watch for persistent indicators that shift after each interaction, as they may signal progress toward a threshold.
 
