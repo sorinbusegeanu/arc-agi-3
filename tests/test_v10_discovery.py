@@ -62,30 +62,36 @@ class CanonicalMultiLevelEnv:
 
 
 def test_inspection_region_history_and_invalid_region(tmp_path):
+    from v10.tools.discovery import DISCOVERY_TOOLS
+
+    inspect_schema = next(item["function"] for item in DISCOVERY_TOOLS
+                          if item["function"]["name"] == "inspect_region")
+    assert "20x20" in inspect_schema["description"]
+    assert "20 rows by 20 columns" in inspect_schema["parameters"]["properties"]["region"]["description"]
     env = Env()
-    env.frame = np.zeros((12, 12), dtype=np.int64)
+    env.frame = np.zeros((24, 24), dtype=np.int64)
     game = GameTools(env, tmp_path, max_actions=3)
     state = game.observe()
     game.act("up")
     discovery = Discovery(game, "r", "g", tmp_path / "memory")
     result = discovery.dispatch({"request_id":"D1", "tool":"inspect_region",
-                                 "arguments":{"evidence_id":state["evidence_id"], "region":[0,0,10,10]}})
-    assert len(result["data"]["pixels"]) == 10
-    assert all(len(row) == 10 for row in result["data"]["pixels"])
+                                 "arguments":{"evidence_id":state["evidence_id"], "region":[0,0,20,20]}})
+    assert len(result["data"]["pixels"]) == 20
+    assert all(len(row) == 20 for row in result["data"]["pixels"])
     transition_id = game.history.records()[-1]["evidence_id"]
     transition = discovery.dispatch({"request_id":"D2", "tool":"inspect_region",
-                                     "arguments":{"evidence_id":transition_id, "region":[0,0,10,10]}})
-    assert len(transition["data"]["before"]) == 10
-    assert len(transition["data"]["after"]) == 10
-    assert transition["data"]["measurements"]["total_pixels"] == 100
+                                     "arguments":{"evidence_id":transition_id, "region":[0,0,20,20]}})
+    assert len(transition["data"]["before"]) == 20
+    assert len(transition["data"]["after"]) == 20
+    assert transition["data"]["measurements"]["total_pixels"] == 400
     invalid = discovery.dispatch({"request_id":"D3", "tool":"inspect_region",
-                                  "arguments":{"evidence_id":state["evidence_id"], "region":[0,0,11,10]}})
+                                  "arguments":{"evidence_id":state["evidence_id"], "region":[0,0,21,20]}})
     assert invalid["status"] == "rejected"
-    assert "at most 10 rows by 10 columns" in invalid["error"]["message"]
+    assert "at most 20 rows by 20 columns" in invalid["error"]["message"]
     invalid_width = discovery.dispatch({"request_id":"D4", "tool":"inspect_region",
-                                        "arguments":{"evidence_id":state["evidence_id"], "region":[0,0,10,11]}})
+                                        "arguments":{"evidence_id":state["evidence_id"], "region":[0,0,20,21]}})
     assert invalid_width["status"] == "rejected"
-    assert "at most 10 rows by 10 columns" in invalid_width["error"]["message"]
+    assert "at most 20 rows by 20 columns" in invalid_width["error"]["message"]
     missing = discovery.dispatch({"request_id":"D5", "tool":"inspect_region",
                                   "arguments":{"evidence_id":state["evidence_id"]}})
     assert missing["status"] == "rejected"

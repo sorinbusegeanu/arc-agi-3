@@ -1,6 +1,6 @@
 # V10 discovery tools
 
-Status: implemented in v10.0.19; available by default in model-driven action-selection calls, including bootstrap. Each selection allows at most three tool-call planning rounds, four newly executed branch outcomes, and ten model completions total. Cached outcomes do not consume the branch limit. After three tool-call rounds or four newly executed branches, tools are withheld and the harness explicitly requires an action-decision JSON object. Bootstrap allows at most three invalid plan attempts; if they produce no valid action, the harness executes one legal directional or wait fallback, counts it as an ordinary game action, and resumes model selection. Use `--no-discovery-tools` to disable.
+Status: implemented in v10.0.20; available by default in model-driven action-selection calls, including bootstrap. Each selection allows at most three tool-call planning rounds, four newly executed branch outcomes, and ten model completions total. Cached outcomes do not consume the branch limit. After three tool-call rounds or four newly executed branches, tools are withheld and the harness explicitly requires an action-decision JSON object. Bootstrap allows at most three invalid plan attempts; if they produce no valid action, the harness executes one legal directional or wait fallback, counts it as an ordinary game action, and resumes model selection. Use `--no-discovery-tools` to disable.
 
 ## Scope
 
@@ -27,7 +27,7 @@ Branch transition evidence is inspected with both identifiers returned in `evide
 ```
 
 - `region` is required and uses original grid coordinates: `[y0,x0,y1,x1]`, excluding the end coordinates.
-- Each crop is limited to 10 rows by 10 columns. Choose the smallest useful region; full-frame inspection is not supported. Pixel arrays are returned as structured data.
+- Each crop is limited to 20 rows by 20 columns. Choose the smallest useful region; full-frame inspection is not supported. Pixel arrays are returned as structured data.
 - A state returns its current crop; a transition returns before/after crops and measurements.
 - When `branch_id` is supplied, both IDs must resolve within that branch. Branch references never fall back to live history.
 - Return changed pixels, color transitions, and candidate displacement with its score and margin.

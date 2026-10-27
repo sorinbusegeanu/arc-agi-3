@@ -15,6 +15,8 @@ from .game import ActionBudget, ActionError, GameTools, evaluate_prediction, val
 from .history import History
 from .vision import candidate_displacement, pixel_diff
 
+MAX_INSPECTION_SIDE = 20
+
 # Keep the function schema aligned with the subset enforced by _experiment.
 _DISCOVERY_PREDICTION_PATHS = (
     "measurements.changed_pixels", "measurements.change_ratio", "game_state",
@@ -56,14 +58,14 @@ DISCOVERY_TOOLS = [
         "type": "function",
         "function": {
             "name": "inspect_region",
-            "description": "Inspect at most a 10x10 raw-grid region and measurements in recorded evidence. Region is required; choose the smallest useful crop.",
+            "description": f"Inspect at most a {MAX_INSPECTION_SIDE}x{MAX_INSPECTION_SIDE} raw-grid region and measurements in recorded evidence. Region is required; choose the smallest useful crop.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "evidence_id": {"type": "string"},
                     "branch_id": {"type": "string"},
                     "region": {
-                        "description": "Required half-open [y0,x0,y1,x1] raw-grid crop, at most 10 rows by 10 columns.",
+                        "description": f"Required half-open [y0,x0,y1,x1] raw-grid crop, at most {MAX_INSPECTION_SIDE} rows by {MAX_INSPECTION_SIDE} columns.",
                         "type": "array", "items": {"type": "integer"},
                         "minItems": 4, "maxItems": 4,
                     },
@@ -528,13 +530,13 @@ class Discovery:
 def _region(region: Any, shape: Sequence[int]) -> tuple[int,int,int,int]:
     height,width = int(shape[0]),int(shape[1])
     if region is None:
-        raise ActionError("region is required and must be at most 10 rows by 10 columns")
+        raise ActionError(f"region is required and must be at most {MAX_INSPECTION_SIDE} rows by {MAX_INSPECTION_SIDE} columns")
     if not isinstance(region, Sequence) or isinstance(region,(str,bytes)) or len(region)!=4 or any(type(x) is not int for x in region):
         raise ActionError("region must be four integer grid coordinates")
     y0,x0,y1,x1=region
     if y0<0 or x0<0 or y1>height or x1>width or y1<=y0 or x1<=x0: raise ActionError("region outside frame or empty")
-    if y1-y0 > 10 or x1-x0 > 10:
-        raise ActionError("region must be at most 10 rows by 10 columns")
+    if y1-y0 > MAX_INSPECTION_SIDE or x1-x0 > MAX_INSPECTION_SIDE:
+        raise ActionError(f"region must be at most {MAX_INSPECTION_SIDE} rows by {MAX_INSPECTION_SIDE} columns")
     return y0,x0,y1,x1
 
 

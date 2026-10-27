@@ -27,7 +27,7 @@ Keep discovery-specific schemas and dispatch in `src/v10/tools/discovery.py`. Re
 
 ## 1. Inspection and history
 
-Implement `inspect_region` using `FrameStore`, `pixel_diff`, and `candidate_displacement`. Require an explicit half-open raw-grid region and reject crops wider or taller than 10 pixels before returning arrays.
+Implement `inspect_region` using `FrameStore`, `pixel_diff`, and `candidate_displacement`. Require an explicit half-open raw-grid region and reject crops wider or taller than 20 pixels before returning arrays.
 
 - Resolve evidence IDs to recorded frames.
 - Validate raw-grid regions and return optional crops.
