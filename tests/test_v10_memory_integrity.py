@@ -56,6 +56,11 @@ def test_global_memory_rejects_oversize_and_preserves_previous_markdown(tmp_path
     assert save_global_memory(tmp_path, memory_text) is False
     assert len(read_global_memory(tmp_path)) <= MAX_GLOBAL_MEMORY_MARKDOWN_CHARS
 
+
+def test_global_memory_hard_cap_cannot_be_raised_by_save_override(tmp_path) -> None:
+    with pytest.raises(MemoryValidationError, match="4500 character limit"):
+        save_global_memory(tmp_path, "x" * 4_501, max_characters=6_000)
+
 def test_markdown_save_preserves_model_authored_text_without_rewriting_duplicates(tmp_path) -> None:
     content = "# Global Memory\n\n- Compare objects before and after each action.\n- Compare objects before and after each action."
     save_global_memory(tmp_path, content)

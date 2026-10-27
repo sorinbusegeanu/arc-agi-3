@@ -39,6 +39,18 @@ def _parse_csv(value: str, convert):
     return result
 
 
+def _parse_global_memory_max_chars(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 1 <= result <= MAX_GLOBAL_MEMORY_MARKDOWN_CHARS:
+        raise argparse.ArgumentTypeError(
+            f"must be between 1 and {MAX_GLOBAL_MEMORY_MARKDOWN_CHARS}"
+        )
+    return result
+
+
 def _add_model_logging_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--log-request", action="store_true",
                          help="save complete outgoing model request payloads in the run directory")
@@ -128,8 +140,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="compatibility setting (0-5); live prompts load saved Markdown in full")
     live.add_argument("--game-memory-max-chars", type=int, default=MAX_MEMORY_MARKDOWN_CHARS,
                       help="maximum characters accepted for game MEMORY.md")
-    live.add_argument("--global-memory-max-chars", type=int, default=MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
-                      help="maximum characters accepted for global MEMORY.md (default: 6000)")
+    live.add_argument("--global-memory-max-chars", type=_parse_global_memory_max_chars,
+                      default=MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
+                      help="maximum characters accepted for global MEMORY.md (hard limit: 4500)")
     live.add_argument(
         "--base-url", default=DEFAULT_STRATA_BASE_URL,
         help=f"OpenAI-compatible Strata endpoint base URL (default: {DEFAULT_STRATA_BASE_URL})",
@@ -142,6 +155,8 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--seed", type=int, default=0)
     live.add_argument("--max-actions", type=int, default=30)
     live.add_argument("--plan-horizon", type=int, default=8)
+    live.add_argument("--discovery-tools", action=argparse.BooleanOptionalAction, default=True,
+                      help="enable discovery tools during model action selection (default: enabled; use --no-discovery-tools to disable)")
     live.add_argument("--timeout-seconds", type=float, default=300.0)
     live.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
     live.add_argument(
@@ -246,6 +261,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     memory_context_entries=args.memory_context_entries,
                     game_memory_max_chars=args.game_memory_max_chars,
                     global_memory_max_chars=args.global_memory_max_chars,
+                    discovery_tools=args.discovery_tools,
                 )
             finally:
                 env.close()

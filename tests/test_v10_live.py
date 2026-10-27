@@ -13,11 +13,12 @@ import pytest
 import v10.live as live_module
 from v10.arcade_env import ArcadeGameEnv
 from v10.live import (
-    _active_level_transitions, _live_context, _perform_game_over_post_mortem,
+    _active_level_transitions, _live_context, _parse_content, _perform_game_over_post_mortem,
     _perform_global_memory_review, _perform_review,
     _perceptual_state_equivalence, _review_events,
     _verified_route_summaries, run_live,
 )
+from v10.analysis import DecisionValidationError
 from v10.tools.game import GameTools
 from v10.tools.game import ActionError
 from v10.tools.history import History
@@ -39,6 +40,16 @@ def test_perceptual_equivalence_is_sparse_exploration_signal_only() -> None:
     assert "hidden state is unknown" in signal["reason"]
     assert _perceptual_state_equivalence(base, moved_object)["equivalent"] is False
     assert _perceptual_state_equivalence(np.zeros((8, 8)), np.zeros((8, 8)))["certainty"] == "unreliable"
+
+
+def test_action_decision_parser_accepts_one_fenced_json_object_with_prose() -> None:
+    payload = {"actions": [{"action": "up", "args": {}}]}
+    content = "The next move should be cautious.\n```json\n" + json.dumps(payload) + "\n```\nProceeding now."
+    assert _parse_content(content) == payload
+    with pytest.raises(DecisionValidationError):
+        _parse_content("```json\nnot json\n```")
+    with pytest.raises(DecisionValidationError):
+        _parse_content("```json\n{}\n```\n```json\n{}\n```")
 
 
 def test_perceptual_state_similarity_is_logged_and_never_resets_game(tmp_path: Path) -> None:
@@ -130,6 +141,7 @@ class _FakeClient:
         self.calls = []
         self.system_prompts = []
         self.response_formats = []
+        self.tool_definitions = []
         self.request_attempts = request_attempts
         self.review_responses = list(review_responses or [])
         self.global_memory_review_responses = list(global_memory_review_responses or [])
@@ -142,7 +154,7 @@ class _FakeClient:
 
     def complete(
         self, system_prompt, user_prompt, image_paths, image_labels,
-        response_format="json_object", *, messages=None, conversation_reset_count=None,
+        response_format="json_object", *, messages=None, conversation_reset_count=None, tools=None,
     ):
         if messages is not None:
             self.message_calls.append({
@@ -161,6 +173,7 @@ class _FakeClient:
         self.calls.append((user_prompt, list(image_paths), list(image_labels)))
         self.system_prompts.append(system_prompt)
         self.response_formats.append(response_format)
+        self.tool_definitions.append(copy.deepcopy(tools))
         if system_prompt.startswith("# V10 memory consolidation"):
             if self.review_errors:
                 raise self.review_errors.pop(0)
@@ -413,20 +426,35 @@ def test_normal_and_bootstrap_prompts_keep_only_applicable_reset_constraints(tmp
     assert "RESET\",\"parameters" not in bootstrap["user_prompt"]
 
 
-def test_default_global_memory_limit_accepts_six_thousand_characters(tmp_path: Path) -> None:
+def test_global_memory_limit_is_hard_capped_at_four_thousand_five_hundred_characters(tmp_path: Path) -> None:
     from v10.live import _validate_review_payload
     from v10.tools.memory import MAX_GLOBAL_MEMORY_MARKDOWN_CHARS
 
-    assert MAX_GLOBAL_MEMORY_MARKDOWN_CHARS == 6_000
+    assert MAX_GLOBAL_MEMORY_MARKDOWN_CHARS == 4_500
     _validate_review_payload({
         "game_memory_markdown": _VALID_GAME_MEMORY,
-        "global_memory_markdown": "g" * 6_000,
+        "global_memory_markdown": "g" * 4_500,
     })
-    with pytest.raises(ValueError, match="6000 character limit"):
+    with pytest.raises(ValueError, match="4500 character limit"):
         _validate_review_payload({
             "game_memory_markdown": _VALID_GAME_MEMORY,
-            "global_memory_markdown": "g" * 6_001,
+            "global_memory_markdown": "g" * 4_501,
         })
+
+
+def test_review_memory_accepts_fixed_level_counts_but_rejects_transient_counts() -> None:
+    from v10.live import _review_memory_quality_errors
+
+    assert not _review_memory_quality_errors(
+        "## Mechanics\n- Each level has four fixed markers.", "# Global\n- Compare before and after."
+    )
+    assert "game_memory_markdown contains a transient item count" in _review_memory_quality_errors(
+        "## Hypothesis\n- Four markers remain.", "# Global\n- Compare before and after."
+    )
+    assert "game_memory_markdown infers a general obstacle from a state-specific no-op" in _review_memory_quality_errors(
+        "## Mechanics\n- A rightward action produced zero pixel change, indicating a wall blocks movement.",
+        "# Global\n- Compare before and after.",
+    )
 
 
 def _seed_game_mechanic(state_dir: Path, game_id: str = "fixture") -> None:
@@ -758,20 +786,73 @@ def test_bootstrap_startup_model_call_uses_memory_and_valid_directions(tmp_path:
     assert plans[-1]["source"] == "bootstrap_model_start"
 
 
-def test_invalid_memory_startup_answer_falls_back_to_standard_routine(tmp_path: Path) -> None:
-    state_dir = tmp_path / "state"
-    _seed_game_mechanic(state_dir)
-    client = _FakeClient([_decision([]), _decision([])])
-    env = _FakeEnv()
+def test_bootstrap_model_may_choose_legal_wait_action(tmp_path: Path) -> None:
+    class WaitEnv(_FakeEnv):
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"].append({
+                "id":"WAIT", "parameters":{
+                    "type":"object", "properties":{}, "required":[], "additionalProperties":False,
+                },
+            })
+            return result
 
-    run_live(env, tmp_path / "run", client, game_id="fixture", max_actions=4, state_dir=state_dir)
+    env = WaitEnv()
+    client = _FakeClient([_decision([_action("WAIT")])])
+    metrics = run_live(env, tmp_path / "run", client, game_id="fixture", max_actions=3)
 
-    assert [action for action, _ in env.actions] == ["ACTION1", "ACTION2", "ACTION1", "ACTION2"]
-    assert env.resets == 1
+    assert [action for action, _ in env.actions] == ["ACTION1", "ACTION2", "WAIT"]
+    assert metrics["actions"] == 3
     rows = [json.loads(line) for line in (tmp_path / "run/decisions.jsonl").read_text().splitlines()]
     plans = [row for row in rows if row.get("schema") == "v10.live_decision/2"]
-    assert plans[-1]["source"] == "bootstrap_start_fallback"
-    assert plans[-1]["initial_validation_error"] == "bootstrap plan must contain legal lowercase directional actions"
+    assert plans[-1]["source"] == "bootstrap_model_start"
+    assert plans[-1]["decision"]["actions"] == [{"action":"WAIT", "args":{}}]
+
+
+def test_invalid_memory_startup_answer_reasks_model_instead_of_moving_by_fallback(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    _seed_game_mechanic(state_dir)
+    client = _FakeClient([_decision([]), _decision([]), _decision([_action("up")])])
+    env = _FakeEnv()
+
+    metrics = run_live(env, tmp_path / "run", client, game_id="fixture", max_actions=3, state_dir=state_dir)
+
+    assert [action for action, _ in env.actions] == ["ACTION1", "ACTION2", "ACTION1"]
+    assert env.resets == 1
+    assert metrics["model_calls"] == 3
+    rows = [json.loads(line) for line in (tmp_path / "run/decisions.jsonl").read_text().splitlines()]
+    plans = [row for row in rows if row.get("schema") == "v10.live_decision/2"]
+    assert plans[-1]["source"] == "bootstrap_model_start"
+    assert not any(row.get("source") == "bootstrap_start_fallback" for row in plans)
+    rejections = [row for row in rows if row.get("schema") == "v10.live_bootstrap_plan/1"]
+    assert len(rejections) == 1
+    assert rejections[0]["status"] == "rejected"
+    assert rejections[0]["validation_error"] == "bootstrap plan must contain legal directional or wait actions"
+
+
+def test_three_invalid_startup_plans_use_directional_fallback_then_resume_model_loop(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    _seed_game_mechanic(state_dir)
+    client = _FakeClient([_decision([])] * 6 + [_decision([_action("up")])])
+    env = _FakeEnv()
+
+    metrics = run_live(env, tmp_path / "run", client, game_id="fixture", max_actions=4, state_dir=state_dir)
+
+    assert len(env.actions) == metrics["actions"] == 4
+    assert [action for action, _ in env.actions[:2]] == ["ACTION1", "ACTION2"]
+    assert env.actions[2][0] in {"ACTION1", "ACTION2"}
+    assert env.actions[3][0] == "ACTION1"
+    assert env.resets == 1
+    assert metrics["model_calls"] == 7
+    assert metrics["stop_reason"] == "action_budget_exhausted"
+    rows = [json.loads(line) for line in (tmp_path / "run/decisions.jsonl").read_text().splitlines()]
+    rejections = [row for row in rows if row.get("schema") == "v10.live_bootstrap_plan/1"]
+    assert [row["attempt"] for row in rejections] == [1, 2, 3]
+    fallback = next(row for row in rows if row.get("schema") == "v10.live_fallback/2" and row.get("status") == "executed")
+    assert fallback["cause"] == "bootstrap_plan_invalid"
+    assert fallback["action"] in {"up", "down"}
+    accepted = [row for row in rows if row.get("schema") == "v10.live_decision/2" and row.get("status") == "accepted"][-1]
+    assert accepted["source"] == "model"
 
 
 def test_recent_history_is_independent_of_plan_horizon(tmp_path: Path) -> None:
@@ -1580,7 +1661,8 @@ def test_live_context_has_no_future_records_and_includes_current_images(tmp_path
     assert '"win_levels":5' in prompt
     assert "first action only" in prompt
     assert "memory contains conflicting claims" in system_prompt
-    assert "use `null` only when no uncertain claim is being tested" in system_prompt
+    assert "use `null` only when no hypothesis is being tested" in system_prompt
+    assert "discovery functions are available during action selection" in system_prompt
 
 
 def test_action_conversation_appends_action_outcomes_and_current_screen(tmp_path: Path) -> None:
@@ -1793,7 +1875,7 @@ def test_cached_level_success_skips_reviews_on_replayed_route(tmp_path: Path) ->
 def test_uncertain_reasoned_action_is_joined_to_outcome_without_extra_model_call(tmp_path: Path) -> None:
     client = _FakeClient([_reasoned(
         _decision([_action("up")]),
-        hypothesis={"claim": "The action changes the visible board.", "evidence": "a visible player-like region", "uncertainty": "tentative"},
+        hypothesis={"claim": "The action changes the visible board.", "evidence": "a visible player-like region"},
         prediction={"visible_change": "yes", "environment_outcome": "no_terminal", "description": "some pixels change"},
     )])
     metrics = _run_live_without_starting_routine(
@@ -1828,7 +1910,7 @@ def test_uncertain_reasoned_action_is_joined_to_outcome_without_extra_model_call
 def test_prediction_mismatch_is_logged_but_does_not_interrupt_plan(tmp_path: Path) -> None:
     client = _FakeClient([_reasoned(
         _decision([_action("up"), _action("down")]),
-        hypothesis={"claim": "The action does not alter the board.", "evidence": "same visible region", "uncertainty": "uncertain"},
+        hypothesis={"claim": "The action does not alter the board.", "evidence": "same visible region"},
         prediction={
             "visible_change": "no", "environment_outcome": "no_terminal",
             "description": "After the full up then down plan, the board remains unchanged.",
@@ -1873,7 +1955,10 @@ def test_review_saves_model_markdown_and_next_action_reads_it_verbatim(tmp_path:
     assert env.actions == [("ACTION1", {})]
     assert metrics["actions"] == 1
     assert metrics["review_count"] == 1
-    assert client.response_formats == ["json_object", "json_object", "json_object"]
+    assert client.response_formats == [None, "json_object", None]
+    assert client.tool_definitions[0]
+    assert client.tool_definitions[1] is None
+    assert client.tool_definitions[2]
     assert "A cue is visible in this game." in client.calls[2][0]
     assert client.calls[2][0].count("A cue is visible in this game.") == 1
     assert "applicable_successful_strategies" not in client.calls[2][0]
@@ -2095,6 +2180,7 @@ def test_review_repairs_transient_progress_and_global_blockage_overclaim(tmp_pat
     assert "action-numbered progress" in repair_prompt
     assert "transient item count" in repair_prompt
     assert "no visible change as proof of blockage or reachability" in repair_prompt
+    assert "current collected/remaining counts" in repair_prompt
     assert (store_dir / "MEMORY.md").read_text() == _VALID_GAME_MEMORY + "\n"
     assert global_memory_path(tmp_path / "state").read_text() == _VALID_GLOBAL_MEMORY + "\n"
 
@@ -2562,6 +2648,7 @@ def test_post_mortem_sends_every_action_and_screen_in_order(tmp_path: Path) -> N
     result = _perform_game_over_post_mortem(
         tools, client, game_id="fixture", guidance_memory="", global_memory="",
     )
+    assert client.tool_definitions == [None]
 
     prompt, paths, labels = client.calls[0]
     assert result["row"]["status"] == "saved"

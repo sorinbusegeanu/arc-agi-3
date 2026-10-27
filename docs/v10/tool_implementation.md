@@ -4,7 +4,7 @@ Companion: [tool_design.md](tool_design.md).
 
 ## Task
 
-Implement the four MVP tools behind `--discovery-tools`, off by default. Read current source and `AGENTS.md` before editing.
+Implementation status: the four MVP tools are available by default in action-selection calls. Use `--no-discovery-tools` to disable them. This document records their contracts and validation requirements.
 
 Preserve `v10.reasoned_action/1`, review's two-Markdown response, existing review inputs and triggers, route validation, and startup/recovery behavior. Ordinary prediction mismatches remain diagnostic.
 
@@ -14,6 +14,8 @@ Preserve `v10.reasoned_action/1`, review's two-Markdown response, existing revie
 |---|---|
 | Action schema and aliases | `src/v10/analysis.py` |
 | Action execution and predicate evaluation | `src/v10/tools/game.py` |
+| Native game environment forks | `src/v10/arcade_env.py` |
+| Discovery schemas, validation, branches, and dispatch | `src/v10/tools/discovery.py` |
 | Frame storage | `src/v10/frames.py` |
 | Image measurements | `src/v10/tools/vision.py` |
 | History queries | `src/v10/tools/history.py` |
@@ -21,11 +23,11 @@ Preserve `v10.reasoned_action/1`, review's two-Markdown response, existing revie
 | Live scheduling, accounting, and review | `src/v10/live.py` |
 | CLI settings | `src/v10/cli.py` |
 
-Add one `src/v10/tools/discovery.py` module for request validation, dispatch, and experiment state. Reuse existing owners for measurement, history, persistence, and execution.
+Keep discovery-specific schemas and dispatch in `src/v10/tools/discovery.py`. Reuse existing owners for measurement, history, persistence, action budgeting, and environment execution.
 
 ## 1. Inspection and history
 
-Implement `inspect_region` using `FrameStore`, `pixel_diff`, and `candidate_displacement`.
+Implement `inspect_region` using `FrameStore`, `pixel_diff`, and `candidate_displacement`. Require an explicit half-open raw-grid region and reject crops wider or taller than 10 pixels before returning arrays.
 
 - Resolve evidence IDs to recorded frames.
 - Validate raw-grid regions and return optional crops.
@@ -37,46 +39,40 @@ Wrap `History.query` for `search_history`. Add pre-action level filtering where 
 
 ## 2. Request dispatch
 
-Implement `validate_discovery_request` and `dispatch_discovery_request` using the design's JSON envelope.
+Define the four function schemas beside the v10 discovery dispatcher. Use native Strata function calls and the provider call ID as the idempotency request ID.
 
-Accept the four tools and `finish`. Validate fields, types, finite values, evidence references, string/list limits, and request IDs. Return structured errors without executing invalid actions.
+Accept the four discovery functions. Validate fields, types, finite values, evidence references, string/list limits, and call IDs. Return structured errors without executing invalid actions. Do not use a `finish` pseudo-tool; an ordinary action decision ends discovery for that selection.
 
-Track per-phase limits:
+Do not impose per-level quotas. Bound discovery planning to three tool-call rounds and four hypothesis cases per action-selection exchange, with a ten-completion hard ceiling as a final guard. Bound payloads through function schemas and Strata's output/context limits. Completed-request retries return the recorded result without another tool execution. Reuse the current model client, request logs, token limits, context handling, and usage accounting.
 
-- Two reads across inspection, history, and memory.
-- One hypothesis test.
-- One memory proposal.
-- Five model completions, each returning one request.
+## 3. Isolated experiment execution
 
-Rejected requests consume their category slot. Completed-request retries return the recorded result without another tool execution. Reuse the current model client, request logs, token limits, context handling, and usage accounting.
-
-## 3. Experiment execution
+Normalize model-facing direction names and recorded replay actions to the canonical IDs exposed by the fork's current legal actions. Replay the ordered reset/action prefix from the initial state, compare the resulting observation fingerprint—including frame, level, and progress—to the requested base evidence, and execute the candidate only after an exact match.
 
 Persist experiment records in run-local `discovery.jsonl`, keyed by run and request ID:
 
 | State | Contents |
 |---|---|
-| prepared | Validated request, predictions, base evidence, measurement scope |
-| started | Dispatch is about to occur |
-| completed | Transition ID, measurements, predicate comparisons, verdicts |
+| started | Dispatch has begun; each isolated case has a branch ID and replay target |
+| experiment_scored | Case results, branch evidence IDs, measurements, predicate comparisons, verdicts |
 | rejected | Validation or known pre-dispatch failure |
-| unknown_execution | Action may have executed without a reliable result |
+| branch_error / replay_mismatch | A branch failed or its observable state did not match the target |
 
-Store a canonical request digest. Same ID and payload returns the existing result; a different payload rejects. Persist and flush `started` before dispatch. Never automatically redispatch an incomplete started experiment.
+Store a canonical request digest. Same ID and payload returns the existing result; a different payload rejects. Persist `started` before branch actions. Never automatically redispatch an incomplete started experiment.
 
-Have the dispatcher return a validated experiment action to the live loop. Execute it through the existing pathway, including action legality, ineffective-action checks, budgets, `learn_transition`, route learning, counters, level changes, reviews, and terminal handling. Extract a small shared helper if needed instead of copying the action loop.
+Fork the current environment and replay the run-local reset/action prefix for each candidate. Compare the observable fingerprint (frame, legal actions, level/progress/state) with the target and execute only after a match. Keep branch evidence under `discovery_branches/`; do not add branch transitions to live route learning or review history or charge them against the live action cap. Track branch resets and transitions separately.
 
 Build one outcome object for all hypotheses and reuse `evaluate_prediction`. Restrict MVP predicates to the paths in the design. Across level changes, mark visual measurements unavailable while retaining environment outcomes.
 
-If dispatch or result persistence leaves execution uncertain, stop automatic advancement and report `unknown_execution`. Normal initialization remains responsible for a new run; this feature adds no automatic crash recovery.
+An observable replay mismatch prevents candidate execution. Hidden environment state that is not exposed through observations cannot be certified by this fingerprint.
 
 ## 4. Live integration
 
 Add the CLI flag, pass it to `run_live`, and record it in the manifest.
 
-Offer one phase per level per run at the first normal model-selection boundary after startup. Resets do not grant additional phases. Skip discovery during verified replay/bootstrap.
+Make tools available during every model action-selection call, including startup/bootstrap. The model may return a native tool call or its ordinary action decision.
 
-Use a dedicated discovery prompt describing tools, available evidence, legal actions, and remaining limits. The model can finish without testing. After a probe, rebuild current context and invalidate pending responses tied to the previous state. Resume normal selection or existing terminal handling.
+Include tool-use guidance in the shared skill and current evidence, legal actions, and remaining live-action allowance in the action prompt. The model can return an action without testing. After a probe, rebuild current context and invalidate pending responses tied to the previous state. Resume normal selection or existing terminal handling.
 
 Read/model failures resume ordinary selection. With the feature disabled, preserve existing prompts, call counts, and behavior.
 

@@ -11,7 +11,7 @@ This plan records the approved V10 changes. It supersedes earlier proposals in t
 The action model returns one `v10.reasoned_action/1` JSON object containing:
 
 - A concise current-screen assessment: player location, target candidates, obstacles, and relevant changes.
-- An optional falsifiable hypothesis with categorical uncertainty (`tentative` or `uncertain`).
+- An optional falsifiable hypothesis with its observed evidence.
 - A short trajectory rationale.
 - A categorical prediction for the first action, where testable.
 - One canonical `actions` list, validated with the existing legal-action, reset, plan-horizon, and budget rules.
@@ -22,7 +22,7 @@ The same contract is used by live action selection and offline analysis. The exi
 
 ### 2. Prediction evidence
 
-For an uncertain decision with a testable prediction, Python joins the response to the first executed transition and appends one run-local `reasoning.jsonl` record. It includes the request/decision ID, action and screen references, prediction, measurable outcome, and categorical comparison (`supported`, `contradicted`, or `inconclusive`). Semantic hypotheses remain unresolved until review.
+For a decision with a testable prediction, Python joins the response to the first executed transition and appends one run-local `reasoning.jsonl` record. It includes the request/decision ID, action and screen references, prediction, measurable outcome, and categorical comparison (`supported`, `contradicted`, or `inconclusive`). Semantic hypotheses remain unresolved until review.
 
 Prediction mismatches are diagnostic only. They do not stop or shorten an otherwise valid action plan and do not create an extra model call.
 

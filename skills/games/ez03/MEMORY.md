@@ -1,8 +1,5 @@
-## Established mechanics
-- Levels 0–4: The blue square is the movable agent (responds to directional inputs); the yellow square is the stationary goal. Completing the level requires the agent to overlap the goal.
+## Level 0 (first level)
 
-## Verified strategy
-- Levels 0–4 (agent left of goal, same row): Move the agent directly rightward toward the goal until overlap. Each level used only rightward moves with no loops or wasted actions.
-
-## Ineffective approaches
-- Levels 2–4 (agent at or near left boundary, goal to the right): A leftward action produced zero pixel change from that state. Do not repeat leftward moves when the agent is already at or near the left boundary and the goal is to the right.
+- **Player and goal:** The blue square is the player (moves with directional actions); the yellow square is a static goal. Both are on the same horizontal row, separated by a gap.
+- **Completion mechanic:** Moving the player rightward to close the gap (adjacent to the goal) does not complete the level. A second rightward step after contact causes the goal to vanish and the level to complete. Verified route: two consecutive right moves from the starting state.
+- **Failed hypotheses:** A single right move from the initial state only steps the player; it does not complete the level. Simply reaching adjacency (overlap) is insufficient—completion requires one additional step past the goal in the same direction.

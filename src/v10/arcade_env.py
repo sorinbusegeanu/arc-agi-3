@@ -34,7 +34,9 @@ class ArcadeGameEnv:
 
             env_factory = make_env
         self.game_id = str(game_id)
-        self._env = env_factory(self.game_id, env_root=env_root, seed=int(seed), op_mode="offline")
+        self._env_factory = env_factory
+        self._env_root = env_root
+        self._env = self._env_factory(self.game_id, env_root=env_root, seed=int(seed), op_mode="offline")
         self._game_action = None
         self._raw_observation: Any = None
         self._seed = int(seed)
@@ -116,6 +118,13 @@ class ArcadeGameEnv:
         if self._raw_observation is None:
             raise RuntimeError("ARC environment reset returned no observation")
         return self.observe()
+
+    def fork(self) -> "ArcadeGameEnv":
+        """Create an isolated environment with the same game factory and seed."""
+        return ArcadeGameEnv(
+            self.game_id, seed=self._seed, env_root=self._env_root,
+            env_factory=self._env_factory,
+        )
 
     def close(self) -> None:
         close = getattr(self._env, "close", None)

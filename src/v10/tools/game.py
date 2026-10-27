@@ -83,18 +83,18 @@ def normalize_measurable_prediction(value: Any) -> Any:
     return {"all": predicates}
 
 
-def validate_measurable_prediction(value: Any, action_name: str = "action") -> None:
+def validate_measurable_prediction(value: Any, field_name: str = "action.measurable_prediction") -> None:
     """Validate canonical all-of comparison predicates against known outputs."""
     if not isinstance(value, Mapping) or set(value) != {"all"}:
         raise ActionError(
-            f"{action_name}.measurable_prediction must use {{'all': [{{'path','op','value'}}]}}; "
+            f"{field_name} must use {{'all': [{{'path','op','value'}}]}}; "
             "flat pixel_diff fields are legacy input only"
         )
     predicates = value.get("all")
     if not isinstance(predicates, list) or not predicates:
-        raise ActionError(f"{action_name}.measurable_prediction.all must be a non-empty list")
+        raise ActionError(f"{field_name}.all must be a non-empty list")
     for index, predicate in enumerate(predicates):
-        name = f"{action_name}.measurable_prediction.all[{index}]"
+        name = f"{field_name}.all[{index}]"
         if not isinstance(predicate, Mapping) or set(predicate) != {"path", "op", "value"}:
             raise ActionError(f"{name} must contain exactly path, op, and value")
         path = predicate["path"]
@@ -138,6 +138,33 @@ class ActionError(ValueError):
 
 class BudgetExceeded(RuntimeError):
     """The requested environment operation exceeds the configured run budget."""
+
+
+class ActionBudget:
+    """Shared cap for live actions in a run."""
+
+    def __init__(self, max_actions: int, *, used: int = 0) -> None:
+        self.max_actions = int(max_actions)
+        self.used = int(used)
+        self.categories: dict[str, int] = {}
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.max_actions - self.used)
+
+    def ensure_capacity(self, count: int = 1) -> None:
+        count = int(count)
+        if count < 0:
+            raise ValueError("action reservation must be non-negative")
+        if count > self.remaining:
+            raise BudgetExceeded(
+                f"action budget exhausted ({self.used}+{count}>{self.max_actions})"
+            )
+
+    def consume(self, category: str = "live") -> None:
+        self.ensure_capacity()
+        self.used += 1
+        self.categories[category] = self.categories.get(category, 0) + 1
 
 
 def _mapping(value: Any, name: str) -> dict[str, Any]:
@@ -370,6 +397,9 @@ class GameTools:
         env: Any,
         run_dir: Path | str,
         max_actions: int = 1000,
+        *,
+        action_budget: ActionBudget | None = None,
+        action_budget_category: str = "live",
     ) -> None:
         if not callable(getattr(env, "observe", None)) or not callable(getattr(env, "act", None)):
             raise TypeError("env must implement observe() and act(action, args)")
@@ -380,6 +410,10 @@ class GameTools:
         self.history = History(self.run_dir)
         self.max_actions = int(max_actions)
         self.action_count = sum(record.get("type") == "transition" for record in self.history.records())
+        self.action_budget = action_budget or ActionBudget(self.max_actions, used=self.action_count)
+        if self.action_budget.max_actions != self.max_actions:
+            raise ValueError("shared action budget must use the GameTools max_actions limit")
+        self.action_budget_category = str(action_budget_category)
         self.reset_count = sum(record.get("type") == "reset" for record in self.history.records())
         self.reset_generation = max((int(record.get("reset_generation", 0)) for record in self.history.records()), default=0)
         self._current: dict[str, Any] | None = None
@@ -387,6 +421,10 @@ class GameTools:
     @property
     def supports_reset(self) -> bool:
         return callable(getattr(self.env, "reset", None))
+
+    @property
+    def actions_remaining(self) -> int:
+        return self.action_budget.remaining
 
     def _capture(self, raw: Any) -> dict[str, Any]:
         observation = _mapping(raw, "observe")
@@ -429,8 +467,7 @@ class GameTools:
         *,
         action_name: str | None = None,
     ) -> dict[str, Any]:
-        if self.action_count >= self.max_actions:
-            raise BudgetExceeded(f"action budget exhausted ({self.max_actions})")
+        self.action_budget.ensure_capacity()
         before = self._current or self.observe()
         table = _action_table(before.get("legal_actions", []))
         if action not in table:
@@ -438,6 +475,8 @@ class GameTools:
         safe_args = _validate_args(action, args or {}, table[action])
         pre_step = self.history.next_step()
         try:
+            # An exception after dispatch may still have changed environment state.
+            self.action_budget.consume(self.action_budget_category)
             result_raw = self.env.act(table[action].get("_environment_id", action), safe_args)
         except Exception as exc:
             self.history.append({
@@ -499,6 +538,7 @@ class GameTools:
             "result": {key: value for key, value in result.items() if key not in {"frames", "frame", "image"}},
             "measurements": measurements, "legal_actions": after["legal_actions"],
             "level": after.get("level"), "levels_completed": after.get("levels_completed"),
+            "pre_level": before.get("level"), "post_level": after.get("level"),
             "terminal": after.get("terminal"), "game_state": after.get("game_state"),
             "reset_generation": self.reset_generation,
         })
@@ -535,4 +575,4 @@ class GameTools:
         return {"observation": dict(current), "evidence": evidence, "reset_count": self.reset_count}
 
 
-__all__ = ["ActionError", "BudgetExceeded", "GameTools", "evaluate_prediction", "validate_decision"]
+__all__ = ["ActionBudget", "ActionError", "BudgetExceeded", "GameTools", "evaluate_prediction", "validate_decision"]

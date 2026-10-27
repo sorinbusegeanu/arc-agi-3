@@ -27,7 +27,7 @@ REVIEW_SUMMARY_ID = "review:latest"
 DEFAULT_MAX_ENTRIES = 60
 DEFAULT_CONTEXT_ENTRIES = 5
 MAX_MEMORY_MARKDOWN_CHARS = 3_000
-MAX_GLOBAL_MEMORY_MARKDOWN_CHARS = 6_000
+MAX_GLOBAL_MEMORY_MARKDOWN_CHARS = 4_500
 PATTERN_TYPES: tuple[str, ...] = ("mechanic", "strategy", "exception", "hypothesis", "failure")
 PATTERN_STATUSES: tuple[str, ...] = ("candidate", "confirmed", "contradicted", "retired")
 STATE_SELECTOR_FIELDS = frozenset({"game_state", "level", "levels_completed", "win_levels", "terminal"})
@@ -118,7 +118,8 @@ def save_global_memory(
     max_characters: int = MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
 ) -> bool:
     """Atomically save model-authored global Markdown without rewriting prose."""
-    rendered = _validated_markdown(markdown, max_characters, "global memory")
+    limit = min(int(max_characters), MAX_GLOBAL_MEMORY_MARKDOWN_CHARS)
+    rendered = _validated_markdown(markdown, limit, "global memory")
     path = global_memory_path(state_dir)
     if path.is_file() and path.read_text(encoding="utf-8") == rendered:
         return False
@@ -773,7 +774,10 @@ class GameMemory:
                     break
                 try:
                     from .game import validate_measurable_prediction
-                    validate_measurable_prediction(expectation.get("measurable_prediction"), "pattern expectation")
+                    validate_measurable_prediction(
+                        expectation.get("measurable_prediction"),
+                        "pattern expectation.measurable_prediction",
+                    )
                 except Exception:
                     invalid_prediction = True
                     break

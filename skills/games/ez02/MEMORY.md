@@ -1,7 +1,22 @@
 ## Established mechanics (Levels 0–4)
-- The yellow square is the stationary goal; the blue square is the movable agent. Overlapping the blue agent with the yellow goal triggers level completion (extra color transitions plus an intermediate frame where the yellow disappears).
-- The agent moves one cell per action in the commanded direction. Ordinary movement produces two color transitions; completion produces additional transitions (observed as 4–6 transitions across Levels 2–4).
-- In Level 1, rightward actions from a state where the agent sat at the right edge produced no visible change; ineffective from that specific state.
+- The blue square is the player-controlled object; each directional action moves it exactly one cell. The yellow square is a static target that does not move.
+- Moving the player onto the target completes the level (confirmed by level transitions in Levels 0, 1, 2, 3, and 4).
+- During completion, an intermediate frame shows the target absorbed (yellow disappears) before the next level's start screen appears.
 
-## Verified strategy (Levels 0–4)
-- Move the blue agent directly toward the yellow goal and overlap its cell. In Levels 2, 3, and 4 the goal was to the left on the same row, so repeated leftward movement completed the level with no obstacles encountered. A direct path avoids wandering and avoids edge-of-screen no-op moves.
+## Strategy (Level 0)
+- From the verified start (player adjacent to target's right), move left until overlap.
+
+## Strategy (Level 1)
+- From the verified start (player several cells right of target on the same row), move left repeatedly until overlap. No obstacles encountered.
+
+## Strategy (Level 2)
+- From the verified start (player far right of target on the same row), move left repeatedly until overlap. No obstacles encountered.
+
+## Strategy (Level 3)
+- From the verified start (player right of target on the same row, separated by several cells), move left repeatedly until overlap. No obstacles encountered along the path.
+
+## Strategy (Level 4)
+- From the verified start (player at right edge, target at left edge, same row), move left repeatedly until overlap. No obstacles encountered along the path.
+
+## Failed hypotheses
+- "No single move advances the level" is incorrect: from an adjacent state, one move onto the target completes it. Completion depends on whether the player is already adjacent to the target.

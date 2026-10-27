@@ -26,7 +26,7 @@ This document records the implemented architecture and default live configuratio
 | Action budget | `30` |
 | Plan horizon (`--plan-horizon`) | `8` actions (accepted range 1–8) |
 | Action-set review | after more than `9` actions since the last review, checked at set end |
-| Game/global Markdown limits | `3000` / `6000` characters |
+| Game/global Markdown limits | `3000` / `4500` characters |
 | Review memory quality | Reject obvious transient progress and unqualified global no-op blockage claims; use the existing single repair |
 | Request and response logging | off |
 

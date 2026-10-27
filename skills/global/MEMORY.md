@@ -1,4 +1,23 @@
-- **Probe and experiment deliberately:** Inspect visually distinct regions, boundaries, and progress indicators. When a cue suggests an interaction, gap, hazard, or traversal condition, test it with one informative legal action and compare before/after. If repeated actions produce no progress, stop and design a short sequence targeting a specific untested hypothesis.
-- **Compare before/after states:** Use one-action comparisons to infer effects and distinguish adjacency from overlap. A zero-change action is state-specific: do not repeat it from that state, but do not generalize it as a permanent rule or proof that other moves are possible. Investigate unexpected changes before assuming failure.
-- **Test preconditions and alternatives:** If reaching a target does not complete the task, test whether a precondition (traversal, collection, sequence) must be satisfied first, then retest the target. Do not assume a precondition until tested. Do not infer completion from proximity. When one approach to a repeated element or region fails, test remaining instances or alternative approaches before concluding irrelevance. When a boundary seems to block movement, look for gaps rather than assuming it is continuous.
-- **Handle ambiguous progress:** When visual state can distinguish visited from unvisited locations, use that cue to track coverage and avoid redundant retracing. When it cannot, use deliberate path tracking and methodical sweeps. If apparent exhaustive traversal does not complete the task, do not repeat the same sweep; re-examine whether the rule differs, whether separated regions were each fully traversed, or whether a required final action exists.
+- Compare the screen before and after one legal action. Motion identifies a controlled object; unchanged pixels do not establish an object's role or a universal rule. Treat large changes as interaction clues and verify them.
+
+- Treat visual interpretations as hypotheses. Choose a legal action that distinguishes plausible explanations, change one factor at a time, and compare both the visible state and environment status.
+
+- Confirm completion from an environment level change or WIN. Adjacency and a single visual effect are clues, not proof of the completion condition.
+
+- When evidence suggests an interaction, distinguish player entry, object movement, collection, and object-to-object effects with targeted tests. Test multiple-object conditions only when simpler tests leave them plausible.
+
+- Verify disappearance or relocation in later frames before calling it collection, teleportation, or a lasting mechanic; a one-frame change may be transient.
+
+- A no-op establishes only that the tested action had no visible effect from that state. Do not infer a wall, blocked target, or general reachability from it; try a safe discriminating action when useful.
+
+- For a suspected opening, test whether the player and a moved object can each pass through it. Align an object before pushing through, and avoid pinning movable objects against boundaries until the consequence is understood.
+
+- Treat trail and path color changes as visual evidence, not proof of safety or danger. Test one move onto the changed region before planning a route that depends on it.
+
+- A hazard may depend on the destination and starting state, not just the action direction. Compare the same action from meaningfully different safe states before generalizing.
+
+- If an exact state/action repeat produces no useful change, stop repeating it and choose a targeted untried action or hypothesis instead of cycling.
+
+- Repeated layouts can suggest a strategy, but verify the first relevant transition before reusing it. Keep object roles and completion rules scoped to the states where they were tested.
+
+- Track collection or progress changes as possible sub-goals. If they do not complete a level, test a separate plausible completion condition rather than assuming proximity or collection is sufficient.

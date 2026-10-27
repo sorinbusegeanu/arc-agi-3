@@ -169,11 +169,11 @@ def validate_reasoned_action(
 
     hypothesis = response["hypothesis"]
     if hypothesis is not None:
-        hypothesis = _require_keys(hypothesis, {"claim", "evidence", "uncertainty"}, "hypothesis")
+        if not isinstance(hypothesis, Mapping) or set(hypothesis) != {"claim", "evidence"}:
+            raise DecisionValidationError("hypothesis must contain claim and evidence")
         _bounded_text(hypothesis["claim"], "hypothesis.claim", 240)
         _bounded_text(hypothesis["evidence"], "hypothesis.evidence", 180)
-        if not isinstance(hypothesis["uncertainty"], str) or hypothesis["uncertainty"] not in {"tentative", "uncertain"}:
-            raise DecisionValidationError("hypothesis.uncertainty must be tentative or uncertain")
+        hypothesis = {"claim": hypothesis["claim"], "evidence": hypothesis["evidence"]}
 
     _bounded_text(response["trajectory_rationale"], "trajectory_rationale", 420)
     prediction = _require_keys(

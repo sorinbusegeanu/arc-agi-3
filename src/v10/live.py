@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import copy
 import random
 import re
 import shutil
@@ -30,8 +31,9 @@ from .analysis import (
 from .frames import IMAGE_KIND, FrameStore
 from .runlog import append_jsonl, read_jsonl, write_json
 from .strata_client import StrataRequestError, V10_VERSION, user_message
-from .tools.game import ActionError, BudgetExceeded, GameTools, evaluate_prediction
+from .tools.game import ActionError, BudgetExceeded, GameTools, evaluate_prediction, validate_decision
 from .tools.history import History
+from .tools.discovery import DISCOVERY_TOOLS, Discovery
 from .tools.memory import (
     DEFAULT_CONTEXT_ENTRIES,
     MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
@@ -50,6 +52,11 @@ from .tools.solutions import (
 )
 
 POST_MORTEM_MAX_CHARS = 4_000
+GLOBAL_MEMORY_REVIEW_TARGET_CHARS = 4_000
+MAX_DISCOVERY_PLANNING_ROUNDS = 3
+MAX_DISCOVERY_TEST_CASES = 4
+MAX_ACTION_SELECTION_COMPLETIONS = 10
+MAX_BOOTSTRAP_PLAN_ATTEMPTS = 3
 
 
 def _perceptual_state_equivalence(left: Any, right: Any) -> dict[str, Any]:
@@ -80,8 +87,14 @@ def _parse_content(content: Any) -> Any:
         raise DecisionValidationError("response content must be text")
     try:
         payload = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise DecisionValidationError(f"response is not valid JSON: {exc}") from exc
+    except json.JSONDecodeError as original_error:
+        fenced = re.findall(r"```(?:json)?[ \t]*\r?\n(.*?)```", content, flags=re.IGNORECASE | re.DOTALL)
+        if len(fenced) != 1:
+            raise DecisionValidationError(f"response is not valid JSON: {original_error}") from original_error
+        try:
+            payload = json.loads(fenced[0])
+        except json.JSONDecodeError as exc:
+            raise DecisionValidationError(f"fenced response is not valid JSON: {exc}") from exc
     return payload
 
 
@@ -227,7 +240,7 @@ _REVIEW_SYSTEM_PROMPT = """# V10 memory consolidation
 
 Review existing game MEMORY.md and shared global MEMORY.md, new ordered observations, and verified successful routes. Return only one JSON object with exactly two non-empty Markdown strings: `game_memory_markdown` and `global_memory_markdown`.
 
-Write only guidance that can change a future action and remains valid after a run restarts. Merge repetition, qualify uncertainty, correct contradictions, and preserve demonstrated strategies with level or applicability scope. Use short prose bullets under brief headings; game memory should contain only a few bullets. Level identifiers may be included to scope a finding; do not include action numbers, action counts, item counts, timelines, raw observation narration, coordinates, pixel distances, displacement values, or action sequences. Do not copy route details into memory; the exact-state route store handles precise routes and replay.
+Write only guidance that can change a future action and remains valid after a run restarts. Merge repetition, qualify unresolved claims, correct contradictions, and preserve demonstrated strategies with level or applicability scope. Use short prose bullets under brief headings; game memory should contain only a few bullets. Level identifiers may be included to scope a finding; do not include action numbers, action counts, transient collected/remaining item counts, timelines, raw observation narration, coordinates, pixel distances, displacement values, or action sequences. A stable count describing an invariant level layout may be retained only when directly observed and useful. Do not copy route details into memory; the exact-state route store handles precise routes and replay.
 
 Game memory is durable across runs. Never store the current run's status, win state, current player position, current visible goal count or location, recent action progress, or statements such as “all levels completed” or “no further levels to solve.” Do not create a “Game status,” “Current state,” or “Level progress” section. Keep one next experiment only for an active unsolved level; describe the question and discriminating test without relying on the player's current position or a transient object count. Remove that experiment when the level is completed.
 
@@ -246,11 +259,11 @@ Global memory is at most a few bullets and contains only transferable exploratio
 
 Do not promote a game mechanic or object rule into global memory unless direct transition evidence is available from at least two distinct game IDs. Repeated evidence within this game counts as one game. When only this game's evidence is available, keep the claim in game memory with its level/state scope or rewrite it as a reusable exploration method without asserting the mechanic. Record source game IDs and transition evidence IDs in review metadata, never in rendered Markdown.
 
-Promote a game-specific mechanic to established memory only when transitions directly support the same effect under a clear level/state scope. One changed frame or a model hypothesis is insufficient to identify an object or establish its mechanic. Compare new claims with existing scoped memory; resolve contradictions using observations and scope, otherwise preserve uncertainty. Never let memory prose change, replace, or broaden a verified route.
+Promote a game-specific mechanic to established memory only when transitions directly support the same effect under a clear level/state scope. One changed frame or a model hypothesis is insufficient to identify an object or establish its mechanic. Compare new claims with existing scoped memory; resolve contradictions using observations and scope, otherwise preserve the claim as unresolved. Never let memory prose change, replace, or broaden a verified route.
 
 Separate observations from explanations. Unchanged pixels show only that an action had no visible effect for that action and state; they do not prove a wall, a blocked target, that other directions are passable, or that the rest of a level is reachable. Describe an observed no-op as state-specific and do not generalize it into an obstacle mechanic without direct evidence. Do not infer completion rules from proximity. Explicitly classify repeated actions with no progress as failed or ineffective approaches, never as successful strategies. If existing memory recommends an action that new observations show repeatedly produces no visible change in the same state, remove or correct that recommendation. Scope object roles, goal identity, and completion rules to the levels where they were directly tested; do not generalize them to untested levels. Distinguish lasting mechanics from historical positions. Follow current observations when they conflict with prior memory. Do not put current run state in durable memory. Return complete replacement Markdown, retaining only concise findings that can change a future decision.
 
-The review context labels the active level and each transition's pre-action and post-action level. A transition that changes levels completed the PRE-action level; its post-action frame is the start of the next level. Never describe the new level as solved or assign its completion strategy based on that boundary transition. Claim a successful strategy only for level scopes listed in verified successful routes. If movement was observed but the level did not complete, describe it only as an observation or tentative approach. State only that an obstacle was encountered when the observations show one; never claim that an entire level has no obstacles based only on a successful route."""
+The review context labels the active level and each transition's pre-action and post-action level. A transition that changes levels completed the PRE-action level; its post-action frame is the start of the next level. Never describe the new level as solved or assign its completion strategy based on that boundary transition. Claim a successful strategy only for level scopes listed in verified successful routes. If movement was observed but the level did not complete, describe it only as an observation or unverified approach. State only that an obstacle was encountered when the observations show one; never claim that an entire level has no obstacles based only on a successful route."""
 
 _GLOBAL_MEMORY_REVIEW_SYSTEM_PROMPT = """# V10 global memory cleanup
 
@@ -281,6 +294,9 @@ def _validate_review_payload(
     game_memory_max_chars: int = MAX_MEMORY_MARKDOWN_CHARS,
     global_memory_max_chars: int = MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
 ) -> tuple[str, str]:
+    global_memory_max_chars = min(
+        int(global_memory_max_chars), MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
+    )
     expected = {"game_memory_markdown", "global_memory_markdown"}
     if not isinstance(value, Mapping) or set(value) != expected:
         raise ValueError("review response must contain exactly game_memory_markdown and global_memory_markdown")
@@ -343,6 +359,16 @@ def _review_memory_quality_errors(game_memory: str, global_memory: str) -> list[
         r"(?:blocked|impassable|unreachable|passable)\b",
         re.IGNORECASE,
     )
+    no_op_inference = re.compile(
+        r"\b(?:zero[- ]pixel(?:s)? change|zero visible (?:change|effect)|no visible (?:change|effect)|no-op)\b"
+        r".{0,120}\b(?:indicates?|indicating|shows?|showing|means?|meaning|proves?|proving|confirms?|confirming)\b.{0,80}"
+        r"\b(?:wall|walls|blocks? movement|blocked|impassable|unreachable|cannot pass|could not pass|can't pass|couldn't pass)\b",
+        re.IGNORECASE,
+    )
+    if any(no_op_inference.search(line) for line in game_memory.splitlines()):
+        errors.append(
+            "game_memory_markdown infers a general obstacle from a state-specific no-op"
+        )
     if any(no_op_claim.search(line) for line in global_memory.splitlines()):
         errors.append(
             "global_memory_markdown treats no visible change as proof of blockage or reachability"
@@ -352,11 +378,36 @@ def _review_memory_quality_errors(game_memory: str, global_memory: str) -> list[
 
 def _review_repair_prompt(base_prompt: str, errors: Any) -> str:
     """Ask for both complete Markdown fields after validation fails."""
+    error_text = str(errors)
+    repair_guidance = [
+        "Return both complete replacement Markdown fields as the required JSON object.",
+        "Address every listed validation error and preserve only durable, directly supported findings.",
+    ]
+    if "truncated at the output-token limit" in error_text:
+        repair_guidance.append(
+            "The prior JSON was truncated. Make both Markdown fields substantially shorter; target at most half of each stated character limit."
+        )
+    if "character limit" in error_text or "exceeds the" in error_text:
+        repair_guidance.append(
+            "Shorten the field named in the error below its stated character limit; merge duplicates and remove lower-value details."
+        )
+    if "transient item count" in error_text:
+        repair_guidance.append(
+            "Remove current collected/remaining counts. A fixed count that describes the level layout may stay if it is directly observed and useful."
+        )
+    if "transient current-position" in error_text or "transient status/progress" in error_text:
+        repair_guidance.append(
+            "Remove current position, run status, and recent progress; retain durable mechanics and tested strategies."
+        )
+    if "no visible change as proof" in error_text:
+        repair_guidance.append(
+            "Describe no-visible-change only for that exact action and state; do not infer a general wall or reachability rule."
+        )
     return (
         base_prompt
-        + "\n\nYour prior review response was invalid. Return both complete replacement Markdown fields "
-        "with concise content within the specified limits. Return only the required JSON object.\n"
-        "Validation errors:\n" + json.dumps(errors, ensure_ascii=False, separators=(",", ":"))
+        + "\n\nThe prior review response was invalid; return a corrected response."
+        + "\n\nRepair instructions:\n- " + "\n- ".join(repair_guidance)
+        + "\nValidation errors:\n" + json.dumps(errors, ensure_ascii=False, separators=(",", ":"))
     )
 
 
@@ -711,7 +762,7 @@ def _reasoning_evidence_record(
     decision_id: str,
     request_ids: Sequence[str],
 ) -> dict[str, Any] | None:
-    """Join an uncertain model claim and its first executed action to observations."""
+    """Join a model claim and its first executed action to observations."""
     hypothesis = decision.get("hypothesis")
     prediction = decision.get("prediction", {})
     if not isinstance(prediction, Mapping):
@@ -943,8 +994,13 @@ def _perform_review(
     trigger_reasons: Sequence[str],
     game_memory_max_chars: int = MAX_MEMORY_MARKDOWN_CHARS,
     global_memory_max_chars: int = MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
+    discovery_proposals: Sequence[Mapping[str, Any]] = (),
+    discovery_events: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Consolidate observations into model-authored game and global Markdown."""
+    global_memory_max_chars = min(
+        int(global_memory_max_chars), MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
+    )
     transition_count = 0
     image_labels: list[str] = []
     usage: dict[str, Any] = {}
@@ -1121,6 +1177,10 @@ def _perform_review(
             + json.dumps(reasoning_evidence, ensure_ascii=False, separators=(",", ":"))
             + "\n\nEvidence provenance for this review (one game cannot establish a global mechanic):\n"
             + json.dumps(evidence_provenance, ensure_ascii=False, separators=(",", ":"))
+            + "\n\nQueued discovery proposals for review (do not accept unsupported claims):\n"
+            + json.dumps(list(discovery_proposals), ensure_ascii=False, separators=(",", ":"))
+            + "\n\nDiscovery experiment outcomes and evidence references:\n"
+            + json.dumps(list(discovery_events), ensure_ascii=False, separators=(",", ":"))
             + (
                 (
                     "\n\nComplete ordered action history for the active level since it began. Use this full sequence to assess observations and avoid repeating experiments. "
@@ -1136,8 +1196,9 @@ def _perform_review(
             + "\n\nVerified successful routes (outcomes and scope are environment facts; summarize strategies without copying routes):\n"
             + json.dumps(verified_routes, ensure_ascii=False, separators=(",", ":"))
             + f"\n\nLength limits: game Markdown at most {int(game_memory_max_chars)} characters; "
-            + f"global Markdown at most {int(global_memory_max_chars)} characters. Keep game memory to a few concise bullets "
-            "and global memory to only broadly reusable bullets."
+            + f"global Markdown at most {int(global_memory_max_chars)} characters and preferably no more than "
+            + f"{min(int(global_memory_max_chars), GLOBAL_MEMORY_REVIEW_TARGET_CHARS)} characters to leave room for future updates. "
+            "Keep both fields concise; global memory contains only broadly reusable bullets."
         )
         responses: list[dict[str, Any]] = []
         review_prompt = user_prompt
@@ -1242,6 +1303,9 @@ def _perform_global_memory_review(
     global_memory_max_chars: int = MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
 ) -> dict[str, Any]:
     """Run the post-WIN cleanup pass on shared global guidance only."""
+    global_memory_max_chars = min(
+        int(global_memory_max_chars), MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
+    )
     attempts = 0
     latency = 0.0
     responses: list[dict[str, Any]] = []
@@ -1258,7 +1322,9 @@ def _perform_global_memory_review(
         f"A terminal WIN was confirmed in game {game_id}. Clean up the shared global MEMORY.md after its normal game review. "
         "The global document must guide future games, so retain reusable methods, merge duplicates, and remove the narrow or repeated tactics identified in the current draft. "
         "Use the just-reviewed game memory only to recognize general exploration methods; do not promote any game-specific mechanic or route. "
-        f"Return no more than {MAX_GLOBAL_MEMORY_REVIEW_BULLETS} concise bullets and stay within {int(global_memory_max_chars)} characters. "
+        f"Return no more than {MAX_GLOBAL_MEMORY_REVIEW_BULLETS} concise bullets, target at most "
+        f"{min(int(global_memory_max_chars), GLOBAL_MEMORY_REVIEW_TARGET_CHARS)} characters, and never exceed "
+        f"{int(global_memory_max_chars)} characters. "
         "Return a complete replacement, not a patch.\n\nCurrent global MEMORY.md:\n"
         + (prior_global_memory or "(empty)")
         + "\n\nFinal game MEMORY.md for context only:\n"
@@ -1305,8 +1371,9 @@ def _perform_global_memory_review(
                 if repair_index:
                     raise
                 prompt = (
-                    user_prompt + "\n\nThe previous output was invalid: " + str(exc)
-                    + f" Return a complete replacement with 1 to {MAX_GLOBAL_MEMORY_REVIEW_BULLETS} concise bullets."
+                    user_prompt + "\n\nRepair the invalid output: " + str(exc)
+                    + f" Return a much shorter complete replacement with 1 to {MAX_GLOBAL_MEMORY_REVIEW_BULLETS} bullets, "
+                    + f"targeting at most {min(int(global_memory_max_chars), GLOBAL_MEMORY_REVIEW_TARGET_CHARS)} characters."
                 )
 
         memory = GameMemory(
@@ -1488,6 +1555,7 @@ def _live_context(
     post_mortem_guidance: str = "",
     harness_activity: Sequence[Mapping[str, Any]] = (),
     carry_forward: Mapping[str, Any] | None = None,
+    discovery_tools: bool = True,
 ) -> dict[str, Any]:
     records = tools.history.records()
     evidence_by_id = {
@@ -1568,7 +1636,8 @@ def _live_context(
         "visible_regions_current_screen": _frame_regions(current.get("frame")),
         "global_memory": global_memory,
         "budgets": {
-            "actions_used": tools.action_count, "actions_remaining": max(0, tools.max_actions - tools.action_count),
+            "actions_used": tools.action_budget.used, "actions_remaining": tools.actions_remaining,
+            "live_actions_used": tools.action_count,
             "resets_used": tools.reset_count,
             "plan_horizon": horizon,
         },
@@ -1654,8 +1723,9 @@ def _live_context(
             "legal_actions": model_facing_action_specs(prompt_legal_actions),
         },
         "budgets": {
-            "actions_used": tools.action_count,
-            "actions_remaining": max(0, tools.max_actions - tools.action_count),
+            "actions_used": tools.action_budget.used,
+            "actions_remaining": tools.actions_remaining,
+            "live_actions_used": tools.action_count,
             "plan_horizon": horizon,
         },
         "memory": memory,
@@ -1677,6 +1747,8 @@ def _live_context(
             ],
         },
     }
+    if discovery_tools:
+        model_context["current_state"]["evidence_id"] = current.get("evidence_id")
     model_context["stagnation"] = {
         "consecutive_repeated_or_no_progress_actions": int(no_progress_actions),
         "recovery_guidance": (
@@ -1717,12 +1789,12 @@ def _live_context(
         + f"Level index {level_index} ({current.get('levels_completed')} completed). Only this level's transitions are included; earlier levels are omitted. Treat the final CURRENT SCREEN as authoritative; attached older screens and action summaries are chronological. "
         + "Memory applies only to its stated level/conditions; current images override it. "
         + (
-            f"Choose up to {horizon} legal directional actions from `current_state.legal_actions`, within `budgets.actions_remaining`; do not RESET. "
+            f"Choose up to {horizon} legal directional or WAIT actions from `current_state.legal_actions`, within `budgets.actions_remaining`; do not RESET. "
             if starting_routine else
             f"Choose up to {horizon} legal actions from `current_state.legal_actions`, within `budgets.actions_remaining`. RESET restarts the whole game; if used, return it alone with the required justification. "
         )
         + ("Use saved routes only as guidance for matching conditions. Check prior post-mortem guidance against current evidence. " if saved_route_guidance or post_mortem_guidance.strip() else "")
-        + "Return only the required `v10.reasoned_action/1` JSON object; actions must be legal and `actions` is the only action list.\n\n"
+        + ("Return a legal action decision when ready; actions must be legal and `actions` is the only action list. Discovery functions may also be called.\n\n" if discovery_tools else "Return only the required `v10.reasoned_action/1` JSON object; actions must be legal and `actions` is the only action list.\n\n")
         + "Required response contract (`v10.reasoned_action/1`):\n"
         + json.dumps(reasoned_action_contract_description(), ensure_ascii=False, separators=(",", ":"))
         + "\n" + reasoned_action_limits_description()
@@ -1737,8 +1809,6 @@ def _live_context(
         "ineffective_action_keys": ineffective_action_keys,
         "skill_sha256": hashlib.sha256(skill_path.read_bytes()).hexdigest(),
     }
-
-
 def _standard_start_routine(legal_action_specs: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Return the fixed up/left/down/right opening, limited to currently legal moves."""
     directions = ("up", "left", "down", "right")
@@ -1885,7 +1955,7 @@ def _action_conversation_observation(
         "levels_completed": current.get("levels_completed"),
         "legal_actions": model_facing_action_specs(legal_actions),
         "actions_used": tools.action_count,
-        "actions_remaining": max(0, tools.max_actions - tools.action_count),
+        "actions_remaining": tools.actions_remaining,
         "plan_horizon": int(horizon),
         "ineffective_attempts_at_current_screen": [
             {"action": model_action_name(action), "args": json.loads(args)}
@@ -2059,6 +2129,7 @@ def run_live(
     import_historical_routes: bool = True,
     game_memory_max_chars: int = MAX_MEMORY_MARKDOWN_CHARS,
     global_memory_max_chars: int = MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
+    discovery_tools: bool = True,
 ) -> dict[str, Any]:
     """Run a bounded live episode, persisting evidence before and after actions.
 
@@ -2074,6 +2145,10 @@ def run_live(
         raise ValueError("memory_context_entries must be between 0 and 5")
     if int(game_memory_max_chars) < 1 or int(global_memory_max_chars) < 1:
         raise ValueError("memory Markdown limits must be positive")
+    if int(global_memory_max_chars) > MAX_GLOBAL_MEMORY_MARKDOWN_CHARS:
+        raise ValueError(
+            f"global memory limit cannot exceed {MAX_GLOBAL_MEMORY_MARKDOWN_CHARS} characters"
+        )
     destination = Path(run_dir)
     source_skill = Path(skill_path) if skill_path is not None else shared_skill_path()
     run_id = uuid.uuid4().hex
@@ -2105,6 +2180,7 @@ def run_live(
             "review_action_threshold": REVIEW_ACTION_THRESHOLD,
             "starting_routine": bool(starting_routine),
             "import_historical_routes": bool(import_historical_routes),
+            "discovery_tools": bool(discovery_tools),
             "game_memory_max_chars": int(game_memory_max_chars),
             "global_memory_max_chars": int(global_memory_max_chars),
             **{name: getattr(client, name, None) for name in (
@@ -2121,11 +2197,14 @@ def run_live(
         },
     })
     tools = GameTools(env, destination, max_actions=max_actions)
+    discovery = Discovery(tools, run_id, game_id, memory_store_dir) if discovery_tools else None
     current = tools.observe()
     memory.record_run_state(game_id, current, step=tools.action_count)
     initial_routine_pending = bool(starting_routine and tools.supports_reset)
     bootstrap_probe_active = bool(starting_routine and tools.supports_reset)
     bootstrap_plan_pending = False
+    bootstrap_plan_attempts = 0
+    bootstrap_selection_budget: dict[str, Any] = {"completions": 0, "test_cases": 0, "test_signatures": set()}
     next_level_bootstrap_pending = False
     bootstrap_target_level_key: str | None = None
     bootstrap_target_observation: dict[str, Any] | None = None
@@ -2216,6 +2295,11 @@ def run_live(
             "game_id": game_id, "model": getattr(client, "model", None),
             "run_id": run_id, "seed": int(seed),
             "actions": tools.action_count, "action_budget": tools.max_actions,
+            "action_budget_used": tools.action_budget.used,
+            "action_budget_remaining": tools.actions_remaining,
+            "discovery_replay_actions": discovery.branch_replay_actions if discovery is not None else 0,
+            "discovery_test_actions": discovery.branch_test_actions if discovery is not None else 0,
+            "discovery_branch_resets": discovery.branch_resets if discovery is not None else 0,
             "resets": tools.reset_count,
             "model_calls": model_calls, "usage": dict(total_usage),
             "action_usage": dict(action_usage), "review_usage": dict(review_usage),
@@ -2275,7 +2359,7 @@ def run_live(
             f"[v10 live] level={level if level is not None else '?'} "
             f"({completed if completed is not None else '?'} completed"
             f"/{total if total is not None else '?'}), "
-            f"actions={tools.action_count}/{tools.max_actions} | {message}",
+            f"actions={tools.action_budget.used}/{tools.max_actions} (live={tools.action_count}) | {message}",
             file=sys.stderr, flush=True,
         )
 
@@ -2380,6 +2464,7 @@ def run_live(
             post_mortem_guidance=post_mortem_guidance,
             harness_activity=harness_activity,
             carry_forward=action_conversation_last_reasoning if preserve_reasoning else None,
+            discovery_tools=discovery_tools,
         )
         if action_conversation_pending_feedback:
             inputs["user_prompt"] += "\n\nPrevious request outcome: " + action_conversation_pending_feedback
@@ -2398,8 +2483,10 @@ def run_live(
         cursor_for_next_request: int,
         new_conversation: bool,
         directional_only: bool = False,
+        selection_budget: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str | None]:
         nonlocal model_calls, total_latency, action_conversation
+        nonlocal decision_source
         nonlocal action_conversation_level_key, action_conversation_reset_generation
         nonlocal action_conversation_level_changed_since_request
         nonlocal action_conversation_memory_hash, action_conversation_evidence_cursor
@@ -2408,9 +2495,16 @@ def run_live(
         nonlocal action_conversation_pending_feedback
         nonlocal action_conversation_post_mortem_guidance
         responses: list[dict[str, Any]] = []
-        request_messages = [dict(message) for message in initial_messages]
+        if selection_budget is None:
+            selection_budget = {"completions": 0, "test_cases": 0, "test_signatures": set()}
+        selection_budget.setdefault("completions", 0)
+        selection_budget.setdefault("test_cases", 0)
+        selection_budget.setdefault("planning_rounds", 0)
+        selection_budget.setdefault("test_signatures", set())
+        request_messages = copy.deepcopy(list(initial_messages))
         validation_error: str | None = None
         accepted: dict[str, Any] | None = None
+        ordinary_attempts = 0
 
         def with_error(messages: Sequence[dict[str, Any]], error: str) -> list[dict[str, Any]]:
             repaired = [dict(message) for message in messages]
@@ -2437,7 +2531,34 @@ def run_live(
                 raise ValueError("action conversation user content must be text or multimodal content")
             return repaired
 
-        for attempt in range(2):
+        request_budget = MAX_ACTION_SELECTION_COMPLETIONS if discovery_tools else 2
+        while int(selection_budget["completions"]) < request_budget:
+            attempt = int(selection_budget["completions"])
+            remaining = request_budget - attempt
+            tools_available = bool(
+                discovery_tools
+                and selection_budget["planning_rounds"] < MAX_DISCOVERY_PLANNING_ROUNDS
+                and selection_budget["test_cases"] < MAX_DISCOVERY_TEST_CASES
+                and remaining > 1
+            )
+            if discovery_tools and not tools_available:
+                unavailable_reasons = []
+                if selection_budget["planning_rounds"] >= MAX_DISCOVERY_PLANNING_ROUNDS:
+                    unavailable_reasons.append("the three tool-call planning rounds have been used")
+                if selection_budget["test_cases"] >= MAX_DISCOVERY_TEST_CASES:
+                    unavailable_reasons.append("the four branch-test cases have been used")
+                if remaining <= 1:
+                    unavailable_reasons.append("only one model completion remains")
+                request_messages.append({
+                    "role": "user",
+                    "content": (
+                        "ACTION DECISION REQUIRED: discovery tools are unavailable because "
+                        + "; ".join(unavailable_reasons) + ". "
+                        "Return only one JSON object matching the required v10.reasoned_action/1 schema. "
+                        "Do not emit XML tool-call markup, prose, or another discovery request."
+                    ),
+                })
+            selection_budget["completions"] = int(selection_budget["completions"]) + 1
             model_calls += 1
             try:
                 response = client.complete(
@@ -2445,6 +2566,8 @@ def run_live(
                     inputs.get("image_paths", ()), inputs.get("image_labels", ()),
                     messages=request_messages,
                     conversation_reset_count=action_conversation_reset_count,
+                    response_format=None if discovery_tools else "json_object",
+                    tools=DISCOVERY_TOOLS if tools_available else None,
                 )
             except StrataRequestError as exc:
                 model_calls += max(0, int(getattr(exc, "request_attempts", 1)) - 1)
@@ -2477,11 +2600,86 @@ def run_live(
             if isinstance(submitted_messages, list):
                 request_messages = [dict(message) for message in submitted_messages]
             try:
+                tool_calls = response.get("tool_calls", [])
+                if tool_calls and tools_available:
+                    selection_budget["planning_rounds"] += 1
+                    assistant_tool_calls = []
+                    for call_index, call in enumerate(tool_calls):
+                        function = call.get("function", {}) if isinstance(call, Mapping) else {}
+                        call_id = call.get("id") if isinstance(call, Mapping) else None
+                        name = function.get("name") if isinstance(function, Mapping) else None
+                        raw_arguments = function.get("arguments") if isinstance(function, Mapping) else None
+                        tool_label = str(name)[:80] if name is not None else "<unknown>"
+                        call_label = str(call_id)[:40] if call_id is not None else "<missing id>"
+                        print(f"[v10 tool] call: {tool_label} (id={call_label})", flush=True)
+                        try:
+                            repeated_provider_call = isinstance(call_id, str) and call_id in discovery.seen
+                            if int(selection_budget["test_cases"]) >= MAX_DISCOVERY_TEST_CASES and not repeated_provider_call:
+                                raise ValueError("branch-test budget is exhausted; return an action decision")
+                            args = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+                            if not isinstance(args, Mapping):
+                                raise ValueError("tool arguments must be a JSON object")
+                            if name == "test_hypotheses":
+                                cases = args.get("cases")
+                                if isinstance(cases, list):
+                                    case_rows = cases
+                                elif isinstance(args.get("action"), Mapping):
+                                    case_rows = [{"action": args.get("action"), "hypotheses": args.get("hypotheses", [])}]
+                                else:
+                                    case_rows = []
+                                signatures = []
+                                base_id = args.get("base_evidence_id")
+                                for case in case_rows:
+                                    if not isinstance(case, Mapping):
+                                        continue
+                                    signature_payload = {
+                                        "base_evidence_id": base_id,
+                                        "action": case.get("action"),
+                                        "predictions": sorted(
+                                            (h.get("prediction") for h in case.get("hypotheses", []) if isinstance(h, Mapping)),
+                                            key=lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")),
+                                        ),
+                                    }
+                                    signatures.append(hashlib.sha256(json.dumps(signature_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
+                                if not case_rows or selection_budget["test_cases"] + len(case_rows) > MAX_DISCOVERY_TEST_CASES:
+                                    raise ValueError(f"test_hypotheses exceeds the remaining branch-test budget ({max(0, MAX_DISCOVERY_TEST_CASES - int(selection_budget['test_cases']))} cases)")
+                                if not repeated_provider_call and (len(set(signatures)) != len(signatures) or any(sig in selection_budget["test_signatures"] for sig in signatures)):
+                                    raise ValueError("duplicate hypothesis test from the same evidence state; change the action or predictions")
+                            result = discovery.dispatch({"request_id": call_id, "tool": name, "arguments": dict(args)})
+                            if name == "test_hypotheses" and result.get("status") == "completed" and not repeated_provider_call:
+                                selection_budget["test_cases"] += len(case_rows)
+                                selection_budget["test_signatures"].update(signatures)
+                        except Exception as exc:
+                            result = {"request_id": call_id, "status": "rejected", "game_id": game_id,
+                                      "run_id": run_id, "error": {"code": "invalid_request", "message": f"{type(exc).__name__}: {exc}"}}
+                            append_jsonl(destination / "discovery.jsonl", {
+                                "request_id": call_id, "tool": name, "status": "rejected",
+                                "error": result["error"],
+                            })
+                        print(
+                            f"[v10 tool] result: {tool_label} status={result.get('status', 'unknown')}",
+                            flush=True,
+                        )
+                        assistant_tool_calls.append({"id": call_id, "type": "function", "function": {"name": name, "arguments": raw_arguments if isinstance(raw_arguments, str) else json.dumps(raw_arguments or {})}})
+                        request_messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(result, ensure_ascii=False, default=str)})
+                    request_messages.insert(len(request_messages) - len(tool_calls), {
+                        "role": "assistant", "content": response.get("content") or None,
+                        "tool_calls": assistant_tool_calls,
+                    })
+                    if int(selection_budget["completions"]) < request_budget:
+                        continue
+                    validation_error = "10-completion action-selection budget exhausted without an action decision"
+                    break
+                if tool_calls and not tools_available:
+                    validation_error = "model returned discovery tool calls after the discovery budget was exhausted"
+                    break
+                parsed = _parse_content(response.get("content"))
+                ordinary_attempts += 1
                 candidate = validate_reasoned_action(
-                    _parse_content(response.get("content")),
+                    parsed,
                     inputs["legal_action_specs"], max_actions=horizon,
                 )
-                directions = {"up", "left", "down", "right"}
+                directions = {"up", "left", "down", "right", "wait", "WAIT"}
                 if directional_only and (
                     not candidate["actions"] or any(
                         str(model_action_name(item["action"])) not in directions
@@ -2489,7 +2687,7 @@ def run_live(
                     )
                 ):
                     raise DecisionValidationError(
-                        "bootstrap plan must contain legal lowercase directional actions"
+                        "bootstrap plan must contain legal directional or wait actions"
                     )
                 if (
                     not directional_only and len(candidate["actions"]) > 1
@@ -2527,8 +2725,10 @@ def run_live(
                 return accepted, responses, validation_error
             except (DecisionValidationError, ActionError) as exc:
                 validation_error = str(exc)
-                if attempt == 0:
+                if ordinary_attempts < 2 and int(selection_budget["completions"]) < request_budget:
                     request_messages = with_error(request_messages, validation_error)
+                else:
+                    break
 
         # The invalid response is not appended. Preserve the last accepted prefix.
         action_conversation_pending_feedback = (
@@ -2583,8 +2783,16 @@ def run_live(
             memory_store_dir=memory_store_dir, trigger_reasons=reasons,
             game_memory_max_chars=game_memory_max_chars,
             global_memory_max_chars=global_memory_max_chars,
+            discovery_proposals=discovery.proposals if discovery is not None else (),
+            discovery_events=[row for row in discovery.events if row.get("status") == "experiment_scored"] if discovery is not None else (),
         )
         no_progress_actions = 0
+        if discovery is not None and result["row"].get("status") == "saved" and discovery.proposals:
+            append_jsonl(destination / "discovery.jsonl", {
+                "status":"proposals_reviewed", "proposal_count":len(discovery.proposals),
+                "review_id":result["row"].get("review_id"),
+            })
+            discovery.proposals.clear()
         recent_state_actions.clear()
         actions_since_review = 0
         attempts = int(result["attempts"])
@@ -2608,7 +2816,7 @@ def run_live(
             and not bootstrap_probe_active
             and not level_all_actions_cached
             and not current.get("terminal")
-            and tools.action_count < tools.max_actions
+            and tools.actions_remaining > 0
         ):
             perform_triggered_review(["action_set_interval"])
 
@@ -2753,7 +2961,7 @@ def run_live(
     update_metrics()
     progress(f"started game={game_id}")
     try:
-        while tools.action_count < tools.max_actions:
+        while tools.actions_remaining > 0:
             if current.get("terminal"):
                 if (
                     str(current.get("game_state", "")).upper() != "GAME_OVER"
@@ -2799,7 +3007,7 @@ def run_live(
                     "reset_evidence_id": reset_result["evidence"]["evidence_id"],
                     "reset_generation": tools.reset_generation,
                     "action_count": tools.action_count,
-                    "actions_remaining": tools.max_actions - tools.action_count,
+                    "actions_remaining": tools.actions_remaining,
                     "bootstrap_pending": initial_routine_pending,
                 })
                 progress("game over; reset game and restarting with the normal startup routine")
@@ -2829,6 +3037,8 @@ def run_live(
                         bootstrap_return_target = None
                         bootstrap_replay_edges.clear()
                         bootstrap_plan_pending = True
+                        bootstrap_plan_attempts = 0
+                        bootstrap_selection_budget = {"completions": 0, "test_cases": 0, "test_signatures": set()}
                         progress("replayed solved earlier levels; restored bootstrapped level start")
                 elif (
                     int(current.get("levels_completed") or 0)
@@ -2874,6 +3084,7 @@ def run_live(
             decision_source = "model"
             solution_edges: list[dict[str, Any]] = []
             starter_chunk = False
+            bootstrap_fallback_pending = False
 
             if bootstrap_replay_edges:
                 decision_source = "bootstrap_replay"
@@ -2941,16 +3152,40 @@ def run_live(
                         inputs, pending_messages, int(plan_horizon),
                         cursor_for_next_request=cursor_for_next_request,
                         new_conversation=new_conversation, directional_only=True,
+                        selection_budget=bootstrap_selection_budget,
                     )
                 except StrataRequestError as exc:
                     validation_error = f"bootstrap planning request failed: {exc}"
                 if decision is not None:
+                    bootstrap_plan_attempts = 0
                     reasoned_decision = decision
                     starter_queue = list(decision["actions"])
                     starter_queue_source = "bootstrap_model_start"
                 else:
-                    starter_queue = _standard_start_routine(inputs["legal_action_specs"])
-                    starter_queue_source = "bootstrap_start_fallback"
+                    bootstrap_plan_attempts += 1
+                    append_jsonl(decisions_path, {
+                        "schema": "v10.live_bootstrap_plan/1", "status": "rejected",
+                        "attempt": bootstrap_plan_attempts,
+                        "validation_error": validation_error,
+                        "request_ids": [request_id for item in responses for request_id in item.get("request_ids", [])],
+                        "request_attempts": sum(int(item.get("request_attempts", 1)) for item in responses),
+                    })
+                    if (
+                        bootstrap_plan_attempts < MAX_BOOTSTRAP_PLAN_ATTEMPTS
+                        and int(bootstrap_selection_budget["completions"]) < MAX_ACTION_SELECTION_COMPLETIONS
+                    ):
+                        bootstrap_plan_pending = True
+                        progress(
+                            "startup plan invalid; asking the model again "
+                            f"({bootstrap_plan_attempts}/{MAX_BOOTSTRAP_PLAN_ATTEMPTS})"
+                        )
+                        update_metrics()
+                        continue
+                    bootstrap_fallback_pending = True
+                    progress(
+                        "startup planning ended without a valid plan after "
+                        f"{bootstrap_plan_attempts} plan(s); using a legal directional fallback"
+                    )
                 if starter_queue:
                     decision_source = starter_queue_source
                     decision = {"actions": starter_queue[:int(plan_horizon)]}
@@ -2983,21 +3218,22 @@ def run_live(
                     # A stored edge may no longer be legal; ask the model from the current state.
                     cached_path_error = f"cached path is no longer valid: {exc}"
                     solution_edges = []
-            if decision is None and not solution_edges:
+            if decision is None and not solution_edges and not bootstrap_fallback_pending:
                 force_model_selection = False
                 validation_error = None
-                if no_progress_actions >= 2:
-                    decision_horizon = 1
-                inputs, pending_messages, cursor_for_next_request, new_conversation = prepare_action_turn(
-                    decision_horizon, starting_routine=False,
-                )
-                decision, responses, validation_error = request_action_plan(
-                    inputs, pending_messages, decision_horizon,
-                    cursor_for_next_request=cursor_for_next_request,
-                    new_conversation=new_conversation,
-                )
-                if decision is not None:
-                    reasoned_decision = decision
+                if decision is None:
+                    if no_progress_actions >= 2:
+                        decision_horizon = 1
+                    inputs, pending_messages, cursor_for_next_request, new_conversation = prepare_action_turn(
+                        decision_horizon, starting_routine=False,
+                    )
+                    decision, responses, validation_error = request_action_plan(
+                        inputs, pending_messages, decision_horizon,
+                        cursor_for_next_request=cursor_for_next_request,
+                        new_conversation=new_conversation,
+                    )
+                    if decision is not None:
+                        reasoned_decision = decision
             if starter_chunk:
                 progress(f"using {decision_source} ({len(starter_queue)} starter actions queued)")
             if decision is None:
@@ -3010,8 +3246,15 @@ def run_live(
                 "request_ids": [request_id for item in responses for request_id in item.get("request_ids", [])],
                     "latency_seconds": round(sum(float(item.get("latency_seconds", 0.0)) for item in responses), 6),
                 })
+                fallback_legal_actions = current.get("legal_actions", [])
+                if bootstrap_fallback_pending:
+                    directional_names = {"up", "down", "left", "right", "wait", "WAIT"}
+                    fallback_legal_actions = [
+                        action for action in _public_actions(fallback_legal_actions)
+                        if str(model_action_name(action.get("id"))) in directional_names
+                    ]
                 fallback = _random_legal_action(
-                    current.get("legal_actions", []), fallback_rng,
+                    fallback_legal_actions, fallback_rng,
                     exclude_actions=inputs.get("ineffective_action_ids", ()),
                 )
                 real_action_ids = {
@@ -3035,19 +3278,24 @@ def run_live(
                     update_metrics()
                     continue
                 if fallback is None:
-                    stop_reason = "invalid_decision_no_legal_fallback"
+                    stop_reason = (
+                        "invalid_bootstrap_no_legal_fallback" if bootstrap_fallback_pending
+                        else "invalid_decision_no_legal_fallback"
+                    )
                     append_jsonl(decisions_path, {
                         "schema": "v10.live_fallback/2", "status": "unavailable",
-                        "reason": "no legal action has arguments that can be generated safely",
+                        "reason": (
+                            "no legal directional or wait action has arguments that can be generated safely"
+                            if bootstrap_fallback_pending
+                            else "no legal action has arguments that can be generated safely"
+                        ),
                         "validation_error": validation_error,
                     })
                     break
                 action_number = tools.action_count + 1
                 fallback_name = model_action_name(fallback["action"])
-                progress(
-                    f"decision invalid after repair; taking random legal fallback action "
-                    f"{action_number}: {fallback_name}"
-                )
+                fallback_cause = "bootstrap_plan_invalid" if bootstrap_fallback_pending else "invalid_decision"
+                progress(f"taking legal fallback action {action_number}: {fallback_name} (cause={fallback_cause})")
                 before_observation = current
                 previous_level = current.get("level")
                 previous_levels_completed = current.get("levels_completed")
@@ -3063,7 +3311,7 @@ def run_live(
                 memory.record_run_state(game_id, current, step=tools.action_count)
                 append_jsonl(decisions_path, {
                     "schema": "v10.live_fallback/2", "status": "executed",
-                    "cause": "invalid_decision", "validation_error": validation_error,
+                    "cause": fallback_cause, "validation_error": validation_error,
                     "action": fallback_name, "args": fallback["args"],
                     "evidence_id": result["evidence"]["evidence_id"],
                 })
@@ -3168,7 +3416,7 @@ def run_live(
                 decision_horizon if decision_source == "model" else int(plan_horizon)
             )
             for action_index, action in enumerate(actions[:execution_horizon]):
-                if tools.action_count >= tools.max_actions:
+                if tools.actions_remaining <= 0:
                     interruption = "action_budget_exhausted"
                     break
                 if decision_source == "model" and not bootstrap_probe_active:
@@ -3379,6 +3627,8 @@ def run_live(
                 "schema": "v10.live_plan_result/2", "status": "interrupted" if interruption else "completed",
                 "executed": executed, "interrupt_reason": interruption,
             })
+            if stop_reason == "unknown_execution":
+                break
             if decision_source in {"model", "bootstrap_model_start"} and reasoned_decision is not None:
                 action_conversation_pending_plan = {
                     "planned_count": len(actions), "executed_count": len(executed),
@@ -3411,6 +3661,8 @@ def run_live(
                 bootstrap_probe_active = False
                 if level_key(current) == target_level_key:
                     bootstrap_plan_pending = True
+                    bootstrap_plan_attempts = 0
+                    bootstrap_selection_budget = {"completions": 0, "test_cases": 0, "test_signatures": set()}
                     bootstrap_return_target = None
                 else:
                     bootstrap_plan_pending = False
@@ -3459,7 +3711,7 @@ def run_live(
                 continue
         if current.get("terminal") and stop_reason != "game_over_reset_failed":
             stop_reason = "win" if current.get("game_state") == "WIN" else "game_over"
-        elif tools.action_count >= tools.max_actions and stop_reason not in {
+        elif tools.actions_remaining <= 0 and stop_reason not in {
             "invalid_decision", "invalid_decision_no_legal_fallback",
             "model_returned_no_actions", "action_error",
         }:

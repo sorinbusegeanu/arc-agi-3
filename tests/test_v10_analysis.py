@@ -286,7 +286,6 @@ def test_reasoned_action_contract_requires_categorical_assessment_and_single_act
         "hypothesis": {
             "claim": "Moving down may affect the boundary-like element.",
             "evidence": "the current screen shows it beside the player",
-            "uncertainty": "tentative",
         },
         "trajectory_rationale": "Test one legal action to distinguish movement from blockage.",
         "prediction": {"visible_change": "yes", "environment_outcome": "no_terminal", "description": "the visible board changes"},
@@ -296,7 +295,14 @@ def test_reasoned_action_contract_requires_categorical_assessment_and_single_act
     normalized = validate_reasoned_action(payload, context["legal_action_specs"], max_actions=1)
 
     assert normalized["actions"][0]["action"] == "ACTION2"
-    assert normalized["hypothesis"]["uncertainty"] == "tentative"
+    assert normalized["hypothesis"] == {
+        "claim": "Moving down may affect the boundary-like element.",
+        "evidence": "the current screen shows it beside the player",
+    }
+    payload["hypothesis"]["uncertainty"] = "unknown"
+    with pytest.raises(DecisionValidationError, match="hypothesis must contain claim and evidence"):
+        validate_reasoned_action(payload, context["legal_action_specs"], max_actions=1)
+    del payload["hypothesis"]["uncertainty"]
     payload["state_assessment"]["player"]["certainty"] = 0.9
     with pytest.raises(DecisionValidationError, match="certainty must be"):
         validate_reasoned_action(payload, context["legal_action_specs"], max_actions=1)
@@ -544,7 +550,7 @@ def test_model_logging_cli_flags_default_off_and_enable_independently() -> None:
     assert defaults.log_request is False
     assert defaults.log_response is False
     assert defaults.reset_memory is False
-    assert defaults.global_memory_max_chars == 6000
+    assert defaults.global_memory_max_chars == 4500
     assert defaults.plan_horizon == 8
     assert defaults.max_output_tokens == 6144
     with pytest.raises(SystemExit):
@@ -558,9 +564,13 @@ def test_model_logging_cli_flags_default_off_and_enable_independently() -> None:
     ])
     assert reset.reset_memory is True
     configured_memory = parser.parse_args([
-        "live", "--game-id", "ez01", "--run-dir", "run", "--global-memory-max-chars", "7200",
+        "live", "--game-id", "ez01", "--run-dir", "run", "--global-memory-max-chars", "4200",
     ])
-    assert configured_memory.global_memory_max_chars == 7200
+    assert configured_memory.global_memory_max_chars == 4200
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "live", "--game-id", "ez01", "--run-dir", "run", "--global-memory-max-chars", "4501",
+        ])
     configured_horizon = parser.parse_args([
         "live", "--game-id", "ez01", "--run-dir", "run", "--plan-horizon", "8",
     ])
@@ -569,15 +579,21 @@ def test_model_logging_cli_flags_default_off_and_enable_independently() -> None:
 
 def test_cli_reports_v10_patch_version_and_context_override(capsys) -> None:
     parser = build_parser()
+    defaults = parser.parse_args(["live", "--game-id", "ez01", "--run-dir", "run"])
+    assert defaults.discovery_tools is True
+    disabled = parser.parse_args(["live", "--game-id", "ez01", "--run-dir", "run", "--no-discovery-tools"])
+    assert disabled.discovery_tools is False
     with pytest.raises(SystemExit) as version_exit:
         parser.parse_args(["--version"])
     assert version_exit.value.code == 0
-    assert capsys.readouterr().out.strip() == "v10 10.0.3"
+    assert capsys.readouterr().out.strip() == "v10 10.0.18"
 
     configured = parser.parse_args([
         "live", "--game-id", "ez01", "--run-dir", "run", "--context-window-tokens", "32768",
+        "--discovery-tools",
     ])
     assert configured.context_window_tokens == 32768
+    assert configured.discovery_tools is True
 
 
 def test_strata_context_window_is_discovered_from_model_metadata(monkeypatch) -> None:
@@ -724,6 +740,37 @@ def test_strata_client_can_omit_json_response_format_for_review_markdown(monkeyp
 
     assert "response_format" not in payloads[0]
     assert response["content"] == "## Patterns\\nObserved."
+
+
+def test_strata_client_sends_native_tools_and_parses_tool_calls(monkeypatch) -> None:
+    payloads = []
+
+    class FakeResponse:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "call-1", "type": "function", "function": {"name": "inspect_region", "arguments": "{}"}},
+            ]}, "finish_reason": "tool_calls"}]}).encode()
+
+    def fake_urlopen(request, **kwargs):
+        payloads.append(json.loads(request.data))
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    client = StrataClient("http://strata.example", "qwen-test")
+    history = [{"role": "system", "content": "sys"}, {"role": "user", "content": "act"}]
+    schema = [{"type": "function", "function": {"name": "inspect_region", "parameters": {"type": "object"}}}]
+
+    response = client.complete("sys", "act", messages=history, tools=schema)
+
+    assert "response_format" not in payloads[0]
+    assert payloads[0]["tools"] == schema
+    assert payloads[0]["tool_choice"] == "auto"
+    assert payloads[0]["parallel_tool_calls"] is False
+    assert response["tool_calls"][0]["id"] == "call-1"
+    assert response["finish_reason"] == "tool_calls"
 
 
 @pytest.mark.parametrize("body", [

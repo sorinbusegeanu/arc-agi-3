@@ -21,7 +21,7 @@ DEFAULT_STRATA_BASE_URL = "http://127.0.0.1:8080"
 DEFAULT_STRATA_MODEL = "qwen3.8-flash-next-iq3_s"
 DEFAULT_REASONING_EFFORT = "medium"
 DEFAULT_MAX_OUTPUT_TOKENS = 6144
-V10_VERSION = "10.0.3"
+V10_VERSION = "10.0.18"
 
 
 def user_message(
@@ -115,6 +115,7 @@ class StrataClient:
         *,
         messages: Sequence[dict[str, Any]] | None = None,
         conversation_reset_count: int | None = None,
+        tools: Sequence[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         self._request_ids = []
         if messages is None:
@@ -128,8 +129,8 @@ class StrataClient:
                 raise ValueError("messages must not be empty")
             if any(
                 not isinstance(message, dict)
-                or message.get("role") not in {"system", "user", "assistant"}
-                or not isinstance(message.get("content"), (str, list))
+                or message.get("role") not in {"system", "user", "assistant", "tool"}
+                or not (isinstance(message.get("content"), (str, list)) or (message.get("role") == "assistant" and message.get("content") is None))
                 for message in request_messages
             ):
                 raise ValueError("messages must contain system, user, or assistant messages with text or multimodal content")
@@ -140,7 +141,11 @@ class StrataClient:
             "temperature": 0,
             "reasoning_effort": self.reasoning_effort,
         }
-        if response_format is not None:
+        if tools:
+            payload["tools"] = copy.deepcopy(list(tools))
+            payload["tool_choice"] = "auto"
+            payload["parallel_tool_calls"] = False
+        elif response_format is not None:
             payload["response_format"] = {"type": str(response_format)}
         if self.reasoning_budget_tokens is not None:
             payload["reasoning_budget_tokens"] = self.reasoning_budget_tokens
@@ -186,12 +191,17 @@ class StrataClient:
             if not isinstance(message, dict):
                 raise ValueError("response message must be an object")
             content_text = message.get("content")
+            tool_calls = message.get("tool_calls", [])
             if isinstance(content_text, list):
                 content_text = "".join(
                     part.get("text", "") for part in content_text if isinstance(part, dict)
                 )
+            if content_text is None and isinstance(tool_calls, list) and tool_calls:
+                content_text = ""
             if not isinstance(content_text, str):
                 raise ValueError("response content is not text")
+            if not isinstance(tool_calls, list):
+                raise ValueError("response tool_calls is not an array")
         except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise StrataRequestError(
                 f"invalid Strata response: {exc}", request_attempts=request_attempts,
@@ -205,6 +215,7 @@ class StrataClient:
         timings = result.get("timings") if isinstance(result.get("timings"), dict) else {}
         return {
             "content": content_text,
+            "tool_calls": copy.deepcopy(tool_calls),
             "model": result.get("model", self.model),
             "finish_reason": choices[0].get("finish_reason"),
             "usage": {
