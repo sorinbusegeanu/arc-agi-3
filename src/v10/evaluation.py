@@ -23,6 +23,7 @@ def _summary(record: dict[str, Any]) -> dict[str, Any]:
         "scored_actions": len(scored),
         "matched_actions": sum(item.get("status") == "matched" for item in scored),
         "usage": record["usage"], "latency_seconds": record["latency_seconds"],
+        "backend": record.get("backend", "strata"),
         "model": record.get("model"),
     }
 
@@ -57,6 +58,7 @@ def run_ablation(
         "schema": "v10.ablation/1", "run_id": run_id,
         "through_action": int(through_action), "horizon": int(horizon),
         "max_output_tokens": getattr(client, "max_output_tokens", None),
+        "backend": getattr(client, "backend", "strata"),
         "compare_prior_decisions": bool(compare_prior_decisions), "arms": arms,
     }
     append_jsonl(Path(run_dir) / "ablation_runs.jsonl", record)

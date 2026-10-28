@@ -536,6 +536,7 @@ def run_analysis(
         "prompt_version": "v10.analysis_prompt/2",
         "source_trace_sha256": inputs["manifest"].get("source_sha256"),
         "skill_sha256": inputs["skill_sha256"],
+        "backend": responses[-1].get("backend", getattr(client, "backend", "strata")),
         "model": responses[-1].get("model"),
         "through_action": int(through_action),
         "conditioning": conditioning,

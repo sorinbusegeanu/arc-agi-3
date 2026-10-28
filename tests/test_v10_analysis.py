@@ -22,7 +22,14 @@ from v10.cli import build_parser
 from v10.frames import FrameStore, png_bytes
 from v10.evaluation import run_ablation
 from v10.replay import replay_trace
-from v10.strata_client import StrataClient, StrataRequestError
+from v10.strata_client import (
+    DEFAULT_STRATA_BASE_URL,
+    DEFAULT_STRATA_MODEL,
+    DEFAULT_VLLM_BASE_URL,
+    DEFAULT_VLLM_MODEL,
+    StrataClient,
+    StrataRequestError,
+)
 from v10.tools.game import evaluate_prediction
 from v10.tools.history import History
 
@@ -149,7 +156,9 @@ def test_ablation_runs_matched_profiles_without_writing_analysis_decisions(tmp_p
     run_dir = tmp_path / "run"
     replay_trace(trace, run_dir)
 
-    result = run_ablation(run_dir, _FakeClient(), through_action=4, horizon=2)
+    client = _FakeClient()
+    client.backend = "vllm"
+    result = run_ablation(run_dir, client, through_action=4, horizon=2)
 
     assert [arm["conditioning"] for arm in result["arms"]] == [
         profile for profile in ("pixels_actions", "pixels_actions_memory")
@@ -157,6 +166,8 @@ def test_ablation_runs_matched_profiles_without_writing_analysis_decisions(tmp_p
     ]
     assert [arm["include_prior_decisions"] for arm in result["arms"]] == [False, True] * 2
     assert all(arm["status"] == "ok" for arm in result["arms"])
+    assert result["backend"] == "vllm"
+    assert all(arm["backend"] == "vllm" for arm in result["arms"])
     assert not (run_dir / "decisions.jsonl").exists()
     assert (run_dir / "ablation_runs.jsonl").exists()
 
@@ -167,6 +178,7 @@ def test_run_analysis_scores_matching_recorded_action_after_model_call(tmp_path:
     run_dir = tmp_path / "run"
     replay_trace(trace, run_dir)
     client = _FakeClient()
+    client.backend = "vllm"
 
     result = run_analysis(run_dir, client, through_action=4)
 
@@ -182,6 +194,7 @@ def test_run_analysis_scores_matching_recorded_action_after_model_call(tmp_path:
     assert "memory_patch" not in client.calls[0][1]
     assert "hypotheses_item" not in client.calls[0][1]
     assert result["usage"]["total_tokens"] == 17
+    assert result["backend"] == "vllm"
     assert (run_dir / "decisions.jsonl").exists()
 
 
@@ -479,6 +492,105 @@ def test_strata_client_sends_labeled_images_and_parses_usage(tmp_path: Path) -> 
     assert response_record["body"] == response_body.decode()
 
 
+def test_vllm_client_preserves_messages_and_uses_openai_compatible_fields(monkeypatch, tmp_path: Path) -> None:
+    payloads = []
+    history = [
+        {"role": "system", "content": "unchanged system prompt"},
+        {"role": "user", "content": [
+            {"type": "text", "text": "unchanged user prompt"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ]},
+    ]
+    tools = [{"type": "function", "function": {"name": "inspect_region", "parameters": {"type": "object"}}}]
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self):
+            return json.dumps({
+                "model": "custom/served-model",
+                "choices": [{"message": {"content": None, "tool_calls": [
+                    {"id": "call-vllm", "type": "function", "function": {"name": "inspect_region", "arguments": "{}"}},
+                ]}, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15},
+            }).encode()
+
+    def fake_urlopen(request, **kwargs):
+        assert request.full_url == "http://vllm.example/v1/chat/completions"
+        payloads.append(json.loads(request.data))
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    client = StrataClient(
+        "http://vllm.example", "custom/served-model", backend="vllm",
+        reasoning_effort="high", reasoning_budget_tokens=128,
+        log_request=True, log_response=True, log_dir=tmp_path,
+    )
+
+    result = client.complete("ignored", "ignored", messages=history, tools=tools)
+
+    payload = payloads[0]
+    assert payload["model"] == "custom/served-model"
+    assert payload["messages"] == history
+    assert payload["tools"] == tools
+    assert payload["tool_choice"] == "auto"
+    assert payload["parallel_tool_calls"] is False
+    assert payload["max_tokens"] == 6144
+    assert "reasoning_effort" not in payload
+    assert "reasoning_budget_tokens" not in payload
+    assert result["backend"] == "vllm"
+    assert result["tool_calls"][0]["id"] == "call-vllm"
+
+    client.complete("ignored", "ignored", messages=history, response_format="json_object")
+    assert payloads[1]["messages"] == history
+    assert payloads[1]["response_format"] == {"type": "json_object"}
+    request_record = json.loads((tmp_path / "model_requests.jsonl").read_text().splitlines()[0])
+    response_record = json.loads((tmp_path / "model_responses.jsonl").read_text().splitlines()[0])
+    assert request_record["backend"] == response_record["backend"] == "vllm"
+
+
+def test_vllm_client_discovers_max_model_len(monkeypatch) -> None:
+    body = json.dumps({"data": [{"id": "custom/served-model", "max_model_len": 131072}]}).encode()
+
+    class FakeResponse:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self): return body
+
+    def fake_urlopen(request, timeout):
+        assert request.full_url == "http://vllm.example/v1/models"
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    client = StrataClient("http://vllm.example", "custom/served-model", backend="vllm")
+
+    assert client.discover_context_window_tokens() == 131072
+
+
+def test_vllm_client_uses_vllm_api_key_environment(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_API_KEY", "vllm-key")
+    monkeypatch.setenv("STRATA_API_KEY", "strata-key")
+
+    client = StrataClient("http://vllm.example", "custom/served-model", backend="vllm")
+
+    assert client.api_key == "vllm-key"
+
+
+def test_vllm_client_surfaces_endpoint_errors(monkeypatch) -> None:
+    def reject_request(request, **kwargs):
+        raise urllib.error.HTTPError(
+            request.full_url, 400, "Bad Request", {}, io.BytesIO(b'{"error":"unsupported model"}'),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", reject_request)
+    client = StrataClient("http://vllm.example", "custom/text-model", backend="vllm")
+
+    with pytest.raises(StrataRequestError, match="vLLM HTTP 400.*unsupported model"):
+        client.complete("system", "user")
+
+
 def test_strata_client_preserves_multimodal_conversation_and_logs_cache_usage(tmp_path: Path) -> None:
     from v10.strata_client import user_message
 
@@ -581,12 +693,16 @@ def test_cli_reports_v10_patch_version_and_context_override(capsys) -> None:
     parser = build_parser()
     defaults = parser.parse_args(["live", "--game-id", "ez01", "--run-dir", "run"])
     assert defaults.discovery_tools is True
+    assert defaults.vllm is False
+    assert cli_module._selected_model_backend(defaults) == (
+        "strata", DEFAULT_STRATA_BASE_URL, DEFAULT_STRATA_MODEL,
+    )
     disabled = parser.parse_args(["live", "--game-id", "ez01", "--run-dir", "run", "--no-discovery-tools"])
     assert disabled.discovery_tools is False
     with pytest.raises(SystemExit) as version_exit:
         parser.parse_args(["--version"])
     assert version_exit.value.code == 0
-    assert capsys.readouterr().out.strip() == "v10 10.0.22"
+    assert capsys.readouterr().out.strip() == "v10 10.0.29"
 
     configured = parser.parse_args([
         "live", "--game-id", "ez01", "--run-dir", "run", "--context-window-tokens", "32768",
@@ -594,6 +710,33 @@ def test_cli_reports_v10_patch_version_and_context_override(capsys) -> None:
     ])
     assert configured.context_window_tokens == 32768
     assert configured.discovery_tools is True
+
+    vllm = parser.parse_args([
+        "live", "--game-id", "ez01", "--run-dir", "run", "--vllm",
+    ])
+    assert cli_module._selected_model_backend(vllm) == (
+        "vllm", DEFAULT_VLLM_BASE_URL, DEFAULT_VLLM_MODEL,
+    )
+    override = parser.parse_args([
+        "live", "--game-id", "ez01", "--run-dir", "run", "--vllm",
+        "--base-url", "http://custom-vllm:9000/v1", "--model", "org/any-model",
+    ])
+    assert cli_module._selected_model_backend(override) == (
+        "vllm", "http://custom-vllm:9000/v1", "org/any-model",
+    )
+
+
+@pytest.mark.parametrize("command,required", [
+    ("analyze", ["--run-dir", "run"]),
+    ("ablate", ["--run-dir", "run"]),
+    ("optimize", ["--run-dir", "run"]),
+    ("live", ["--game-id", "ez01", "--run-dir", "run"]),
+])
+def test_model_backed_cli_commands_accept_vllm_and_model(command: str, required: list[str]) -> None:
+    args = build_parser().parse_args([command, *required, "--vllm", "--model", "Qwen/custom"])
+
+    assert args.vllm is True
+    assert args.model == "Qwen/custom"
 
 
 def test_strata_context_window_is_discovered_from_model_metadata(monkeypatch) -> None:
@@ -656,6 +799,34 @@ def test_live_reset_memory_flag_clears_persistent_memory_before_run(tmp_path: Pa
     ])
 
     assert result == 0
+
+
+def test_live_cli_passes_vllm_backend_and_model_to_client(tmp_path: Path, monkeypatch) -> None:
+    from v10 import arcade_env
+
+    received = {}
+
+    class CapturingClient:
+        def __init__(self, **kwargs):
+            received.update(kwargs)
+
+    class FakeEnv:
+        def __init__(self, *args, **kwargs): pass
+        def close(self): pass
+
+    monkeypatch.setattr(cli_module, "StrataClient", CapturingClient)
+    monkeypatch.setattr(cli_module, "run_live", lambda *args, **kwargs: {"started": True})
+    monkeypatch.setattr(arcade_env, "ArcadeGameEnv", FakeEnv)
+
+    result = cli_module.main([
+        "live", "--game-id", "ez01", "--run-dir", str(tmp_path / "run"),
+        "--vllm", "--base-url", "http://vllm.example:8000/v1", "--model", "org/served-model",
+    ])
+
+    assert result == 0
+    assert received["backend"] == "vllm"
+    assert received["base_url"] == "http://vllm.example:8000/v1"
+    assert received["model"] == "org/served-model"
 
 
 def test_strata_client_falls_back_when_strata_rejects_json_mode_output(tmp_path: Path) -> None:

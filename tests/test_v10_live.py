@@ -4,6 +4,7 @@ import json
 import copy
 import re
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -40,6 +41,32 @@ def test_perceptual_equivalence_is_sparse_exploration_signal_only() -> None:
     assert "hidden state is unknown" in signal["reason"]
     assert _perceptual_state_equivalence(base, moved_object)["equivalent"] is False
     assert _perceptual_state_equivalence(np.zeros((8, 8)), np.zeros((8, 8)))["certainty"] == "unreliable"
+
+
+def test_shared_global_memory_review_lock_is_held_during_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = threading.RLock()
+    lock_states = []
+
+    def review(*args, **kwargs):
+        lock_states.append(lock._is_owned())
+        return {
+            "row": {"status": "failed"}, "attempts": 0,
+            "usage": {}, "latency_seconds": 0.0,
+        }
+
+    monkeypatch.setattr(live_module, "_perform_review", review)
+    monkeypatch.setattr(live_module, "REVIEW_ACTION_THRESHOLD", 1)
+    client = _FakeClient([_decision([_action()]) for _ in range(3)])
+
+    run_live(
+        _FakeEnv(), tmp_path / "locked-review", client, game_id="fixture",
+        state_dir=tmp_path / "state", starting_routine=False, max_actions=3,
+        plan_horizon=1, global_memory_lock=lock,
+    )
+
+    assert lock_states == [True]
 
 
 def test_action_decision_parser_accepts_one_fenced_json_object_with_prose() -> None:

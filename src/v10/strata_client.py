@@ -1,4 +1,4 @@
-"""Small OpenAI-compatible multimodal client for a configured Strata endpoint."""
+"""Small OpenAI-compatible multimodal client for Strata and vLLM endpoints."""
 
 from __future__ import annotations
 
@@ -19,9 +19,11 @@ from .runlog import append_jsonl
 
 DEFAULT_STRATA_BASE_URL = "http://127.0.0.1:8080"
 DEFAULT_STRATA_MODEL = "qwen3.8-flash-next-iq3_s"
+DEFAULT_VLLM_BASE_URL = "http://192.168.0.51:8000"
+DEFAULT_VLLM_MODEL = "Qwen/Qwen3-VL-4B-Thinking-FP8"
 DEFAULT_REASONING_EFFORT = "medium"
 DEFAULT_MAX_OUTPUT_TOKENS = 6144
-V10_VERSION = "10.0.22"
+V10_VERSION = "10.0.29"
 
 
 def user_message(
@@ -29,7 +31,7 @@ def user_message(
     image_paths: Sequence[Path] = (),
     image_labels: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """Build one immutable multimodal user turn in the format sent to Strata."""
+    """Build one immutable multimodal user turn in OpenAI-compatible format."""
     content: list[dict[str, Any]] = [{"type": "text", "text": str(text)}]
     for index, path in enumerate(image_paths):
         label = image_labels[index] if index < len(image_labels) else f"Image {index + 1}"
@@ -70,12 +72,23 @@ class StrataClient:
         log_response: bool = False,
         log_dir: str | Path | None = None,
         context_window_tokens: int | None = None,
+        backend: str = "strata",
     ) -> None:
+        backend = str(backend).strip().lower()
+        if backend not in {"strata", "vllm"}:
+            raise ValueError("backend must be strata or vllm")
+        self.backend = backend
+        self.backend_label = "Strata" if backend == "strata" else "vLLM"
         self.base_url = str(base_url).rstrip("/")
         self.model = str(model).strip()
         if not self.base_url or not self.model:
             raise ValueError("base_url and model are required")
-        self.api_key = api_key if api_key is not None else os.environ.get("STRATA_API_KEY")
+        if api_key is None:
+            env_key = "VLLM_API_KEY" if backend == "vllm" else "STRATA_API_KEY"
+            api_key = os.environ.get(env_key)
+            if backend == "vllm" and api_key is None:
+                api_key = os.environ.get("STRATA_API_KEY")
+        self.api_key = api_key
         self.timeout_seconds = float(timeout_seconds)
         self.max_output_tokens = int(max_output_tokens)
         if reasoning_effort not in {"none", "low", "medium", "high"}:
@@ -139,15 +152,16 @@ class StrataClient:
             "messages": request_messages,
             "max_tokens": self.max_output_tokens,
             "temperature": 0,
-            "reasoning_effort": self.reasoning_effort,
         }
+        if self.backend == "strata":
+            payload["reasoning_effort"] = self.reasoning_effort
         if tools:
             payload["tools"] = copy.deepcopy(list(tools))
             payload["tool_choice"] = "auto"
             payload["parallel_tool_calls"] = False
         elif response_format is not None:
             payload["response_format"] = {"type": str(response_format)}
-        if self.reasoning_budget_tokens is not None:
+        if self.backend == "strata" and self.reasoning_budget_tokens is not None:
             payload["reasoning_budget_tokens"] = self.reasoning_budget_tokens
         conversation_message_count = len(request_messages) if messages is not None else None
         request_attempts = 1
@@ -204,7 +218,7 @@ class StrataClient:
                 raise ValueError("response tool_calls is not an array")
         except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise StrataRequestError(
-                f"invalid Strata response: {exc}", request_attempts=request_attempts,
+                f"invalid {self.backend_label} response: {exc}", request_attempts=request_attempts,
                 latency_seconds=total_latency,
             ) from exc
         usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
@@ -214,6 +228,7 @@ class StrataClient:
         cached_prompt_tokens = prompt_details.get("cached_tokens")
         timings = result.get("timings") if isinstance(result.get("timings"), dict) else {}
         return {
+            "backend": self.backend,
             "content": content_text,
             "tool_calls": copy.deepcopy(tool_calls),
             "model": result.get("model", self.model),
@@ -237,7 +252,7 @@ class StrataClient:
         }
 
     def discover_context_window_tokens(self) -> int | None:
-        """Read the loaded model's effective context from Strata's model list."""
+        """Read the loaded model's effective context from the endpoint model list."""
         if self.context_window_tokens is not None:
             return self.context_window_tokens
         models_url = self.base_url if self.base_url.endswith("/v1") else self.base_url + "/v1"
@@ -253,7 +268,7 @@ class StrataClient:
                     if not isinstance(model, dict):
                         continue
                     meta = model.get("meta") if isinstance(model.get("meta"), dict) else {}
-                    limit = meta.get("n_ctx")
+                    limit = meta.get("n_ctx") or model.get("max_model_len")
                     if limit is not None and int(limit) > 0:
                         self.context_window_tokens = int(limit)
                         return self.context_window_tokens
@@ -305,6 +320,7 @@ class StrataClient:
             append_jsonl(self.log_dir / "model_requests.jsonl", {
                 "request_id": request_id,
                 "sequence": self._request_sequence,
+                "backend": self.backend,
                 "endpoint": self.endpoint,
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "payload_bytes": len(request.data or b""),
@@ -355,7 +371,7 @@ class StrataClient:
                 and error_data.get("code") == "structured_output_failed"
             )
             raise StrataRequestError(
-                f"Strata HTTP {exc.code}: {detail}", latency_seconds=elapsed,
+                f"{self.backend_label} HTTP {exc.code}: {detail}", latency_seconds=elapsed,
                 structured_output_failed=structured_output_failed,
             ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -366,7 +382,7 @@ class StrataClient:
                 conversation_reset_count=conversation_reset_count,
             )
             raise StrataRequestError(
-                f"Strata request failed: {exc}", latency_seconds=elapsed,
+                f"{self.backend_label} request failed: {exc}", latency_seconds=elapsed,
             ) from exc
         return response_body, time.monotonic() - started
 
@@ -384,6 +400,7 @@ class StrataClient:
         if not self.log_response:
             return
         diagnostics: dict[str, Any] = {
+            "backend": self.backend,
             "conversation_message_count": conversation_message_count,
             "conversation_reset_count": conversation_reset_count,
         }
@@ -445,5 +462,6 @@ class StrataClient:
 
 __all__ = [
     "DEFAULT_REASONING_EFFORT", "DEFAULT_STRATA_BASE_URL", "DEFAULT_STRATA_MODEL",
-    "DEFAULT_MAX_OUTPUT_TOKENS", "StrataClient", "StrataRequestError", "V10_VERSION", "user_message",
+    "DEFAULT_VLLM_BASE_URL", "DEFAULT_VLLM_MODEL", "DEFAULT_MAX_OUTPUT_TOKENS",
+    "StrataClient", "StrataRequestError", "V10_VERSION", "user_message",
 ]

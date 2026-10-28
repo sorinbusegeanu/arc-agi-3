@@ -12,6 +12,7 @@ import sys
 import time
 import uuid
 from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -2130,6 +2131,7 @@ def run_live(
     game_memory_max_chars: int = MAX_MEMORY_MARKDOWN_CHARS,
     global_memory_max_chars: int = MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
     discovery_tools: bool = True,
+    global_memory_lock: Any | None = None,
 ) -> dict[str, Any]:
     """Run a bounded live episode, persisting evidence before and after actions.
 
@@ -2176,6 +2178,7 @@ def run_live(
         "global_memory_path": str(global_memory_path(state_root)),
         "level_solutions_path": str(memory_store_dir / "level_solutions.jsonl"),
         "configuration": {
+            "backend": getattr(client, "backend", "strata"),
             "max_actions": int(max_actions), "plan_horizon": int(plan_horizon),
             "review_action_threshold": REVIEW_ACTION_THRESHOLD,
             "starting_routine": bool(starting_routine),
@@ -2293,6 +2296,7 @@ def run_live(
         result = {
             "schema": "v10.live_metrics/2", "v10_version": V10_VERSION,
             "game_id": game_id, "model": getattr(client, "model", None),
+            "backend": getattr(client, "backend", "strata"),
             "run_id": run_id, "seed": int(seed),
             "actions": tools.action_count, "action_budget": tools.max_actions,
             "action_budget_used": tools.action_budget.used,
@@ -2732,11 +2736,12 @@ def run_live(
         global_memory_review_done = True
         global_memory_review_count += 1
         progress("global-memory cleanup starting after WIN")
-        result = _perform_global_memory_review(
-            tools, client, game_id=game_id, run_id=run_id,
-            memory_store_dir=memory_store_dir,
-            global_memory_max_chars=global_memory_max_chars,
-        )
+        with global_memory_lock if global_memory_lock is not None else nullcontext():
+            result = _perform_global_memory_review(
+                tools, client, game_id=game_id, run_id=run_id,
+                memory_store_dir=memory_store_dir,
+                global_memory_max_chars=global_memory_max_chars,
+            )
         attempts = int(result["attempts"])
         global_memory_review_model_calls += attempts
         review_model_calls += attempts
@@ -2763,14 +2768,15 @@ def run_live(
         nonlocal review_latency, total_latency
         review_count += 1
         progress(f"review starting; triggers={list(reasons)}")
-        result = _perform_review(
-            tools, client, game_id=game_id, run_id=run_id,
-            memory_store_dir=memory_store_dir, trigger_reasons=reasons,
-            game_memory_max_chars=game_memory_max_chars,
-            global_memory_max_chars=global_memory_max_chars,
-            discovery_proposals=discovery.proposals if discovery is not None else (),
-            discovery_events=[row for row in discovery.events if row.get("status") == "experiment_scored"] if discovery is not None else (),
-        )
+        with global_memory_lock if global_memory_lock is not None else nullcontext():
+            result = _perform_review(
+                tools, client, game_id=game_id, run_id=run_id,
+                memory_store_dir=memory_store_dir, trigger_reasons=reasons,
+                game_memory_max_chars=game_memory_max_chars,
+                global_memory_max_chars=global_memory_max_chars,
+                discovery_proposals=discovery.proposals if discovery is not None else (),
+                discovery_events=[row for row in discovery.events if row.get("status") == "experiment_scored"] if discovery is not None else (),
+            )
         no_progress_actions = 0
         if discovery is not None and result["row"].get("status") == "saved" and discovery.proposals:
             append_jsonl(destination / "discovery.jsonl", {

@@ -1,6 +1,6 @@
 # V10 — Live Runs, Replay, and Memory
 
-This package implements replay, offline analysis, bounded live play, persistent game memory, and discovery tools described in [`DESIGN.md`](DESIGN.md) v0.10. Version 10.0.22 runs discovery hypothesis cases from reproducible isolated branches without charging branch actions to the live action cap. Completed outcomes are reused by base evidence, canonical action, and arguments; branch evidence can be inspected using its branch ID. Each action-selection cycle allows at most three tool-call planning rounds, four newly executed branch outcomes, and ten model completions total. After three tool-call rounds or four newly executed branches, discovery tools are withheld and the harness explicitly requires an action-decision JSON object. `inspect_region` requires an explicit crop no larger than 20 by 20 pixels. Discovery calls have no per-level quota; model-completion, output-token, and context limits bound LLM cost. Bootstrap allows at most three invalid plan attempts; if they produce no valid action, the harness executes one legal directional or `WAIT` fallback, counts it against `--max-actions`, and resumes model selection. Legal `WAIT` actions are accepted during startup planning. Discovery tools remain available by default during model-driven action selection; use `live --no-discovery-tools` to disable them. Strata requests retain a 6144-token default output budget and the append-only action conversation for prefix reuse.
+This package implements replay, offline analysis, bounded live play, persistent game memory, and discovery tools described in [`DESIGN.md`](DESIGN.md) v0.10. Version 10.0.29 adds parallel multi-game live runs. Discovery hypothesis cases run from reproducible isolated branches without charging branch actions to the live action cap. Completed outcomes are reused by base evidence, canonical action, and arguments; branch evidence can be inspected using its branch ID. Each action-selection cycle allows at most three tool-call planning rounds, four newly executed branch outcomes, and ten model completions total. After three tool-call rounds or four newly executed branches, discovery tools are withheld and the harness explicitly requires an action-decision JSON object. `inspect_region` requires an explicit crop no larger than 20 by 20 pixels. Discovery calls have no per-level quota; model-completion, output-token, and context limits bound LLM cost. Bootstrap allows at most three invalid plan attempts; if they produce no valid action, the harness executes one legal directional or `WAIT` fallback, counts it against `--max-actions`, and resumes model selection. Legal `WAIT` actions are accepted during startup planning. Discovery tools remain available by default during model-driven action selection; use `live --no-discovery-tools` to disable them. The vLLM backend is opt-in with `--vllm`; Strata remains the default. Both backends receive the same prompt and multimodal message content through their OpenAI-compatible chat endpoint.
 
 ## Requirements
 
@@ -18,7 +18,7 @@ Python 3.12+, `numpy`, and Pillow (provided by the ARC-AGI dependency). No MCP s
 - `build_analysis_input(run_dir, through_action=4)` / `run_analysis(run_dir, client, through_action=4)`
 - `ArcadeGameEnv(game_id, seed=0)` / `run_live(env, run_dir, client, game_id=...)`
 - `run_ablation(run_dir, client)` / `run_optimization(run_dir, client_factory)`
-- `StrataClient(base_url, model, api_key=None).complete(...)`
+- `StrataClient(base_url, model, api_key=None, backend="strata").complete(...)`
 
 The live environment adapter expects `observe() -> mapping` with a `frame` or `image` pixel grid and `legal_actions`, plus `act(action_id, args) -> mapping`. Action descriptors may include a `parameters` JSON-schema-like object for argument validation. Reset is explicit and requires a non-empty justification.
 
@@ -36,7 +36,7 @@ PYTHONPATH=src python -m v10.cli analyze \
   --model <deployed-qwen-model>
 ```
 
-The client reads `STRATA_API_KEY` from the environment. Analysis and live runs default to `http://127.0.0.1:8080` and model `qwen3.8-flash-next-iq3_s`; `--base-url` and `--model` remain available to override them. Replay stores ordered transition evidence, palette-rendered frames, intermediate frames, and same-shape pixel deltas. Analysis sends the previous and current actual frames, recent action outcomes, visible state, and compact read-only memory. Continuation evidence is used only after a valid model response; action comparison stops at the first divergence or a level/terminal interruption.
+The Strata client reads `STRATA_API_KEY`; vLLM reads `VLLM_API_KEY` and falls back to `STRATA_API_KEY`. Without `--vllm`, model-backed commands default to `http://127.0.0.1:8080` and `qwen3.8-flash-next-iq3_s`. With `--vllm`, they default to `http://192.168.0.51:8000` and `Qwen/Qwen3-VL-4B-Thinking-FP8`. `--base-url` and `--model` override the selected backend's defaults. A vision-capable model is needed for live game play because requests include game-frame images; v10 does not maintain a model allowlist. Strata-specific `--reasoning-effort` and `--reasoning-budget-tokens` are omitted from vLLM requests, which use the served model's/server's defaults. Replay stores ordered transition evidence, palette-rendered frames, intermediate frames, and same-shape pixel deltas. Analysis sends the previous and current actual frames, recent action outcomes, visible state, and compact read-only memory. Continuation evidence is used only after a valid model response; action comparison stops at the first divergence or a level/terminal interruption.
 
 ## Persistent skill and game memory
 
@@ -75,6 +75,70 @@ PYTHONPATH=src:other_repos/arc-agi:other_repos/ARCEngine python -m v10.cli live 
   --reasoning-effort medium --timeout-seconds 300 --max-output-tokens 6144
 ```
 
+Select vLLM explicitly and choose any model served by that endpoint with `--model`:
+
+```sh
+PYTHONPATH=src:other_repos/arc-agi:other_repos/ARCEngine python -m v10.cli live \
+  --game-id ez01 --run-dir runs/v10/ez01-vllm \
+  --vllm --base-url http://127.0.0.1:8000 --model <model-served-by-vllm> --max-actions 30
+```
+
+Run multiple games concurrently against either backend with `--game-list` and `--parallel-games`:
+
+```sh
+PYTHONPATH=src:other_repos/arc-agi:other_repos/ARCEngine python -m v10.cli live \
+  --game-list ez01,ez02 --run-dir runs/v10/batch-01 --parallel-games 2 \
+  --vllm --base-url http://127.0.0.1:8000 --model <model-served-by-vllm>
+```
+
+The run directory is a parent in batch mode; each game gets a separately cleaned `<run-dir>/<game-id>` directory. `--parallel-games` defaults to 1 and is capped to the number of listed games. The same seed is used for each game. Each worker has its own environment and model client. If one game fails, the other games continue; the final JSON reports each result in input order and the command exits nonzero if any game failed. `--reset-memory`, when supplied, clears persistent memory once before workers start. Global-memory reviews are serialized across workers to prevent concurrent updates from overwriting one another; game play remains concurrent.
+
+Pass `--base-url` to use a different vLLM server. The server must serve an image-capable model for game play and enable automatic tool choice for discovery tools. To start a local server automatically when the selected endpoint is not ready, add `--vllm-autostart`. v10 starts vLLM from the active Python environment with `--enable-auto-tool-choice`; Qwen3 models use the `hermes` parser and Qwen3-Coder uses `qwen3_xml`. Other models default to `hermes`; select their parser with `--vllm-tool-call-parser` when needed. A manually started server needs the same `--enable-auto-tool-choice --tool-call-parser <parser>` options. Auto-start waits up to 900 seconds for the selected model, then leaves the server running after the game command exits. For model IDs containing `NVFP4`, it starts vLLM with the SM120-capable `flashinfer_b12x` linear backend. `--vllm-startup-timeout-seconds` changes the wait limit and `--vllm-max-model-len` sets the context limit for a newly started server (default 65,536). `--max-output-tokens` remains 6,144 by default, matching Strata. Auto-start only accepts a local HTTP endpoint; start remote servers separately. Server output is written under `~/.cache/v10/vllm/`.
+
+### Kaggle-only: `primitive-ai/Qwen3.8-Flash-Next-NVFP4`
+
+This is a Kaggle-only serving recipe for the Flash-Next multimodal checkpoint. It is not the default Qwen3-VL model and does not change the normal v10 model defaults. Start its model server manually with the model author's vLLM image and settings, then point v10 at that server. v10's generic `--vllm-autostart` does not configure this checkpoint's PLE host-memory offload or multiprocessing executor and is not suitable for it.
+
+Check the actual Kaggle session before downloading the checkpoint:
+
+```sh
+nvidia-smi -L
+nvidia-smi
+free -h
+df -h /kaggle/working
+```
+
+The model files total about 186 GB. The model author's single-GPU recipe was validated on a 96 GB Blackwell card and calls for about 100 GB of free host RAM for the PLE n-gram table. Kaggle's published T4x2 notebook configuration has two 16 GB T4 GPUs and 29 GB of host RAM, so that standard accelerator does not meet the recipe's requirements. Use this only in a Kaggle session that actually provides compatible GPU memory, host RAM, and scratch space; recheck `nvidia-smi`, `free -h`, and `df` because Kaggle resources can vary. See the [checkpoint serving notes](https://huggingface.co/primitive-ai/Qwen3.8-Flash-Next-NVFP4/blob/main/README.md) and [Kaggle notebook resource specifications](https://www.kaggle.com/docs/notebooks).
+
+When the Kaggle environment meets those requirements and permits Docker with GPU passthrough, start the server using the model card's tested configuration:
+
+```sh
+docker run --gpus all --ipc=host -p 8000:8000 \
+  -e VLLM_PLE_CPU_OFFLOAD=1 \
+  -e VLLM_PLE_OFFLOAD_READY_TIMEOUT=1800 \
+  vllm/vllm-openai:qwen38-flash-next \
+  --model primitive-ai/Qwen3.8-Flash-Next-NVFP4 \
+  --distributed-executor-backend mp \
+  --gpu-memory-utilization 0.92 \
+  --max-model-len 32768 --max-num-seqs 36 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3
+```
+
+Keep `--distributed-executor-backend mp` and `VLLM_PLE_OFFLOAD_READY_TIMEOUT=1800`: the model card reports that the first is needed to start the single-GPU PLE offload worker, and the longer timeout allows its large table to load. The 32,768 context and 36 sequence settings are the validated serving values; do not assume the model's larger advertised context fits the same GPU and memory budget. Use the model author's CUDA/vLLM container as a matched unit, and confirm the Kaggle host driver exposes the GPU inside Docker. The NVFP4 kernels need compatible Blackwell hardware; the Kaggle T4x2 configuration is not a substitute.
+
+If v10 runs in the same Kaggle session, connect to the locally mapped endpoint without auto-starting another server:
+
+```sh
+PYTHONPATH=src:other_repos/arc-agi:other_repos/ARCEngine python -m v10.cli live \
+  --game-id <game-id> --run-dir runs/v10/<run-name> \
+  --vllm --base-url http://127.0.0.1:8000 \
+  --model primitive-ai/Qwen3.8-Flash-Next-NVFP4 \
+  --max-actions 30 --timeout-seconds 300 --max-output-tokens 6144
+```
+
+The model card's optional NVMe PLE overlay and speculative MTP settings are omitted here; add them only after checking that their extra disk, memory, and vLLM requirements fit the Kaggle runtime.
+
 The repository launcher forwards options to the same live CLI:
 
 ```sh
@@ -92,24 +156,31 @@ Live CLI defaults:
 
 | Option | Default | Behavior |
 | --- | --- | --- |
-| `--base-url` | `http://127.0.0.1:8080` | Strata OpenAI-compatible endpoint |
-| `--model` | `qwen3.8-flash-next-iq3_s` | Deployed model identifier |
+| `--vllm` | off | Select the vLLM backend; Strata stays the default |
+| `--vllm-autostart` | off | Start the selected model locally if the configured endpoint is not ready; requires `--vllm` |
+| `--vllm-startup-timeout-seconds` | `900` | Maximum wait for an auto-started model |
+| `--vllm-max-model-len` | `65536` | Context limit passed when auto-starting a model |
+| `--base-url` | backend-specific | OpenAI-compatible endpoint; defaults to Strata `http://127.0.0.1:8080` or vLLM `http://192.168.0.51:8000` |
+| `--model` | backend-specific | Model ID; defaults to Strata `qwen3.8-flash-next-iq3_s` or vLLM `Qwen/Qwen3-VL-4B-Thinking-FP8` |
+| `--game-id` | required unless `--game-list` | Run one game with the existing single-run directory behavior |
+| `--game-list` | unset | Comma-separated batch game IDs; writes one run folder per ID under `--run-dir` |
+| `--parallel-games` | `1` | Maximum concurrent games in batch mode, for either backend |
 | `--seed` | `0` | Seed for environment and safe random fallback actions |
 | `--max-actions` | `30` | Total action budget, including bootstrap and route replay |
 | `--plan-horizon` | `8` | Maximum actions per plan; accepted range is 1–8 |
 | `--timeout-seconds` | `300` | Per-request timeout |
 | `--max-output-tokens` | `6144` | Maximum generated tokens, including reasoning and JSON output |
-| `--reasoning-effort` | `medium` | Strata reasoning effort (`none`, `low`, `medium`, or `high`) |
-| `--reasoning-budget-tokens` | unset | Optional positive cap on reasoning tokens |
+| `--reasoning-effort` | `medium` | Strata reasoning effort (`none`, `low`, `medium`, or `high`); omitted for vLLM |
+| `--reasoning-budget-tokens` | unset | Optional Strata reasoning-token cap; omitted for vLLM |
 | `--game-memory-max-chars` | `3000` | Maximum accepted game Markdown size |
 | `--global-memory-max-chars` | `4500` | Maximum accepted global Markdown size (hard ceiling 4500; lower values allowed; reviews target 4000 when possible) |
 | `--memory-context-entries` | `5` | Compatibility option (0–5); recorded in metrics and does not limit saved Markdown |
 | `--log-request`, `--log-response` | off | Write request and/or raw response attempts into the run directory |
-| `--context-window-tokens` | detected from Strata | Override the context size used to start a fresh action conversation before compaction |
+| `--context-window-tokens` | detected from endpoint | Override the context size used to start a fresh action conversation before compaction |
 
 Requests use temperature 0. Action plans and memory reviews use JSON response mode; game-over post-mortems return plain Markdown. `--reset-memory` clears game memory, saved routes, and global memory before startup. `--state-dir` overrides the default project `skills/` persistence root; `--skill` selects another shared action-instructions file.
 
-The live command clears existing contents from its `--run-dir` before starting; it refuses protected locations, symlink run directories, and overlap with game/global persistence or the skill source. `--game-id` selects the game, `--max-actions` sets the total action limit, and `--plan-horizon` sets how many actions the model may return at once (default 8, range 1–8). A level-completion review receives the complete ordered action/outcome history for that level and attaches at most the latest 20 available screens in chronological order, including intermediate frames and the completion transition. Active-play reviews are checked only after an action set finishes and trigger after more than 9 actions since the prior review; they do not interrupt the set. Budget exhaustion does not trigger a review or assessment. `GAME_OVER` uses its separate post-mortem before restart when budget remains. Stagnation still guides action selection and limits plans to one action while recovering; it does not independently trigger a review. After a review, the next normal action prompt asks whether to reset or continue: continuing returns a fresh plan for the current screen; choosing reset restarts the normal startup flow. An exact verified-route match is replayed, a route for a different starting screen is provided as guidance, and bootstrap runs only when no verified route exists for the level. Startup bootstrap planning itself retains its no-reset instruction. `--game-memory-max-chars` sets the game-memory output maximum (default 3000). `--global-memory-max-chars` defaults to 4500 and cannot exceed that hard ceiling; lower values are allowed. A nonterminal level replayed entirely from a verified route may skip its prose review when persistent game memory already exists; terminal `WIN` always receives final consolidation. Review does not advance or reset the game. It stores review triggers, transition coverage, result status, and timing in `reviews.jsonl`; `metrics.json` reports action and review usage separately. Invalid or failed reviews leave prior Markdown files intact and the game loop continues. Successful level routes are saved before review and remain available if review fails.
+In single-game mode, the live command clears existing contents from its `--run-dir` before starting; it refuses protected locations, symlink run directories, and overlap with game/global persistence or the skill source. In batch mode, it applies those checks to each per-game subdirectory. `--game-id` and `--game-list` are mutually exclusive. `--max-actions` sets each game's total action limit, and `--plan-horizon` sets how many actions the model may return at once (default 8, range 1–8). A level-completion review receives the complete ordered action/outcome history for that level and attaches at most the latest 20 available screens in chronological order, including intermediate frames and the completion transition. Active-play reviews are checked only after an action set finishes and trigger after more than 9 actions since the prior review; they do not interrupt the set. Budget exhaustion does not trigger a review or assessment. `GAME_OVER` uses its separate post-mortem before restart when budget remains. Stagnation still guides action selection and limits plans to one action while recovering; it does not independently trigger a review. After a review, the next normal action prompt asks whether to reset or continue: continuing returns a fresh plan for the current screen; choosing reset restarts the normal startup flow. An exact verified-route match is replayed, a route for a different starting screen is provided as guidance, and bootstrap runs only when no verified route exists for the level. Startup bootstrap planning itself retains its no-reset instruction. `--game-memory-max-chars` sets the game-memory output maximum (default 3000). `--global-memory-max-chars` defaults to 4500 and cannot exceed that hard ceiling; lower values are allowed. A nonterminal level replayed entirely from a verified route may skip its prose review when persistent game memory already exists; terminal `WIN` always receives final consolidation. Review does not advance or reset the game. It stores review triggers, transition coverage, result status, and timing in `reviews.jsonl`; `metrics.json` reports action and review usage separately. Invalid or failed reviews leave prior Markdown files intact and the game loop continues. Successful level routes are saved before review and remain available if review fails.
 
 The runner prints the current level, action count, each planned and executed action, and inference time to stderr while running. On the initial level, an exact verified-route match is replayed immediately; a route for the same level from another starting screen is supplied as guidance without replay. If no route exists, the runner bootstraps, resets, then calls the model with ordered bootstrap screens and the restored initial screen. On every later level, it also bootstraps, resets the game, replays exact verified routes for earlier solved levels, then calls the model from the restored start of the bootstrapped level. Missing routes or replay divergence stop restoration rather than presenting a mismatched screen. Bootstrap and replay actions count against `--max-actions`. Resets have no separate budget; `RESET` is available whenever the environment supports it. A `GAME_OVER` triggers a dedicated post-mortem (not a memory review) with the complete active-level action sequence and every available screen in chronological order, including intermediate environment frames, with action entries cross-referencing their source and produced screen numbers; its diagnosis is logged and supplied to the retry prompts before the game resets when budget remains. `WIN` stops without restarting. `metrics.json` includes post-mortem usage and `game_over_restarts`. Level-completion reviews include the full ordered action history and attach at most the latest 20 available screens in chronological order, with shared action/screen references. Game-over post-mortems still include every available screen. All later prompts use the ordinary action prompt. Directional actions are shown as `up`, `down`, `left`, and `right` in console output and run logs; the adapter still sends the corresponding environment IDs. It stores a run manifest, rendered frames, append-only transition history, decisions and plan outcomes, and `metrics.json`; the action model receives saved game/global Markdown as read-only context, with no duplicate strategy payload. Review calls write the two Markdown files and append a JSONL checkpoint. The model returns only an `actions` array with legal action names and arguments. The four movement actions are presented as `up`, `down`, `left`, and `right`, and the model must return those exact lowercase words; the harness converts them to environment IDs `ACTION1`–`ACTION4`. Other legal actions, including `RESET`, retain their listed names. Actions are revalidated against each observation; plans stop on level changes, terminal states, action errors, budget exhaustion, or illegal next actions. Verified successful trajectories are stored per level and exact starting state; the shortest verified success for that start is replayed, and complete prior winning run logs are validated and imported at startup. Same-level routes from another start guide the model but are never replayed. Cached actions stop on divergence or illegality and return to model selection. Diverged steps are suspended from ordinary route selection for the rest of the run. `RESET` is listed as a legal pseudo-action whenever the environment supports it, has no separate budget, and must be returned alone with a justification in `args`. Stagnation summaries expose repeated states and ineffective actions; after stagnation the prompt directs the model to try a different action or reset. Object roles, goal identity, and completion rules stay scoped to levels where they were tested. Before each planned action in a multi-action sequence, the harness checks the full active-level history and stops before a known same-screen no-op with the same arguments; single-action experiments can repeat inputs to test delayed effects; if model output remains invalid and every real parameterless action is a known no-op, fallback recovery resets the game. If the model decision and its single repair attempt both fail validation, the runner logs the rejection, takes a seeded-random legal action when its required arguments can be generated from the action schema, records that transition, and resumes the model loop. If no safe fallback action can be generated, the run stops. On interruption, completed evidence and saved routes remain intact and `metrics.json` records `stop_reason=interrupted` without launching a shutdown review.
 
