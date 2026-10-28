@@ -42,7 +42,6 @@ from .tools.memory import (
     default_state_dir,
     enqueue_profile_candidate,
     game_memory_dir,
-    MAX_PROFILE_MEMORY_MARKDOWN_CHARS,
     migrate_legacy_global_memory,
     profile_memory_path,
     project_skills_dir,
@@ -57,11 +56,15 @@ from .tools.solutions import (
 from .tools.vision import propose_click_candidates
 
 POST_MORTEM_MAX_CHARS = 4_000
-GLOBAL_MEMORY_REVIEW_TARGET_CHARS = 4_000
 MAX_DISCOVERY_PLANNING_ROUNDS = 3
 MAX_DISCOVERY_TEST_CASES = 4
 MAX_ACTION_SELECTION_COMPLETIONS = 10
 MAX_BOOTSTRAP_PLAN_ATTEMPTS = 3
+
+
+def _display_action_name(action_id: Any) -> Any:
+    """Use model-facing aliases in context while evidence keeps canonical IDs."""
+    return "click" if str(action_id) == "ACTION6" else model_action_name(action_id)
 
 
 def _perceptual_state_equivalence(left: Any, right: Any) -> dict[str, Any]:
@@ -101,6 +104,18 @@ def _parse_content(content: Any) -> Any:
         except json.JSONDecodeError as exc:
             raise DecisionValidationError(f"fenced response is not valid JSON: {exc}") from exc
     return payload
+
+
+def _log_profile_request(tools: GameTools, phase: str, metadata: Mapping[str, Any], response: Mapping[str, Any]) -> None:
+    append_jsonl(tools.run_dir / "profile_requests.jsonl", {
+        "schema": "v11.profile_request/1", "phase": phase,
+        **{key: metadata.get(key) for key in (
+            "profile_id", "action_signature", "argument_schema_fingerprint",
+            "skill_sha256", "profile_prompt_sha256", "profile_memory_sha256",
+            "game_memory_sha256",
+        )},
+        "request_ids": list(response.get("request_ids", [])),
+    })
 
 
 def _prepare_live_run_directory(destination: Path, protected_paths: Sequence[Path] = ()) -> None:
@@ -257,7 +272,7 @@ _REVIEW_SYSTEM_PROMPT = """# V11 game memory and profile candidate review
 
 Review existing game MEMORY.md, approved active-profile method memory, new ordered observations, and verified successful routes. Return only one JSON object with exactly `game_memory_markdown` and `profile_memory_candidates`; the first is non-empty Markdown and the second is an array of candidate objects, which may be empty.
 
-Write only guidance that can change a future action and remains valid after a run restarts. Merge repetition, qualify unresolved claims, correct contradictions, and preserve demonstrated strategies with level or applicability scope. Use short prose bullets under brief headings; game memory should contain only a few bullets. Level identifiers may be included to scope a finding; do not include action numbers, action counts, transient collected/remaining item counts, timelines, raw observation narration, coordinates, pixel distances, displacement values, or action sequences. A stable count describing an invariant level layout may be retained only when directly observed and useful. Do not copy route details into memory; the exact-state route store handles precise routes and replay.
+Write only guidance that can change a future action and remains valid after a run restarts. Merge repetition, qualify unresolved claims, correct contradictions, and preserve demonstrated strategies with level or applicability scope. Use short prose bullets under brief headings; game memory should contain only a few bullets. Level identifiers may be included to scope a finding; do not include action numbers, action counts, transient collected/remaining item counts, timelines, raw observation narration, raw coordinates, pixel distances, displacement values, transient coordinate lists, or action sequences. A stable count describing an invariant level layout may be retained only when directly observed and useful. Preserve verified reusable spatial relationships, including reflection across a visible axis, rotations of a row, column, or region, relative positions of interactive regions, and conditional click-to-effect relationships, only when directly supported by transitions and scoped to where they were tested. Do not infer axes, rotations, region relationships, or click effects from appearance alone. Do not copy exact route details into memory; the exact-state route store handles precise routes and replay.
 
 Game memory is durable across runs. Never store the current run's status, win state, current player position, current visible goal count or location, recent action progress, or statements such as “all levels completed” or “no further levels to solve.” Do not create a “Game status,” “Current state,” or “Level progress” section. Keep one next experiment only for an active unsolved level; describe the question and discriminating test without relying on the player's current position or a transient object count. Remove that experiment when the level is completed. Before retaining an existing next experiment, audit it against the new ordered observations and relevant history in this review. If an equivalent test has already been attempted under matching level/state conditions, do not present it as pending or repeat it; classify its result as supported, contradicted, ineffective, or inconclusive. Retain it only when the result was inconclusive and a materially different follow-up can distinguish a remaining explanation. An unresolved hypothesis by itself does not justify repeating a tested experiment.
 
@@ -270,7 +285,7 @@ Keep these sections concise and omit a section when there is no useful finding. 
 
 Routes are supplied only when the environment recorded level completion or WIN. Treat their outcome as fixed facts. You may merge equivalent routes into one high-level strategy while retaining scope in words (such as “on matching level start states”), but never derive or reproduce route lengths, exact actions, counts, or arguments. Game memory may contain lasting mechanics, useful approaches, repeated failures, and unresolved experiments. Describe a tested approach qualitatively (for example: “When the goal is above the player, move upward toward it; use the verified route when the starting state matches.”).
 
-For a level completed by replaying a verified route, inspect the ordered transitions and screens for avoidable loops or actions that produced no useful change. Mention an efficiency improvement only when the observations support it; do not replace or weaken the verified route based on an untested alternative. Exact action sequences remain in the solution store.
+For a level completed by replaying a verified route, inspect the ordered transitions and screens for avoidable loops or actions that produced no useful change. Mention an efficiency improvement only when the observations support it; do not replace or weaken the verified route based on an untested alternative. Exact action sequences and transient coordinate lists remain in the solution store.
 
 Profile memory is read-only during a game run. Propose at most three transferable methods in `profile_memory_candidates`, each with exactly `claim`, `applicability_conditions`, and `evidence_ids`. A candidate must not state a game mechanic, object rule, color, direction, coordinate, route, or game-specific fact. Every evidence ID must identify a reviewed direct transition supporting the method. If no useful transferable method is directly supported, return an empty array. Candidates are queued for human review and never enter profile memory automatically.
 
@@ -280,11 +295,11 @@ Separate observations from explanations. Unchanged pixels show only that an acti
 
 The review context labels the active level and each transition's pre-action and post-action level. A transition that changes levels completed the PRE-action level; its post-action frame is the start of the next level. Never describe the new level as solved or assign its completion strategy based on that boundary transition. Claim a successful strategy only for level scopes listed in verified successful routes. If movement was observed but the level did not complete, describe it only as an observation or unverified approach. State only that an obstacle was encountered when the observations show one; never claim that an entire level has no obstacles based only on a successful route."""
 
-_POST_MORTEM_SYSTEM_PROMPT = """# V10 game-over post-mortem
+_POST_MORTEM_SYSTEM_PROMPT = """# V11 game-over post-mortem
 
 Analyze the failed attempt using its complete ordered action list, the labeled before/after screens, current game memory, and approved profile memory. Identify which choices were ineffective or likely caused GAME_OVER, what observations support that conclusion, and one concrete change or experiment for the retry. Separate directly observed facts from hypotheses; do not infer object roles, hazards, walls, or completion rules from appearance or proximity alone. If the images do not establish a cause, say so and recommend the safest discriminating experiment. Correct stale memory claims when the sequence contradicts them.
 
-Write a concise, decision-useful Markdown note. Use the headings `What happened`, `Choices to change`, and `Retry experiment`. Refer to actions by their numbered position and lowercase direction name. Do not include chain-of-thought, raw pixel measurements, evidence IDs, or repeated narration."""
+Write a concise, decision-useful Markdown note. Use the headings `What happened`, `Choices to change`, and `Retry experiment`. Refer to each action by its numbered position, actual legal action name, and exact arguments when present. For clicks, identify the attempted coordinates and the observed local or remote outcome that followed. Do not include chain-of-thought, raw pixel measurements, evidence IDs, or repeated narration."""
 
 MAX_REVIEW_IMAGES = 20
 REVIEW_ACTION_THRESHOLD = 9
@@ -297,6 +312,10 @@ def _validate_review_payload(
     max_profile_candidates: int = 3,
 ) -> tuple[str, list[dict[str, Any]]]:
     expected = {"game_memory_markdown", "profile_memory_candidates"}
+    # Older model outputs may still contain the former shared-memory field.
+    # Ignore it during migration; shared profile memory is human-promoted only.
+    if isinstance(value, Mapping) and set(value) == {"game_memory_markdown", "global_memory_markdown"}:
+        value = {"game_memory_markdown": value.get("game_memory_markdown"), "profile_memory_candidates": []}
     if not isinstance(value, Mapping) or set(value) != expected:
         raise ValueError("review response must contain exactly game_memory_markdown and profile_memory_candidates")
     game_memory = value.get("game_memory_markdown")
@@ -405,7 +424,7 @@ def _review_repair_prompt(base_prompt: str, errors: Any) -> str:
         repair_guidance.append(
             "Remove current position, run status, and recent progress; retain durable mechanics and tested strategies."
         )
-    if "no visible change as proof" in error_text:
+    if "general obstacle from a state-specific no-op" in error_text:
         repair_guidance.append(
             "Describe no-visible-change only for that exact action and state; do not infer a general wall or reachability rule."
         )
@@ -459,7 +478,7 @@ def _review_events(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
             before = by_id.get(str(row.get("pre_evidence_id")), {})
             events.append({
                 "type": "transition",
-                "action": model_action_name(row.get("action")), "args": row.get("args", {}),
+                "action": _display_action_name(row.get("action")), "args": row.get("args", {}),
                 "measurements": row.get("measurements"), "result": row.get("result"),
                 "level_index_before_action_zero_based": before.get("level"),
                 "level_index_after_action_zero_based": row.get("level"),
@@ -1021,18 +1040,11 @@ def _perform_review(
         transition_count = len(transitions)
         state_root = memory_store_dir.parent.parent
         view_path = memory_store_dir / "MEMORY.md"
+        active_state = tools.observe()
         existing_memory = view_path.read_text(encoding="utf-8").strip() if view_path.is_file() else ""
         legacy_review = memory.get("review:latest")
         if not existing_memory and legacy_review:
             existing_memory = str(legacy_review.get("claim", "")).strip()
-        active_profile = resolve_action_profile(active_state.get("legal_actions", []))
-        active_profile_id = profile_id or active_profile.profile_id
-        profile_memory = read_profile_memory(
-            state_root, active_profile_id, max_characters=profile_memory_max_chars,
-        )
-        profile_prompt, profile_prompt_sha256 = compose_profile_prompt(
-            active_profile, project_skills_dir() / "profile_capabilities",
-        )
         events = _review_events(records)
         covered_event_count = len(events)
         if memory.has_review_coverage(game_id, covered_event_count):
@@ -1049,7 +1061,6 @@ def _perform_review(
         prior_event_count = min(memory.reviewed_event_count(game_id), len(events))
         new_events = events[prior_event_count:]
         frames = tools.frames
-        active_state = tools.observe()
         success_triggered = any(reason in {"level_completed", "win"} for reason in trigger_reasons)
         # Reviews analyze the complete current or completed level attempt.
         review_transitions: Sequence[Mapping[str, Any]] = transitions
@@ -1130,6 +1141,18 @@ def _perform_review(
         image_labels = image_labels[-MAX_REVIEW_IMAGES:]
         active_level = active_state.get("level")
         active_level_number = int(active_level) + 1 if isinstance(active_level, int) else None
+        profile_basis = active_state
+        if success_triggered and review_transitions:
+            pre_id = review_transitions[-1].get("pre_evidence_id")
+            profile_basis = next((row for row in records if row.get("evidence_id") == pre_id), active_state)
+        active_profile = resolve_action_profile(profile_basis.get("legal_actions", []))
+        active_profile_id = profile_id or active_profile.profile_id
+        profile_memory = read_profile_memory(
+            state_root, active_profile_id, max_characters=profile_memory_max_chars,
+        )
+        profile_prompt, profile_prompt_sha256 = compose_profile_prompt(
+            active_profile, project_skills_dir() / "profile_capabilities",
+        )
         solution_store = LevelSolutionStore(memory_store_dir / "level_solutions.jsonl", game_id)
         verified_routes = _verified_route_summaries(solution_store)
         reviewed_transition_ids = [str(row.get("evidence_id")) for row in review_transitions if row.get("evidence_id")]
@@ -1223,6 +1246,15 @@ def _perform_review(
                     _REVIEW_SYSTEM_PROMPT, review_prompt, image_paths, image_labels,
                     response_format="json_object",
                 )
+                _log_profile_request(tools, "memory_review", {
+                    "profile_id": active_profile_id,
+                    "action_signature": active_profile.action_signature,
+                    "argument_schema_fingerprint": active_profile.argument_schema_fingerprint,
+                    "skill_sha256": hashlib.sha256(shared_skill_path().read_bytes()).hexdigest(),
+                    "profile_prompt_sha256": profile_prompt_sha256,
+                    "profile_memory_sha256": hashlib.sha256(profile_memory.encode("utf-8")).hexdigest(),
+                    "game_memory_sha256": hashlib.sha256(existing_memory.encode("utf-8")).hexdigest(),
+                }, response)
             except StrataRequestError as exc:
                 attempts += max(0, int(getattr(exc, "request_attempts", 1)) - 1)
                 raise
@@ -1287,6 +1319,8 @@ def _perform_review(
             "game_memory_path": str(view_path), "game_memory_updated": memory_saved,
             "game_memory_characters": len(game_markdown),
             "profile_id": active_profile_id,
+            "action_signature": active_profile.action_signature,
+            "argument_schema_fingerprint": active_profile.argument_schema_fingerprint,
             "profile_prompt_sha256": profile_prompt_sha256,
             "profile_memory_sha256": hashlib.sha256(profile_memory.encode("utf-8")).hexdigest(),
             "profile_candidates_queued": profile_candidates_queued,
@@ -1324,6 +1358,7 @@ def _perform_game_over_post_mortem(
     game_id: str,
     guidance_memory: str,
     profile_memory: str,
+    profile_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Analyze the complete failed-level action sequence before an automatic retry."""
     current = tools.observe()
@@ -1334,7 +1369,9 @@ def _perform_game_over_post_mortem(
     action_sequence = [
         {
             "action_number": index + 1,
-            "action": model_action_name(row.get("action")),
+            "action": _display_action_name(row.get("action")),
+            "args": dict(row.get("args", {})) if isinstance(row.get("args"), Mapping) else {},
+            "measurements": _compact_transition_measurements(row.get("measurements")),
             "level_index": row.get("level"),
             "levels_completed": row.get("levels_completed"),
             "resulting_game_state": row.get("game_state"),
@@ -1382,7 +1419,7 @@ def _perform_game_over_post_mortem(
         + json.dumps(action_sequence, ensure_ascii=False, separators=(",", ":"))
         + "\n\nGame MEMORY.md at failure:\n"
         + (guidance_memory.strip() or "(none)")
-        + "\n\nGlobal MEMORY.md at failure:\n"
+        + "\n\nApproved profile MEMORY.md at failure:\n"
         + (profile_memory.strip() or "(none)")
         + "\n\nWrite a concise post-mortem with the required headings and one concrete retry experiment."
     )
@@ -1394,6 +1431,7 @@ def _perform_game_over_post_mortem(
             _POST_MORTEM_SYSTEM_PROMPT, prompt, image_paths, image_labels,
             response_format=None,
         )
+        _log_profile_request(tools, "game_over_post_mortem", profile_metadata or {}, response)
         attempts = max(1, int(response.get("request_attempts", 1)))
         usage = dict(response.get("usage", {}))
         latency = float(response.get("latency_seconds", 0.0))
@@ -1530,7 +1568,6 @@ def _live_context(
         "game_id": game_id,
         "action_profile": {
             "profile_id": action_profile.profile_id,
-            "action_signature": action_profile.action_signature,
             "argument_schema_fingerprint": action_profile.argument_schema_fingerprint,
             "capabilities": list(action_profile.capabilities),
             "prompt_sha256": profile_prompt_sha256,
@@ -1548,7 +1585,7 @@ def _live_context(
         },
         "recent_transitions": [
             {
-                "action": row.get("action"), "args": row.get("args", {}),
+                "action": _display_action_name(row.get("action")), "args": row.get("args", {}),
                 "measurements": _compact_transition_measurements(row.get("measurements")),
                 "observed_pixel_region_motion": _observed_region_motion(row, frames),
                 "levels_completed_before_action": evidence_by_id.get(
@@ -1590,7 +1627,8 @@ def _live_context(
     if starting_routine:
         context["bootstrap_observations"] = [
             {
-                "action": model_action_name(row.get("action")),
+                "action": _display_action_name(row.get("action")),
+                "args": dict(row.get("args", {})) if isinstance(row.get("args"), Mapping) else {},
                 "measurements": _compact_transition_measurements(row.get("measurements")),
                 "level": row.get("level"),
                 "levels_completed": row.get("levels_completed"),
@@ -1708,10 +1746,10 @@ def _live_context(
         summary_row["levels_completed_before_action"] = evidence_by_id.get(
             str(row.get("pre_evidence_id")), {}
         ).get("levels_completed")
-        model_context["recent_transitions"].append(_action_transition_summary(summary_row, index))
+        model_context["recent_transitions"].append(_model_transition_summary(summary_row, index))
     if starting_routine and bootstrap_observations:
         model_context["bootstrap_observations"] = [
-            _action_transition_summary(row, index)
+            _model_transition_summary(row, index)
             for index, row in enumerate(bootstrap_observations, start=1)
         ]
     if saved_route_guidance:
@@ -1806,6 +1844,15 @@ def _compact_transition_measurements(value: Any) -> dict[str, Any]:
     result: dict[str, Any] = {}
     if "changed_pixels" in value:
         result["changed_pixels"] = value["changed_pixels"]
+    click_effect = value.get("click_effect")
+    if isinstance(click_effect, Mapping):
+        fields = (
+            "local_changed_pixels", "remote_changed_pixels", "total_changed_pixels",
+            "level_changed", "terminal_changed",
+        )
+        compact_effect = {key: click_effect[key] for key in fields if key in click_effect}
+        if compact_effect:
+            result["click_effect"] = compact_effect
     displacement = value.get("candidate_displacement")
     if isinstance(displacement, Mapping) and isinstance(displacement.get("best"), Mapping):
         best = displacement["best"]
@@ -1822,7 +1869,18 @@ def _action_transition_summary(
     transition: Mapping[str, Any], action_number: int,
 ) -> str:
     """Describe only the action and visible outcome, without repeating raw telemetry."""
-    action = model_action_name(transition.get("action"))
+    action = _display_action_name(transition.get("action"))
+    args = transition.get("args")
+    if isinstance(args, Mapping) and args:
+        if str(action) == "click" and "x" in args and "y" in args:
+            ordered_args = {key: args[key] for key in ("x", "y") if key in args}
+            ordered_args.update({key: value for key, value in args.items() if key not in ordered_args})
+            action = "click(" + ",".join(
+                f"{key}={json.dumps(value, ensure_ascii=False, separators=(',', ':'))}"
+                for key, value in ordered_args.items()
+            ) + ")"
+        else:
+            action = f"{action}(args={json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(',', ':'))})"
     measurements = transition.get("measurements")
     measurements = measurements if isinstance(measurements, Mapping) else {}
     changed = measurements.get("changed_pixels")
@@ -1866,6 +1924,19 @@ def _action_transition_summary(
         if len(candidate) <= 200:
             summary = candidate
     return summary
+
+
+def _model_transition_summary(
+    transition: Mapping[str, Any], action_number: int,
+) -> Any:
+    """Keep movement summaries unchanged; make click outcome fields explicit."""
+    summary = _action_transition_summary(transition, action_number)
+    if str(transition.get("action")) != "ACTION6":
+        return summary
+    measurements = transition.get("measurements")
+    measurements = measurements if isinstance(measurements, Mapping) else {}
+    click_effect = _compact_transition_measurements(measurements).get("click_effect", {})
+    return {"summary": summary, "click_effect": click_effect}
 
 
 def _memory_revision_hash(memory_store_dir: Path, state_root: Path, profile_id: str) -> str:
@@ -2002,10 +2073,14 @@ def _action_observation_events(records: Sequence[Mapping[str, Any]]) -> list[dic
             pre = evidence_by_id.get(str(row.get("pre_evidence_id")), {})
             summary_row = dict(row)
             summary_row["levels_completed_before_action"] = pre.get("levels_completed")
+            args = row.get("args")
+            action_name = _display_action_name(row.get("action"))
             events.append({
                 "action_number": action_number,
-                "action": model_action_name(row.get("action")),
+                "action": action_name,
+                **({"args": dict(args)} if isinstance(args, Mapping) and args and action_name != "click" else {}),
                 "observed_result": _action_transition_summary(summary_row, action_number),
+                "measurements": _compact_transition_measurements(row.get("measurements")),
                 "intermediate_screens": len(
                     (row.get("result") or {}).get("intermediate_frame_image_ids", [])
                     if isinstance(row.get("result"), Mapping) else []
@@ -2615,6 +2690,7 @@ def run_live(
                     response_format=None if discovery_tools else "json_object",
                     tools=DISCOVERY_TOOLS if tools_available else None,
                 )
+                _log_profile_request(tools, "action_selection", inputs, response)
             except StrataRequestError as exc:
                 model_calls += max(0, int(getattr(exc, "request_attempts", 1)) - 1)
                 total_latency += float(getattr(exc, "latency_seconds", 0.0))
@@ -2677,6 +2753,12 @@ def run_live(
                                 if not case_rows or selection_budget["test_cases"] + new_branches > MAX_DISCOVERY_TEST_CASES:
                                     raise ValueError(f"test_hypotheses exceeds the remaining branch-test budget ({max(0, MAX_DISCOVERY_TEST_CASES - int(selection_budget['test_cases']))} new branches)")
                             result = discovery.dispatch({"request_id": call_id, "tool": name, "arguments": dict(args)})
+                            proposal_data = result.get("data") if isinstance(result, Mapping) else None
+                            proposal = proposal_data.get("proposal") if isinstance(proposal_data, Mapping) else None
+                            if (isinstance(proposal_data, Mapping)
+                                    and proposal_data.get("status") == "queued_for_human_review"
+                                    and isinstance(proposal, Mapping) and proposal.get("candidate_id")):
+                                profile_candidate_ids_queued.add(str(proposal["candidate_id"]))
                             if name == "test_hypotheses" and result.get("status") == "completed" and not repeated_provider_call:
                                 selection_budget["test_cases"] += int(result.get("data", {}).get("executed_branches", 0))
                         except Exception as exc:
@@ -2774,40 +2856,6 @@ def run_live(
         )[:500]
         return None, responses, validation_error
 
-    def perform_global_memory_review() -> None:
-        nonlocal global_memory_review_count, global_memory_review_model_calls
-        nonlocal global_memory_review_latency, global_memory_review_status
-        nonlocal global_memory_review_done, review_model_calls, model_calls
-        nonlocal review_latency, total_latency
-        if global_memory_review_done or str(current.get("game_state", "")).upper() != "WIN":
-            return
-        global_memory_review_done = True
-        global_memory_review_count += 1
-        progress("global-memory cleanup starting after WIN")
-        with global_memory_lock if global_memory_lock is not None else nullcontext():
-            result = _perform_global_memory_review(
-                tools, client, game_id=game_id, run_id=run_id,
-                memory_store_dir=memory_store_dir,
-                global_memory_max_chars=global_memory_max_chars,
-            )
-        attempts = int(result["attempts"])
-        global_memory_review_model_calls += attempts
-        review_model_calls += attempts
-        model_calls += attempts
-        elapsed = float(result["latency_seconds"])
-        global_memory_review_latency += elapsed
-        review_latency += elapsed
-        total_latency += elapsed
-        global_memory_review_status = str(result["row"].get("status", "failed"))
-        for key in total_usage:
-            value = result["usage"].get(key)
-            if value is not None:
-                amount = int(value)
-                total_usage[key] += amount
-                review_usage[key] += amount
-                global_memory_review_usage[key] += amount
-        progress(f"global-memory cleanup {global_memory_review_status}")
-
     def perform_triggered_review(
         reasons: Sequence[str],
     ) -> None:
@@ -2816,15 +2864,14 @@ def run_live(
         nonlocal review_latency, total_latency
         review_count += 1
         progress(f"review starting; triggers={list(reasons)}")
-        with global_memory_lock if global_memory_lock is not None else nullcontext():
-            result = _perform_review(
-                tools, client, game_id=game_id, run_id=run_id,
-                memory_store_dir=memory_store_dir, trigger_reasons=reasons,
-                game_memory_max_chars=game_memory_max_chars,
-                global_memory_max_chars=global_memory_max_chars,
-                discovery_proposals=discovery.proposals if discovery is not None else (),
-                discovery_events=[row for row in discovery.events if row.get("status") == "experiment_scored"] if discovery is not None else (),
-            )
+        result = _perform_review(
+            tools, client, game_id=game_id, run_id=run_id,
+            memory_store_dir=memory_store_dir, trigger_reasons=reasons,
+            game_memory_max_chars=game_memory_max_chars,
+            profile_memory_max_chars=profile_memory_max_chars,
+            discovery_proposals=discovery.proposals if discovery is not None else (),
+            discovery_events=[row for row in discovery.events if row.get("status") == "experiment_scored"] if discovery is not None else (),
+        )
         no_progress_actions = 0
         if discovery is not None and result["row"].get("status") == "saved" and discovery.proposals:
             append_jsonl(destination / "discovery.jsonl", {
@@ -2846,8 +2893,7 @@ def run_live(
                 total_usage[key] += int(value)
                 review_usage[key] += int(value)
         progress(f"review {result['row']['status']}")
-        if str(current.get("game_state", "")).upper() == "WIN":
-            perform_global_memory_review()
+        profile_candidate_ids_queued.update(result["row"].get("profile_candidates_queued", []))
 
     def maybe_review_after_action_set() -> None:
         if (
@@ -3048,7 +3094,21 @@ def run_live(
                         (memory_store_dir / "MEMORY.md").read_text(encoding="utf-8")
                         if (memory_store_dir / "MEMORY.md").is_file() else ""
                     ),
-                    global_memory=read_global_memory(state_root),
+                    profile_memory=read_profile_memory(state_root, active_profile.profile_id, max_characters=profile_memory_max_chars),
+                    profile_metadata={
+                        "profile_id": active_profile.profile_id,
+                        "action_signature": active_profile.action_signature,
+                        "argument_schema_fingerprint": active_profile.argument_schema_fingerprint,
+                        "skill_sha256": skill_sha256,
+                        "profile_prompt_sha256": compose_profile_prompt(
+                            active_profile, project_skills_dir() / "profile_capabilities",
+                        )[1],
+                        "profile_memory_sha256": hashlib.sha256(read_profile_memory(
+                            state_root, active_profile.profile_id, max_characters=profile_memory_max_chars,
+                        ).encode("utf-8")).hexdigest(),
+                        "game_memory_sha256": hashlib.sha256((memory_store_dir / "MEMORY.md").read_bytes()).hexdigest()
+                        if (memory_store_dir / "MEMORY.md").is_file() else hashlib.sha256(b"").hexdigest(),
+                    },
                 )
                 post_mortem_model_calls += int(post_mortem["attempts"])
                 model_calls += int(post_mortem["attempts"])

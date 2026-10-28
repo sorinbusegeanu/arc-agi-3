@@ -1,17 +1,17 @@
-# Hydra v11.0.0 — Visual Click and Mixed-Action Games
+# Hydra v11 — Visual Click, Mixed-Action, and Action-Profile Harness
 
-**Status:** Implemented; automated v11 validation passed. Live model benchmarks remain outstanding.  
-**Target release:** 11.0.0  
-**Fork baseline:** v10.0.29 source copied into `src/v11`; v10 remains unchanged  
+**Status:** v11.0 click/mixed-action implementation remains the baseline; v11.1 profile design is implemented. Live model benchmarks remain outstanding.
+**Current release:** 11.1.0
+**Fork baseline:** v10.0.29 source copied into `src/v11`; v10 remains unchanged
 **Scope:** Fork the v10 LLM/vision/tool harness into v11, then add click-only and mixed click/movement ARC-AGI-3 support while preserving movement-game behavior and leaving v10 frozen.
 
 ## Version boundary and implementation order
 
 - `src/v11` is a standalone copy of `src/v10` made before any click-feature code changes. V11 imports no runtime modules from `v10`.
 - Keep v10 source, tests, docs, skill, and persistent state unchanged. The unchanged `v10.reasoned_action/1` response and evidence/route formats may remain compatible inside v11; new v11-only records use `v11.*` schema names.
-- V11 reports version `11.0.0` from its own runtime constant and CLI. Root package metadata describes the current release as `11.0.0`; v10 retains its `10.0.29` runtime constant.
-- V11 defaults to `skills/v11/SKILL.md` and `skills/v11/state/` for game/global memory and routes. It does not automatically read v10 memory, routes, or historical runs. `--state-dir` remains an explicit override; sharing requires the user to choose it intentionally.
-- Establish this design first, then copy the v10 package into `src/v11`, verify that baseline copy, and only then begin click-feature implementation.
+- V11 started at `11.0.0`; action-set profiles and scoped profile learning ship in `11.1.0`. Root package metadata and the v11 runtime constant report `11.1.0`; v10 retains its `10.0.29` runtime constant.
+- V11 defaults to `skills/v11/SKILL.md` and `skills/v11/state/` for game/profile memory and routes. It does not automatically read v10 memory, routes, or historical runs. `--state-dir` remains an explicit override; sharing requires the user to choose it intentionally.
+- The original fork order above documents the completed v11.0 baseline. For v11.1 changes, keep the common harness authoritative and add only the profile composition and isolated profile-learning responsibilities.
 
 ## 1. Objective
 
@@ -255,7 +255,17 @@ Count click effectiveness by **state-specific** actions; distinguish exact no-op
 
 ### Release/versioning note
 
-The copied v10 runtime reports `10.0.29`. V11 is a separate major feature line and starts at `11.0.0`; keep that version in v11's runtime constant and CLI, update root package metadata to `11.0.0`, and leave v10's runtime version unchanged.
+The copied v10 runtime reports `10.0.29`. V11 is a separate feature line and started at `11.0.0`; action-set profiles and scoped profile learning ship in `11.1.0`. Keep root package metadata and the v11 runtime constant synchronized; leave v10's runtime version unchanged.
+
+## Action-set profiles and scoped learning (11.1)
+
+V11 remains one harness. At initialization and whenever legal actions change, it resolves the sorted environment action IDs to one of the nine documented signatures or `generic`. `RESET` is excluded. The resolver also fingerprints argument schemas, while prompt composition loads only the capability fragments that apply to the active signature from `skills/v11/profile_capabilities/`. Neither action names nor catalog descriptions are treated as proof of behavior. If the signature or schema changes during a run, the run logs the change and starts a fresh model conversation while retaining game evidence and game memory.
+
+The general procedure belongs in `skills/v11/SKILL.md`; action-family knowledge belongs in the capability fragments; current state and constraints belong in the live prompt; game-specific findings belong in `games/<game-id>/MEMORY.md`. Approved transferable methods belong in `profiles/<profile-id>/MEMORY.md`. The former shared `global/MEMORY.md` is removed once per state root during migration, with a marker in `migrations/v11-profile-memory.json`.
+
+Model review and discovery may only enqueue profile candidates linked to direct transition evidence. They never edit approved profile memory. The `v11 profiles` CLI lists, rejects, and promotes candidates. Promotion requires matching normalized claims from at least two source games and a held-out report that identifies a distinct test set, candidate and baseline revisions, measured metrics, and an improvement. The proposed replacement Markdown is human-curated and recorded in an append-only promotion audit. `--reset-memory` removes learned game/profile state while preserving migration markers and tracked capability prompts.
+
+Each run manifest, profile-switch event, review, and model action context records profile ID, sorted action signature, argument-schema fingerprint, core skill revision, composed capability-prompt revision, and game/profile memory revisions. Reproducibility logs must not contain secrets or raw model credentials.
 
 ## 10. Risks and design decisions
 
@@ -339,7 +349,7 @@ This chapter defines implementation order, affected files, tests and acceptance 
 2. Execute deterministic click-only and mixed fixtures with model-driven selection and with cached replay.
 3. Re-run ez01–ez04 movement benchmarks with comparable seed, model and budget, investigating any regression.
 4. Verify evidence replay, game-over/restart behavior, action budget accounting, prompt validity and coordinate logs.
-5. Update `docs/v11/DESIGN.md`, `docs/v11/README.md`, `docs/v11/IMPLEMENTATION_PLAN.md`, and release metadata for v11.0.0.
+5. Update `docs/v11/DESIGN.md`, `docs/v11/README.md`, `docs/v11/IMPLEMENTATION_PLAN.md`, and release metadata for v11.1.0.
 
 **Release gate:** All deterministic fixtures solved and replayable, zero invalid executed coordinates, existing movement suite green, and no regression in stored-route compatibility. Model-backed benchmark results (solve rate, actions and model calls) are reported separately from deterministic correctness tests.
 
@@ -354,7 +364,7 @@ This chapter defines implementation order, affected files, tests and acceptance 
 - [x] Coordinate-aware fallback and stagnation comparisons implemented.
 - [x] Mixed click/movement route argument preservation verified in both action orders.
 - [x] Complete automated v11 tests and movement regressions pass; v10 source/tests remain unchanged.
-- [x] V11 runtime and package metadata report 11.0.0; v10 remains at 10.0.29.
+- [x] V11 runtime and package metadata report 11.1.0; v10 remains at 10.0.29.
 - [ ] Model-backed movement benchmarks and live click-game runs recorded.
 
 ## 12. Out of scope for this release

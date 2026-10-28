@@ -146,7 +146,8 @@ def enqueue_profile_candidate(
         "applicability_conditions": conditions, "evidence_ids": evidence,
     }
     path = profile_candidates_path(state_dir, profile_id)
-    with path.open("a+", encoding="utf-8") if path.parent.exists() else _new_candidate_file(path) as handle:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         handle.seek(0)
         existing = [json.loads(line) for line in handle if line.strip()]
@@ -157,11 +158,6 @@ def enqueue_profile_candidate(
             os.fsync(handle.fileno())
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     return row
-
-
-def _new_candidate_file(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path.open("a+", encoding="utf-8")
 
 
 def list_profile_candidates(
@@ -739,7 +735,7 @@ class GameMemory:
 
     def record_markdown_revision(self, scope: str, markdown: str, *, step: int) -> bool:
         """Archive authoritative prose in the existing ledger without rendering it."""
-        if scope not in {"game", "global"} or not isinstance(markdown, str) or not markdown.strip():
+        if scope not in {"game", "profile"} or not isinstance(markdown, str) or not markdown.strip():
             return False
         self._rows = read_jsonl(self.path)
         previous = next((row for row in reversed(self._rows)

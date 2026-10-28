@@ -64,7 +64,8 @@ def resolve_action_profile(legal_actions: Any) -> ActionProfile:
     """Resolve by sorted environment action IDs; RESET and schema details do not split profiles."""
     if isinstance(legal_actions, Mapping):
         rows: list[Any] = [
-            {"id": action_id, "parameters": value.get("parameters", {}) if isinstance(value, Mapping) else {}}
+            {"id": action_id, "parameters": value if isinstance(value, Mapping) and "parameters" not in value
+             else value.get("parameters", {}) if isinstance(value, Mapping) else {}}
             for action_id, value in legal_actions.items()
         ]
     elif isinstance(legal_actions, Sequence) and not isinstance(legal_actions, (str, bytes)):

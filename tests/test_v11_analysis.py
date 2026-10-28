@@ -662,7 +662,7 @@ def test_model_logging_cli_flags_default_off_and_enable_independently() -> None:
     assert defaults.log_request is False
     assert defaults.log_response is False
     assert defaults.reset_memory is False
-    assert defaults.global_memory_max_chars == 4500
+    assert defaults.profile_memory_max_chars == 4500
     assert defaults.plan_horizon == 8
     assert defaults.max_output_tokens == 6144
     with pytest.raises(SystemExit):
@@ -676,12 +676,12 @@ def test_model_logging_cli_flags_default_off_and_enable_independently() -> None:
     ])
     assert reset.reset_memory is True
     configured_memory = parser.parse_args([
-        "live", "--game-id", "ez01", "--run-dir", "run", "--global-memory-max-chars", "4200",
+        "live", "--game-id", "ez01", "--run-dir", "run", "--profile-memory-max-chars", "4200",
     ])
-    assert configured_memory.global_memory_max_chars == 4200
+    assert configured_memory.profile_memory_max_chars == 4200
     with pytest.raises(SystemExit):
         parser.parse_args([
-            "live", "--game-id", "ez01", "--run-dir", "run", "--global-memory-max-chars", "4501",
+            "live", "--game-id", "ez01", "--run-dir", "run", "--profile-memory-max-chars", "4501",
         ])
     configured_horizon = parser.parse_args([
         "live", "--game-id", "ez01", "--run-dir", "run", "--plan-horizon", "8",
@@ -702,7 +702,7 @@ def test_cli_reports_v10_patch_version_and_context_override(capsys) -> None:
     with pytest.raises(SystemExit) as version_exit:
         parser.parse_args(["--version"])
     assert version_exit.value.code == 0
-    assert capsys.readouterr().out.strip() == "v11 11.0.0"
+    assert capsys.readouterr().out.strip() == "v11 11.1.0"
 
     configured = parser.parse_args([
         "live", "--game-id", "ez01", "--run-dir", "run", "--context-window-tokens", "32768",

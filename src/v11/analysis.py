@@ -204,6 +204,7 @@ def reasoned_action_contract_description(
     legal_action_specs: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Single canonical model response contract; ``actions`` is the only action list."""
+    faced_specs: list[dict[str, Any]] = []
     if legal_action_specs is None:
         example_action, example_args = "up", {}
     else:
@@ -224,13 +225,19 @@ def reasoned_action_contract_description(
                     example_args[name] = property_schema.get("minimum", 0)
                 elif property_schema.get("type") == "number":
                     example_args[name] = property_schema.get("minimum", 0)
+    click_only = bool(faced_specs) and {str(spec.get("id")) for spec in faced_specs} == {"click"}
+    assessment_example = {
+        "player": (
+            {"location": "unknown", "certainty": "unknown", "evidence": "unknown or not present"}
+            if click_only else
+            {"location": "visual region or unknown", "certainty": "observed | inferred | unknown", "evidence": "brief visual basis"}
+        ),
+        "target_candidates": [] if click_only else [{"description": "visual candidate", "location": "visual region", "relevance": "why it may matter", "certainty": "observed | inferred | unknown"}],
+        "obstacles": [] if click_only else [{"description": "visual element", "location": "visual region", "status": "observed_blocked | suspected_blocked | unknown", "evidence": "brief basis"}],
+        "other_relevant_changes": ["brief observation"],
+    }
     return {
-        "state_assessment": {
-            "player": {"location": "visual region or unknown", "certainty": "observed | inferred | unknown", "evidence": "brief visual basis"},
-            "target_candidates": [{"description": "visual candidate", "location": "visual region", "relevance": "why it may matter", "certainty": "observed | inferred | unknown"}],
-            "obstacles": [{"description": "visual element", "location": "visual region", "status": "observed_blocked | suspected_blocked | unknown", "evidence": "brief basis"}],
-            "other_relevant_changes": ["brief observation"],
-        },
+        "state_assessment": assessment_example,
         "hypothesis": None,
         "trajectory_rationale": "one to three concise sentences; no chain-of-thought",
         "prediction": {"visible_change": "yes | no | unknown", "environment_outcome": "level_change | GAME_OVER | WIN | no_terminal | unknown", "description": "expected result of the first action only; do not describe later actions or the whole plan"},

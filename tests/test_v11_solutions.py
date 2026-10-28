@@ -248,10 +248,10 @@ class _Client:
 
     def complete(self, system_prompt, user_prompt, image_paths, image_labels, response_format="json_object", *, messages=None, conversation_reset_count=None, tools=None):
         self.calls.append(system_prompt)
-        if system_prompt.startswith("# V10 memory consolidation"):
+        if system_prompt.startswith("# V11 game memory and profile candidate review"):
             content = json.dumps({
                 "game_memory_markdown": "# Game Memory\n\n- The verified route completes level zero.",
-                "global_memory_markdown": "# Global Memory\n\n- Compare objects before and after actions.",
+                "profile_memory_candidates": [],
             })
         else:
             content = json.dumps({

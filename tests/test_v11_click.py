@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 
-from v11.analysis import model_action_aliases, validate_model_decision
+from v11.analysis import (
+    model_action_aliases, reasoned_action_contract_description, validate_model_decision,
+)
+from v11.live import (
+    _action_conversation_observation, _action_observation_events,
+    _action_transition_summary, _compact_transition_measurements, _live_context,
+    _review_events,
+)
 from v11.tools.game import GameTools
+from v11.tools.memory import game_memory_dir, shared_skill_path
 from v11.tools.vision import click_effect, propose_click_candidates
 
 
@@ -87,3 +97,128 @@ def test_click_effect_distinguishes_local_from_remote_without_progress_claims() 
     assert effect["remote_changed_pixels"] == 1
     assert effect["level_changed"] is True
     assert "player" not in effect
+
+
+def test_click_coordinates_and_distinct_targets_survive_compact_summaries() -> None:
+    first = {"action": "ACTION6", "args": {"x": 12, "y": 8}, "measurements": {"changed_pixels": 2}}
+    second = {"action": "ACTION6", "args": {"x": 2, "y": 3}, "measurements": {"changed_pixels": 2}}
+    assert _action_transition_summary(first, 1) == "1 click(x=12,y=8): visible change"
+    assert _action_transition_summary(second, 2) == "2 click(x=2,y=3): visible change"
+    assert _action_transition_summary(first, 1) != _action_transition_summary(second, 2)
+    assert _action_transition_summary({"action": "ACTION5", "args": {"mode": "toggle"}}, 3).startswith(
+        '3 ACTION5(args={"mode":"toggle"}):'
+    )
+
+
+def test_compact_click_effect_keeps_existing_local_remote_measurements_only() -> None:
+    compact = _compact_transition_measurements({
+        "changed_pixels": 7,
+        "click_effect": {
+            "schema": "v11.click_effect/1", "x": 12, "y": 8, "radius": 2,
+            "local_changed_pixels": 3, "remote_changed_pixels": 4,
+            "total_changed_pixels": 7, "level_changed": True, "terminal_changed": False,
+        },
+        "raw_pixels": [[1, 2, 3]],
+    })
+    assert compact == {
+        "changed_pixels": 7,
+        "click_effect": {
+            "local_changed_pixels": 3, "remote_changed_pixels": 4,
+            "total_changed_pixels": 7, "level_changed": True, "terminal_changed": False,
+        },
+    }
+
+
+def test_click_args_and_effect_survive_continued_bootstrap_review_and_reinitialized_context(tmp_path) -> None:
+    class ClickEnv:
+        def __init__(self):
+            self.frame = np.zeros((12, 16), dtype=np.uint8)
+            self.legal_actions = [{"id": "ACTION6", "parameters": {
+                "type": "object", "properties": {
+                    "x": {"type": "integer", "minimum": 0, "maximum": 15},
+                    "y": {"type": "integer", "minimum": 0, "maximum": 11},
+                }, "required": ["x", "y"], "additionalProperties": False,
+            }}]
+
+        def observe(self):
+            return {"frame": self.frame.copy(), "legal_actions": self.legal_actions,
+                    "game_state": "NOT_FINISHED", "level": 0, "levels_completed": 0,
+                    "win_levels": 1, "terminal": False}
+
+        def act(self, action, args):
+            self.frame[args["y"], args["x"]] = 1
+            self.frame[0, 0] = int(args["x"] + args["y"])
+            return {}
+
+    tools = GameTools(ClickEnv(), tmp_path / "click-context", max_actions=4)
+    tools.observe()
+    first = tools.act("ACTION6", {"x": 12, "y": 8})
+    second = tools.act("ACTION6", {"x": 2, "y": 3})
+    current = second["observation"]
+    records = tools.history.records()
+
+    events = _action_observation_events(records)
+    click_events = [row for row in events if row.get("action") == "click"]
+    assert [row["observed_result"].split(";", 1)[0] for row in click_events] == [
+        "1 click(x=12,y=8): visible change", "2 click(x=2,y=3): visible change",
+    ]
+    assert [row["measurements"]["click_effect"]["local_changed_pixels"] for row in click_events] == [1, 1]
+    assert [row["measurements"]["click_effect"]["remote_changed_pixels"] for row in click_events] == [1, 1]
+
+    continued, _, _ = _action_conversation_observation(
+        tools, current, records, horizon=1,
+    )
+    continued_payload, _ = json.JSONDecoder().raw_decode(
+        continued.split("CURRENT SCREEN is the actual latest environment state.\n", 1)[1]
+    )
+    continued_events = continued_payload["new_observations_since_previous_action_request"]
+    assert [row["observed_result"].split(";", 1)[0] for row in continued_events if row.get("action") == "click"] == [
+        "1 click(x=12,y=8): visible change", "2 click(x=2,y=3): visible change",
+    ]
+    bootstrap, _, _ = _action_conversation_observation(
+        tools, current, records, horizon=1, bootstrap_transitions=[records[1], records[2]],
+    )
+    assert "click(x=12,y=8)" in bootstrap and "click(x=2,y=3)" in bootstrap
+    assert "local_changed_pixels" in bootstrap and "remote_changed_pixels" in bootstrap
+
+    reinitialized = _live_context(
+        tools, current, "click-fixture", 1, shared_skill_path(),
+        game_memory_dir(tmp_path / "state", "click-fixture"), "reinit", 0,
+    )
+    compacted_rows = reinitialized["context"]["recent_transitions"]
+    assert [row["args"] for row in compacted_rows] == [{"x": 12, "y": 8}, {"x": 2, "y": 3}]
+    assert [row["measurements"]["click_effect"]["total_changed_pixels"] for row in compacted_rows] == [2, 2]
+    visible_context = json.loads(reinitialized["user_prompt"].split("Visible context:\n", 1)[1])
+    assert "click(x=12,y=8)" in visible_context["recent_transitions"][0]["summary"]
+    assert visible_context["recent_transitions"][0]["click_effect"]["local_changed_pixels"] == 1
+
+    review_events = [row for row in _review_events(records) if row.get("type") == "transition"]
+    assert [row["args"] for row in review_events] == [{"x": 12, "y": 8}, {"x": 2, "y": 3}]
+    assert review_events[0]["measurements"]["click_effect"]["remote_changed_pixels"] == 1
+    # Keep a reference to the first transition's observation for the assertions above.
+    assert first["evidence"]["args"] == {"x": 12, "y": 8}
+
+
+def test_click_only_contract_has_required_coordinates_and_no_assumed_player_or_obstacles() -> None:
+    click_spec = {"id": "ACTION6", "parameters": {
+        "type": "object", "properties": {
+            "x": {"type": "integer", "minimum": 0, "maximum": 15},
+            "y": {"type": "integer", "minimum": 0, "maximum": 11},
+        }, "required": ["x", "y"], "additionalProperties": False,
+    }}
+    contract = reasoned_action_contract_description([click_spec])
+    assert contract["actions"] == [{"action": "click", "args": {"x": 0, "y": 0}}]
+    assert contract["state_assessment"]["player"]["location"] == "unknown"
+    assert contract["state_assessment"]["player"]["certainty"] == "unknown"
+    assert contract["state_assessment"]["target_candidates"] == []
+    assert contract["state_assessment"]["obstacles"] == []
+    valid = {
+        **contract,
+        "hypothesis": None,
+        "trajectory_rationale": "Test this legal coordinate.",
+        "prediction": {"visible_change": "unknown", "environment_outcome": "unknown", "description": "unknown"},
+    }
+    from v11.analysis import validate_reasoned_action
+    assert validate_reasoned_action(valid, [click_spec])["actions"] == [
+        {"action": "ACTION6", "args": {"x": 0, "y": 0}},
+    ]

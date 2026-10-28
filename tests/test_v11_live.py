@@ -4,7 +4,6 @@ import json
 import copy
 import re
 import sys
-import threading
 import types
 from pathlib import Path
 
@@ -15,7 +14,7 @@ import v11.live as live_module
 from v11.arcade_env import ArcadeGameEnv
 from v11.live import (
     _active_level_transitions, _live_context, _parse_content, _perform_game_over_post_mortem,
-    _perform_global_memory_review, _perform_review,
+    _perform_review,
     _perceptual_state_equivalence, _review_events,
     _verified_route_summaries, run_live,
 )
@@ -24,7 +23,7 @@ from v11.tools.game import GameTools
 from v11.tools.game import ActionError
 from v11.tools.history import History
 from v11.tools.memory import (
-    GameMemory, game_memory_dir, global_memory_path, save_game_memory, shared_skill_path,
+    GameMemory, game_memory_dir, profile_memory_path, save_game_memory, shared_skill_path,
 )
 
 
@@ -43,30 +42,6 @@ def test_perceptual_equivalence_is_sparse_exploration_signal_only() -> None:
     assert _perceptual_state_equivalence(np.zeros((8, 8)), np.zeros((8, 8)))["certainty"] == "unreliable"
 
 
-def test_shared_global_memory_review_lock_is_held_during_review(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    lock = threading.RLock()
-    lock_states = []
-
-    def review(*args, **kwargs):
-        lock_states.append(lock._is_owned())
-        return {
-            "row": {"status": "failed"}, "attempts": 0,
-            "usage": {}, "latency_seconds": 0.0,
-        }
-
-    monkeypatch.setattr(live_module, "_perform_review", review)
-    monkeypatch.setattr(live_module, "REVIEW_ACTION_THRESHOLD", 1)
-    client = _FakeClient([_decision([_action()]) for _ in range(3)])
-
-    run_live(
-        _FakeEnv(), tmp_path / "locked-review", client, game_id="fixture",
-        state_dir=tmp_path / "state", starting_routine=False, max_actions=3,
-        plan_horizon=1, global_memory_lock=lock,
-    )
-
-    assert lock_states == [True]
 
 
 def test_action_decision_parser_accepts_one_fenced_json_object_with_prose() -> None:
@@ -151,7 +126,7 @@ _VALID_GAME_MEMORY = "# Game Memory\n\n- A cue is visible in this game."
 _VALID_GLOBAL_MEMORY = "# Global Memory\n\n- Compare each object before and after an action."
 _VALID_REVIEW = json.dumps({
     "game_memory_markdown": _VALID_GAME_MEMORY,
-    "global_memory_markdown": _VALID_GLOBAL_MEMORY,
+    "profile_memory_candidates": [],
 })
 
 
@@ -160,7 +135,6 @@ class _FakeClient:
 
     def __init__(
         self, decisions, *, request_attempts=1, review_responses=None,
-        global_memory_review_responses=None,
         post_mortem_responses=None, review_errors=None, reasoning_responses=None,
         default_decision=None,
     ):
@@ -171,7 +145,6 @@ class _FakeClient:
         self.tool_definitions = []
         self.request_attempts = request_attempts
         self.review_responses = list(review_responses or [])
-        self.global_memory_review_responses = list(global_memory_review_responses or [])
         self.post_mortem_responses = list(post_mortem_responses or [])
         self.review_errors = list(review_errors or [])
         self.reasoning_responses = list(reasoning_responses or [])
@@ -201,17 +174,11 @@ class _FakeClient:
         self.system_prompts.append(system_prompt)
         self.response_formats.append(response_format)
         self.tool_definitions.append(copy.deepcopy(tools))
-        if system_prompt.startswith("# V10 memory consolidation"):
+        if system_prompt.startswith("# V11 game memory and profile candidate review"):
             if self.review_errors:
                 raise self.review_errors.pop(0)
             content = self.review_responses.pop(0) if self.review_responses else _VALID_REVIEW
-        elif system_prompt.startswith("# V10 global memory cleanup"):
-            content = (
-                self.global_memory_review_responses.pop(0)
-                if self.global_memory_review_responses
-                else "# Global methods\n\n- Compare the state before and after one action."
-            )
-        elif system_prompt.startswith("# V10 game-over post-mortem"):
+        elif system_prompt.startswith("# V11 game-over post-mortem"):
             content = self.post_mortem_responses.pop(0) if self.post_mortem_responses else "Post-mortem unavailable."
         elif system_prompt.startswith("# V10 uncertain action assessment"):
             content = self.reasoning_responses.pop(0) if self.reasoning_responses else json.dumps({
@@ -387,17 +354,17 @@ def test_review_consolidates_scoped_hypotheses_and_feasible_experiment(tmp_path:
         assert instruction in review_prompt
     assert "remains valid after a run restarts" in system_prompt
     assert "Do not create a “Game status,” “Current state,” or “Level progress” section" in system_prompt
-    assert "Merge overlapping bullets instead of appending duplicates" in system_prompt
-    assert "they do not prove a wall" in system_prompt
+    assert "Merge repetition" in system_prompt
+    assert "do not prove a wall" in system_prompt
     assert "Legal actions available from the current active screen" in review_prompt
     assert '"id":"up"' in review_prompt
-    assert "exactly two non-empty Markdown strings" in system_prompt
+    assert "exactly `game_memory_markdown` and `profile_memory_candidates`" in system_prompt
     from v11.live import _validate_review_payload
     assert _validate_review_payload({
         "game_memory_markdown": game_memory,
         "global_memory_markdown": global_memory,
-    }) == (game_memory, global_memory)
-    with pytest.raises(ValueError, match="exactly game_memory_markdown and global_memory_markdown"):
+    }) == (game_memory, [])
+    with pytest.raises(ValueError, match="exactly game_memory_markdown and profile_memory_candidates"):
         _validate_review_payload({
             "game_memory_markdown": game_memory,
             "global_memory_markdown": global_memory,
@@ -406,7 +373,7 @@ def test_review_consolidates_scoped_hypotheses_and_feasible_experiment(tmp_path:
 
     saved = (store_dir / "MEMORY.md").read_text(encoding="utf-8")
     assert saved == game_memory + "\n"
-    assert (tmp_path / "state/global/MEMORY.md").read_text(encoding="utf-8") == global_memory + "\n"
+    assert not (tmp_path / "state/global/MEMORY.md").exists()
     action_context = _live_context(
         tools, tools.observe(), "fixture", 2, shared_skill_path(), store_dir, "next-run", 0,
     )
@@ -453,34 +420,17 @@ def test_normal_and_bootstrap_prompts_keep_only_applicable_reset_constraints(tmp
     assert "RESET\",\"parameters" not in bootstrap["user_prompt"]
 
 
-def test_global_memory_limit_is_hard_capped_at_four_thousand_five_hundred_characters(tmp_path: Path) -> None:
-    from v11.live import _validate_review_payload
-    from v11.tools.memory import MAX_GLOBAL_MEMORY_MARKDOWN_CHARS
-
-    assert MAX_GLOBAL_MEMORY_MARKDOWN_CHARS == 4_500
-    _validate_review_payload({
-        "game_memory_markdown": _VALID_GAME_MEMORY,
-        "global_memory_markdown": "g" * 4_500,
-    })
-    with pytest.raises(ValueError, match="4500 character limit"):
-        _validate_review_payload({
-            "game_memory_markdown": _VALID_GAME_MEMORY,
-            "global_memory_markdown": "g" * 4_501,
-        })
 
 
 def test_review_memory_accepts_fixed_level_counts_but_rejects_transient_counts() -> None:
     from v11.live import _review_memory_quality_errors
 
-    assert not _review_memory_quality_errors(
-        "## Mechanics\n- Each level has four fixed markers.", "# Global\n- Compare before and after."
-    )
+    assert not _review_memory_quality_errors("## Mechanics\n- Each level has four fixed markers.")
     assert "game_memory_markdown contains a transient item count" in _review_memory_quality_errors(
-        "## Hypothesis\n- Four markers remain.", "# Global\n- Compare before and after."
+        "## Hypothesis\n- Four markers remain."
     )
     assert "game_memory_markdown infers a general obstacle from a state-specific no-op" in _review_memory_quality_errors(
         "## Mechanics\n- A rightward action produced zero pixel change, indicating a wall blocks movement.",
-        "# Global\n- Compare before and after.",
     )
 
 
@@ -949,9 +899,9 @@ def test_memory_revision_updates_existing_action_conversation_without_reset(tmp_
     assert client.message_calls[1]["conversation_reset_count"] == 1
     assert client.message_calls[2]["conversation_reset_count"] == 1
     updated_user = _message_user_text(client, 2)
-    assert "Authoritative memory update" in updated_user
+    assert "Approved profile MEMORY.md" in updated_user
     assert _VALID_GAME_MEMORY in updated_user
-    assert _VALID_GLOBAL_MEMORY in updated_user
+    assert "(empty)" in updated_user
 
 
 def test_action_conversation_without_token_usage_compacts_after_24_turns(
@@ -1036,7 +986,7 @@ def test_action_context_includes_full_saved_game_and_global_memory(tmp_path: Pat
         f"- Global method {index}: " + ("m" * 90) for index in range(12)
     ) + "\n- FINAL_GLOBAL_FINDING_MARKER"
     (memory_store_dir / "MEMORY.md").write_text(game_memory, encoding="utf-8")
-    global_path = tmp_path / "state/global/MEMORY.md"
+    global_path = profile_memory_path(tmp_path / "state", "generic")
     global_path.parent.mkdir(parents=True)
     global_path.write_text(global_memory, encoding="utf-8")
 
@@ -1049,7 +999,7 @@ def test_action_context_includes_full_saved_game_and_global_memory(tmp_path: Pat
     assert len(game_memory) > 850
     assert len(global_memory) > 350
     assert prompt_context["memory"] == game_memory
-    assert prompt_context["global_memory"] == global_memory
+    assert prompt_context["profile_memory"] == global_memory
 
 
 def test_compact_action_prompt_preserves_noop_and_failed_action_details(tmp_path: Path) -> None:
@@ -1893,7 +1843,7 @@ def test_cached_level_success_skips_reviews_on_replayed_route(tmp_path: Path) ->
     )
     assert win_metrics["won"] is True
     assert win_metrics["review_count"] == 0
-    assert win_metrics["global_memory_review_count"] == 0
+    assert win_metrics["review_count"] == 0
     assert win_metrics["review_skipped_cached_success_count"] == 1
     assert win_client.calls == []
     assert _review_rows(tmp_path / "cached-win") == []
@@ -2185,11 +2135,9 @@ def test_review_repairs_transient_progress_and_global_blockage_overclaim(tmp_pat
         "game_memory_markdown": (
             "## Game status\n- All levels completed; game state is WIN.\n\n"
             "## Level 2 progress\n- Four yellows collected at actions 10 and 20. "
-            "The player recently moved left."
+            "The player recently moved left.\n- A rightward action produced zero pixel change, indicating a wall blocks movement."
         ),
-        "global_memory_markdown": (
-            "- When an action produces zero visible change, the target cell is blocked."
-        ),
+        "global_memory_markdown": "ignored during migration",
     })
     client = _FakeClient([], review_responses=[invalid, _VALID_REVIEW])
     store_dir = tmp_path / "state/games/fixture"
@@ -2206,48 +2154,12 @@ def test_review_repairs_transient_progress_and_global_blockage_overclaim(tmp_pat
     assert "run-specific completion status" in repair_prompt
     assert "action-numbered progress" in repair_prompt
     assert "transient item count" in repair_prompt
-    assert "no visible change as proof of blockage or reachability" in repair_prompt
+    assert "Describe no-visible-change only for that exact action and state" in repair_prompt
     assert "current collected/remaining counts" in repair_prompt
     assert (store_dir / "MEMORY.md").read_text() == _VALID_GAME_MEMORY + "\n"
-    assert global_memory_path(tmp_path / "state").read_text() == _VALID_GLOBAL_MEMORY + "\n"
+    assert not (tmp_path / "state/global/MEMORY.md").exists()
 
 
-@pytest.mark.parametrize(
-    ("bad_payload", "game_limit", "global_limit"),
-    [
-        ('{"game_memory_markdown":" ","global_memory_markdown":"# Global Memory"}', 6000, 3000),
-        ('{"game_memory_markdown":"' + "g" * 40 + '","global_memory_markdown":"# Global Memory"}', 32, 3000),
-        ('{"game_memory_markdown":"# Game Memory","global_memory_markdown":"' + "g" * 40 + '"}', 6000, 32),
-        (json.dumps({
-            "game_memory_markdown": "## Game status\n- All levels completed; game state is WIN.",
-            "global_memory_markdown": _VALID_GLOBAL_MEMORY,
-        }), 6000, 3000),
-        (json.dumps({
-            "game_memory_markdown": _VALID_GAME_MEMORY,
-            "global_memory_markdown": "- No visible change proves the target cell is blocked.",
-        }), 6000, 3000),
-    ],
-)
-def test_rejected_markdown_review_preserves_both_previous_files(
-    tmp_path: Path, bad_payload: str, game_limit: int, global_limit: int,
-) -> None:
-    state_dir = tmp_path / "state"
-    store_dir = game_memory_dir(state_dir, "fixture")
-    previous_game = "# Game Memory\n\n- Keep prior game guidance."
-    previous_global = "# Global Memory\n\n- Keep prior global guidance."
-    save_game_memory(store_dir, previous_game)
-    from v11.tools.memory import save_global_memory
-    save_global_memory(state_dir, previous_global)
-    client = _FakeClient([], review_responses=[bad_payload, bad_payload])
-    result = _perform_review(
-        GameTools(_FakeEnv(), tmp_path / "run"), client, game_id="fixture", run_id="r1",
-        memory_store_dir=store_dir, trigger_reasons=["test_review"],
-        game_memory_max_chars=game_limit, global_memory_max_chars=global_limit,
-    )
-    assert result["row"]["status"] == "failed"
-    assert (store_dir / "MEMORY.md").read_text() == previous_game + "\n"
-    assert global_memory_path(state_dir).read_text() == previous_global + "\n"
-    assert result["row"]["review_checkpoint_saved"] is False
 
 def test_action_set_review_uses_strict_nine_action_threshold(tmp_path: Path) -> None:
     client = _FakeClient([
@@ -2541,9 +2453,9 @@ def test_terminal_level_completion_is_reviewed_without_resuming_play(tmp_path: P
     assert env.resets == 0
     assert metrics["stop_reason"] == "win"
     assert metrics["review_count"] == 1
-    assert metrics["global_memory_review_count"] == 1
-    assert len(client.calls) == 3
-    assert client.system_prompts[-1].startswith("# V10 global memory cleanup")
+    assert metrics["review_count"] == 1
+    assert len(client.calls) == 2
+    assert client.system_prompts[-1].startswith("# V11 game memory and profile candidate review")
     assert _review_rows(tmp_path / "run")[0]["status"] == "saved"
     assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["level_completed"]
 
@@ -2630,6 +2542,7 @@ def test_game_over_with_budget_remaining_resets_and_repeats_startup_bootstrap(
         "action_number": 1, "action": "left", "level_index": 0,
         "levels_completed": 0, "resulting_game_state": "GAME_OVER",
         "starts_from_screen_number": 1, "produces_screen_numbers": [2],
+        "args": {}, "measurements": {"changed_pixels": 1, "color_change_count": 1},
     }]
 
     bootstrap_prompts = [
@@ -2673,7 +2586,7 @@ def test_post_mortem_sends_every_action_and_screen_in_order(tmp_path: Path) -> N
     client = _FakeClient([], post_mortem_responses=["The sequence shows no supported cause."])
 
     result = _perform_game_over_post_mortem(
-        tools, client, game_id="fixture", guidance_memory="", global_memory="",
+        tools, client, game_id="fixture", guidance_memory="", profile_memory="",
     )
     assert client.tool_definitions == [None]
 
@@ -2743,91 +2656,8 @@ def test_win_without_level_counter_change_is_treated_as_level_completion(tmp_pat
     assert _review_rows(tmp_path / "run")[0]["trigger_reasons"] == ["level_completed"]
 
 
-def test_game_win_runs_dedicated_global_memory_cleanup_after_normal_review(tmp_path: Path) -> None:
-    state_dir = tmp_path / "state"
-    global_path = state_dir / "global/MEMORY.md"
-    global_path.parent.mkdir(parents=True)
-    global_path.write_text("# Old global memory\n\n- Repeated, narrow advice.\n", encoding="utf-8")
-    crowded_global = "# Global memory\n\n" + "\n".join(
-        f"- Narrow tactic {index}: do a specific thing in a specific puzzle." for index in range(10)
-    )
-    cleaned_global = (
-        "# Global methods\n\n"
-        "- Compare the state before and after one action.\n"
-        "- Treat no-ops as specific to the observed state."
-    )
-    normal_review = json.dumps({
-        "game_memory_markdown": _VALID_GAME_MEMORY,
-        "global_memory_markdown": crowded_global,
-    })
-    invalid_cleanup = "\n".join(f"- Excess bullet {index}." for index in range(8))
-    client = _FakeClient(
-        [_decision([_action()])], review_responses=[normal_review],
-        global_memory_review_responses=[invalid_cleanup, cleaned_global],
-    )
-
-    metrics = _run_live_without_starting_routine(
-        _LevelCompleteEnv(terminal=True, start_completed=4),
-        tmp_path / "win-global-cleanup", client, game_id="fixture",
-        max_actions=1, state_dir=state_dir,
-    )
-
-    assert metrics["won"] is True
-    assert metrics["review_count"] == 1
-    assert metrics["global_memory_review_count"] == 1
-    assert metrics["global_memory_review_model_calls"] == 2
-    assert metrics["global_memory_review_status"] == "saved"
-    assert global_path.read_text(encoding="utf-8") == cleaned_global + "\n"
-    cleanup_index = next(
-        index for index, system_prompt in enumerate(client.system_prompts)
-        if system_prompt.startswith("# V10 global memory cleanup")
-    )
-    assert cleanup_index == 2
-    assert "Do not preserve a bullet merely because it already exists." in client.system_prompts[cleanup_index]
-    assert "Do not state that a particular mechanic, object type, or completion condition is present or typical" in client.system_prompts[cleanup_index]
-    assert "Keep useful investigation topics as conditional hypotheses" in client.system_prompts[cleanup_index]
-    assert "whether a special object may act as a portal, switch, or hazard" in client.system_prompts[cleanup_index]
-    assert "Preserve a concise startup probe for unfamiliar games" in client.system_prompts[cleanup_index]
-    assert "Do not recommend exhaustive testing of every direction, object, path, or combination as a default" in client.system_prompts[cleanup_index]
-    cleanup_prompt = client.calls[cleanup_index][0]
-    assert f"Current global MEMORY.md:\n{crowded_global}" in cleanup_prompt
-    assert "Final game MEMORY.md for context only:" in cleanup_prompt
-    assert "Return no more than 7 concise bullets" in cleanup_prompt
-    assert client.response_formats[cleanup_index] is None
-    assert client.calls[cleanup_index][1:] == ([], [])
-    cleanup_log = [
-        json.loads(line) for line in
-        (tmp_path / "win-global-cleanup/global_memory_reviews.jsonl").read_text().splitlines()
-    ]
-    assert cleanup_log[0]["status"] == "saved"
-    assert cleanup_log[0]["repair_history"]
 
 
-def test_invalid_global_memory_cleanup_preserves_previous_file(tmp_path: Path) -> None:
-    state_dir = tmp_path / "state"
-    memory_store_dir = state_dir / "games/fixture"
-    memory_store_dir.mkdir(parents=True)
-    global_path = state_dir / "global/MEMORY.md"
-    global_path.parent.mkdir(parents=True)
-    previous = "# Global memory\n\n- Preserve this method."
-    global_path.write_text(previous + "\n", encoding="utf-8")
-    client = _FakeClient(
-        [], global_memory_review_responses=[
-            "", "\n".join(f"- Too many bullets {index}." for index in range(8)),
-        ],
-    )
-    tools = GameTools(_FakeEnv(), tmp_path / "run")
-    tools.observe()
-
-    result = _perform_global_memory_review(
-        tools, client, game_id="fixture", run_id="failed-cleanup",
-        memory_store_dir=memory_store_dir,
-    )
-
-    assert result["row"]["status"] == "failed"
-    assert global_path.read_text(encoding="utf-8") == previous + "\n"
-    assert len(client.calls) == 2
-    assert json.loads((tmp_path / "run/global_memory_reviews.jsonl").read_text().splitlines()[0])["status"] == "failed"
 
 
 def test_stagnation_never_triggers_a_review(tmp_path: Path) -> None:
@@ -2937,36 +2767,6 @@ def test_stale_stagnation_states_from_previous_level_do_not_retrigger(tmp_path: 
     assert _review_rows(tmp_path / "run")[0]["through_action"] == 3
 
 
-def test_global_and_game_markdown_persist_across_sessions_without_duplicates(tmp_path: Path) -> None:
-    state_dir = tmp_path / "state"
-    reusable_lesson = "Track each object's motion separately when several move at once."
-    game_text = "# Game Memory\n\n- A fixture strategy works on level zero."
-    global_text = f"# Global Memory\n\n- {reusable_lesson}"
-    review = json.dumps({
-        "game_memory_markdown": game_text,
-        "global_memory_markdown": global_text,
-    })
-    first_client = _FakeClient([_decision([_action()])], review_responses=[review])
-    first_metrics = _run_live_without_starting_routine(
-        _LevelCompleteEnv(), tmp_path / "ez01-run", first_client,
-        game_id="ez01", max_actions=1, state_dir=state_dir,
-    )
-    second_client = _FakeClient([_decision([])])
-    different_start = _FakeEnv()
-    different_start.frame[:] = 7
-    # A new run uses the already persisted Markdown verbatim in its first prompt.
-    second_metrics = _run_live_without_starting_routine(
-        different_start, tmp_path / "ez01-next", second_client,
-        game_id="ez01", max_actions=1, state_dir=state_dir,
-    )
-
-    assert first_metrics["review_count"] == 1
-    assert second_metrics["game_id"] == "ez01"
-    assert "A fixture strategy works on level zero." in second_client.calls[0][0]
-    assert reusable_lesson in second_client.calls[0][0]
-    assert second_client.calls[0][0].count(reusable_lesson) == 1
-    assert (game_memory_dir(state_dir, "ez01") / "MEMORY.md").read_text() == game_text + "\n"
-    assert global_memory_path(state_dir).read_text() == global_text + "\n"
 
 def test_live_direction_words_map_to_ids_and_logs_use_direction_names(
     tmp_path: Path, capsys: pytest.CaptureFixture[str],
@@ -3215,8 +3015,9 @@ def test_review_archives_previous_and_new_prose_and_manifest_records_settings(tm
     state = tmp_path / "state"
     game = game_memory_dir(state, "fixture")
     save_game_memory(game, "Previous game lesson")
-    from v11.tools.memory import save_global_memory
-    save_global_memory(state, "Previous reusable method")
+    profile_path = profile_memory_path(state, "generic")
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text("Previous reusable method\n", encoding="utf-8")
     client = _FakeClient([_decision([_action()])])
     client.max_output_tokens = 4096
     client.reasoning_effort = "medium"
@@ -3227,14 +3028,16 @@ def test_review_archives_previous_and_new_prose_and_manifest_records_settings(tm
     assert metrics["won"]
     rows = [row for row in GameMemory(run, store_dir=game).ledger() if row.get("op") == "markdown"]
     assert [row["markdown"] for row in rows if row["scope"] == "game"] == ["Previous game lesson\n", _VALID_GAME_MEMORY + "\n"]
-    assert [row["markdown"] for row in rows if row["scope"] == "global"] == [
-        "Previous reusable method\n", _VALID_GLOBAL_MEMORY + "\n",
-        "# Global methods\n\n- Compare the state before and after one action.\n",
-    ]
+    assert not [row for row in rows if row["scope"] == "profile"]
+    assert profile_path.read_text(encoding="utf-8") == "Previous reusable method\n"
     manifest = json.loads((run / "run_manifest.json").read_text())
     assert manifest["configuration"]["max_output_tokens"] == 4096
     assert manifest["configuration"]["reasoning_effort"] == "medium"
     assert manifest["starting_memory_sha256"]["game"] == next(row["sha256"] for row in rows if row["scope"] == "game")
+    profile_requests = [json.loads(line) for line in (run / "profile_requests.jsonl").read_text().splitlines()]
+    assert {row["phase"] for row in profile_requests} == {"action_selection", "memory_review"}
+    assert all(row["profile_id"] == "generic" for row in profile_requests)
+    assert all(row["argument_schema_fingerprint"] for row in profile_requests)
 
 
 def test_run_directory_cannot_clear_persistent_state(tmp_path):
@@ -3299,3 +3102,22 @@ def test_click_capable_startup_uses_one_model_guided_native_click_per_turn(tmp_p
     assert '"coordinate_system":"native_zero_based_xy"' in first_context_text
     assert "click_candidates" in first_context_text
     assert "choose an informative legal action" in first_context_text.lower()
+
+
+def test_game_and_profile_memory_persist_in_separate_scopes(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    game_text = "# Game Memory\n\n- A fixture strategy works on level zero."
+    profile_text = "# Approved methods\n\n- Compare each outcome after one action."
+    save_game_memory(game_memory_dir(state_dir, "ez01"), game_text)
+    profile_path = profile_memory_path(state_dir, "generic")
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(profile_text + "\n", encoding="utf-8")
+    client = _FakeClient([_decision([])])
+    _run_live_without_starting_routine(
+        _FakeEnv(), tmp_path / "ez01-next", client, game_id="ez01", max_actions=1, state_dir=state_dir,
+    )
+    prompt = client.calls[0][0]
+    assert "A fixture strategy works on level zero." in prompt
+    assert "Compare each outcome after one action." in prompt
+    assert (game_memory_dir(state_dir, "ez01") / "MEMORY.md").read_text() == game_text + "\n"
+    assert profile_path.read_text() == profile_text + "\n"

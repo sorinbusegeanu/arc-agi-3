@@ -21,6 +21,18 @@ def test_live_parser_accepts_game_list_and_defaults_to_one_worker() -> None:
     assert args.game_id is None
     assert args.game_list == ["ez01", "ez02"]
     assert args.parallel_games == 1
+    assert args.profile_memory_max_chars == 4500
+
+
+def test_profile_memory_cli_flag_and_legacy_alias_are_equivalent() -> None:
+    parser = cli_module.build_parser()
+    current = parser.parse_args([
+        "live", "--game-id", "ez01", "--run-dir", "run", "--profile-memory-max-chars", "4000",
+    ])
+    legacy = parser.parse_args([
+        "live", "--game-id", "ez01", "--run-dir", "run", "--global-memory-max-chars", "4000",
+    ])
+    assert current.profile_memory_max_chars == legacy.profile_memory_max_chars == 4000
 
 
 def test_live_parser_rejects_both_game_selectors() -> None:
@@ -56,7 +68,7 @@ def test_batch_continues_after_failure_and_writes_per_game_results(
     clients = []
     envs = []
     reset_calls = []
-    review_locks = []
+    run_arguments = []
 
     class FakeClient:
         def __init__(self, **kwargs):
@@ -83,7 +95,7 @@ def test_batch_continues_after_failure_and_writes_per_game_results(
         if wait_for_pair:
             initial_workers.wait(timeout=2)
         time.sleep(0.02)
-        review_locks.append(kwargs["global_memory_lock"])
+        run_arguments.append(dict(kwargs))
         with active_lock:
             active -= 1
         if env.game_id == "ez02":
@@ -110,7 +122,7 @@ def test_batch_continues_after_failure_and_writes_per_game_results(
     assert all(client.kwargs["log_dir"].parent == tmp_path / "batch" for client in clients)
     assert all(env.seed == 17 and env.closed for env in envs)
     assert len(reset_calls) == 1
-    assert len(review_locks) == 3 and len({id(lock) for lock in review_locks}) == 1
+    assert all("global_memory_lock" not in kwargs for kwargs in run_arguments)
 
     output = json.loads(capsys.readouterr().out)
     assert output["status"] == "partial_failure"

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from getpass import getuser
 import json
-import threading
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -16,9 +16,13 @@ from .live import run_live
 from .replay import replay_trace
 from .tools.memory import (
     DEFAULT_CONTEXT_ENTRIES,
-    MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
+    MAX_PROFILE_MEMORY_MARKDOWN_CHARS,
     MAX_MEMORY_MARKDOWN_CHARS,
     default_state_dir,
+    list_profile_candidates,
+    migrate_legacy_global_memory,
+    promote_profile_candidates,
+    reject_profile_candidates,
     reset_persistent_memory,
 )
 from .strata_client import (
@@ -44,14 +48,14 @@ def _parse_csv(value: str, convert):
     return result
 
 
-def _parse_global_memory_max_chars(value: str) -> int:
+def _parse_profile_memory_max_chars(value: str) -> int:
     try:
         result = int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("must be an integer") from exc
-    if not 1 <= result <= MAX_GLOBAL_MEMORY_MARKDOWN_CHARS:
+    if not 1 <= result <= MAX_PROFILE_MEMORY_MARKDOWN_CHARS:
         raise argparse.ArgumentTypeError(
-            f"must be between 1 and {MAX_GLOBAL_MEMORY_MARKDOWN_CHARS}"
+            f"must be between 1 and {MAX_PROFILE_MEMORY_MARKDOWN_CHARS}"
         )
     return result
 
@@ -155,7 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_REASONING_EFFORT,
     )
     analyze.add_argument("--reasoning-budget-tokens", type=int, default=None)
-    analyze.add_argument("--skill", type=Path, default=None, help="override the shared v10 SKILL.md")
+    analyze.add_argument("--skill", type=Path, default=None, help="override the shared v11 SKILL.md")
     _add_model_logging_options(analyze)
 
     ablate = subparsers.add_parser("ablate", help="compare matched offline context ablations")
@@ -185,6 +189,26 @@ def build_parser() -> argparse.ArgumentParser:
         evaluation_parser.add_argument("--reasoning-budget-tokens", type=int, default=None)
         _add_model_logging_options(evaluation_parser)
 
+    profiles = subparsers.add_parser("profiles", help="review and explicitly promote reusable profile methods")
+    profile_commands = profiles.add_subparsers(dest="profile_command", required=True)
+    candidates = profile_commands.add_parser("candidates", help="list pending profile memory candidates")
+    candidates.add_argument("--state-dir", type=Path, default=default_state_dir())
+    candidates.add_argument("--profile", required=True)
+    candidates.add_argument("--all", action="store_true", help="include promoted and rejected candidates")
+    promote = profile_commands.add_parser("promote", help="promote reviewed candidates after held-out evaluation")
+    promote.add_argument("--state-dir", type=Path, default=default_state_dir())
+    promote.add_argument("--profile", required=True)
+    promote.add_argument("--candidate-ids", required=True, help="comma-separated candidate IDs")
+    promote.add_argument("--memory-file", required=True, type=Path, help="curated replacement Markdown")
+    promote.add_argument("--evaluation-file", required=True, type=Path, help="held-out evaluation report JSON")
+    promote.add_argument("--max-chars", type=_parse_profile_memory_max_chars,
+                         default=MAX_PROFILE_MEMORY_MARKDOWN_CHARS)
+    reject = profile_commands.add_parser("reject", help="reject pending profile candidates with an audit reason")
+    reject.add_argument("--state-dir", type=Path, default=default_state_dir())
+    reject.add_argument("--profile", required=True)
+    reject.add_argument("--candidate-ids", required=True, help="comma-separated candidate IDs")
+    reject.add_argument("--reason", required=True)
+
     live = subparsers.add_parser("live", help="run a bounded live ARC game episode through the configured model backend")
     game_selector = live.add_mutually_exclusive_group(required=True)
     game_selector.add_argument("--game-id", help="run one game")
@@ -201,7 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="output directory (batch mode creates one cleaned subdirectory per game)",
     )
     live.add_argument("--state-dir", type=Path, default=default_state_dir(),
-                      help="persistent v10 memory root; defaults to the project skills directory")
+                      help="persistent v11 memory root; defaults to the project skills directory")
     live.add_argument(
         "--reset-memory", action="store_true",
         help="clear memory and solutions, and skip historical recovery for this run",
@@ -210,9 +234,12 @@ def build_parser() -> argparse.ArgumentParser:
                       help="compatibility setting (0-5); live prompts load saved Markdown in full")
     live.add_argument("--game-memory-max-chars", type=int, default=MAX_MEMORY_MARKDOWN_CHARS,
                       help="maximum characters accepted for game MEMORY.md")
-    live.add_argument("--global-memory-max-chars", type=_parse_global_memory_max_chars,
-                      default=MAX_GLOBAL_MEMORY_MARKDOWN_CHARS,
-                      help="maximum characters accepted for global MEMORY.md (hard limit: 4500)")
+    live.add_argument("--profile-memory-max-chars", type=_parse_profile_memory_max_chars,
+                      default=MAX_PROFILE_MEMORY_MARKDOWN_CHARS,
+                      help="maximum characters loaded from active action-profile memory (hard limit: 4500)")
+    live.add_argument("--global-memory-max-chars", dest="profile_memory_max_chars",
+                      type=_parse_profile_memory_max_chars, default=argparse.SUPPRESS,
+                      help="deprecated alias for --profile-memory-max-chars")
     _add_model_backend_options(live)
     live.add_argument("--env-root", default=None, help="optional ARC environment-files root")
     live.add_argument("--seed", type=int, default=0)
@@ -231,7 +258,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--context-window-tokens", type=int, default=None,
         help="override the endpoint's discovered model context window for action conversation compaction",
     )
-    live.add_argument("--skill", type=Path, default=None, help="override the general v10 SKILL.md")
+    live.add_argument("--skill", type=Path, default=None, help="override the general v11 SKILL.md")
     _add_model_logging_options(live)
     return parser
 
@@ -239,6 +266,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "profiles":
+            migrate_legacy_global_memory(args.state_dir)
+            if args.profile_command == "candidates":
+                result = list_profile_candidates(args.state_dir, args.profile, pending_only=not args.all)
+            elif args.profile_command == "promote":
+                report = json.loads(args.evaluation_file.read_text(encoding="utf-8"))
+                result = promote_profile_candidates(
+                    args.state_dir, args.profile, _parse_csv(args.candidate_ids, str),
+                    args.memory_file.read_text(encoding="utf-8"), report,
+                    max_characters=args.max_chars, approved_by=getuser(),
+                )
+            else:
+                result = {"rejected": reject_profile_candidates(
+                    args.state_dir, args.profile, _parse_csv(args.candidate_ids, str), args.reason,
+                )}
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         backend, base_url, model = _selected_model_backend(args)
         if getattr(args, "vllm_autostart", False):
             if backend != "vllm":
@@ -311,7 +355,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reset_persistent_memory(args.state_dir)
                 print(f"[v11] cleared persistent memory under {args.state_dir}", file=sys.stderr, flush=True)
 
-            def run_game(game_id: str, run_dir: Path, global_memory_lock=None):
+            def run_game(game_id: str, run_dir: Path):
                 client = StrataClient(
                     base_url=base_url,
                     model=model,
@@ -336,9 +380,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         state_dir=args.state_dir,
                         memory_context_entries=args.memory_context_entries,
                         game_memory_max_chars=args.game_memory_max_chars,
-                        global_memory_max_chars=args.global_memory_max_chars,
+                        profile_memory_max_chars=args.profile_memory_max_chars,
                         discovery_tools=args.discovery_tools,
-                        global_memory_lock=global_memory_lock,
                     )
                 finally:
                     env.close()
@@ -350,12 +393,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             game_ids = args.game_list
             worker_count = min(args.parallel_games, len(game_ids))
-            global_memory_lock = threading.RLock()
             results: dict[str, dict[str, object]] = {}
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="v11-game") as executor:
                 futures = {
                     executor.submit(
-                        run_game, game_id, args.run_dir / game_id, global_memory_lock,
+                        run_game, game_id, args.run_dir / game_id,
                     ): game_id
                     for game_id in game_ids
                 }

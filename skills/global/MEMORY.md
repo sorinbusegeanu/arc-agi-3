@@ -10,8 +10,10 @@
 
 - **Partial progress ≠ completion:** If a state change resolves one apparent constraint but the level does not complete, the obstacle was not the only condition. Test whether the changed entity must also satisfy additional conditions beyond the one just resolved before assuming the path forward is clear.
 
-- **Transferable strategy caution:** A strategy that completed one level may produce a terminal failure (e.g., game over) on the next. Before reusing a prior level's movement pattern, test one step of it and check for hazards or changed cell properties before committing to the full sequence.
+- **Transferable strategy caution:** A strategy that completed one level may produce a terminal failure on the next. Before reusing a prior level's movement pattern, test one step and check for hazards or changed cell properties before committing to the full sequence.
 
 - **Trail and backtracking hazards:** When movement leaves persistent marks on the grid, treat every previously visited cell as potentially hazardous. Plan a path that visits each cell at most once. If a level introduces trail mechanics, verify whether backtracking is fatal before attempting any reversal.
 
 - **Collectible-target levels:** When multiple identical marked cells are visible and a progress indicator fills as the player moves, the goal is likely to visit all marked cells. Identify impassable obstacles first, then plan a path that covers every target without crossing obstacles or revisiting cells.
+
+- **Budget-constrained levels:** When a resource bar depletes with each action, calculate the minimum path length to all targets before committing to a route. If the minimum exceeds the budget, the completion condition may differ from "visit all targets"—test partial visits to identify which subset triggers completion. Track depletion rate across multiple moves to estimate total budget before committing.

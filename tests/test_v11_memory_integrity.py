@@ -8,9 +8,9 @@ import pytest
 from v11.frames import FrameStore
 from v11.tools.history import History
 from v11.tools.memory import (
-    MAX_GLOBAL_MEMORY_MARKDOWN_CHARS, GameMemory, MemoryValidationError, default_state_dir,
-    game_memory_dir, global_memory_path, read_global_memory, reset_persistent_memory,
-    save_game_memory, save_global_memory, shared_skill_path,
+    MAX_PROFILE_MEMORY_MARKDOWN_CHARS, GameMemory, MemoryValidationError, default_state_dir,
+    game_memory_dir, profile_memory_path, read_profile_memory, reset_persistent_memory,
+    save_game_memory, shared_skill_path, migrate_legacy_global_memory,
 )
 
 
@@ -21,12 +21,12 @@ def test_default_persistent_memory_and_shared_skill_are_project_local(monkeypatc
     v11_skills = project_skills / "v11"
     assert default_state_dir() == v11_skills / "state"
     assert game_memory_dir(default_state_dir(), "ez01") == v11_skills / "state/games/ez01"
-    assert global_memory_path(default_state_dir()) == v11_skills / "state/global/MEMORY.md"
+    assert profile_memory_path(default_state_dir(), "a6") == v11_skills / "state/profiles/a6/MEMORY.md"
     assert shared_skill_path() == v11_skills / "SKILL.md"
     assert shared_skill_path().is_file()
 
 
-def test_reset_persistent_memory_removes_all_game_stores_and_only_global_memory(tmp_path) -> None:
+def test_reset_persistent_memory_removes_game_and_profile_stores_and_legacy_global_memory(tmp_path) -> None:
     (tmp_path / "games/ez01").mkdir(parents=True)
     (tmp_path / "games/ez01/MEMORY.md").write_text("game prose")
     (tmp_path / "games/ez01/memory.jsonl").write_text("ledger")
@@ -36,36 +36,35 @@ def test_reset_persistent_memory_removes_all_game_stores_and_only_global_memory(
     (tmp_path / "global").mkdir()
     (tmp_path / "global/MEMORY.md").write_text("shared prose")
     (tmp_path / "global/KEEP.txt").write_text("unrelated global file")
+    (tmp_path / "profiles/a6/MEMORY.md").parent.mkdir(parents=True)
+    (tmp_path / "profiles/a6/MEMORY.md").write_text("profile")
 
     reset_persistent_memory(tmp_path)
 
     assert not (tmp_path / "games").exists()
+    assert not (tmp_path / "profiles").exists()
     assert not (tmp_path / "global/MEMORY.md").exists()
     assert (tmp_path / "global/KEEP.txt").read_text() == "unrelated global file"
 
 
-def test_global_memory_rejects_oversize_and_preserves_previous_markdown(tmp_path) -> None:
-    memory_text = "# Global Memory\n\n- Compare each object before and after an action."
-    assert save_global_memory(tmp_path, memory_text) is True
-    path = global_memory_path(tmp_path)
-    before = path.read_text()
-
+def test_profile_memory_rejects_oversize_and_is_scoped(tmp_path) -> None:
+    memory_text = "# Profile Memory\n\n- Compare each object before and after an action."
+    path = profile_memory_path(tmp_path, "a6")
+    path.parent.mkdir(parents=True)
+    path.write_text(memory_text)
     with pytest.raises(MemoryValidationError, match="character limit"):
-        save_global_memory(tmp_path, "x" * (MAX_GLOBAL_MEMORY_MARKDOWN_CHARS + 1))
-
-    assert path.read_text() == before
-    assert save_global_memory(tmp_path, memory_text) is False
-    assert len(read_global_memory(tmp_path)) <= MAX_GLOBAL_MEMORY_MARKDOWN_CHARS
+        read_profile_memory(tmp_path, "a6", max_characters=10)
+    assert read_profile_memory(tmp_path, "a5") == ""
+    assert MAX_PROFILE_MEMORY_MARKDOWN_CHARS == 4_500
 
 
-def test_global_memory_hard_cap_cannot_be_raised_by_save_override(tmp_path) -> None:
-    with pytest.raises(MemoryValidationError, match="4500 character limit"):
-        save_global_memory(tmp_path, "x" * 4_501, max_characters=6_000)
-
-def test_markdown_save_preserves_model_authored_text_without_rewriting_duplicates(tmp_path) -> None:
-    content = "# Global Memory\n\n- Compare objects before and after each action.\n- Compare objects before and after each action."
-    save_global_memory(tmp_path, content)
-    assert global_memory_path(tmp_path).read_text() == content + "\n"
+def test_legacy_global_memory_is_removed_by_one_time_migration(tmp_path):
+    legacy = tmp_path / "global/MEMORY.md"
+    legacy.parent.mkdir()
+    legacy.write_text("stale shared guidance")
+    assert migrate_legacy_global_memory(tmp_path) is True
+    assert not legacy.exists()
+    assert migrate_legacy_global_memory(tmp_path) is False
 
 def test_model_cannot_author_prediction_verdict_or_evidence_metadata(tmp_path) -> None:
     memory = GameMemory(tmp_path)
@@ -246,17 +245,11 @@ def test_failed_atomic_markdown_save_preserves_previous_file(tmp_path, monkeypat
     save_game_memory(store_dir, "# Game Memory\n\n- Previous strategy.")
     path = store_dir / "MEMORY.md"
     before = path.read_text()
-    global_before = "# Global Memory\n\n- Previous reusable method."
-    save_global_memory(tmp_path / "state", global_before)
-    global_path = global_memory_path(tmp_path / "state")
     monkeypatch.setattr(memory_module, "_atomic_write_text", lambda *_: (_ for _ in ()).throw(OSError("disk full")))
     with pytest.raises(OSError, match="disk full"):
         save_game_memory(store_dir, "# Game Memory\n\n- Replacement strategy.")
     assert path.read_text() == before
 
-    with pytest.raises(OSError, match="disk full"):
-        save_global_memory(tmp_path / "state", "# Global Memory\n\n- Replacement method.")
-    assert global_path.read_text() == global_before + "\n"
 
 def test_pattern_updates_are_independent_incremental_and_idempotent(tmp_path) -> None:
     state_dir = game_memory_dir(tmp_path / "state", "ez01")
@@ -458,7 +451,7 @@ def test_markdown_revisions_use_existing_ledger_without_entering_action_patterns
     assert memory.record_markdown_revision("game", "Original observation", step=1)
     assert memory.record_markdown_revision("game", "Corrected observation", step=2)
     assert not memory.record_markdown_revision("game", "Corrected observation", step=3)
-    assert memory.record_markdown_revision("global", "Compare objects separately", step=3)
+    assert memory.record_markdown_revision("profile", "Compare objects separately", step=3)
     restored = GameMemory(tmp_path / "run", store_dir=tmp_path / "game", run_id="r", game_id="fixture")
     assert restored.patterns() == []
     assert [row["markdown"] for row in restored.ledger()] == [
