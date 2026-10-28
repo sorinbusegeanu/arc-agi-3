@@ -1,25 +1,26 @@
-### Established mechanics (Level 4)
-- The player moves freely through the gap in the gray wall separating left and right regions.
-- Walking into a colored square pushes it one step in the same direction; colored squares can be pushed through the gap.
-- Pushing a colored square into another colored square causes the target square to vanish (observed: blue pushed left into purple on the yellow shape; purple disappeared).
-- A purple pushed onto the edge of the yellow L-shape remains visible without being absorbed (confirmed across multiple runs).
-- Walking through the yellow shape as the player produces no interaction.
-- The green square at the bottom-right corner is present from the level's initial state.
+### Established mechanics (Level 5, index 4)
+- Gray wall has a gap; player and pushable squares pass through it. A push moves the square farther than a solo move; player stays in the square's prior cell.
+- Yellow cells are passable to the player alone and do not complete the level by themselves.
+- Squares can be removed by pushing one into another, pushing one onto yellow, or the player entering a square on yellow.
+- A square pushed through the wall gap to the yellow side can remain there while the player repositions.
+- Pushing a square into the solid wall (not the gap) produces no visible change.
+- The player can reappear after entering yellow; disappearance is not permanent.
+- Player moving down from above the green-cell area pushed a square but did not enter the green cell; the player was blocked from entering the green cell from directly above.
 
-### Failed hypotheses (Level 4)
-- Absorbing one purple into the yellow shape: no completion (confirmed in prior run and this run).
-- Visiting the green square at bottom-right: no transition (confirmed in prior run).
-- Extensive free movement in the left region without pushing colored squares toward the yellow shape: no progress (ineffective approach).
-- Pushing the blue square onto the yellow shape and then moving it off: no completion.
-- Causing a purple to vanish by pushing the blue into it: no completion.
-- Up or left from certain positions: state-specific no-op; does not prove a general obstacle.
+### Failed/ineffective approaches (Level 5, index 4)
+- Free movement, walking through yellow, moving/pushing squares on/off yellow, leaving a single square on yellow, pushing squares onto green, and pushing a square through the wall gap to the yellow side have not completed the level.
+- Absorbing a square by entering it on yellow, then moving away, has not completed the level.
+- Pushing squares to boundaries or into other squares can make them unreachable or lost; too few movable squares for remaining targets is a dead end.
+- A square pinned against the left edge cannot be pushed rightward; if it is the only movable square, reset/replay.
+- Repeated actions producing no visible change from the same state are ineffective for that state.
+- Moving the player toward the green cell without entering it does not complete the level.
+- Player moving down toward the green cell from above pushed a square but did not enter the green cell; level did not complete.
 
-### Unresolved hypotheses (Level 4)
-- Whether leaving a colored square on the yellow shape (without moving it off) triggers completion.
-- Whether the remaining purple must be pushed through the gap into the yellow shape and left there.
-- Whether a different interaction (e.g., pushing a colored square onto the green square, or a specific spatial arrangement) is required.
-- Whether the yellow shape needs to be covered or filled by a colored square in a specific way.
+### Unresolved hypotheses (Level 5, index 4)
+- Completion may require a purple square placed on the green cell, multiple squares on different yellow cells simultaneously, or a specific configuration of all three purple squares.
+- The green cell's role is unconfirmed; the player could not enter it from above. It may require a square on it, approach from a different direction, or may not be the goal.
+- A vanished square may be hidden, removed, or transformed; reappearance has not completed the level.
 
-### Next experiment (Level 4)
-- Question: Does pushing the remaining purple through the gap and leaving it on the yellow shape trigger completion, or is a different condition needed?
-- Test: Navigate to the remaining purple in the upper-left, push it right through the gap and down onto the yellow shape, then leave it there without moving it off. If no completion, try pushing the blue square onto the yellow shape and leaving it there. If still no completion, test pushing a colored square onto the green square.
+### Next experiment (Level 5, index 4)
+- Question: Does placing a purple square on the green cell complete the level, or does the player need to enter the green cell from a different direction?
+- Test: From the current state, push the purple square below the player downward toward the bottom row, then reposition to push it rightward onto the green cell. If the level completes, the green cell requires a square. If the square cannot reach the green cell or placement fails, test whether all three purple squares must occupy yellow cells simultaneously.

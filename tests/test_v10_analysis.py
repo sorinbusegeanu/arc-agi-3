@@ -586,7 +586,7 @@ def test_cli_reports_v10_patch_version_and_context_override(capsys) -> None:
     with pytest.raises(SystemExit) as version_exit:
         parser.parse_args(["--version"])
     assert version_exit.value.code == 0
-    assert capsys.readouterr().out.strip() == "v10 10.0.21"
+    assert capsys.readouterr().out.strip() == "v10 10.0.22"
 
     configured = parser.parse_args([
         "live", "--game-id", "ez01", "--run-dir", "run", "--context-window-tokens", "32768",
