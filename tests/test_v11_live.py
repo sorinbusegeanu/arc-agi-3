@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import copy
+import random
 import re
 import sys
 import types
@@ -13,7 +14,8 @@ import pytest
 import v11.live as live_module
 from v11.arcade_env import ArcadeGameEnv
 from v11.live import (
-    _active_level_transitions, _adaptive_click_plan_horizon, _live_context, _parse_content, _perform_game_over_post_mortem,
+    _action_screen_sequence, _active_level_transitions, _adaptive_click_plan_horizon, _live_context, _parse_content, _perform_game_over_post_mortem,
+    _random_legal_action, _review_repair_prompt,
     _perform_review,
     _perceptual_state_equivalence, _review_events,
     _verified_route_summaries, run_live,
@@ -22,6 +24,7 @@ from v11.analysis import DecisionValidationError
 from v11.tools.game import GameTools
 from v11.tools.game import ActionError
 from v11.tools.history import History
+from v11.frames import FrameStore
 from v11.tools.memory import (
     GameMemory, game_memory_dir, profile_memory_path, save_game_memory, shared_skill_path,
 )
@@ -52,6 +55,37 @@ def test_action_decision_parser_accepts_one_fenced_json_object_with_prose() -> N
         _parse_content("```json\nnot json\n```")
     with pytest.raises(DecisionValidationError):
         _parse_content("```json\n{}\n```\n```json\n{}\n```")
+
+
+def test_click_fallback_samples_all_valid_candidates() -> None:
+    legal = [{"id": "ACTION6", "parameters": {
+        "type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}},
+        "required": ["x", "y"],
+    }}]
+    click_candidates = {"items": [{"x": 12, "y": 8}, {"x": 31, "y": 4}, {"x": 5, "y": 29}]}
+    selected = {
+        tuple(_random_legal_action(legal, random.Random(seed), click_candidates=click_candidates)["args"].values())
+        for seed in range(20)
+    }
+    assert selected == {(12, 8), (31, 4), (5, 29)}
+
+
+def test_action_screen_caption_shows_click_alias_and_coordinates(tmp_path: Path) -> None:
+    frames = FrameStore(tmp_path)
+    frames.put_image(np.zeros((2, 2, 3), dtype=np.uint8), image_id="before")
+    frames.put_image(np.ones((2, 2, 3), dtype=np.uint8), image_id="after", kind="image")
+    _paths, labels, _sequence = _action_screen_sequence(
+        [{"action": "ACTION6", "args": {"x": 12, "y": 8}, "pre_frame_image_id": "before", "post_frame_image_id": "after"}],
+        "after", frames,
+    )
+    assert any("click(x=12,y=8)" in label for label in labels)
+    assert all("ACTION6" not in label for label in labels)
+
+
+def test_review_repair_explains_applicability_conditions_schema() -> None:
+    prompt = _review_repair_prompt("review", "profile_memory_candidates[0].applicability_conditions is invalid")
+    assert "JSON array of 0–8 non-empty strings" in prompt
+    assert "never a string or object" in prompt
 
 
 def test_perceptual_state_similarity_is_logged_and_never_resets_game(tmp_path: Path) -> None:
@@ -3011,8 +3045,15 @@ def test_click_plans_execute_predictable_actions_without_intermediate_model_call
     first = _reasoned(_decision([{"action": "click", "args": {"x": 0, "y": 0}}]), prediction={
         "visible_change": "yes", "environment_outcome": "no_terminal", "description": "One cell changes."
     })
-    second = _reasoned(_decision([{"action": "click", "args": {"x": 7, "y": 0}}]), prediction={
-        "visible_change": "yes", "environment_outcome": "no_terminal", "description": "A second cell changes."
+    partial_invalid = _reasoned(_decision([
+        {"action": "click", "args": {"x": x, "y": 0}} for x in (7, 6, 5)
+    ]), prediction={
+        "visible_change": "yes", "environment_outcome": "no_terminal", "description": "The next cells change."
+    })
+    partial = _reasoned(_decision([
+        {"action": "click", "args": {"x": x, "y": 0}} for x in (7, 6)
+    ]), prediction={
+        "visible_change": "yes", "environment_outcome": "no_terminal", "description": "Two cells change."
     })
     followup = _reasoned(_decision([
         {"action": "click", "args": {"x": x, "y": 1}} for x in range(1, 6)
@@ -3024,21 +3065,23 @@ def test_click_plans_execute_predictable_actions_without_intermediate_model_call
         "relevance": "Two matching click outcomes support this target class.", "certainty": "observed",
     }]
     env = ClickEnv()
-    client = _FakeClient([first, second, followup])
+    client = _FakeClient([first, partial_invalid, partial, followup])
     metrics = _run_live_without_starting_routine(
-        env, tmp_path / "multi-click", client, game_id="fixture", max_actions=7, plan_horizon=8,
+        env, tmp_path / "multi-click", client, game_id="fixture", max_actions=8, plan_horizon=8,
     )
 
-    assert metrics["actions"] == 7
-    assert len(env.actions) == 7
+    assert metrics["actions"] == 8
+    assert len(env.actions) == 8
     assert env.observe_calls == len(env.actions) + 1
-    assert len(client.calls) == 3
+    assert len(client.calls) == 4
     first_context = json.loads(client.calls[0][0].split("Visible context:\n", 1)[1])
     second_context = _continued_context(_message_user_text(client, 1))
-    third_context = _continued_context(_message_user_text(client, 2))
+    final_context = _continued_context(_message_user_text(client, 3))
+    repair_text = _message_user_text(client, 2)
     assert first_context["budgets"]["plan_horizon"] == 1
     assert second_context["state"]["plan_horizon"] == 2
-    assert third_context["state"]["plan_horizon"] == 5
+    assert "0 to 2 actions" in repair_text
+    assert final_context["state"]["plan_horizon"] == 5
 
 
 def test_click_plan_stops_when_first_click_prediction_is_contradicted(tmp_path):

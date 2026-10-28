@@ -499,7 +499,7 @@ def test_live_caps_planning_at_three_tool_rounds_then_requires_action(tmp_path, 
     assert len(client.calls) == 4
     assert all(call["tools"] and call["response_format"] is None for call in client.calls[:3])
     assert client.calls[3]["tools"] is None
-    assert client.calls[3]["response_format"] is None
+    assert client.calls[3]["response_format"] == "json_object"
     assert any(
         message.get("role") == "user"
         and "three tool-call planning rounds have been used" in message.get("content", "")

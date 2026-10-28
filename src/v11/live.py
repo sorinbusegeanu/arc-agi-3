@@ -333,12 +333,12 @@ def _random_legal_action(
             items = click_candidates.get("items", [])
             required_names = set(required)
             if {"x", "y"}.issubset(required_names) and isinstance(items, list):
+                click_options = []
                 for candidate in items:
                     if isinstance(candidate, Mapping) and isinstance(candidate.get("x"), int) and isinstance(candidate.get("y"), int):
-                        args = {"x": int(candidate["x"]), "y": int(candidate["y"])}
-                        break
-                if args:
-                    candidates.append({"action": action_id, "args": args})
+                        click_options.append({"x": int(candidate["x"]), "y": int(candidate["y"])})
+                if click_options:
+                    candidates.extend({"action": action_id, "args": option} for option in click_options)
                     continue
         for name in required:
             schema = properties.get(name)
@@ -374,7 +374,7 @@ Routes are supplied only when the environment recorded level completion or WIN. 
 
 For a level completed by replaying a verified route, inspect the ordered transitions and screens for avoidable loops or actions that produced no useful change. Mention an efficiency improvement only when the observations support it; do not replace or weaken the verified route based on an untested alternative. Exact action sequences and transient coordinate lists remain in the solution store.
 
-Profile memory is read-only during a game run. Propose at most three transferable methods in `profile_memory_candidates`, each with exactly `claim`, `applicability_conditions`, and `evidence_ids`. A candidate must not state a game mechanic, object rule, color, direction, coordinate, route, or game-specific fact. Every evidence ID must identify a reviewed direct transition supporting the method. If no useful transferable method is directly supported, return an empty array. Candidates are queued for human review and never enter profile memory automatically.
+Profile memory is read-only during a game run. Propose at most three transferable methods in `profile_memory_candidates`, each as an object with exactly `claim` (a non-empty string of at most 500 characters), `applicability_conditions` (an array of 0–8 non-empty strings, each at most 300 characters), and `evidence_ids` (an array of 1–20 direct transition evidence ID strings). Do not use a single string or object for `applicability_conditions`. A candidate must not state a game mechanic, object rule, color, direction, coordinate, route, or game-specific fact. Every evidence ID must identify a reviewed direct transition supporting the method. If no useful transferable method is directly supported, return an empty array. Candidates are queued for human review and never enter profile memory automatically.
 
 Promote a game-specific mechanic to established memory only when transitions directly support the same effect under a clear level/state scope. One changed frame or a model hypothesis is insufficient to identify an object or establish its mechanic. Compare new claims with existing scoped memory; resolve contradictions using observations and scope, otherwise preserve the claim as unresolved. Never let memory prose change, replace, or broaden a verified route.
 
@@ -514,6 +514,10 @@ def _review_repair_prompt(base_prompt: str, errors: Any) -> str:
     if "general obstacle from a state-specific no-op" in error_text:
         repair_guidance.append(
             "Describe no-visible-change only for that exact action and state; do not infer a general wall or reachability rule."
+        )
+    if "applicability_conditions" in error_text:
+        repair_guidance.append(
+            "Each profile_memory_candidates item must have exactly claim, applicability_conditions, and evidence_ids. Set applicability_conditions to a JSON array of 0–8 non-empty strings (each at most 300 characters), never a string or object; set evidence_ids to an array of 1–20 direct transition ID strings."
         )
     return (
         base_prompt
@@ -739,7 +743,10 @@ def _action_screen_sequence(
     image_paths: list[Path] = []
     image_labels: list[str] = []
     sequence: list[dict[str, Any]] = []
-    action_names = [str(model_action_name(row.get("action"))) for row in transitions]
+    action_names = [
+        _display_action_call(row.get("action"), row.get("args", {}))
+        for row in transitions
+    ]
     display_action_numbers = (
         [int(number) for number in action_numbers]
         if action_numbers is not None and len(action_numbers) == len(transitions)
@@ -2781,7 +2788,7 @@ def run_live(
                     inputs.get("image_paths", ()), inputs.get("image_labels", ()),
                     messages=request_messages,
                     conversation_reset_count=action_conversation_reset_count,
-                    response_format=None if discovery_tools else "json_object",
+                    response_format=None if tools_available else "json_object",
                     tools=DISCOVERY_TOOLS if tools_available else None,
                 )
                 _log_profile_request(tools, "action_selection", inputs, response)
