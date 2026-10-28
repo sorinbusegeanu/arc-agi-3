@@ -168,6 +168,8 @@ def test_ablation_runs_matched_profiles_without_writing_analysis_decisions(tmp_p
     assert all(arm["status"] == "ok" for arm in result["arms"])
     assert result["backend"] == "vllm"
     assert all(arm["backend"] == "vllm" for arm in result["arms"])
+    assert all(arm["profile_id"] == "generic" and arm["action_signature"] == "ACTION1,ACTION2" for arm in result["arms"])
+    assert all(arm["prompt_revision"] and arm["memory_revision"] for arm in result["arms"])
     assert not (run_dir / "decisions.jsonl").exists()
     assert (run_dir / "ablation_runs.jsonl").exists()
 
@@ -964,13 +966,16 @@ def test_strata_malformed_envelope_raises_request_error(monkeypatch, body: str) 
 
 
 def test_offline_memory_limit_changes_the_actual_prompt(tmp_path):
-    from v11.tools.memory import game_memory_dir, save_game_memory
+    from v11.tools.memory import GameMemory, game_memory_dir, save_game_memory
     trace = tmp_path / "trace.jsonl"
     _write_trace(trace)
     run = tmp_path / "replay"
     replay_trace(trace, run)
     state = tmp_path / "state"
-    save_game_memory(game_memory_dir(state, "fixture"), "First observation.\n\nSecond observation.\n\nThird observation.")
+    store_dir = game_memory_dir(state, "fixture")
+    saved = "First observation.\n\nSecond observation.\n\nThird observation."
+    save_game_memory(store_dir, saved)
+    GameMemory(run, store_dir=store_dir, game_id="fixture").record_markdown_revision("game", saved, step=2)
     none = build_analysis_input(run, through_action=2, state_dir=state, memory_context_entries=0)
     one = build_analysis_input(run, through_action=2, state_dir=state, memory_context_entries=1)
     all_memory = build_analysis_input(run, through_action=2, state_dir=state, memory_context_entries=5)
@@ -978,3 +983,160 @@ def test_offline_memory_limit_changes_the_actual_prompt(tmp_path):
     assert one["context"]["memory"] == "First observation.\n"
     assert "Third observation." in all_memory["context"]["memory"]
     assert len({row["user_prompt"] for row in (none, one, all_memory)}) == 3
+
+
+def _write_click_profile_trace(path: Path, *, change_after_prefix: bool = False) -> None:
+    rows = []
+    for index in range(4):
+        if index == 0:
+            action_id, available = "RESET", ["ACTION6"]
+        else:
+            action_id = "ACTION6"
+            available = ["ACTION6", "ACTION5"] if change_after_prefix and index >= 3 else ["ACTION6"]
+        rows.append({
+            "timestamp": f"2028-01-01T00:00:0{index}Z",
+            "data": {
+                "timestamp": f"2028-01-01T00:00:0{index}Z",
+                "game_id": "click-fixture", "state": "NOT_FINISHED",
+                "levels_completed": 0, "win_levels": 1, "guid": "click-fixture",
+                "full_reset": index == 0,
+                "action_input": {"id": action_id, "data": {} if index == 0 else {"x": index, "y": index}},
+                "available_actions": available,
+                "frame": [[index, 0], [0, 0]],
+            },
+        })
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def test_offline_profile_prompt_matches_live_capability_composition(tmp_path: Path) -> None:
+    from v11.live import _live_context
+    from v11.tools.memory import game_memory_dir, shared_skill_path
+    from v11.tools.game import GameTools
+
+    trace = tmp_path / "click.jsonl"
+    _write_click_profile_trace(trace)
+    run = tmp_path / "run"
+    replay_trace(trace, run)
+    offline = build_analysis_input(run, through_action=2, state_dir=tmp_path / "state")
+
+    class ClickEnv:
+        legal_actions = [{"id": "ACTION6", "parameters": {
+            "type": "object", "properties": {"x": {"type": "integer", "minimum": 0, "maximum": 1},
+                                                 "y": {"type": "integer", "minimum": 0, "maximum": 1}},
+            "required": ["x", "y"], "additionalProperties": False,
+        }}]
+        def observe(self):
+            return {"frame": np.zeros((2, 2), dtype=np.uint8), "legal_actions": self.legal_actions,
+                    "game_state": "NOT_FINISHED", "level": 0, "levels_completed": 0,
+                    "win_levels": 1, "terminal": False}
+        def act(self, action, args): return {}
+
+    tools = GameTools(ClickEnv(), tmp_path / "live")
+    current = tools.observe()
+    live = _live_context(
+        tools, current, "click-fixture", 2, shared_skill_path(),
+        game_memory_dir(tmp_path / "state", "click-fixture"), "live", 5,
+    )
+    capability = (Path(__file__).parents[1] / "skills/v11/profile_capabilities/coordinate_action6.md").read_text().strip()
+    discrete = (Path(__file__).parents[1] / "skills/v11/profile_capabilities/discrete_control.md").read_text().strip()
+    assert offline["profile_id"] == live["context"]["action_profile"]["profile_id"] == "a6"
+    assert capability in offline["system_prompt"] and capability in live["system_prompt"]
+    assert discrete not in offline["system_prompt"] and discrete not in live["system_prompt"]
+    assert offline["system_prompt"] == live["system_prompt"]
+
+
+def test_offline_movement_profile_excludes_click_capability(tmp_path: Path) -> None:
+    trace = tmp_path / "movement.jsonl"
+    _write_trace(trace)
+    run = tmp_path / "run"
+    replay_trace(trace, run)
+    offline = build_analysis_input(run, through_action=2)
+    capability_dir = Path(__file__).parents[1] / "skills/v11/profile_capabilities"
+    click = (capability_dir / "coordinate_action6.md").read_text().strip()
+    movement = (capability_dir / "discrete_control.md").read_text().strip()
+    assert movement in offline["system_prompt"]
+    assert click not in offline["system_prompt"]
+
+
+def test_offline_prefix_isolates_actions_and_game_memory_revisions(tmp_path: Path) -> None:
+    from v11.tools.memory import GameMemory, game_memory_dir
+
+    trace = tmp_path / "prefix.jsonl"
+    _write_click_profile_trace(trace, change_after_prefix=True)
+    run = tmp_path / "run"
+    replay_trace(trace, run)
+    state = tmp_path / "state"
+    store_dir = game_memory_dir(state, "click-fixture")
+    memory = GameMemory(run, store_dir=store_dir, game_id="click-fixture")
+    memory.record_markdown_revision("game", "Known at action two.", step=2)
+    memory.record_markdown_revision("game", "Known only later.", step=3)
+
+    early = build_analysis_input(run, through_action=2, state_dir=state)
+    later = build_analysis_input(run, through_action=3, state_dir=state)
+    assert len(early["prefix_transitions"]) == 2
+    assert len(later["prefix_transitions"]) == 3
+    assert early["context"]["memory"] == "Known at action two.\n"
+    assert later["context"]["memory"] == "Known only later.\n"
+    assert early["context"]["current_state"]["legal_actions"] == [{
+        "id": "click", "parameters": {"type": "object", "properties": {
+            "x": {"type": "integer", "minimum": 0, "maximum": 1},
+            "y": {"type": "integer", "minimum": 0, "maximum": 1}},
+            "required": ["x", "y"], "additionalProperties": False},
+    }]
+    assert early["profile_id"] == "a6"
+    assert later["profile_id"] == "a56"
+    assert "Known only later." not in early["user_prompt"]
+    assert "ACTION5" not in early["user_prompt"]
+    assert early["memory_revision"]["game"]["step"] == 2
+
+
+def test_offline_profile_memory_is_scoped_and_prefix_timestamped(tmp_path: Path) -> None:
+    from v11.tools.memory import archive_profile_memory_revision, profile_memory_path
+
+    trace = tmp_path / "profile-memory.jsonl"
+    _write_click_profile_trace(trace)
+    run = tmp_path / "run"
+    replay_trace(trace, run)
+    state = tmp_path / "state"
+    archive_profile_memory_revision(state, "a6", "# Earlier click method\n\n- Compare one outcome.", timestamp_utc="2027-01-01T00:00:00+00:00")
+    archive_profile_memory_revision(state, "a6", "# Later click method\n\n- Learned after this prefix.", timestamp_utc="2029-01-01T00:00:00+00:00")
+    archive_profile_memory_revision(state, "a5", "# Other profile\n\n- Must stay isolated.", timestamp_utc="2027-01-01T00:00:00+00:00")
+    profile_memory_path(state, "a6").write_text("# Current unversioned\n\n- Must not leak.", encoding="utf-8")
+
+    offline = build_analysis_input(run, through_action=2, state_dir=state)
+    assert offline["context"]["profile_memory"] == "# Earlier click method\n\n- Compare one outcome.\n"
+    assert "Must stay isolated" not in offline["user_prompt"]
+    assert "Learned after this prefix" not in offline["user_prompt"]
+    assert "Current unversioned" not in offline["user_prompt"]
+    assert offline["memory_revision"]["profile"]["status"] == "historical_snapshot"
+
+
+def test_pixels_actions_omits_both_saved_memory_scopes_and_analysis_records_revisions(tmp_path: Path) -> None:
+    from v11.tools.memory import GameMemory, archive_profile_memory_revision, game_memory_dir
+
+    trace = tmp_path / "memory-ablation.jsonl"
+    _write_click_profile_trace(trace)
+    run = tmp_path / "run"
+    replay_trace(trace, run)
+    state = tmp_path / "state"
+    GameMemory(run, store_dir=game_memory_dir(state, "click-fixture")).record_markdown_revision(
+        "game", "Game-only saved knowledge.", step=2,
+    )
+    archive_profile_memory_revision(state, "a6", "# Approved profile method\n\n- Reuse verified mechanics.", timestamp_utc="2027-01-01T00:00:00+00:00")
+    no_memory = build_analysis_input(run, through_action=2, state_dir=state, conditioning="pixels_actions")
+    with_memory = build_analysis_input(run, through_action=2, state_dir=state, conditioning="pixels_actions_memory")
+    assert no_memory["context"]["memory"] is None
+    assert no_memory["context"]["profile_memory"] is None
+    assert with_memory["context"]["memory"]
+    assert with_memory["context"]["profile_memory"].startswith("# Approved profile method")
+
+    result = run_analysis(
+        run, _FakeClient(decision=_reasoned_decision("click", {"x": 1, "y": 1})),
+        through_action=2, state_dir=state, write_decision=False,
+    )
+    assert result["profile_id"] == "a6"
+    assert result["action_signature"] == "ACTION6"
+    assert result["profile_prompt_revision"]
+    assert result["prompt_revision"]
+    assert result["memory_revision"]["game"]["step"] == 2
+    assert result["memory_revision"]["profile"]["status"] == "historical_snapshot"

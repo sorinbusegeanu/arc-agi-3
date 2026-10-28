@@ -12,8 +12,10 @@ from .runlog import append_jsonl, read_json
 from .tools.game import ActionError, validate_decision
 from .tools.history import History
 from .tools.memory import (
-    DEFAULT_CONTEXT_ENTRIES, GameMemory, default_state_dir, game_memory_dir, shared_skill_path,
+    DEFAULT_CONTEXT_ENTRIES, default_state_dir, game_memory_dir, project_skills_dir,
+    read_game_memory_as_of, read_profile_memory_as_of, shared_skill_path,
 )
+from .profiles import compose_profile_prompt, resolve_action_profile
 
 
 DECISION_SCHEMA = "v10.action_set/2"
@@ -209,7 +211,8 @@ def reasoned_action_contract_description(
         example_action, example_args = "up", {}
     else:
         faced_specs = model_facing_action_specs(legal_action_specs)
-        example_spec = faced_specs[0] if faced_specs else {"id": "legal action"}
+        non_reset_specs = [spec for spec in faced_specs if str(spec.get("id")) != "RESET"]
+        example_spec = non_reset_specs[0] if non_reset_specs else (faced_specs[0] if faced_specs else {"id": "legal action"})
         example_action = str(example_spec.get("id", "legal action"))
         schema = example_spec.get("parameters", example_spec.get("args_schema", {}))
         properties = schema.get("properties", {}) if isinstance(schema, Mapping) else {}
@@ -225,7 +228,8 @@ def reasoned_action_contract_description(
                     example_args[name] = property_schema.get("minimum", 0)
                 elif property_schema.get("type") == "number":
                     example_args[name] = property_schema.get("minimum", 0)
-    click_only = bool(faced_specs) and {str(spec.get("id")) for spec in faced_specs} == {"click"}
+    non_reset_ids = {str(spec.get("id")) for spec in faced_specs if str(spec.get("id")) != "RESET"}
+    click_only = non_reset_ids == {"click"}
     assessment_example = {
         "player": (
             {"location": "unknown", "certainty": "unknown", "evidence": "unknown or not present"}
@@ -351,14 +355,23 @@ def build_analysis_input(
 
     game_id = manifest.get("game_id") or Path(str(manifest.get("source_trace", "unknown"))).stem
     run_id = manifest.get("run_id") or manifest.get("source_sha256", "replay")[:16]
-    memory_store = GameMemory(
-        run_path, store_dir=game_memory_dir(state_dir or default_state_dir(), str(game_id)),
-        run_id=str(run_id),
+    state_root = Path(state_dir) if state_dir is not None else default_state_dir()
+    memory_store_dir = game_memory_dir(state_root, str(game_id))
+    game_memory, game_memory_revision = read_game_memory_as_of(
+        state_root, str(game_id), visible_step,
     )
-    # Replay decisions consume the same model-authored Markdown as live runs.
-    memory = memory_store.view_path.read_text(encoding="utf-8") if memory_store.view_path.is_file() else ""
+    profile = resolve_action_profile(_action_specs(prefix, last))
+    profile_prompt, profile_prompt_revision = compose_profile_prompt(
+        profile, project_skills_dir() / "profile_capabilities",
+    )
+    prefix_timestamp = last.get("timestamp")
+    profile_memory, profile_memory_revision = read_profile_memory_as_of(
+        state_root, profile.profile_id, prefix_timestamp,
+    )
+    memory = game_memory
     if conditioning == "pixels_actions" or int(memory_context_entries) == 0:
         memory = ""
+        profile_memory = ""
     elif memory:
         # Offline experiments select whole Markdown blocks, never partial sentences.
         blocks = memory.strip().split("\n\n")
@@ -372,6 +385,12 @@ def build_analysis_input(
                 entries += 1
         memory = "\n\n".join(selected) + "\n"
     context = {
+        "action_profile": {
+            "profile_id": profile.profile_id,
+            "action_signature": profile.action_signature,
+            "capabilities": list(profile.capabilities),
+            "profile_prompt_revision": profile_prompt_revision,
+        },
         "current_state": {
             "level": last.get("levels_completed"),
             "win_levels": last.get("win_levels"),
@@ -389,6 +408,7 @@ def build_analysis_input(
             for row in prefix[-int(horizon):]
         ],
         "memory": memory if conditioning != "pixels_actions" else None,
+        "profile_memory": profile_memory if conditioning != "pixels_actions" else None,
     }
     if include_prior_decisions:
         prior = []
@@ -407,8 +427,12 @@ def build_analysis_input(
     if not default_skill.exists():
         default_skill = shared_skill_path()
     skill_file = Path(skill_path) if skill_path is not None else default_skill
-    system_prompt = skill_file.read_text(encoding="utf-8")
+    core_prompt = skill_file.read_text(encoding="utf-8").strip()
+    system_prompt = "\n\n".join(part for part in (core_prompt, profile_prompt) if part)
     skill_digest = hashlib.sha256(skill_file.read_bytes()).hexdigest()
+    prompt_revision = hashlib.sha256(
+        (skill_digest + "\0" + profile_prompt_revision).encode("utf-8")
+    ).hexdigest()
     prompt = (
         f"Choose up to {horizon} legal actions from the visible replay and return the structured reasoned-action JSON. "
         "Do not provide chain-of-thought. Keep actions as the only action list. If RESET is listed, use it alone and include args.justification.\n\n"
@@ -431,9 +455,18 @@ def build_analysis_input(
         "visible_step": visible_step,
         "manifest": manifest,
         "skill_sha256": skill_digest,
+        "profile_id": profile.profile_id,
+        "action_signature": profile.action_signature,
+        "profile_prompt_revision": profile_prompt_revision,
+        "prompt_revision": prompt_revision,
+        "memory_revision": {
+            "game": game_memory_revision,
+            "profile": profile_memory_revision,
+            "causal": bool(game_memory_revision.get("causal", False) and profile_memory_revision.get("causal", False)),
+        },
         "run_id": str(run_id),
         "game_id": str(game_id),
-        "memory_store_dir": memory_store.store_dir,
+        "memory_store_dir": memory_store_dir,
     }
 
 
@@ -566,6 +599,11 @@ def run_analysis(
         "prompt_version": "v10.analysis_prompt/2",
         "source_trace_sha256": inputs["manifest"].get("source_sha256"),
         "skill_sha256": inputs["skill_sha256"],
+        "profile_id": inputs["profile_id"],
+        "action_signature": inputs["action_signature"],
+        "profile_prompt_revision": inputs["profile_prompt_revision"],
+        "prompt_revision": inputs["prompt_revision"],
+        "memory_revision": inputs["memory_revision"],
         "backend": responses[-1].get("backend", getattr(client, "backend", "strata")),
         "model": responses[-1].get("model"),
         "through_action": int(through_action),

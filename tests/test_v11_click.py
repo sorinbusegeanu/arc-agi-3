@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 
 from v11.analysis import (
     model_action_aliases, reasoned_action_contract_description, validate_model_decision,
@@ -222,3 +223,76 @@ def test_click_only_contract_has_required_coordinates_and_no_assumed_player_or_o
     assert validate_reasoned_action(valid, [click_spec])["actions"] == [
         {"action": "ACTION6", "args": {"x": 0, "y": 0}},
     ]
+
+
+@pytest.mark.parametrize(
+    ("actions", "click_example"),
+    [
+        (["ACTION6"], True),
+        (["ACTION6", "RESET"], True),
+        (["ACTION1", "ACTION2", "ACTION3", "ACTION4", "RESET"], False),
+        (["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION6", "RESET"], False),
+    ],
+)
+def test_click_only_contract_detection_ignores_reset(actions, click_example) -> None:
+    specs = []
+    for action in actions:
+        if action == "ACTION6":
+            params = {"type": "object", "properties": {
+                "x": {"type": "integer", "minimum": 0, "maximum": 15},
+                "y": {"type": "integer", "minimum": 0, "maximum": 11},
+            }, "required": ["x", "y"], "additionalProperties": False}
+        elif action == "RESET":
+            params = {"type": "object", "properties": {
+                "justification": {"type": "string"},
+            }, "required": ["justification"], "additionalProperties": False}
+        else:
+            params = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
+        specs.append({"id": action, "parameters": params})
+    contract = reasoned_action_contract_description(specs)
+    assert contract["state_assessment"]["player"]["location"] == ("unknown" if click_example else "visual region or unknown")
+    if click_example:
+        assert contract["state_assessment"]["target_candidates"] == []
+        assert contract["state_assessment"]["obstacles"] == []
+    else:
+        assert contract["state_assessment"]["target_candidates"]
+        assert contract["state_assessment"]["obstacles"]
+    assert contract["actions"][0]["action"] != "RESET"
+    if click_example:
+        assert contract["actions"] == [{"action": "click", "args": {"x": 0, "y": 0}}]
+
+
+def test_live_click_profile_with_reset_uses_click_contract_in_full_prompt(tmp_path) -> None:
+    class ClickResetEnv:
+        legal_actions = [{"id": "ACTION6", "parameters": {
+            "type": "object", "properties": {
+                "x": {"type": "integer", "minimum": 0, "maximum": 15},
+                "y": {"type": "integer", "minimum": 0, "maximum": 11},
+            }, "required": ["x", "y"], "additionalProperties": False,
+        }}]
+
+        def observe(self):
+            return {"frame": np.zeros((12, 16), dtype=np.uint8), "legal_actions": self.legal_actions,
+                    "game_state": "NOT_FINISHED", "level": 0, "levels_completed": 0,
+                    "win_levels": 1, "terminal": False}
+
+        def act(self, action, args):
+            return {}
+
+        def reset(self):
+            return self.observe()
+
+    tools = GameTools(ClickResetEnv(), tmp_path / "live-click-reset")
+    current = tools.observe()
+    inputs = _live_context(
+        tools, current, "click-reset", 2, shared_skill_path(),
+        game_memory_dir(tmp_path / "state", "click-reset"), "run", 5,
+    )
+    prompt = inputs["user_prompt"]
+    contract_text = prompt.split("Required response contract (`v10.reasoned_action/1`):\n", 1)[1].split("\nString limits:", 1)[0]
+    contract = json.loads(contract_text)
+    assert {item["id"] for item in inputs["context"]["current_state"]["legal_actions"]} == {"ACTION6", "RESET"}
+    assert contract["actions"] == [{"action": "click", "args": {"x": 0, "y": 0}}]
+    assert contract["state_assessment"]["player"]["location"] == "unknown"
+    assert contract["state_assessment"]["target_candidates"] == []
+    assert contract["state_assessment"]["obstacles"] == []

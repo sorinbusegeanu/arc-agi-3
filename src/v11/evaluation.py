@@ -25,6 +25,11 @@ def _summary(record: dict[str, Any]) -> dict[str, Any]:
         "usage": record["usage"], "latency_seconds": record["latency_seconds"],
         "backend": record.get("backend", "strata"),
         "model": record.get("model"),
+        "profile_id": record.get("profile_id"),
+        "action_signature": record.get("action_signature"),
+        "profile_prompt_revision": record.get("profile_prompt_revision"),
+        "prompt_revision": record.get("prompt_revision"),
+        "memory_revision": record.get("memory_revision"),
     }
 
 

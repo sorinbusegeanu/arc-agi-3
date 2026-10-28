@@ -14,6 +14,7 @@ import re
 import shutil
 import tempfile
 import fcntl
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote
@@ -30,6 +31,7 @@ DEFAULT_CONTEXT_ENTRIES = 5
 MAX_MEMORY_MARKDOWN_CHARS = 3_000
 MAX_PROFILE_MEMORY_MARKDOWN_CHARS = 4_500
 PROFILE_MEMORY_NAME = "MEMORY.md"
+PROFILE_MEMORY_REVISIONS_NAME = "memory_revisions.jsonl"
 PATTERN_TYPES: tuple[str, ...] = ("mechanic", "strategy", "exception", "hypothesis", "failure")
 PATTERN_STATUSES: tuple[str, ...] = ("candidate", "confirmed", "contradicted", "retired")
 STATE_SELECTOR_FIELDS = frozenset({"game_state", "level", "levels_completed", "win_levels", "terminal"})
@@ -102,6 +104,75 @@ def read_profile_memory(
             f"profile memory exceeds the {min(int(max_characters), MAX_PROFILE_MEMORY_MARKDOWN_CHARS)} character limit"
         )
     return markdown
+
+
+def read_game_memory_as_of(
+    state_dir: Path | str, game_id: str, step: int,
+) -> tuple[str, dict[str, Any]]:
+    """Read the latest archived game Markdown no later than an action step."""
+    path = game_memory_dir(state_dir, game_id) / LEDGER_NAME
+    candidates = [
+        row for row in read_jsonl(path)
+        if row.get("op") == "markdown" and row.get("scope") == "game"
+        and isinstance(row.get("markdown"), str) and int(row.get("step", -1)) <= int(step)
+    ]
+    if not candidates:
+        return "", {"status": "no_historical_snapshot", "causal": True}
+    row = max(candidates, key=lambda item: (int(item.get("step", -1)), int(item.get("revision", 0))))
+    return str(row["markdown"]), {
+        "status": "historical_snapshot", "sha256": row.get("sha256"),
+        "step": int(row.get("step", 0)), "causal": True,
+    }
+
+
+def archive_profile_memory_revision(
+    state_dir: Path | str, profile_id: str, markdown: str,
+    *, timestamp_utc: str | None = None,
+) -> dict[str, Any]:
+    """Append an immutable, timestamped snapshot when profile memory is approved."""
+    rendered = _validated_markdown(markdown, MAX_PROFILE_MEMORY_MARKDOWN_CHARS, "profile memory")
+    row = {
+        "schema": "v11.profile_memory_revision/1", "profile_id": profile_id,
+        "markdown": rendered,
+        "sha256": hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+        "timestamp_utc": timestamp_utc or datetime.now(timezone.utc).isoformat(),
+    }
+    _append_locked_jsonl(profile_store_dir(state_dir, profile_id) / PROFILE_MEMORY_REVISIONS_NAME, row)
+    return row
+
+
+def read_profile_memory_as_of(
+    state_dir: Path | str, profile_id: str, timestamp: Any,
+) -> tuple[str, dict[str, Any]]:
+    """Read approved profile memory that existed by the replay-prefix timestamp."""
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        return "", {"status": "prefix_timestamp_unavailable", "causal": True}
+    try:
+        cutoff = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return "", {"status": "invalid_prefix_timestamp", "causal": True}
+    path = profile_store_dir(state_dir, profile_id) / PROFILE_MEMORY_REVISIONS_NAME
+    eligible = []
+    for row in read_jsonl(path):
+        if row.get("profile_id") != profile_id or not isinstance(row.get("timestamp_utc"), str):
+            continue
+        try:
+            revised = datetime.fromisoformat(row["timestamp_utc"].replace("Z", "+00:00"))
+            if revised.tzinfo is None:
+                revised = revised.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if revised <= cutoff:
+            eligible.append((revised, row))
+    if not eligible:
+        return "", {"status": "no_historical_snapshot", "causal": True}
+    _revised, row = max(eligible, key=lambda item: item[0])
+    return str(row.get("markdown", "")), {
+        "status": "historical_snapshot", "sha256": row.get("sha256"),
+        "timestamp_utc": row.get("timestamp_utc"), "causal": True,
+    }
 
 
 def _append_locked_jsonl(path: Path, row: Mapping[str, Any]) -> None:
@@ -232,6 +303,7 @@ def promote_profile_candidates(
     rendered = _validated_markdown(markdown, max_characters, "profile memory")
     destination = profile_memory_path(state_dir, profile_id)
     _atomic_write_text(destination, rendered)
+    archive_profile_memory_revision(state_dir, profile_id, rendered)
     audit = {
         "schema": "v11.profile_promotion/1", "event": "promoted",
         "profile_id": profile_id, "candidate_ids": ids,
@@ -1415,6 +1487,7 @@ __all__ = [
     "default_state_dir",
     "game_memory_dir",
     "profile_store_dir", "profile_memory_path", "profile_candidates_path", "profile_audit_path",
+    "read_game_memory_as_of", "archive_profile_memory_revision", "read_profile_memory_as_of",
     "read_profile_memory", "enqueue_profile_candidate", "list_profile_candidates", "promote_profile_candidates",
     "reject_profile_candidates", "migrate_legacy_global_memory",
     "reset_persistent_memory",
