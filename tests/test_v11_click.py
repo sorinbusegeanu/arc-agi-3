@@ -299,3 +299,13 @@ def test_live_click_profile_with_reset_uses_click_contract_in_full_prompt(tmp_pa
     assert contract["state_assessment"]["player"]["location"] == "unknown"
     assert contract["state_assessment"]["target_candidates"] == []
     assert contract["state_assessment"]["obstacles"] == []
+    profile_prompt = inputs["system_prompt"]
+    for instruction in (
+        "Observe → Model → Compare → Click → Verify",
+        "mechanics are unknown or a hypothesis is uncertain",
+        "at most two clicks",
+        "at most five clicks",
+        "click_candidates` are optional exploration suggestions, not preferred actions",
+        "Empty or background-colored cells may be the correct destinations",
+    ):
+        assert instruction in profile_prompt

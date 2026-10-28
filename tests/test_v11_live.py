@@ -13,7 +13,7 @@ import pytest
 import v11.live as live_module
 from v11.arcade_env import ArcadeGameEnv
 from v11.live import (
-    _active_level_transitions, _live_context, _parse_content, _perform_game_over_post_mortem,
+    _active_level_transitions, _adaptive_click_plan_horizon, _live_context, _parse_content, _perform_game_over_post_mortem,
     _perform_review,
     _perceptual_state_equivalence, _review_events,
     _verified_route_summaries, run_live,
@@ -2960,6 +2960,174 @@ def test_failed_click_does_not_block_other_coordinates(tmp_path, capsys):
     )
     assert accepted["decision"]["actions"] == [{"action": "click", "args": {"x": 0, "y": 0}}]
     assert accepted["display_actions"] == ["click(x=0,y=0)"]
+
+
+def test_click_plan_horizon_grows_only_after_consistent_observed_effects():
+    def transition(local, remote):
+        return {
+            "action": "ACTION6",
+            "measurements": {
+                "changed_pixels": local + remote,
+                "click_effect": {
+                    "local_changed_pixels": local,
+                    "remote_changed_pixels": remote,
+                    "level_changed": False,
+                    "terminal_changed": False,
+                },
+            },
+        }
+
+    assert _adaptive_click_plan_horizon(8, []) == 1
+    assert _adaptive_click_plan_horizon(8, [transition(4, 0)]) == 2
+    assert _adaptive_click_plan_horizon(8, [transition(4, 0), transition(5, 0)]) == 5
+    assert _adaptive_click_plan_horizon(8, [transition(4, 0), transition(0, 5)]) == 2
+
+
+def test_click_plans_execute_predictable_actions_without_intermediate_model_calls(tmp_path):
+    class ClickEnv:
+        legal_actions = [{"id": "ACTION6", "parameters": {
+            "type": "object", "properties": {
+                "x": {"type": "integer", "minimum": 0, "maximum": 7},
+                "y": {"type": "integer", "minimum": 0, "maximum": 7},
+            }, "required": ["x", "y"], "additionalProperties": False,
+        }}]
+
+        def __init__(self):
+            self.frame = np.zeros((8, 8), dtype=np.uint8)
+            self.actions = []
+            self.observe_calls = 0
+
+        def observe(self):
+            self.observe_calls += 1
+            return {"frame": self.frame.copy(), "legal_actions": self.legal_actions,
+                    "game_state": "NOT_FINISHED", "level": 0, "levels_completed": 0,
+                    "win_levels": 1, "terminal": False}
+
+        def act(self, action, args):
+            self.actions.append((action, dict(args)))
+            self.frame[args["y"], args["x"]] = 1
+            return {}
+
+    first = _reasoned(_decision([{"action": "click", "args": {"x": 0, "y": 0}}]), prediction={
+        "visible_change": "yes", "environment_outcome": "no_terminal", "description": "One cell changes."
+    })
+    second = _reasoned(_decision([{"action": "click", "args": {"x": 7, "y": 0}}]), prediction={
+        "visible_change": "yes", "environment_outcome": "no_terminal", "description": "A second cell changes."
+    })
+    followup = _reasoned(_decision([
+        {"action": "click", "args": {"x": x, "y": 1}} for x in range(1, 6)
+    ]), prediction={
+        "visible_change": "yes", "environment_outcome": "no_terminal", "description": "The pattern advances."
+    })
+    followup["state_assessment"]["target_candidates"] = [{
+        "description": "The established target pattern", "location": "row 1",
+        "relevance": "Two matching click outcomes support this target class.", "certainty": "observed",
+    }]
+    env = ClickEnv()
+    client = _FakeClient([first, second, followup])
+    metrics = _run_live_without_starting_routine(
+        env, tmp_path / "multi-click", client, game_id="fixture", max_actions=7, plan_horizon=8,
+    )
+
+    assert metrics["actions"] == 7
+    assert len(env.actions) == 7
+    assert env.observe_calls == len(env.actions) + 1
+    assert len(client.calls) == 3
+    first_context = json.loads(client.calls[0][0].split("Visible context:\n", 1)[1])
+    second_context = _continued_context(_message_user_text(client, 1))
+    third_context = _continued_context(_message_user_text(client, 2))
+    assert first_context["budgets"]["plan_horizon"] == 1
+    assert second_context["state"]["plan_horizon"] == 2
+    assert third_context["state"]["plan_horizon"] == 5
+
+
+def test_click_plan_stops_when_first_click_prediction_is_contradicted(tmp_path):
+    class ClickEnv:
+        legal_actions = [{"id": "ACTION6", "parameters": {
+            "type": "object", "properties": {
+                "x": {"type": "integer", "minimum": 0, "maximum": 7},
+                "y": {"type": "integer", "minimum": 0, "maximum": 7},
+            }, "required": ["x", "y"], "additionalProperties": False,
+        }}]
+
+        def __init__(self):
+            self.frame = np.zeros((8, 8), dtype=np.uint8)
+            self.actions = []
+
+        def observe(self):
+            return {"frame": self.frame.copy(), "legal_actions": self.legal_actions,
+                    "game_state": "NOT_FINISHED", "level": 0, "levels_completed": 0,
+                    "win_levels": 1, "terminal": False}
+
+        def act(self, action, args):
+            self.actions.append((action, dict(args)))
+            if args["x"] != 1:
+                self.frame[args["y"], args["x"]] = 1
+            return {}
+
+    def decision(xs):
+        return _reasoned(_decision([{"action": "click", "args": {"x": x, "y": 0}} for x in xs]), prediction={
+            "visible_change": "yes", "environment_outcome": "no_terminal", "description": "The selected cell changes."
+        })
+
+    env = ClickEnv()
+    client = _FakeClient([decision([0]), decision([1, 2]), decision([3])])
+    metrics = _run_live_without_starting_routine(
+        env, tmp_path / "contradicted-click", client, game_id="fixture", max_actions=3, plan_horizon=8,
+    )
+    plans = [json.loads(line) for line in (tmp_path / "contradicted-click" / "decisions.jsonl").read_text().splitlines()]
+
+    assert [args["x"] for _, args in env.actions] == [0, 1, 3]
+    assert metrics["actions"] == 3
+    assert len(client.calls) == 3
+    assert any(row.get("interrupt_reason") == "click_prediction_contradicted" for row in plans)
+
+
+def test_uncertain_click_hypothesis_limits_model_plan_to_one_action(tmp_path):
+    class ClickEnv:
+        legal_actions = [{"id": "ACTION6", "parameters": {
+            "type": "object", "properties": {
+                "x": {"type": "integer", "minimum": 0, "maximum": 7},
+                "y": {"type": "integer", "minimum": 0, "maximum": 7},
+            }, "required": ["x", "y"], "additionalProperties": False,
+        }}]
+
+        def __init__(self):
+            self.frame = np.zeros((8, 8), dtype=np.uint8)
+            self.actions = []
+
+        def observe(self):
+            return {"frame": self.frame.copy(), "legal_actions": self.legal_actions,
+                    "game_state": "NOT_FINISHED", "level": 0, "levels_completed": 0,
+                    "win_levels": 1, "terminal": False}
+
+        def act(self, action, args):
+            self.actions.append((action, dict(args)))
+            self.frame[args["y"], args["x"]] = 1
+            return {}
+
+    def decision(xs, *, hypothesis=None):
+        return _reasoned(_decision([{"action": "click", "args": {"x": x, "y": 0}} for x in xs]),
+                         hypothesis=hypothesis, prediction={
+            "visible_change": "yes", "environment_outcome": "no_terminal", "description": "The target changes."
+        })
+
+    uncertain = {"claim": "The next blue target behaves the same way.", "evidence": "Only one target has been tested."}
+    env = ClickEnv()
+    client = _FakeClient([
+        decision([0]),
+        decision([1, 2], hypothesis=uncertain),
+        decision([1], hypothesis=uncertain),
+    ])
+    metrics = _run_live_without_starting_routine(
+        env, tmp_path / "uncertain-click", client, game_id="fixture", max_actions=2, plan_horizon=8,
+    )
+
+    assert metrics["actions"] == 2
+    assert [args["x"] for _, args in env.actions] == [0, 1]
+    assert len(client.calls) == 3
+    repair_text = _message_user_text(client, 2)
+    assert "0 to 1 actions" in repair_text
 
 
 def test_reset_memory_cli_does_not_reimport_historical_route_or_ledger(tmp_path, monkeypatch):

@@ -85,6 +85,75 @@ def _display_action_reference(action_id: Any, args: Any = None) -> dict[str, Any
     return {"action": _display_action_name(action_id), "args": dict(args) if isinstance(args, Mapping) else {}}
 
 
+def _click_prediction_mismatch(
+    prediction: Any,
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    measurements: Mapping[str, Any],
+) -> str | None:
+    """Return the first observed click result that contradicts its plan prediction."""
+    if not isinstance(prediction, Mapping):
+        return None
+    changed_pixels = measurements.get("changed_pixels")
+    if isinstance(changed_pixels, (int, float)) and not isinstance(changed_pixels, bool):
+        visible_change = prediction.get("visible_change")
+        if visible_change == "yes" and changed_pixels == 0:
+            return "predicted a visible change, observed none"
+        if visible_change == "no" and changed_pixels > 0:
+            return "predicted no visible change, observed changed pixels"
+
+    expected = prediction.get("environment_outcome")
+    level_changed = (
+        before.get("level") != after.get("level")
+        or before.get("levels_completed") != after.get("levels_completed")
+    )
+    state = str(after.get("game_state", "")).upper()
+    terminal = bool(after.get("terminal"))
+    if expected == "level_change":
+        matches = level_changed
+    elif expected in {"GAME_OVER", "WIN"}:
+        matches = state == expected
+    elif expected == "no_terminal":
+        matches = not terminal
+    else:
+        matches = True
+    if not matches:
+        return f"predicted {expected}, observed {state or 'unknown'}"
+    return None
+
+
+def _adaptive_click_plan_horizon(
+    requested_horizon: int,
+    transitions: Sequence[Mapping[str, Any]],
+) -> int:
+    """Bound click plans by how consistently live click outcomes are established."""
+    successful = [
+        row for row in transitions
+        if str(row.get("action")) == "ACTION6"
+        and int((row.get("measurements") or {}).get("changed_pixels", 0)) > 0
+    ]
+    if not successful:
+        return min(int(requested_horizon), 1)
+    if len(successful) < 2:
+        return min(int(requested_horizon), 2)
+
+    def effect_class(row: Mapping[str, Any]) -> tuple[bool, bool, bool, bool]:
+        measurements = row.get("measurements", {})
+        effect = measurements.get("click_effect", {}) if isinstance(measurements, Mapping) else {}
+        if not isinstance(effect, Mapping):
+            effect = {}
+        return (
+            int(effect.get("local_changed_pixels", 0)) > 0,
+            int(effect.get("remote_changed_pixels", 0)) > 0,
+            bool(effect.get("level_changed")),
+            bool(effect.get("terminal_changed")),
+        )
+
+    if effect_class(successful[-1]) == effect_class(successful[-2]):
+        return min(int(requested_horizon), 5)
+    return min(int(requested_horizon), 2)
+
+
 def _perceptual_state_equivalence(left: Any, right: Any) -> dict[str, Any]:
     """Return a cautious visual-similarity signal; never a replay/safety match."""
     first = np.asarray(left)
@@ -2812,9 +2881,29 @@ def run_live(
                     break
                 parsed = _parse_content(response.get("content"))
                 ordinary_attempts += 1
+                validation_horizon = horizon
+                click_profile = any(
+                    str(item.get("id")) == "ACTION6"
+                    for item in inputs.get("legal_action_specs", [])
+                )
+                if click_profile and isinstance(parsed, Mapping):
+                    if parsed.get("hypothesis") is not None:
+                        validation_horizon = min(validation_horizon, 1)
+                    else:
+                        assessment = parsed.get("state_assessment", {})
+                        targets = assessment.get("target_candidates") if isinstance(assessment, Mapping) else None
+                        established_target = (
+                            isinstance(targets, list) and bool(targets)
+                            and all(
+                                isinstance(target, Mapping) and target.get("certainty") == "observed"
+                                for target in targets
+                            )
+                        )
+                        if not established_target:
+                            validation_horizon = min(validation_horizon, 2)
                 candidate = validate_reasoned_action(
                     parsed,
-                    inputs["legal_action_specs"], max_actions=horizon,
+                    inputs["legal_action_specs"], max_actions=validation_horizon,
                 )
                 directions = {"up", "left", "down", "right", "wait", "WAIT"}
                 if directional_only and (
@@ -3391,6 +3480,14 @@ def run_live(
                 force_model_selection = False
                 validation_error = None
                 if decision is None:
+                    model_legal_actions = _public_actions(current.get("legal_actions", []))
+                    if any(str(item.get("id")) == "ACTION6" for item in model_legal_actions):
+                        observed_clicks = _active_level_transitions(
+                            tools.history.records(), current, tools.reset_generation, limit=None,
+                        )
+                        decision_horizon = _adaptive_click_plan_horizon(
+                            decision_horizon, observed_clicks,
+                        )
                     if no_progress_actions >= 2:
                         decision_horizon = 1
                     inputs, pending_messages, cursor_for_next_request, new_conversation = prepare_action_turn(
@@ -3789,6 +3886,25 @@ def run_live(
                     interruption = "level_change"
                 elif trigger_reasons:
                     interruption = "review"
+                elif (
+                    action["action"] == "ACTION6"
+                    and action_index + 1 < len(actions)
+                    and reasoned_decision is not None
+                    and action_index == 0
+                    and (mismatch := _click_prediction_mismatch(
+                        reasoned_decision.get("prediction"), before_observation, current,
+                        result.get("measurements", {}) if isinstance(result.get("measurements"), Mapping) else {},
+                    )) is not None
+                ):
+                    interruption = "click_prediction_contradicted"
+                    progress(f"stopping click plan: {mismatch}; replanning from the observed screen")
+                elif (
+                    action["action"] == "ACTION6"
+                    and action_index + 1 < len(actions)
+                    and int((result.get("measurements") or {}).get("changed_pixels", 0)) == 0
+                ):
+                    interruption = "click_no_visible_change"
+                    progress("stopping click plan after a click with no visible change; replanning from the observed screen")
                 elif (
                     decision_source == "model"
                     and not bootstrap_probe_active
