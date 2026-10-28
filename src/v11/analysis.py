@@ -75,9 +75,12 @@ def _canonicalize_model_actions(payload: Any, legal_action_specs: Sequence[Mappi
                 action = {**action, "action": aliases[action_name]}
             elif isinstance(action_name, str) and action_name in canonical_ids:
                 alias = _DIRECTION_BY_ACTION.get(action_name, _MODEL_ALIAS_BY_ACTION[action_name])
-                kind = "directional name" if action_name in _DIRECTION_BY_ACTION else "model-facing name"
+                if action_name == "ACTION6":
+                    raise ActionError(
+                        f"actions[{index}] must use the model-facing name {alias!r} for this coordinate action"
+                    )
                 raise ActionError(
-                    f"actions[{index}] must use {kind} {alias!r} instead of {action_name}"
+                    f"actions[{index}] must use directional name {alias!r} instead of {action_name}"
                 )
         normalized_actions.append(action)
     normalized["actions"] = normalized_actions

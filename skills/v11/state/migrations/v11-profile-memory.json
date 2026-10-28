@@ -1,0 +1,5 @@
+{
+  "legacy_file_removed": false,
+  "migration": "remove_legacy_global_memory",
+  "schema": "v11.memory_migration/1"
+}

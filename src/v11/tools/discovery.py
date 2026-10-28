@@ -17,6 +17,15 @@ from .vision import candidate_displacement, pixel_diff
 
 MAX_INSPECTION_SIDE = 20
 
+
+def _display_action(action_id: Any, args: Any = None) -> tuple[Any, str | None]:
+    """Return the model-facing action name and a readable click reference."""
+    if str(action_id) != "ACTION6":
+        return action_id, None
+    if isinstance(args, Mapping) and "x" in args and "y" in args:
+        return "click", f"click(x={args['x']},y={args['y']})"
+    return "click", None
+
 # Keep the function schema aligned with the subset enforced by _experiment.
 _DISCOVERY_PREDICTION_PATHS = (
     "measurements.changed_pixels", "measurements.change_ratio", "game_state",
@@ -48,7 +57,10 @@ _DISCOVERY_HYPOTHESIS_SCHEMA = {
 }
 _DISCOVERY_ACTION_SCHEMA = {
     "type": "object",
-    "properties": {"action": {"type": "string"}, "args": {"type": "object"}},
+    "properties": {
+        "action": {"type": "string", "description": "Use the model-facing legal name; coordinate actions are named click, with x and y in args."},
+        "args": {"type": "object"},
+    },
     "required": ["action"], "additionalProperties": False,
 }
 
@@ -82,7 +94,7 @@ DISCOVERY_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string"}, "level": {},
+                    "action": {"type": "string", "description": "Filter by a model-facing action name such as click."}, "level": {},
                     "reset_generation": {},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                     "evidence_ids": {"type": "array", "items": {"type": "string"}},
@@ -263,14 +275,13 @@ class Discovery:
             y0,x0,y1,x1 = _region(region, frame.shape)
             return {"evidence_id": eid, "region": [y0,x0,y1,x1], "pixels": frame[y0:y1,x0:x1].tolist()}
         if tool == "search_history":
-            from ..analysis import model_action_name
             allowed = {"action", "level", "reset_generation", "limit", "evidence_ids", "since_step"}
             if set(args) - allowed: raise ActionError("unsupported search_history filter")
             limit = int(args.get("limit", 10))
             if limit <= 0 or limit > 20: raise ActionError("limit must be between 1 and 20")
             action = args.get("action")
             level = args.get("level")
-            normalized_action = model_action_name(action) if action is not None else None
+            normalized_action = ("ACTION6" if action == "click" else action) if action is not None else None
             wanted_ids = None
             if args.get("evidence_ids") is not None:
                 if not isinstance(args["evidence_ids"], list) or any(not isinstance(item, str) for item in args["evidence_ids"]):
@@ -287,7 +298,15 @@ class Discovery:
                     and (level is None or r.get("pre_level", (self.history.get(r.get("pre_evidence_id")) or {}).get("level")) == level)]
             truncated = len(rows) > limit
             rows = rows[-limit:]
-            return {"schema":"v10.history_query/1", "evidence":rows, "count":len(rows),
+            displayed_rows = []
+            for row in rows:
+                item = dict(row)
+                shown, label = _display_action(item.get("action"), item.get("args", {}))
+                item["action"] = shown
+                if label:
+                    item["display_action"] = label
+                displayed_rows.append(item)
+            return {"schema":"v10.history_query/1", "evidence":displayed_rows, "count":len(rows),
                     "truncated":truncated, "through_step":current_step}
         if tool == "game_memory":
             operation = args.get("operation")
@@ -492,13 +511,21 @@ class Discovery:
                                             action_name=case["action"]["action"])
                 actual = dict(transition["evidence"])
                 actual.update(transition["measurements"])
+                shown_action, display_action = _display_action(actual.get("action"), actual.get("args", {}))
+                actual["action"] = shown_action
+                if display_action:
+                    actual["display_action"] = display_action
                 if transition["evidence"].get("pre_level") != transition["evidence"].get("post_level"):
                     actual.pop("measurements", None)
                 verdicts = [{"id": h.get("id"), **evaluate_prediction(h["prediction"], actual)}
                             for h in case["hypotheses"]]
                 completed = {"case_id": case["case_id"], "status": "completed",
                                 "branch_id": branch_id, "base_evidence_id": base_id,
-                                "action": case["action"],
+                                "action": {
+                                    **case["action"],
+                                    "action": _display_action(case["action"]["action"], case["action"].get("args", {}))[0],
+                                },
+                                **({"display_action": display_action} if display_action else {}),
                                 "evidence_id": transition["evidence"].get("evidence_id"),
                                 "measurements": transition["measurements"], "hypotheses": verdicts,
                                 "actual": actual, "cache_key": cache_key}

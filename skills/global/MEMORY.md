@@ -17,3 +17,5 @@
 - **Collectible-target levels:** When multiple identical marked cells are visible and a progress indicator fills as the player moves, the goal is likely to visit all marked cells. Identify impassable obstacles first, then plan a path that covers every target without crossing obstacles or revisiting cells.
 
 - **Budget-constrained levels:** When a resource bar depletes with each action, calculate the minimum path length to all targets before committing to a route. If the minimum exceeds the budget, the completion condition may differ from "visit all targets"—test partial visits to identify which subset triggers completion. Track depletion rate across multiple moves to estimate total budget before committing.
+
+- **Budget equals minimum path:** When the estimated budget exactly equals the minimum path to all targets, arriving at the last target with zero remaining may trigger failure. Test stopping at fewer targets to see if a subset triggers completion, or look for alternative completion conditions beyond target collection.

@@ -593,3 +593,55 @@ def test_same_hypothesis_test_reuses_outcome_from_same_evidence_state(tmp_path, 
     rows = [json.loads(line) for line in (run_dir / "discovery.jsonl").read_text().splitlines()]
     assert any(row.get("event") == "branch_reused" for row in rows)
     assert metrics["discovery_branch_reuses"] == 1
+
+
+def test_click_discovery_answers_use_click_label_and_preserve_canonical_branch_evidence(tmp_path):
+    class ClickEnv:
+        legal_actions = [{"id": "ACTION6", "parameters": {
+            "type": "object", "properties": {
+                "x": {"type": "integer", "minimum": 0, "maximum": 7},
+                "y": {"type": "integer", "minimum": 0, "maximum": 7},
+            }, "required": ["x", "y"], "additionalProperties": False,
+        }}]
+
+        def __init__(self):
+            self.frame = np.zeros((8, 8), dtype=np.int64)
+
+        def observe(self):
+            return {"frame": self.frame.copy(), "legal_actions": self.legal_actions,
+                    "level": 0, "levels_completed": 0, "terminal": False, "game_state": "PLAYING"}
+
+        def act(self, action, args):
+            self.frame[args["y"], args["x"]] = 1
+            return {}
+
+        def fork(self):
+            return ClickEnv()
+
+    game = GameTools(ClickEnv(), tmp_path, max_actions=3)
+    state = game.observe()
+    discovery = Discovery(game, "run", "fixture", tmp_path / "memory")
+    result = discovery.dispatch({"request_id": "click-test", "tool": "test_hypotheses", "arguments": {
+        "base_evidence_id": state["evidence_id"], "cases": [{
+            "case_id": "click-site", "action": {"action": "click", "args": {"x": 2, "y": 3}},
+            "hypotheses": [{"id": "changed", "prediction": {"all": [
+                {"path": "measurements.changed_pixels", "op": "gt", "value": 0},
+            ]}}],
+        }],
+    }})
+    case = result["data"]["cases"][0]
+    assert case["action"] == {"action": "click", "args": {"x": 2, "y": 3}}
+    assert case["display_action"] == "click(x=2,y=3)"
+    assert case["actual"]["action"] == "click"
+    assert case["actual"]["display_action"] == "click(x=2,y=3)"
+    branch_evidence = json.loads((tmp_path / "discovery_branches" / case["branch_id"] / "evidence.jsonl").read_text().splitlines()[-1])
+    assert branch_evidence["action"] == "ACTION6"
+    assert branch_evidence["args"] == {"x": 2, "y": 3}
+    assert branch_evidence["display_action"] == "click(x=2,y=3)"
+
+    game.act("ACTION6", {"x": 4, "y": 3})
+    history = discovery.dispatch({"request_id": "click-history", "tool": "search_history", "arguments": {
+        "action": "click",
+    }})
+    assert history["data"]["evidence"][-1]["action"] == "click"
+    assert history["data"]["evidence"][-1]["display_action"] == "click(x=4,y=3)"

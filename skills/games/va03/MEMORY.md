@@ -3,7 +3,7 @@
 - Level 1: Trail alternates yellow/green. Backtracking onto trail cells causes GAME_OVER. Snake-like path visiting all yellow cells without revisiting completed the level.
 - Level 2: Yellow cells are targets; gray cells are obstacles. Progress fills green as targets collected. Route around gray obstacle completed the level.
 - Level 3: Yellow targets around gray center obstacle. Route around obstacle completed the level.
-- Level 4: Four yellow squares at grid corners; player starts on top-left one. Cyan bar near bottom-right depletes each move (move budget). Up/left from start are boundary no-ops. Down from start works, leaving green trail. No obstacles observed on the grid.
+- Level 4: Four yellow squares at grid corners; player starts on top-left one. Cyan bar near bottom-right depletes each move (move budget); small green square at its end tracks remaining budget. Up/left from start are boundary no-ops. Down from start works, leaving green trail. No obstacles observed on the grid. Trail does NOT cause GAME_OVER on Level 4 (player moved along trail-adjacent cells without death).
 
 ### Failed hypotheses
 - Level 1: Staircase from start → GAME_OVER (backtracking onto trail). Snake path is correct.
@@ -11,11 +11,11 @@
 - Level 4: Perimeter tour (right along top, down along right) reached two corners without completing; budget insufficient for remaining corners.
 - Level 4: Straight-down route reached bottom-left corner without completing after visiting only two corners (start + bottom-left).
 - Level 4: Down-left-column then right-bottom-row then up-right-column route reached top-right area and triggered GAME_OVER (~19 total moves). Cause unclear: budget exhaustion or trail interaction.
+- Level 4: All-corners minimum path (21 moves) appears to equal or exceed the budget, making visit-all-corners completion impossible with a minimum path.
 
 ### Unresolved hypotheses
-- Level 4: Completion likely requires visiting all four yellow corners. Minimum path is 18 moves (three edges of 6). Whether the budget permits this is unconfirmed; the GAME_OVER at ~19 moves in one attempt suggests budget may be tight or trail is hazardous.
-- Level 4: The cyan bar is likely a move budget; the small green square at its end may track progress but its exact role is unclear.
-- Level 4: The green trail may be a hazard (backtracking causes GAME_OVER) as in Level 1, but this has not been directly confirmed on Level 4.
+- Level 4: Completion condition is unknown. Visit-all-corners is contradicted by budget constraints. Possible alternatives: visiting a subset of corners, reaching a specific target, or a different mechanic entirely.
+- Level 4: The green trail may or may not be hazardous on Level 4; no direct backtracking-onto-trail test has been performed.
 
 ### Next experiment
-- Level 4 (player one cell right of bottom-left corner, trail on left column, ~8 moves used): Continue right along bottom edge to bottom-right corner, then up along right edge to top-right corner. Tests whether visiting all four corners completes the level and whether the budget (~26 estimated from bar depletion rate) suffices for an 18-move minimum path. If GAME_OVER occurs before reaching top-right, distinguishes budget exhaustion from trail hazard.
+- Level 4 (player one cell right of bottom-left corner, trail on left column): Continue right along bottom edge to bottom-right corner, then stop and observe whether visiting 3 corners (top-left, bottom-left, bottom-right) triggers completion. If not, continue up along right edge toward top-right to test whether 4 corners ever completes. This distinguishes "3 corners suffice" from "all 4 required but budget insufficient" from "completion condition is entirely different."

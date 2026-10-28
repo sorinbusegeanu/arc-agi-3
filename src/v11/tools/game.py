@@ -544,6 +544,8 @@ class GameTools:
             "type": "transition",
             "action": str(action_name) if action_name else action,
             "args": safe_args,
+            **({"display_action": f"click(x={safe_args['x']},y={safe_args['y']})"}
+               if str(action) == "ACTION6" and "x" in safe_args and "y" in safe_args else {}),
             "pre_frame_id": before["frame_id"], "post_frame_id": after["frame_id"],
             "pre_frame_image_id": before["frame_image_id"], "post_frame_image_id": after["frame_image_id"],
             "pre_evidence_id": before.get("evidence_id"),

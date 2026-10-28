@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from v11.analysis import (
-    model_action_aliases, reasoned_action_contract_description, validate_model_decision,
+    DecisionValidationError, model_action_aliases, reasoned_action_contract_description, validate_model_decision,
 )
 from v11.live import (
     _action_conversation_observation, _action_observation_events,
@@ -52,6 +52,9 @@ def test_click_alias_is_available_only_when_action6_is_legal() -> None:
         "actions": [{"action": "ACTION6", "args": {"x": 2, "y": 1}}],
     }
     assert model_action_aliases([]) == {}
+    with pytest.raises(DecisionValidationError, match="model-facing name 'click'") as exc_info:
+        validate_model_decision({"actions": [{"action": "ACTION6", "args": {"x": 2, "y": 1}}]}, [click_spec])
+    assert "ACTION6" not in str(exc_info.value)
 
 
 def test_game_tools_records_local_remote_click_effect(tmp_path) -> None:

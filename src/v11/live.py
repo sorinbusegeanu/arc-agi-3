@@ -67,6 +67,24 @@ def _display_action_name(action_id: Any) -> Any:
     return "click" if str(action_id) == "ACTION6" else model_action_name(action_id)
 
 
+def _display_action_call(action_id: Any, args: Any = None) -> str:
+    """Format a model-facing action reference without changing stored action IDs."""
+    name = str(_display_action_name(action_id))
+    if name == "click" and isinstance(args, Mapping) and "x" in args and "y" in args:
+        return "click(" + ",".join(
+            f"{key}={json.dumps(args[key], ensure_ascii=False, separators=(',', ':'))}"
+            for key in ("x", "y")
+        ) + ")"
+    return name
+
+
+def _display_action_reference(action_id: Any, args: Any = None) -> dict[str, Any]:
+    """Keep ordinary action records stable; compact click references as click(x,y)."""
+    if str(_display_action_name(action_id)) == "click" and isinstance(args, Mapping) and "x" in args and "y" in args:
+        return {"action": _display_action_call(action_id, args)}
+    return {"action": _display_action_name(action_id), "args": dict(args) if isinstance(args, Mapping) else {}}
+
+
 def _perceptual_state_equivalence(left: Any, right: Any) -> dict[str, Any]:
     """Return a cautious visual-similarity signal; never a replay/safety match."""
     first = np.asarray(left)
@@ -464,14 +482,14 @@ def _review_events(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
                 events.append({
                     "type": "pattern_prediction",
                     "pattern_id": row.get("pattern_id"),
-                    "verdict": row.get("verdict"), "action": model_action_name(row.get("action")),
+                    "verdict": row.get("verdict"), "action": _display_action_name(row.get("action")),
                     "expected": row.get("expected"), "actual": row.get("actual"),
                     "reason": row.get("reason"), "reset_generation": row.get("reset_generation"),
                 })
             else:
                 events.append({
                     "type": "action_error",
-                    "kind": row.get("kind"), "action": model_action_name(row.get("action")),
+                    "kind": row.get("kind"), "action": _display_action_name(row.get("action")),
                     "error": row.get("error"), "reset_generation": row.get("reset_generation"),
                 })
         elif kind == "transition":
@@ -767,7 +785,9 @@ def _action_screen_links(
         ), None)
         links.append({
             "action_number": action_number,
-            "action": str(model_action_name(row.get("action"))),
+            "action": _display_action_name(row.get("action")),
+            **({"display_action": _display_action_call(row.get("action"), row.get("args", {}))}
+               if str(row.get("action")) == "ACTION6" else {}),
             "starts_from_screen_number": source,
             "produces_screen_numbers": produced,
         })
@@ -863,8 +883,10 @@ def _reasoning_evidence_record(
         "hypothesis_status": "unresolved",
         "hypothesis_status_source": "requires semantic review",
         "planned_first_action": {
-            "action": model_action_name(transition.get("action")),
+            "action": _display_action_name(transition.get("action")),
             "args": transition.get("args", {}),
+            **({"display_action": _display_action_call(transition.get("action"), transition.get("args", {}))}
+               if str(transition.get("action")) == "ACTION6" else {}),
         },
         "prediction": dict(prediction),
         "actual_observed_change": {
@@ -961,7 +983,7 @@ def _saved_route_guidance(
     route = candidates[0]
     return [{
         "success": route.get("success"),
-        "actions": [model_action_name(step.get("action")) for step in route["steps"]],
+        "actions": [_display_action_call(step.get("action"), step.get("args", {})) for step in route["steps"]],
         "action_arguments": [dict(step.get("args", {})) for step in route["steps"]],
         "applies_to_current_starting_screen": state_matches_fingerprint(current, str(route.get("start_state", ""))),
         "guidance": (
@@ -1109,7 +1131,9 @@ def _perform_review(
                 "sequence_index": index,
                 "evidence_id": row.get("evidence_id"),
                 "pre_evidence_id": row.get("pre_evidence_id"),
-                "action": model_action_name(row.get("action")),
+                "action": _display_action_name(row.get("action")),
+                **({"display_action": _display_action_call(row.get("action"), row.get("args", {}))}
+                   if str(row.get("action")) == "ACTION6" else {}),
                 "args": row.get("args", {}),
                 "level_index_before_action": before.get("level"),
                 "levels_completed_before_action": before.get("levels_completed"),
@@ -1371,6 +1395,8 @@ def _perform_game_over_post_mortem(
             "action_number": index + 1,
             "action": _display_action_name(row.get("action")),
             "args": dict(row.get("args", {})) if isinstance(row.get("args"), Mapping) else {},
+            **({"display_action": _display_action_call(row.get("action"), row.get("args", {}))}
+               if str(row.get("action")) == "ACTION6" else {}),
             "measurements": _compact_transition_measurements(row.get("measurements")),
             "level_index": row.get("level"),
             "levels_completed": row.get("levels_completed"),
@@ -1586,6 +1612,8 @@ def _live_context(
         "recent_transitions": [
             {
                 "action": _display_action_name(row.get("action")), "args": row.get("args", {}),
+                **({"display_action": _display_action_call(row.get("action"), row.get("args", {}))}
+                   if str(row.get("action")) == "ACTION6" else {}),
                 "measurements": _compact_transition_measurements(row.get("measurements")),
                 "observed_pixel_region_motion": _observed_region_motion(row, frames),
                 "levels_completed_before_action": evidence_by_id.get(
@@ -1601,10 +1629,10 @@ def _live_context(
         "profile_memory": profile_memory,
         "repeated_outcomes": _repeated_outcome_summary(transitions, tools.frames),
         "ineffective_actions_at_current_screen": [
-            model_action_name(action) for action in sorted(ineffective_action_ids)
+            _display_action_name(action) for action in sorted(ineffective_action_ids)
         ],
         "ineffective_attempts_at_current_screen": [
-            {"action": model_action_name(action), "args": json.loads(args)}
+            _display_action_reference(action, json.loads(args))
             for action, args in sorted(ineffective_action_keys)
         ],
         "visible_regions_current_screen": _frame_regions(current.get("frame")),
@@ -1629,6 +1657,8 @@ def _live_context(
             {
                 "action": _display_action_name(row.get("action")),
                 "args": dict(row.get("args", {})) if isinstance(row.get("args"), Mapping) else {},
+                **({"display_action": _display_action_call(row.get("action"), row.get("args", {}))}
+                   if str(row.get("action")) == "ACTION6" else {}),
                 "measurements": _compact_transition_measurements(row.get("measurements")),
                 "level": row.get("level"),
                 "levels_completed": row.get("levels_completed"),
@@ -1710,10 +1740,10 @@ def _live_context(
         "action_profile": context["action_profile"],
         "recent_transitions": [],
         "ineffective_actions_at_current_screen": [
-            model_action_name(action) for action in sorted(ineffective_action_ids)
+            _display_action_name(action) for action in sorted(ineffective_action_ids)
         ][:4],
         "ineffective_attempts_at_current_screen": [
-            {"action": model_action_name(action), "args": json.loads(args)}
+            _display_action_reference(action, json.loads(args))
             for action, args in sorted(ineffective_action_keys)
         ][:4],
         "recent_action_errors": _recent_action_errors(records, tools.reset_generation),
@@ -1873,12 +1903,7 @@ def _action_transition_summary(
     args = transition.get("args")
     if isinstance(args, Mapping) and args:
         if str(action) == "click" and "x" in args and "y" in args:
-            ordered_args = {key: args[key] for key in ("x", "y") if key in args}
-            ordered_args.update({key: value for key, value in args.items() if key not in ordered_args})
-            action = "click(" + ",".join(
-                f"{key}={json.dumps(value, ensure_ascii=False, separators=(',', ':'))}"
-                for key, value in ordered_args.items()
-            ) + ")"
+            action = _display_action_call(transition.get("action"), args)
         else:
             action = f"{action}(args={json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(',', ':'))})"
     measurements = transition.get("measurements")
@@ -1989,7 +2014,7 @@ def _action_conversation_observation(
         "actions_remaining": tools.actions_remaining,
         "plan_horizon": int(horizon),
         "ineffective_attempts_at_current_screen": [
-            {"action": model_action_name(action), "args": json.loads(args)}
+            _display_action_reference(action, json.loads(args))
             for action, args in sorted(ineffective_keys)
         ][:8],
         "consecutive_repeated_or_no_progress_actions": int(no_progress_actions),
@@ -2093,7 +2118,7 @@ def _action_observation_events(records: Sequence[Mapping[str, Any]]) -> list[dic
             events.append({"reset": True, "reason": str(row.get("justification", ""))[:180]})
         elif kind == "audit" and row.get("kind") == "action_error":
             events.append({
-                "action_error": model_action_name(row.get("action")),
+                "action_error": _display_action_name(row.get("action")),
                 "error": str(row.get("error", ""))[:180],
             })
     return events
@@ -2106,7 +2131,7 @@ def _recent_action_errors(records: Sequence[Mapping[str, Any]], reset_generation
         and int(row.get("reset_generation", 0)) == int(reset_generation)
     ][-2:]
     return [
-        f"{model_action_name(row.get('action'))}: {str(row.get('error', 'action failed'))[:120]}"
+        f"{_display_action_name(row.get('action'))}: {str(row.get('error', 'action failed'))[:120]}"
         for row in errors
     ]
 
@@ -3432,8 +3457,9 @@ def run_live(
                     break
                 action_number = tools.action_count + 1
                 fallback_name = model_action_name(fallback["action"])
+                fallback_display = _display_action_call(fallback["action"], fallback["args"])
                 fallback_cause = "bootstrap_plan_invalid" if bootstrap_fallback_pending else "invalid_decision"
-                progress(f"taking legal fallback action {action_number}: {fallback_name} (cause={fallback_cause})")
+                progress(f"taking legal fallback action {action_number}: {fallback_display} (cause={fallback_cause})")
                 before_observation = current
                 previous_level = current.get("level")
                 previous_levels_completed = current.get("levels_completed")
@@ -3452,11 +3478,12 @@ def run_live(
                 append_jsonl(decisions_path, {
                     "schema": "v10.live_fallback/2", "status": "executed",
                     "cause": fallback_cause, "validation_error": validation_error,
-                    "action": fallback_name, "args": fallback["args"],
+                    "action": _display_action_name(fallback_name), "args": fallback["args"],
+                    **({"display_action": fallback_display} if fallback["action"] == "ACTION6" else {}),
                     "evidence_id": result["evidence"]["evidence_id"],
                 })
                 progress(
-                    f"fallback action {tools.action_count}: {fallback_name} -> "
+                    f"fallback action {tools.action_count}: {fallback_display} -> "
                     f"{current.get('game_state', '?')}; observation captured"
                 )
                 update_stagnation_state(
@@ -3498,7 +3525,7 @@ def run_live(
                 **(reasoned_decision or {}),
                 **decision,
                 "actions": [
-                    {**item, "action": model_action_name(item["action"])}
+                    {**item, "action": _display_action_name(item["action"])}
                     for item in decision["actions"]
                 ],
             }
@@ -3515,6 +3542,10 @@ def run_live(
                 "cached_path_edge_ids": [edge["id"] for edge in solution_edges],
                 "cached_path_error": cached_path_error,
                 "input_image_labels": inputs["image_labels"], "decision": logged_decision,
+                **({"display_actions": [
+                    _display_action_call(item["action"], item.get("args", {}))
+                    for item in decision["actions"] if item["action"] == "ACTION6"
+                ]} if any(item["action"] == "ACTION6" for item in decision["actions"]) else {}),
                 "repair_attempted": len(responses) > 1,
                 "initial_validation_error": validation_error, "usage": _sum_usage(responses),
                 "request_attempts": sum(int(item.get("request_attempts", 1)) for item in responses),
@@ -3531,7 +3562,7 @@ def run_live(
             plan = decision
             progress(
                 f"decision ready in {decision_row['latency_seconds']:.1f}s; "
-                f"planned={[model_action_name(item['action']) for item in plan['actions']]}"
+                f"planned={[_display_action_call(item['action'], item.get('args', {})) for item in plan['actions']]}"
             )
             reset_action = next((item for item in plan["actions"] if item["action"] == "RESET"), None)
             if reset_action is not None:
@@ -3570,7 +3601,7 @@ def run_live(
                         interruption = "known_ineffective_action"
                         progress(
                             f"stopping plan before repeating ineffective action "
-                            f"{model_action_name(action['action'])} from the same screen"
+                            f"{_display_action_call(action['action'], action.get('args', {}))} from the same screen"
                         )
                         break
                 expected_cached_edge = solution_edges[action_index] if solution_edges else None
@@ -3601,7 +3632,8 @@ def run_live(
                 try:
                     next_number = tools.action_count + 1
                     action_name = model_action_name(action["action"])
-                    progress(f"taking action {next_number}: {action_name}")
+                    action_display = _display_action_call(action["action"], action.get("args", {}))
+                    progress(f"taking action {next_number}: {action_display}")
                     result = tools.act(
                         action["action"], action.get("args", {}), action_name=action_name,
                     )
@@ -3676,12 +3708,16 @@ def run_live(
                 )
                 memory.record_run_state(game_id, current, step=tools.action_count)
                 progress(
-                    f"action {tools.action_count}: {model_action_name(action['action'])} -> "
+                    f"action {tools.action_count}: {_display_action_call(action['action'], action.get('args', {}))} -> "
                     f"{current.get('game_state', '?')}"
                 )
                 executed_action = {
-                    "action": model_action_name(action["action"]),
+                    "action": _display_action_name(action["action"]),
                     "evidence_id": result["evidence"]["evidence_id"],
+                    **({
+                        "args": dict(action.get("args", {})),
+                        "display_action": _display_action_call(action["action"], action.get("args", {})),
+                    } if action["action"] == "ACTION6" else {}),
                 }
                 if expected_pattern is not None:
                     actual = {

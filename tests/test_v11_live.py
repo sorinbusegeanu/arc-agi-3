@@ -2916,7 +2916,7 @@ def test_diverged_route_at_same_screen_is_suspended_and_model_runs(tmp_path):
     assert [action for action, _ in env.actions] == ["ACTION1", "ACTION2"]
 
 
-def test_failed_click_does_not_block_other_coordinates(tmp_path):
+def test_failed_click_does_not_block_other_coordinates(tmp_path, capsys):
     class ClickEnv(_FakeEnv):
         def observe(self):
             result = super().observe()
@@ -2936,10 +2936,30 @@ def test_failed_click_does_not_block_other_coordinates(tmp_path):
     metrics = run_live(env, tmp_path / "clicks", client, game_id="fixture", max_actions=2, starting_routine=False)
     assert [args["x"] for _, args in env.actions] == [0, 1]
     assert metrics["model_calls"] == 2
+    assert "Refer to an attempted click as `click(x=12,y=8)`" in client.system_prompts[0]
+    assert "the legal action name `click`" in client.system_prompts[0]
+    assert "ACTION6" not in client.system_prompts[0]
+    assert "ACTION6" not in client.calls[0][0]
+    assert '"id":"click"' in client.calls[0][0]
     context = _continued_context(_message_user_text(client, 1))
     assert context["state"]["ineffective_attempts_at_current_screen"] == [
-        {"action": "ACTION6", "args": {"x": 0, "y": 0}}
+        {"action": "click(x=0,y=0)"}
     ]
+    output = capsys.readouterr().err
+    assert "planned=['click(x=0,y=0)']" in output
+    assert "taking action 1: click(x=0,y=0)" in output
+    assert "action 1: click(x=0,y=0) ->" in output
+    assert "ACTION6" not in output
+    evidence = [row for row in History(tmp_path / "clicks").records() if row.get("type") == "transition"]
+    assert evidence[0]["action"] == "ACTION6"
+    assert evidence[0]["args"] == {"x": 0, "y": 0}
+    assert evidence[0]["display_action"] == "click(x=0,y=0)"
+    accepted = next(
+        row for row in (json.loads(line) for line in (tmp_path / "clicks" / "decisions.jsonl").read_text().splitlines())
+        if row.get("status") == "accepted"
+    )
+    assert accepted["decision"]["actions"] == [{"action": "click", "args": {"x": 0, "y": 0}}]
+    assert accepted["display_actions"] == ["click(x=0,y=0)"]
 
 
 def test_reset_memory_cli_does_not_reimport_historical_route_or_ledger(tmp_path, monkeypatch):
