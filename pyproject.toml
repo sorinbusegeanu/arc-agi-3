@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arc-agi-v6"
-version = "10.0.29"
+version = "11.0.0"
 description = "AGI v6 - Agent General Intelligence System"
 requires-python = ">=3.12"
 dependencies = [
@@ -24,6 +24,7 @@ dependencies = [
 [project.scripts]
 arc-agi3-v7 = "v7.cli:main"
 arc-agi3-v9 = "v9.cli:main"
+arc-agi3-v11 = "v11.cli:main"
 
 [project.optional-dependencies]
 curriculum = ["minigrid>=2.3,<3.0", "gymnasium[box2d,atari]>=1.0,<2.0", "ale-py>=0.10,<1.0"]

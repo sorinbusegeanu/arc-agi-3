@@ -1,14 +1,17 @@
-- Compare state before and after each legal action; larger changes suggest an interaction to verify. Confirm lasting effects over multiple frames. Confirm completion only from an environment-level change or explicit WIN signal, not from adjacency or a single visual effect.
-- A no-op proves only that the tested action had no visible effect from that specific state. Do not infer general blockage, a wall, or unreachability from it. If a state/action repeat yields no change, choose a targeted untried action.
-- Treat visual features as hypotheses: an object may be collectible, interactive, a switch, a portal, or a hazard; an apparent barrier may have a gap; a region's coverage may matter. Test each possibility with one informative legal action and compare before/after.
-- Do not assume a prior level's completion condition applies to a new level; verify independently. If free movement produces no progress, redirect to a targeted interaction with a specific object.
-- Before committing to an interaction that may alter or remove an object, consider whether it could become unrecoverable. If an object disappears or becomes immovable, test whether reversing or continuing the action restores it.
-- If the controlled agent itself disappears after an interaction, test whether it can be recovered by moving in other directions before concluding the state is a dead end.
-- When an object is passable (agent enters without vanishing or triggering completion), classify it as inert or decorative rather than a goal; redirect testing to untried objects.
-- When approaching a target near a screen edge or corner, a no-op from the edge may reflect the grid boundary rather than the target's properties. Distinguish boundary limits from object interactions by testing the same action from a different nearby state.
-- When all visible objects have been tested individually without triggering completion, consider that the completion condition may involve a sequence, combination, or hidden element rather than a single object interaction.
-- When two objects merge or combine into a new visual state, test whether the combined entity interacts differently with other objects than either component alone.
-- When a movable object can be pushed, avoid pushing it into corners or edges where it becomes unreachable; if this occurs, reset rather than continue.
-- When a merged pair's size exceeds a gap or corridor dimension, the pair cannot traverse it regardless of merge axis alignment. Test whether individual components can cross the gap separately, then recombine on the far side.
-- If repeated actions cycle between a small set of states without producing new interactions or progress, recognize the loop as ineffective and commit to a single targeted untried action that tests a specific hypothesis.
-- When a combined entity successfully traverses an obstacle but the level does not complete, the obstacle was not the only constraint; test whether the entity must also interact with a target as a unit rather than having components enter the target separately.
+- **State comparison and completion:** Compare state before and after each legal action; larger changes suggest an interaction worth verifying. Confirm lasting effects over multiple frames. Confirm completion only from an environment-level change or explicit WIN signal, not from adjacency or a single visual effect.
+
+- **No-ops and loops:** A no-op proves only that the tested action had no visible effect from that specific state; do not infer general blockage. Distinguish boundary limits from object properties by testing the same action from a nearby different state. If repeated actions cycle between a small set of states without new interactions, recognize the loop and commit to a single targeted untried action that tests a specific hypothesis.
+
+- **Conditional hypotheses from visual cues:** Treat visual features as hypotheses to test, not facts. An object may be collectible, interactive, a switch, a portal, or a hazard; an apparent barrier may have a gap; a region's coverage may matter. Test each possibility with one informative legal action and compare before/after. If an object produces no state change when interacted with, deprioritize it and redirect to untried objects.
+
+- **Independent verification per level:** Do not assume a prior level's completion condition applies to a new level; verify independently. If free movement produces no progress, redirect to a targeted interaction with a specific object. When all visible objects tested individually without completion, consider that the condition may involve a sequence, combination, or hidden element.
+
+- **Irreversibility caution:** Before committing to an interaction that may alter or remove an object, consider whether it could become unrecoverable. If an object disappears or becomes immovable, test whether reversing or continuing restores it. If the agent's own state changes unexpectedly, test recovery before concluding dead end. Avoid actions that make objects unreachable; if this occurs, reset rather than continue.
+
+- **Partial progress ≠ completion:** If a state change resolves one apparent constraint but the level does not complete, the obstacle was not the only condition. Test whether the changed entity must also satisfy additional conditions beyond the one just resolved before assuming the path forward is clear.
+
+- **Transferable strategy caution:** A strategy that completed one level may produce a terminal failure (e.g., game over) on the next. Before reusing a prior level's movement pattern, test one step of it and check for hazards or changed cell properties before committing to the full sequence.
+
+- **Trail and backtracking hazards:** When movement leaves persistent marks on the grid, treat every previously visited cell as potentially hazardous. Plan a path that visits each cell at most once. If a level introduces trail mechanics, verify whether backtracking is fatal before attempting any reversal.
+
+- **Collectible-target levels:** When multiple identical marked cells are visible and a progress indicator fills as the player moves, the goal is likely to visit all marked cells. Identify impassable obstacles first, then plan a path that covers every target without crossing obstacles or revisiting cells.

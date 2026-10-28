@@ -1,0 +1,3 @@
+## Coordinate action ACTION6
+
+Some games have no controllable avatar; do not invent one. Use only legal native-grid bounds. Coordinates use zero-based `x` as column and `y` as row, never measurements from a resized screenshot. Candidate points are suggestions grounded in the current frame, not the only legal targets. Compare local and remote changes after a click; a click with no visible change does not prove the target is inactive. A failed coordinate does not rule out other coordinates or a later state. For an uncertain click, choose one informative point and inspect its outcome before continuing.
