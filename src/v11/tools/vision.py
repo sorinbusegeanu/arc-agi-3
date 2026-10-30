@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 from urllib.parse import quote
 
 import numpy as np
@@ -25,6 +25,8 @@ DEFAULT_MAX_TRANSITIONS = 32
 DEFAULT_MAX_SHIFT = 16
 CLICK_CANDIDATES_SCHEMA = "v11.click_candidates/1"
 CLICK_EFFECT_SCHEMA = "v11.click_effect/1"
+MAX_SPATIAL_DETAILS = 64
+MAX_COMPARE_REGION_CELLS = 4096
 
 
 def _match_pair(before: np.ndarray, after: np.ndarray) -> None:
@@ -129,6 +131,162 @@ def pixel_diff(
         "color_transitions": pairs,
         "transitions_truncated": truncated,
         "per_color": per_color,
+    }
+
+
+def changed_cell_summary(
+    before: Any, after: Any, *, ui_mask: Mapping[str, Any] | None = None,
+    max_cells: int = MAX_SPATIAL_DETAILS,
+) -> dict[str, Any]:
+    """Return bounded native-grid deltas, optionally separated by a valid UI mask."""
+    first, second = to_frame_array(before, "before"), to_frame_array(after, "after")
+    _match_pair(first, second)
+    changed = first != second
+    height, width = first.shape
+    excluded = np.zeros(first.shape, dtype=bool)
+    mask_valid = False
+    if isinstance(ui_mask, Mapping) and ui_mask.get("frame_shape") == [height, width]:
+        regions = ui_mask.get("excluded_regions")
+        if isinstance(regions, list):
+            mask_valid = True
+            for item in regions:
+                bounds = item.get("bounds") if isinstance(item, Mapping) else None
+                if not isinstance(bounds, list) or len(bounds) != 4:
+                    mask_valid = False
+                    break
+                y0, x0, y1, x1 = bounds
+                if any(type(v) is not int for v in bounds) or not (0 <= y0 < y1 <= height and 0 <= x0 < x1 <= width):
+                    mask_valid = False
+                    break
+                excluded[y0:y1, x0:x1] = True
+    if not mask_valid:
+        excluded.fill(False)
+    board_changed = changed & ~excluded
+    ui_changed = changed & excluded
+
+    def box(mask: np.ndarray) -> list[int] | None:
+        return _changed_box(mask, 0, 0)
+
+    rows, cols = np.nonzero(changed)
+    details = []
+    limit = min(MAX_SPATIAL_DETAILS, max(0, int(max_cells)))
+    for y, x in zip(rows[:limit], cols[:limit]):
+        details.append({
+            "x": int(x), "y": int(y), "before": int(first[y, x]), "after": int(second[y, x]),
+            "region": "ui" if excluded[y, x] else "board" if mask_valid else "unclassified",
+        })
+    return {
+        "changed_cells": int(changed.sum()), "changed_box_yxyx": box(changed),
+        "board_changed_cells": int(board_changed.sum()) if mask_valid else None,
+        "board_changed_box_yxyx": box(board_changed) if mask_valid else None,
+        "ui_changed_cells": int(ui_changed.sum()) if mask_valid else None,
+        "ui_changed_box_yxyx": box(ui_changed) if mask_valid else None,
+        "ui_mask_status": "available" if mask_valid else "unavailable",
+        "cell_details": details, "cell_details_limit": limit,
+        "cell_details_truncated": int(changed.sum()) > limit,
+    }
+
+
+def compare_regions(
+    frame: Any,
+    first_region: Sequence[int],
+    second_region: Sequence[int],
+    transformation: str = "identity",
+    *,
+    max_mismatches: int = MAX_SPATIAL_DETAILS,
+) -> dict[str, Any]:
+    """Compare two bounded native-grid regions after transforming the first.
+
+    Rectangles use half-open [y0, x0, y1, x1] coordinates. Rotations are
+    clockwise for 90 degrees; 270 degrees is counterclockwise.
+    """
+    array = to_frame_array(frame, "frame")
+    height, width = array.shape
+    allowed = {"identity", "mirror_horizontal", "mirror_vertical", "rotate90", "rotate180", "rotate270"}
+
+    def bounds(value: Sequence[int], label: str) -> tuple[int, int, int, int]:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) != 4 or any(type(v) is not int for v in value):
+            raise ValueError(f"{label} must be four integer half-open [y0,x0,y1,x1] coordinates")
+        y0, x0, y1, x1 = value
+        if not (0 <= y0 < y1 <= height and 0 <= x0 < x1 <= width):
+            raise ValueError(f"{label} must be a non-empty in-frame rectangle")
+        if (y1 - y0) * (x1 - x0) > MAX_COMPARE_REGION_CELLS:
+            raise ValueError(f"{label} exceeds {MAX_COMPARE_REGION_CELLS} cells")
+        return y0, x0, y1, x1
+
+    if not isinstance(transformation, str) or transformation not in allowed:
+        raise ValueError(f"transformation must be one of {sorted(allowed)}")
+    y0, x0, y1, x1 = bounds(first_region, "first_region")
+    ty0, tx0, ty1, tx1 = bounds(second_region, "second_region")
+    source = array[y0:y1, x0:x1]
+    target = array[ty0:ty1, tx0:tx1]
+    if transformation == "identity":
+        transformed = source
+        inverse = lambda row, col: (row, col)
+    elif transformation == "mirror_horizontal":
+        transformed = np.fliplr(source)
+        inverse = lambda row, col: (row, source.shape[1] - 1 - col)
+    elif transformation == "mirror_vertical":
+        transformed = np.flipud(source)
+        inverse = lambda row, col: (source.shape[0] - 1 - row, col)
+    elif transformation == "rotate90":
+        transformed = np.rot90(source, k=3)
+        inverse = lambda row, col: (source.shape[0] - 1 - col, row)
+    elif transformation == "rotate180":
+        transformed = np.rot90(source, k=2)
+        inverse = lambda row, col: (source.shape[0] - 1 - row, source.shape[1] - 1 - col)
+    else:
+        transformed = np.rot90(source, k=1)
+        inverse = lambda row, col: (col, source.shape[1] - 1 - row)
+    compatible = transformed.shape == target.shape
+    if not compatible:
+        return {
+            "transformed_match": False, "shape_compatible": False,
+            "transformed_source_shape": list(transformed.shape), "target_shape": list(target.shape),
+            "mismatched_cells": None, "mismatch_box_yxyx": None,
+            "mismatches": [], "mismatches_truncated": False,
+            "difference_runs": [], "difference_runs_truncated": False,
+            "transformation": transformation,
+        }
+    mismatch = transformed != target
+    mismatch_count = int(np.count_nonzero(mismatch))
+    mismatch_rows, mismatch_cols = np.nonzero(mismatch)
+    limit = min(MAX_SPATIAL_DETAILS, max(0, int(max_mismatches)))
+    details = []
+    for row, col in zip(mismatch_rows[:limit], mismatch_cols[:limit]):
+        source_row, source_col = inverse(int(row), int(col))
+        details.append({
+            "source_xy": [int(x0 + source_col), int(y0 + source_row)],
+            "target_xy": [int(tx0 + col), int(ty0 + row)],
+            "transformed_source_value": int(transformed[row, col]),
+            "target_value": int(target[row, col]),
+        })
+    mismatch_box = _changed_box(mismatch, ty0, tx0)
+    runs = []
+    for local_y in range(mismatch.shape[0]):
+        xs = np.flatnonzero(mismatch[local_y])
+        if not len(xs):
+            continue
+        starts = [int(xs[0])]
+        ends = []
+        for left, right in zip(xs, xs[1:]):
+            if right != left + 1:
+                ends.append(int(left + 1))
+                starts.append(int(right))
+        ends.append(int(xs[-1] + 1))
+        for start, end in zip(starts, ends):
+            if len(runs) < limit:
+                runs.append({"y": int(ty0 + local_y), "x0": int(tx0 + start), "x1": int(tx0 + end)})
+    run_count = sum(int(np.count_nonzero(np.diff(np.r_[False, row, False].astype(np.int8)) == 1)) for row in mismatch)
+    return {
+        "transformed_match": mismatch_count == 0, "shape_compatible": True,
+        "transformation": transformation,
+        "source_shape": list(source.shape), "transformed_source_shape": list(transformed.shape),
+        "target_shape": list(target.shape), "mismatched_cells": mismatch_count,
+        "mismatch_box_yxyx": mismatch_box,
+        "mismatches": details, "mismatches_truncated": mismatch_count > len(details),
+        "difference_runs": runs, "difference_runs_truncated": run_count > len(runs),
+        "coordinate_mapping": "Each mismatch maps the indicated source_xy cell through the requested transform to target_xy.",
     }
 
 
@@ -424,7 +582,9 @@ __all__ = [
     "DISPLACEMENT_SCHEMA",
     "appearance_masks",
     "candidate_displacement",
+    "changed_cell_summary",
     "click_effect",
+    "compare_regions",
     "delta_image",
     "load_click_ui_mask",
     "pixel_diff",

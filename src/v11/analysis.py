@@ -244,10 +244,16 @@ def validate_reasoned_action(
         raise DecisionValidationError("click-only predictions must contain one prediction per action")
     predictions = []
     for index, raw_prediction in enumerate(raw_predictions, start=1):
-        prediction = _require_keys(
-            raw_prediction, {change_key, "environment_outcome", "description"},
-            "prediction" if index == 1 else f"predictions[{index - 1}]",
-        )
+        prediction_keys = {change_key, "environment_outcome", "description"}
+        if not isinstance(raw_prediction, Mapping) or frozenset(raw_prediction) not in (
+            {frozenset(prediction_keys), frozenset(prediction_keys | {"expected_cells"})}
+            if click_contract else {frozenset(prediction_keys)}
+        ):
+            raise DecisionValidationError(
+                f"prediction must contain exactly: {', '.join(sorted(prediction_keys))}"
+                + (" and optional expected_cells" if click_contract else "")
+            )
+        prediction = dict(raw_prediction)
         if not isinstance(prediction[change_key], str) or prediction[change_key] not in _PREDICTED_VISUAL_CHANGE:
             raise DecisionValidationError(f"prediction.{change_key} must be yes, no, or unknown")
         environment_outcome = prediction["environment_outcome"]
@@ -258,7 +264,19 @@ def validate_reasoned_action(
             environment_outcome = "no_terminal"
         if not isinstance(environment_outcome, str) or environment_outcome not in _PREDICTED_OUTCOMES:
             raise DecisionValidationError("prediction.environment_outcome is not a supported outcome")
-        _bounded_text(prediction["description"], f"predictions[{index - 1}].description", 240)
+        _bounded_text(
+            prediction["description"], f"predictions[{index - 1}].description",
+            180 if click_contract else 240,
+        )
+        if click_contract and "expected_cells" in prediction:
+            cells = prediction["expected_cells"]
+            if not isinstance(cells, list) or len(cells) > 12:
+                raise DecisionValidationError("prediction.expected_cells must be a list of at most 12 cells")
+            for cell_index, cell in enumerate(cells):
+                if not isinstance(cell, Mapping) or set(cell) != {"x", "y", "value"}:
+                    raise DecisionValidationError("each expected cell must contain exactly x, y, and value")
+                if any(isinstance(cell[k], bool) or not isinstance(cell[k], int) or cell[k] < 0 for k in ("x", "y", "value")):
+                    raise DecisionValidationError("expected cell coordinates and value must be non-negative integers")
         predictions.append({**prediction, "environment_outcome": environment_outcome})
 
     try:
@@ -312,7 +330,7 @@ def reasoned_action_contract_description(
             "actions": [{"action": "click", "args": example_args}],
             "hypothesis": None,
             "trajectory_rationale": "brief reason for this click plan",
-            "predictions": [{"board_change": "unknown", "environment_outcome": "unknown", "description": "expected result of this click"}],
+            "predictions": [{"board_change": "unknown", "environment_outcome": "unknown", "description": "expected result of this click", "expected_cells": []}],
         }
     assessment_example = {
         "player": (

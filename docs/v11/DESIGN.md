@@ -1,7 +1,7 @@
 # Hydra v11 — Visual Click, Mixed-Action, and Action-Profile Harness
 
 **Status:** v11.0 click/mixed-action implementation remains the baseline; v11.1 profile design is implemented. Live model benchmarks remain outstanding.
-**Current release:** 11.1.4
+**Current release:** 11.1.6
 **Fork baseline:** v10.0.29 source copied into `src/v11`; v10 remains unchanged
 **Scope:** Fork the v10 LLM/vision/tool harness into v11, then add click-only and mixed click/movement ARC-AGI-3 support while preserving movement-game behavior and leaving v10 frozen.
 
@@ -10,6 +10,8 @@
 - `src/v11` is a standalone copy of `src/v10` made before any click-feature code changes. V11 imports no runtime modules from `v10`.
 - Keep v10 source, tests, docs, skill, and persistent state unchanged. The unchanged `v10.reasoned_action/1` response and evidence/route formats may remain compatible inside v11; new v11-only records use `v11.*` schema names.
 - V11 started at `11.0.0`; action-set profiles and scoped profile learning ship in `11.1.0`. Click-only decisions, bounded review context, safer invalid-decision handling, and graceful SIGTERM finalization ship in `11.1.1`. Version `11.1.2` adds a standalone click-only skill and per-game HUD-excluded board measurements. Version `11.1.3` removes reset-based bootstrap from click-only runs and bounds attached click history to the latest executed batch with a compact predicted/measured ledger. Version `11.1.4` compares up to ten independent single-click branches from one live state, then forms the next candidate set from each later live state. Live click batches use schema `/3` with one prediction per click, record each prediction with its transition, check outcomes between clicks, and rebuild context after a batch with the latest screens and compact history; v10 retains its `10.0.29` runtime constant.
+- Version `11.1.5` requires click exploration before live selection when discovery is enabled, supports short sequential click branches from cloned current states, caps click prediction descriptions at 180 characters, supports exact cell assertions, records reset-to-start comparisons, accepts valid plans without a redundant final completion, truncates over-budget branch requests, and performs a final review when the action budget ends.
+- Version `11.1.6` makes discovery optional for valid click decisions; centers the ACTION6 skill on inferring and comparing a target board; budgets default click experiments at one or two candidates, with broader exploration only for competing hypotheses; supports up to three clicks per isolated branch and three-click live plans; checks precise expected cells after each action; adds `compare_regions` for exact native-grid identity, mirror, and rotation comparisons; returns bounded branch visual deltas and intermediate frame references; and presents the latest twenty clicks alongside summaries of older effects and unresolved hypotheses.
 - V11 defaults to `skills/v11/SKILL.md` and `skills/v11/state/` for game/profile memory and routes. It does not automatically read v10 memory, routes, or historical runs. `--state-dir` remains an explicit override; sharing requires the user to choose it intentionally.
 - The original fork order above documents the completed v11.0 baseline. For v11.1 changes, keep the common harness authoritative and add only the profile composition and isolated profile-learning responsibilities.
 
@@ -349,7 +351,7 @@ This chapter defines implementation order, affected files, tests and acceptance 
 2. Execute deterministic click-only and mixed fixtures with model-driven selection and with cached replay.
 3. Re-run ez01–ez04 movement benchmarks with comparable seed, model and budget, investigating any regression.
 4. Verify evidence replay, game-over/restart behavior, action budget accounting, prompt validity and coordinate logs.
-5. Update `docs/v11/DESIGN.md`, `docs/v11/README.md`, `docs/v11/IMPLEMENTATION_PLAN.md`, and release metadata for v11.1.4.
+5. Update `docs/v11/DESIGN.md`, `docs/v11/README.md`, `docs/v11/IMPLEMENTATION_PLAN.md`, and release metadata for v11.1.6.
 
 **Release gate:** All deterministic fixtures solved and replayable, zero invalid executed coordinates, existing movement suite green, and no regression in stored-route compatibility. Model-backed benchmark results (solve rate, actions and model calls) are reported separately from deterministic correctness tests.
 
@@ -364,7 +366,7 @@ This chapter defines implementation order, affected files, tests and acceptance 
 - [x] Coordinate-aware fallback and stagnation comparisons implemented.
 - [x] Mixed click/movement route argument preservation verified in both action orders.
 - [x] Complete automated v11 tests and movement regressions pass; v10 source/tests remain unchanged.
-- [x] V11 runtime and package metadata report 11.1.4; v10 remains at 10.0.29.
+- [x] V11 runtime and package metadata report 11.1.6; v10 remains at 10.0.29.
 - [ ] Model-backed movement benchmarks and live click-game runs recorded.
 
 ## 12. Out of scope for this release

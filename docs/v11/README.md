@@ -18,7 +18,7 @@ The v11 CLI is also available through `src/start_live_v11.sh`. Its model options
 
 V11 reads shared instructions from `skills/v11/SKILL.md` and selects profile-specific instructions for the runtime action set. ACTION6-only games use the standalone click-only skill. Their board-delta measurements use explicit per-game masks under `skills/v11/game_masks/`; when no valid mask exists, board effect is unknown. Game memory, approved profile method memory, candidate proposals, and verified routes live under `skills/v11/state/` by default. Profile memory is isolated by action set; review and discovery can queue candidates, but only an explicit promotion after cross-game and held-out evaluation can change it. The first live run in a state root removes the obsolete `global/MEMORY.md` once and records a migration marker. It discovers prior successful runs only under `runs/v11/`. V10 memory and routes are not imported automatically. Set `V11_STATE_DIR` or pass `--state-dir` to choose another state root.
 
-The v11 runtime reports version `11.1.4`. Data records whose structure is unchanged may retain their existing `v10.*` schema identifiers for compatibility; the manifest and metrics identify the producing runtime as `v11_version`.
+The v11 runtime reports version `11.1.6`. Data records whose structure is unchanged may retain their existing `v10.*` schema identifiers for compatibility; the manifest and metrics identify the producing runtime as `v11_version`.
 
 ## Profile memory review
 

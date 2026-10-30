@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import copy
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -14,7 +14,7 @@ from ..frames import FrameStore
 from ..runlog import append_jsonl, read_jsonl
 from .game import ActionBudget, ActionError, GameTools, evaluate_prediction, validate_decision, validate_measurable_prediction
 from .history import History
-from .vision import candidate_displacement, pixel_diff
+from .vision import changed_cell_summary, candidate_displacement, compare_regions, pixel_diff
 
 MAX_INSPECTION_SIDE = 20
 
@@ -71,6 +71,25 @@ DISCOVERY_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "compare_regions",
+            "description": "Compare two half-open native-grid rectangles in one observed frame after transforming the first. Regions are [y0,x0,y1,x1]. rotate90 is clockwise; rotate270 is counterclockwise. Returns shape compatibility, exact mismatch count/bounds, up to 64 source-to-target cell mappings, and compact difference runs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "evidence_id": {"type": "string"},
+                    "branch_id": {"type": "string"},
+                    "first_region": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4},
+                    "second_region": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4},
+                    "transformation": {"type": "string", "enum": ["identity", "mirror_horizontal", "mirror_vertical", "rotate90", "rotate180", "rotate270"]},
+                },
+                "required": ["evidence_id", "first_region", "second_region"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "inspect_region",
             "description": f"Inspect at most a {MAX_INSPECTION_SIDE}x{MAX_INSPECTION_SIDE} raw-grid region and measurements in recorded evidence. Region is required; choose the smallest useful crop.",
             "parameters": {
@@ -110,7 +129,7 @@ DISCOVERY_TOOLS = [
         "type": "function",
         "function": {
             "name": "test_hypotheses",
-            "description": "Run independent click experiments from one reproducible live state. First compare up to ten one-click candidates. After reviewing them, you may extend only promising candidates with short action sequences (up to three clicks) to compare alternative trajectories; each case is still an isolated branch from the same base, and every step outcome is returned. Branches do not change the live board or consume its action budget. Each case uses either `action` for one click or `actions` for a sequence, never both. Predictions score the final state; `steps` reports every intermediate consequence. Other action profiles may test up to four one-action cases. Predictions use measurable path/op/value predicates. Raw full-frame pixel changes do not establish board effect or progress.",
+            "description": "Optional isolated experiments from one observed state. Test one or two meaningful candidates by default; use up to ten only when distinguishing competing explanations. After the mechanic is understood, compare promising solution paths using sequences of up to three clicks. Each case uses either `action` or `actions`, never both, and returns every intermediate observation, board/UI changes when a valid mask exists, changed-cell details, frame references, and final level/terminal state. The live executor allows up to 20 new cases per selection, reports omitted cases, and preserves remaining allowance. Other profiles may test up to four one-action cases. Predictions use measurable predicates; raw pixel changes do not establish board effect or progress.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -189,6 +208,8 @@ class Discovery:
         self._prepared_base_env: Any = None
         self._prepared_base_observation: dict[str, Any] | None = None
         self._prepared_base_replay_actions = 0
+        self._prepared_base_game: GameTools | None = None
+        self._prepared_base_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self.seen: dict[str, tuple[str, dict[str, Any]]] = {}
         for row in self.events:
             if row.get("request_id") and row.get("status") in {"prepared", "completed", "rejected", "unknown_execution"}:
@@ -236,7 +257,7 @@ class Discovery:
             return dict(row["response"])
         if self.stopped:
             return self._result(rid, "unknown_execution", code="unknown_execution", message="automatic discovery stopped pending reconciliation")
-        if tool not in {"inspect_region", "search_history", "test_hypotheses", "game_memory"}:
+        if tool not in {"inspect_region", "compare_regions", "search_history", "test_hypotheses", "game_memory"}:
             raise ActionError(f"unsupported discovery tool: {tool}")
         # Persist a start marker before anything that could execute an action.
         self._save({"request_id": rid, "payload_hash": payload_hash, "status": "started", "tool": tool})
@@ -254,6 +275,36 @@ class Discovery:
         return response
 
     def _dispatch(self, tool: str, args: dict[str, Any], *, request_id: str) -> Any:
+        if tool == "compare_regions":
+            allowed = {"evidence_id", "branch_id", "first_region", "second_region", "transformation"}
+            if set(args) - allowed:
+                raise ActionError("unsupported compare_regions fields")
+            eid, branch_id = args.get("evidence_id"), args.get("branch_id")
+            if branch_id is not None:
+                if not isinstance(branch_id, str) or not branch_id or any(c not in "0123456789abcdef" for c in branch_id):
+                    raise ActionError("invalid branch_id")
+                branch_dir = self.game.run_dir / "discovery_branches" / branch_id
+                record = next((row for row in reversed(read_jsonl(branch_dir / "evidence.jsonl")) if row.get("evidence_id") == eid), None)
+                if record is None:
+                    raise ActionError("unknown branch evidence_id")
+                frames = FrameStore(branch_dir)
+            else:
+                record = self.history.get(eid) if isinstance(eid, str) else None
+                if record is None:
+                    raise ActionError("unknown evidence_id")
+                frames = self.frames
+            frame_id = record.get("post_frame_id") if record.get("type") == "transition" else record.get("frame_id")
+            if not isinstance(frame_id, str) or not frames.exists(frame_id):
+                raise ActionError("evidence does not identify an observed frame")
+            frame = frames.get(frame_id)
+            try:
+                comparison = compare_regions(
+                    frame, args.get("first_region"), args.get("second_region"),
+                    args.get("transformation", "identity"),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ActionError(str(exc)) from exc
+            return {"evidence_id": eid, "frame_id": frame_id, **comparison}
         if tool == "inspect_region":
             eid = args.get("evidence_id")
             branch_id = args.get("branch_id")
@@ -394,15 +445,127 @@ class Discovery:
         aliases = _model_action_aliases(target["legal_actions"])
         keys = set()
         for case in cases:
-            action = case.get("action", {}) if isinstance(case, Mapping) else {}
-            name = action.get("action")
-            canonical = aliases.get(name, name)
+            actions = case.get("actions") if isinstance(case, Mapping) else None
+            if not isinstance(actions, list):
+                actions = [case.get("action", {})] if isinstance(case, Mapping) else [{}]
+            canonical_actions = []
+            for action in actions:
+                name = action.get("action") if isinstance(action, Mapping) else None
+                canonical_actions.append({"action": aliases.get(name, name), "args": action.get("args", {}) if isinstance(action, Mapping) else {}})
             key = hashlib.sha256(json.dumps({"base_evidence_id": base_id,
-                "action": canonical, "args": action.get("args", {})},
+                "actions": canonical_actions},
                 sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
             if key not in self._outcomes:
                 keys.add(key)
         return len(keys)
+
+    def _close_prepared_base(self) -> None:
+        if self._prepared_base_game is not None:
+            close = getattr(self._prepared_base_game.env, "close", None)
+            if callable(close):
+                close()
+        if self._prepared_base_tmpdir is not None:
+            self._prepared_base_tmpdir.cleanup()
+        self._prepared_base_id = None
+        self._prepared_base_env = None
+        self._prepared_base_observation = None
+        self._prepared_base_replay_actions = 0
+        self._prepared_base_game = None
+        self._prepared_base_tmpdir = None
+
+    def _clone_prepared_base(
+        self, base_id: str, target: Mapping[str, Any], initial_target: Mapping[str, Any],
+        replay_events: Sequence[Mapping[str, Any]], replay_action_count: int,
+        request_id: str,
+    ) -> tuple[Any | None, int]:
+        """Clone a verified current or reconstructed base snapshot for one branch."""
+        current_records = self.history.records()
+        current_id = current_records[-1].get("evidence_id") if current_records else None
+        if base_id == current_id and callable(getattr(self.game.env, "fork_current", None)):
+            try:
+                env = self.game.env.fork_current()
+                if self._observation_fingerprint(env.observe()) == self._row_fingerprint(target):
+                    return env, 0
+                close = getattr(env, "close", None)
+                if callable(close): close()
+            except Exception:
+                pass
+
+        if (self._prepared_base_id == base_id and self._prepared_base_env is not None
+                and self._prepared_base_observation is not None
+                and callable(getattr(self._prepared_base_env, "fork_current", None))):
+            try:
+                env = self._prepared_base_env.fork_current()
+                if self._observation_fingerprint(env.observe()) == self._row_fingerprint(target):
+                    return env, 0
+                close = getattr(env, "close", None)
+                if callable(close): close()
+            except Exception:
+                self._close_prepared_base()
+
+        if not callable(getattr(self.game.env, "fork", None)):
+            return None, replay_action_count
+        # A reconstructed base is useful only if it can be cloned for each
+        # independent case. Avoid replaying it once and then discarding it.
+        if not callable(getattr(self.game.env, "fork_current", None)):
+            return None, replay_action_count
+        self._close_prepared_base()
+        tmpdir = tempfile.TemporaryDirectory(prefix="hydra-v11-discovery-base-")
+        base_env = self.game.env.fork()
+        replay_budget = ActionBudget(self.game.max_actions)
+        base_game = GameTools(
+            base_env, Path(tmpdir.name), max_actions=self.game.max_actions,
+            action_budget=replay_budget, action_budget_category="discovery_replay",
+            game_id=self.game.game_id,
+        )
+        try:
+            initial_observation = base_game.observe()
+            if self._observation_fingerprint(initial_observation) != self._row_fingerprint(initial_target):
+                close = getattr(base_env, "close", None)
+                if callable(close): close()
+                tmpdir.cleanup()
+                return None, replay_action_count
+            for event in replay_events:
+                if event.get("type") == "reset":
+                    self.branch_resets += 1
+                    self._save({"request_id": request_id, "event": "branch_reset",
+                                "base_evidence_id": base_id, "prepared_base": True})
+                    base_game.reset(str(event.get("justification") or "replay recorded reset"))
+                else:
+                    self.branch_replay_actions += 1
+                    name = str(event.get("action"))
+                    aliases = _model_action_aliases(base_game.observe().get("legal_actions", []))
+                    base_game.act(aliases.get(name, name), event.get("args", {}), action_name=name)
+            observation = base_game.observe()
+            if self._observation_fingerprint(observation) != self._row_fingerprint(target):
+                close = getattr(base_env, "close", None)
+                if callable(close): close()
+                tmpdir.cleanup()
+                return None, replay_action_count
+            if not callable(getattr(base_env, "fork_current", None)):
+                close = getattr(base_env, "close", None)
+                if callable(close): close()
+                tmpdir.cleanup()
+                return None, replay_action_count
+            self._prepared_base_id = base_id
+            self._prepared_base_env = base_env
+            self._prepared_base_observation = dict(observation)
+            self._prepared_base_replay_actions = replay_action_count
+            self._prepared_base_game = base_game
+            self._prepared_base_tmpdir = tmpdir
+            clone = base_env.fork_current()
+            if self._observation_fingerprint(clone.observe()) != self._row_fingerprint(target):
+                close = getattr(clone, "close", None)
+                if callable(close): close()
+                self._close_prepared_base()
+                return None, replay_action_count
+            return clone, 0
+        except Exception:
+            close = getattr(base_env, "close", None)
+            if callable(close): close()
+            tmpdir.cleanup()
+            self._close_prepared_base()
+            return None, replay_action_count
 
     def _experiment(self, args: dict[str, Any], *, request_id: str) -> dict[str, Any]:
         base_id = args.get("base_evidence_id")
@@ -437,27 +600,32 @@ class Discovery:
         normalized_cases: list[dict[str, Any]] = []
         seen_case_ids: set[str] = set()
         for index, case in enumerate(cases, start=1):
-            if not isinstance(case, Mapping) or set(case) - {"case_id", "action", "hypotheses"}:
+            if not isinstance(case, Mapping) or set(case) - {"case_id", "action", "actions", "hypotheses"}:
                 raise ActionError(f"case {index} has unsupported fields")
             case_id = case.get("case_id", f"case-{index}")
             if not isinstance(case_id, str) or not case_id.strip() or case_id in seen_case_ids:
                 raise ActionError("case_id values must be unique non-empty strings")
             seen_case_ids.add(case_id)
-            action, hypotheses = case.get("action"), case.get("hypotheses")
-            if not isinstance(action, Mapping) or not isinstance(hypotheses, list) or not hypotheses:
-                raise ActionError(f"case {case_id} requires one action and at least one hypothesis")
-            if str(action.get("action", "")).upper() == "RESET":
-                raise ActionError("discovery branches cannot request RESET as a candidate action")
-            requested_action = action.get("action")
+            actions, hypotheses = case.get("actions"), case.get("hypotheses")
+            if ("action" in case) == ("actions" in case) or not isinstance(hypotheses, list) or not hypotheses:
+                raise ActionError(f"case {case_id} requires exactly one of action/actions and at least one hypothesis")
+            action_rows = [case["action"]] if "action" in case else actions
+            if not isinstance(action_rows, list) or not 1 <= len(action_rows) <= 3:
+                raise ActionError(f"case {case_id} actions must contain one to three actions")
+            if len(action_rows) > 1 and {str(item.get("id", item.get("action"))) for item in target["legal_actions"] if isinstance(item, Mapping)} != {"ACTION6"}:
+                raise ActionError("multi-click discovery sequences are available only for click-only action profiles")
+            validated_actions = []
             aliases = _model_action_aliases(target["legal_actions"])
-            canonical_action = (
-                aliases.get(requested_action, requested_action)
-                if isinstance(requested_action, str) else requested_action
-            )
-            validated = validate_decision(
-                {"actions": [{"action": canonical_action, "args": action.get("args", {})}]},
-                target["legal_actions"], max_actions=1,
-            )["actions"][0]
+            legal = target["legal_actions"]
+            for action in action_rows:
+                if not isinstance(action, Mapping) or str(action.get("action", "")).upper() == "RESET":
+                    raise ActionError("discovery branches require legal non-RESET actions")
+                requested_action = action.get("action")
+                canonical_action = aliases.get(requested_action, requested_action) if isinstance(requested_action, str) else requested_action
+                validated_actions.append(validate_decision(
+                    {"actions": [{"action": canonical_action, "args": action.get("args", {})}]},
+                    legal, max_actions=1,
+                )["actions"][0])
             for hypothesis in hypotheses:
                 if not isinstance(hypothesis, Mapping):
                     raise ActionError(f"case {case_id} hypotheses must be objects")
@@ -466,7 +634,7 @@ class Discovery:
                 allowed = set(_DISCOVERY_PREDICTION_PATHS)
                 if any(item["path"] not in allowed for item in prediction["all"]):
                     raise ActionError("hypothesis uses a measurement path outside the discovery MVP")
-            normalized_cases.append({"case_id": case_id, "action": validated, "hypotheses": [dict(h) for h in hypotheses]})
+            normalized_cases.append({"case_id": case_id, "actions": validated_actions, "hypotheses": [dict(h) for h in hypotheses]})
 
         if not callable(getattr(self.game.env, "fork", None)):
             raise ActionError("environment does not support isolated discovery branches")
@@ -475,14 +643,15 @@ class Discovery:
         executed_this_request = 0
         for case in normalized_cases:
             cache_key = hashlib.sha256(json.dumps({"base_evidence_id": base_id,
-                "action": case["action"]["action"], "args": case["action"].get("args", {})},
+                "actions": case["actions"]},
                 sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
             cached = self._outcomes.get(cache_key)
             if cached is not None:
-                verdicts = [{"id": h.get("id"), **evaluate_prediction(h["prediction"], cached["actual"])}
+                verdicts = [{"id": h.get("id"), "prediction": h["prediction"],
+                             **evaluate_prediction(h["prediction"], cached["actual"])}
                             for h in case["hypotheses"]]
                 self.branch_reuses += 1
-                results.append({**{k: cached[k] for k in ("branch_id", "base_evidence_id", "action", "evidence_id", "measurements")},
+                results.append({**{k: cached[k] for k in ("branch_id", "base_evidence_id", "action", "actions", "steps", "final_state", "evidence_id", "measurements") if k in cached},
                                 "case_id": case["case_id"], "status": "completed", "reused": True,
                                 "cache_key": cache_key, "hypotheses": verdicts})
                 self._save({"request_id": request_id, "event": "branch_reused", "branch_id": cached["branch_id"],
@@ -490,23 +659,37 @@ class Discovery:
                 continue
             branch_id = hashlib.sha256(f"{request_id}:{base_id}:{case['case_id']}".encode()).hexdigest()[:16]
             branch_dir = self.game.run_dir / "discovery_branches" / branch_id
+            branch_env, replay_for_branch = self._clone_prepared_base(
+                base_id, target, initial_target, replay_events, replay_action_count, request_id,
+            )
+            cloned_base = branch_env is not None
+            if not cloned_base:
+                branch_env = self.game.env.fork()
+                replay_for_branch = replay_action_count
             self._save({"request_id": request_id, "event": "branch_started",
                         "branch_id": branch_id, "case_id": case["case_id"],
-                        "base_evidence_id": base_id, "replay_actions": replay_action_count})
-            branch_env = self.game.env.fork()
-            branch_budget = ActionBudget(replay_action_count + 1)
+                        "base_evidence_id": base_id, "replay_actions": replay_for_branch,
+                        "used_base_snapshot": cloned_base})
+            branch_budget = ActionBudget(self.game.max_actions)
             try:
                 branch_game = GameTools(
-                    branch_env, branch_dir, max_actions=branch_budget.max_actions,
+                    branch_env, branch_dir, max_actions=self.game.max_actions,
                     action_budget=branch_budget, action_budget_category="discovery_replay",
                     game_id=self.game.game_id,
                 )
                 initial_observation = branch_game.observe()
-                if self._observation_fingerprint(initial_observation) != self._row_fingerprint(initial_target):
+                if cloned_base:
+                    replayed_state = initial_observation
+                    if self._observation_fingerprint(replayed_state) != self._row_fingerprint(target):
+                        results.append({"case_id": case["case_id"], "status": "replay_mismatch",
+                                        "replayed_actions": 0, "branch_id": branch_id,
+                                        "detail": "cloned live state differs from requested base evidence"})
+                        continue
+                elif self._observation_fingerprint(initial_observation) != self._row_fingerprint(initial_target):
                     results.append({"case_id": case["case_id"], "status": "replay_mismatch",
                                     "replayed_actions": 0, "branch_id": branch_id})
                     continue
-                for event in replay_events:
+                for event in ([] if cloned_base else replay_events):
                     if event.get("type") == "reset":
                         self.branch_resets += 1
                         self._save({"request_id": request_id, "event": "branch_reset",
@@ -525,29 +708,66 @@ class Discovery:
                                     "replayed_actions": replay_action_count, "branch_id": branch_id})
                     continue
                 branch_game.action_budget_category = "discovery_test"
-                self.branch_test_actions += 1
+                steps = []
+                actual = None
+                final_observation = None
+                for action in case["actions"]:
+                    self.branch_test_actions += 1
+                    before_observation = branch_game.observe()
+                    transition = branch_game.act(action["action"], action.get("args", {}), action_name=action["action"])
+                    final_observation = transition["observation"]
+                    actual = dict(transition["evidence"])
+                    actual.update(transition["measurements"])
+                    shown_action, display_action = _display_action(actual.get("action"), actual.get("args", {}))
+                    actual["action"] = shown_action
+                    if display_action: actual["display_action"] = display_action
+                    if transition["evidence"].get("pre_level") != transition["evidence"].get("post_level"):
+                        actual.pop("measurements", None)
+                    visual_changes = changed_cell_summary(
+                        before_observation["frame"], final_observation["frame"],
+                        ui_mask=branch_game.click_ui_mask,
+                    )
+                    steps.append({
+                        "action_order": len(steps) + 1,
+                        "action": {"action": shown_action, "args": action.get("args", {})},
+                        "observation": {
+                            "game_state": final_observation.get("game_state"),
+                            "level": final_observation.get("level"),
+                            "levels_completed": final_observation.get("levels_completed"),
+                            "terminal": bool(final_observation.get("terminal", False)),
+                            "legal_actions": final_observation.get("legal_actions", []),
+                        },
+                        "evidence_id": transition["evidence"].get("evidence_id"),
+                        "frame_id": transition["evidence"].get("post_frame_id"),
+                        "frame_image_id": transition["evidence"].get("post_frame_image_id"),
+                        "frame_reference": {
+                            "branch_id": branch_id,
+                            "evidence_id": transition["evidence"].get("evidence_id"),
+                            "frame_id": transition["evidence"].get("post_frame_id"),
+                        },
+                        "measurements": transition["measurements"],
+                        "visual_changes": visual_changes,
+                    })
                 executed_this_request += 1
-                transition = branch_game.act(case["action"]["action"], case["action"].get("args", {}),
-                                            action_name=case["action"]["action"])
-                actual = dict(transition["evidence"])
-                actual.update(transition["measurements"])
-                shown_action, display_action = _display_action(actual.get("action"), actual.get("args", {}))
-                actual["action"] = shown_action
-                if display_action:
-                    actual["display_action"] = display_action
-                if transition["evidence"].get("pre_level") != transition["evidence"].get("post_level"):
-                    actual.pop("measurements", None)
-                verdicts = [{"id": h.get("id"), **evaluate_prediction(h["prediction"], actual)}
+                verdicts = [{"id": h.get("id"), "prediction": h["prediction"],
+                             **evaluate_prediction(h["prediction"], actual)}
                             for h in case["hypotheses"]]
+                final_state = {
+                    "game_state": final_observation.get("game_state"),
+                    "level": final_observation.get("level"),
+                    "levels_completed": final_observation.get("levels_completed"),
+                    "terminal": bool(final_observation.get("terminal", False)),
+                    "legal_actions": final_observation.get("legal_actions", []),
+                    "evidence_id": steps[-1]["evidence_id"],
+                    "frame_id": steps[-1]["frame_id"],
+                    "frame_image_id": steps[-1]["frame_image_id"],
+                }
                 completed = {"case_id": case["case_id"], "status": "completed",
                                 "branch_id": branch_id, "base_evidence_id": base_id,
-                                "action": {
-                                    **case["action"],
-                                    "action": _display_action(case["action"]["action"], case["action"].get("args", {}))[0],
-                                },
+                                "action": steps[0]["action"], "actions": [step["action"] for step in steps],
                                 **({"display_action": display_action} if display_action else {}),
-                                "evidence_id": transition["evidence"].get("evidence_id"),
-                                "measurements": transition["measurements"], "hypotheses": verdicts,
+                                "evidence_id": steps[-1]["evidence_id"], "measurements": steps[-1]["measurements"],
+                                "steps": steps, "final_state": final_state, "hypotheses": verdicts,
                                 "actual": actual, "cache_key": cache_key}
                 results.append(completed)
                 self._outcomes[cache_key] = completed

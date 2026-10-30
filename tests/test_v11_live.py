@@ -1732,6 +1732,26 @@ def test_arcade_adapter_maps_native_action_ids_and_observation(monkeypatch) -> N
     assert native.last_action == (1, {"game_id": "ez01"}, None)
 
 
+def test_arcade_environment_fork_current_clones_the_exact_state():
+    class NativeEnv:
+        def __init__(self):
+            self.raw = types.SimpleNamespace(
+                frame=np.zeros((1, 2, 2), dtype=np.int64), available_actions=[1],
+                state=types.SimpleNamespace(name="NOT_FINISHED"), levels_completed=0, win_levels=1,
+            )
+
+        def reset(self):
+            return self.raw
+
+    native = NativeEnv()
+    adapter = ArcadeGameEnv("fixture", env_factory=lambda *args, **kwargs: native)
+    adapter._raw_observation.frame[0, 1, 1] = 7
+    clone = adapter.fork_current()
+    assert np.array_equal(clone._raw_observation.frame, adapter._raw_observation.frame)
+    clone._raw_observation.frame[0, 1, 1] = 3
+    assert int(adapter._raw_observation.frame[0, 1, 1]) == 7
+
+
 def test_live_context_has_no_future_records_and_includes_current_images(tmp_path: Path) -> None:
     env = _FakeEnv()
     client = _FakeClient([_decision([])])
@@ -3051,8 +3071,8 @@ def test_missing_ui_mask_keeps_board_effect_unknown(tmp_path, capsys):
     client = _FakeClient([_reasoned(_decision([{"action": "click", "args": {"x": x, "y": 0}}])) for x in (1, 2)])
     env = ClickEnv()
     metrics = run_live(env, tmp_path / "clicks", client, game_id="fixture", max_actions=2,
-                       starting_routine=False, state_dir=tmp_path / "state")
-    assert metrics["actions"] == len(env.actions) == 1
+                       starting_routine=False, state_dir=tmp_path / "state", discovery_tools=False)
+    assert metrics["actions"] == len(env.actions) == 2
     transition = next(row for row in History(tmp_path / "clicks").records() if row.get("type") == "transition")
     assert transition["measurements"]["click_effect"]["board_measurement_status"] == "mask_unavailable"
     assert transition["measurements"]["click_effect"]["board_changed_pixels"] is None
@@ -3063,22 +3083,22 @@ def test_missing_ui_mask_keeps_board_effect_unknown(tmp_path, capsys):
     assert '"id":"click"' in client.calls[0][0]
     output = capsys.readouterr().err
     assert "planned=['click(x=2,y=0)']" in output
-    assert "taking action 1: click(x=2,y=0)" in output
-    assert "action 1: click(x=2,y=0) ->" in output
+    assert "taking action 2: click(x=2,y=0)" in output
+    assert "action 2: click(x=2,y=0) ->" in output
     assert "ACTION6" not in output
     evidence = [row for row in History(tmp_path / "clicks").records() if row.get("type") == "transition"]
     assert evidence[0]["action"] == "ACTION6"
-    assert evidence[0]["args"] == {"x": 2, "y": 0}
-    assert evidence[0]["display_action"] == "click(x=2,y=0)"
+    assert evidence[0]["args"] == {"x": 1, "y": 0}
+    assert evidence[0]["display_action"] == "click(x=1,y=0)"
     accepted = next(
         row for row in (json.loads(line) for line in (tmp_path / "clicks" / "decisions.jsonl").read_text().splitlines())
         if row.get("status") == "accepted"
     )
-    assert accepted["decision"]["actions"] == [{"action": "click", "args": {"x": 2, "y": 0}}]
-    assert accepted["display_actions"] == ["click(x=2,y=0)"]
+    assert accepted["decision"]["actions"] == [{"action": "click", "args": {"x": 1, "y": 0}}]
+    assert accepted["display_actions"] == ["click(x=1,y=0)"]
 
 
-def test_click_plan_horizon_grows_only_after_consistent_observed_effects():
+def test_click_plan_horizon_is_bounded_independently_of_pixel_change_counts():
     def transition(local, remote):
         return {
             "action": "ACTION6",
@@ -3095,13 +3115,26 @@ def test_click_plan_horizon_grows_only_after_consistent_observed_effects():
             },
         }
 
-    assert _adaptive_click_plan_horizon(8, []) == 1
-    assert _adaptive_click_plan_horizon(8, [transition(4, 0)]) == 2
+    assert _adaptive_click_plan_horizon(8, []) == 3
+    assert _adaptive_click_plan_horizon(8, [transition(4, 0)]) == 3
     assert _adaptive_click_plan_horizon(8, [transition(4, 0), transition(4, 0)]) == 3
-    assert _adaptive_click_plan_horizon(8, [transition(4, 0), transition(0, 5)]) == 2
+    assert _adaptive_click_plan_horizon(8, [transition(4, 0), transition(0, 5)]) == 3
+    assert _adaptive_click_plan_horizon(2, []) == 2
 
 
-def test_click_plan_rejected_at_current_horizon_stops_without_fallback(tmp_path):
+def test_click_no_terminal_prediction_detects_terminal_flag_without_label():
+    from v11.live import _click_prediction_mismatch
+
+    mismatch = _click_prediction_mismatch(
+        {"environment_outcome": "no_terminal"},
+        {"level": 0, "levels_completed": 0},
+        {"level": 0, "levels_completed": 0, "terminal": True, "game_state": "PLAYING"},
+        {},
+    )
+    assert mismatch == "predicted no_terminal, observed terminal (PLAYING)"
+
+
+def test_click_short_plan_is_trimmed_to_remaining_action_budget(tmp_path):
     class ClickEnv:
         legal_actions = [{"id": "ACTION6", "parameters": {
             "type": "object", "properties": {
@@ -3145,14 +3178,13 @@ def test_click_plan_rejected_at_current_horizon_stops_without_fallback(tmp_path)
         env, tmp_path / "multi-click", client, game_id="fixture", max_actions=3, plan_horizon=8,
     )
 
-    assert metrics["actions"] == 0
-    assert env.actions == []
-    assert metrics["stop_reason"] == "invalid_decision"
+    assert metrics["actions"] == 3
+    assert [args["x"] for _, args in env.actions] == [7, 7, 6]
     assert env.observe_calls == len(env.actions) + 1
     assert any("actions" in prompt for prompt, _paths, _labels in client.calls)
 
 
-def test_click_invalid_plan_does_not_execute_unvalidated_actions(tmp_path):
+def test_click_spatial_prediction_interrupts_a_contradicted_plan(tmp_path):
     class ClickEnv:
         legal_actions = [{"id": "ACTION6", "parameters": {
             "type": "object", "properties": {
@@ -3182,16 +3214,18 @@ def test_click_invalid_plan_does_not_execute_unvalidated_actions(tmp_path):
         })
 
     env = ClickEnv()
-    client = _FakeClient([decision([7]), decision([1, 2]), decision([3])])
+    contradicted = _reasoned(_decision([
+        {"action": "click", "args": {"x": x, "y": 0}} for x in (1, 2)
+    ]), prediction={"board_change": "yes", "environment_outcome": "no_terminal",
+                    "description": "Both selected cells become color 1.",
+                    "expected_cells": [{"x": 1, "y": 0, "value": 1}]})
+    client = _FakeClient([decision([7]), contradicted, decision([3])])
     metrics = _run_live_without_starting_routine(
         env, tmp_path / "contradicted-click", client, game_id="fixture", max_actions=3, plan_horizon=8,
+        discovery_tools=False,
     )
-    plans = [json.loads(line) for line in (tmp_path / "contradicted-click" / "decisions.jsonl").read_text().splitlines()]
-
-    assert [args["x"] for _, args in env.actions] == [3]
-    assert metrics["actions"] == 1
-    assert metrics["stop_reason"] == "invalid_decision"
-    assert any(row.get("status") == "unavailable" for row in plans)
+    assert [args["x"] for _, args in env.actions] == [7, 1, 3]
+    assert metrics["actions"] == 3
 
 
 def test_uncertain_click_hypothesis_limits_model_plan_to_one_action(tmp_path):
@@ -3232,13 +3266,14 @@ def test_uncertain_click_hypothesis_limits_model_plan_to_one_action(tmp_path):
     ])
     metrics = _run_live_without_starting_routine(
         env, tmp_path / "uncertain-click", client, game_id="fixture", max_actions=2, plan_horizon=8,
+        discovery_tools=False,
     )
 
-    assert metrics["actions"] == 1
-    assert metrics["stop_reason"] == "invalid_decision"
-    assert [args["x"] for _, args in env.actions] == [1]
+    assert metrics["actions"] == 2
+    assert metrics["stop_reason"] == "action_budget_exhausted"
+    assert [args["x"] for _, args in env.actions] == [7, 1]
     assert len(client.calls) >= 3
-    assert client.response_formats[0] is None
+    assert client.response_formats[0] == "json_object"
     assert client.response_formats[1] == "json_object"
     assert "v11.click_action/3" in client.calls[1][0]
 

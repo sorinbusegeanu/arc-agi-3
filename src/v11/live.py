@@ -61,7 +61,7 @@ from .tools.vision import propose_click_candidates
 POST_MORTEM_MAX_CHARS = 4_000
 MAX_DISCOVERY_PLANNING_ROUNDS = 3
 MAX_DISCOVERY_TEST_CASES = 4
-MAX_CLICK_DISCOVERY_TEST_CASES = 10
+MAX_CLICK_DISCOVERY_TEST_CASES = 20
 MAX_ACTION_SELECTION_COMPLETIONS = 10
 MAX_BOOTSTRAP_PLAN_ATTEMPTS = 3
 
@@ -103,6 +103,19 @@ def _click_prediction_mismatch(
     """Return the first observed click result that contradicts its plan prediction."""
     if not isinstance(prediction, Mapping):
         return None
+    expected_cells = prediction.get("expected_cells", [])
+    if isinstance(expected_cells, list):
+        frame = np.asarray(after.get("frame"))
+        for cell in expected_cells:
+            if not isinstance(cell, Mapping):
+                continue
+            x, y, value = cell.get("x"), cell.get("y"), cell.get("value")
+            if all(isinstance(v, int) and not isinstance(v, bool) for v in (x, y, value)):
+                if frame.ndim >= 2:
+                    if not (0 <= y < frame.shape[0] and 0 <= x < frame.shape[1]):
+                        return f"predicted cell ({x},{y}) lies outside observed frame {frame.shape[1]}x{frame.shape[0]}"
+                    if int(frame[y, x]) != value:
+                        return f"predicted cell ({x},{y}) to be {value}, observed {int(frame[y, x])}"
     click_effect = measurements.get("click_effect")
     board_changed_pixels = click_effect.get("board_changed_pixels") if isinstance(click_effect, Mapping) else None
     if isinstance(board_changed_pixels, (int, float)) and not isinstance(board_changed_pixels, bool):
@@ -118,17 +131,14 @@ def _click_prediction_mismatch(
         or before.get("levels_completed") != after.get("levels_completed")
     )
     state = str(after.get("game_state", "")).upper()
-    terminal = bool(after.get("terminal"))
-    if expected == "level_change":
-        matches = level_changed
-    elif expected in {"GAME_OVER", "WIN"}:
-        matches = state == expected
-    elif expected == "no_terminal":
-        matches = not terminal
-    else:
-        matches = True
-    if not matches:
-        return f"predicted {expected}, observed {state or 'unknown'}"
+    actual_outcome = (
+        state if state in {"GAME_OVER", "WIN"}
+        else "terminal" if bool(after.get("terminal"))
+        else "level_change" if level_changed
+        else "no_terminal"
+    )
+    if expected in {"level_change", "GAME_OVER", "WIN", "no_terminal"} and expected != actual_outcome:
+        return f"predicted {expected}, observed {actual_outcome} ({state or 'unknown'})"
     return None
 
 
@@ -136,33 +146,9 @@ def _adaptive_click_plan_horizon(
     requested_horizon: int,
     transitions: Sequence[Mapping[str, Any]],
 ) -> int:
-    """Bound click plans by how consistently live click outcomes are established."""
-    successful = [
-        row for row in transitions
-        if str(row.get("action")) == "ACTION6"
-        and isinstance((row.get("measurements") or {}).get("click_effect"), Mapping)
-        and isinstance((row.get("measurements") or {}).get("click_effect", {}).get("board_changed_pixels"), int)
-        and (row.get("measurements") or {}).get("click_effect", {}).get("board_changed_pixels") > 0
-    ]
-    if not successful:
-        return min(int(requested_horizon), 1)
-    if len(successful) < 2:
-        return min(int(requested_horizon), 2)
-
-    def effect_class(row: Mapping[str, Any]) -> tuple[int, bool, bool]:
-        measurements = row.get("measurements", {})
-        effect = measurements.get("click_effect", {}) if isinstance(measurements, Mapping) else {}
-        if not isinstance(effect, Mapping):
-            effect = {}
-        return (
-            int(effect["board_changed_pixels"]),
-            bool(effect.get("level_changed")),
-            bool(effect.get("terminal_changed")),
-        )
-
-    if effect_class(successful[-1]) == effect_class(successful[-2]):
-        return min(int(requested_horizon), 3)
-    return min(int(requested_horizon), 2)
+    """Apply only the hard click-plan ceiling; maturity is judged by the prompted model."""
+    del transitions
+    return min(max(1, int(requested_horizon)), 3)
 
 
 def _perceptual_state_equivalence(left: Any, right: Any, ui_mask: Any = None) -> dict[str, Any]:
@@ -960,7 +946,9 @@ def _reasoning_evidence_record(
         return None
     is_click = str(transition.get("action")) in {"ACTION6", "click"}
     change_prediction_key = "board_change" if is_click else "visible_change"
-    uncertain = hypothesis is not None or prediction.get(change_prediction_key) != "unknown" or prediction.get("environment_outcome") != "unknown"
+    expected_cells = prediction.get("expected_cells", [])
+    uncertain = (hypothesis is not None or prediction.get(change_prediction_key) != "unknown"
+                 or prediction.get("environment_outcome") != "unknown" or bool(expected_cells))
     if not uncertain:
         return None
     result = transition.get("result") if isinstance(transition.get("result"), Mapping) else {}
@@ -1000,6 +988,17 @@ def _reasoning_evidence_record(
     expected_outcome = prediction.get("environment_outcome")
     if expected_outcome in {"level_change", "GAME_OVER", "WIN", "no_terminal"}:
         check_results["environment_outcome"] = expected_outcome == outcome
+    if is_click and isinstance(expected_cells, list) and expected_cells:
+        post = frames.get(post_frame_id) if isinstance(post_frame_id, str) and frames.exists(post_frame_id) else np.asarray(after.get("frame"))
+        checks_cells = []
+        for cell in expected_cells:
+            if not isinstance(cell, Mapping):
+                continue
+            x, y, value = cell.get("x"), cell.get("y"), cell.get("value")
+            if all(isinstance(v, int) and not isinstance(v, bool) for v in (x, y, value)) and post.ndim >= 2:
+                checks_cells.append(0 <= y < post.shape[0] and 0 <= x < post.shape[1] and int(post[y, x]) == value)
+        if checks_cells:
+            check_results["expected_cells"] = all(checks_cells)
     checks = list(check_results.values())
     comparison = (
         "inconclusive" if not checks else
@@ -1058,6 +1057,7 @@ def _reasoning_evidence_record(
         "comparison_check_results": check_results,
         "prediction_description_assessed": False,
         "comparison": comparison,
+        "prediction_checks": check_results,
         "comparison_checks": checks,
         "trajectory_rationale": decision.get("trajectory_rationale"),
         "remaining_plan_aborted_due_to_prediction": False,
@@ -1713,6 +1713,7 @@ def _live_context(
     bootstrap_observations: Sequence[Mapping[str, Any]] = (),
     click_screen_transitions: Sequence[Mapping[str, Any]] = (),
     click_history_ledger: Sequence[Mapping[str, Any]] = (),
+    click_discovery_events: Sequence[Mapping[str, Any]] = (),
     saved_route_guidance: Sequence[Mapping[str, Any]] = (),
     no_progress_actions: int = 0,
     post_mortem_guidance: str = "",
@@ -1992,13 +1993,13 @@ def _live_context(
         if not click_only_profile:
             model_context["recent_transitions"].append(_model_transition_summary(summary_row, index))
     if click_only_profile:
-        current_level = current.get("level")
-        current_completed = current.get("levels_completed")
-        model_context["click_history_ledger"] = [
-            dict(row) for row in click_history_ledger
-            if row.get("level_index") == current_level
-            and row.get("levels_completed_before") == current_completed
-        ]
+        latest_clicks, older_click_summary = _click_history_context(
+            click_history_ledger, click_discovery_events, records, current,
+        )
+        model_context["click_history_ledger"] = latest_clicks
+        model_context["older_click_history_summary"] = older_click_summary
+        if isinstance(current.get("reset_state_verification"), Mapping):
+            model_context["reset_state_verification"] = dict(current["reset_state_verification"])
     if starting_routine and bootstrap_observations:
         model_context["bootstrap_observations"] = [
             _model_transition_summary(row, index)
@@ -2015,12 +2016,13 @@ def _live_context(
     action_contract = reasoned_action_contract_description(model_context["current_state"]["legal_actions"])
     action_schema = str(action_contract.get("schema", REASONED_ACTION_SCHEMA))
     action_limits = (
-        "String limits: hypothesis.claim 240 characters; hypothesis.evidence 180; trajectory_rationale 420; each predictions[i].description 240. "
+        "String limits: hypothesis.claim 240 characters; hypothesis.evidence 180; trajectory_rationale 420; each predictions[i].description 180. "
         "Return one prediction per click in action order; the runtime checks each click's categorical prediction before continuing the batch. "
         "environment_outcome must be exactly level_change, GAME_OVER, WIN, no_terminal, or unknown. "
         "Use no_terminal when the observed/current game state is NOT_FINISHED; NOT_FINISHED is a game-state label, not a prediction value. "
+        "For checkable board results, add expected_cells as up to 12 {x,y,value} grid assertions; HUD changes do not satisfy these assertions. "
         "Do not predict raw full-frame pixel changes as board effects. "
-        "click_history_ledger is chronological and pairs each live click with its prediction when one was supplied. "
+        "click_history_ledger contains the latest 20 relevant clicks; older effects, ineffective attempts, and unresolved experiment hypotheses are summarized separately. "
         "Attached screens cover only the latest executed batch; use the ledger for earlier outcomes. "
         "If RESET is legal and needed, return it alone as {\"action\":\"RESET\",\"args\":{\"justification\":\"...\"}}."
         if action_schema == CLICK_ACTION_SCHEMA else reasoned_action_limits_description()
@@ -2049,7 +2051,7 @@ def _live_context(
             f"Choose up to {horizon} legal actions from `current_state.legal_actions`, within `budgets.actions_remaining`. RESET restarts the whole game; if used, return it alone with the required justification. "
         )
         + (
-            "Click exploration: before choosing live clicks, test up to ten distinct candidate clicks from the current live evidence state in one `test_hypotheses` call when discovery is available. Each case is one click in its own isolated branch from that same base; the branch is discarded after its result, like click-reset, and does not change the live board. Compare every returned consequence before selecting a live plan. After the live state advances, make the next candidate set from that new state. Do not use branch evidence IDs as live evidence or as game-memory support.\n"
+            "Puzzle solving: identify visible board structure, reference patterns, counters and likely completion indicators. Infer the goal and, when evidence permits, write a concise target-state representation in your trajectory rationale; compare the current board with it and derive corrective native-grid clicks. Keep uncertain mechanics as hypotheses. Discovery is optional: return a valid live click plan immediately when ready. If a specific uncertainty blocks a decision, use one or two meaningful candidate branches by default; explore up to ten only when they distinguish competing explanations. Once the mechanic is understood, use branches to compare candidate solution paths. Branches may contain up to three ordered clicks and return every intermediate result. Judge each resulting board against the inferred target, not by changed-pixel count. Use `compare_regions` to test visual identity, reflection, or rotation when that comparison bears on the puzzle. Plan length follows understanding: one click for an unknown objective/mechanic, up to two for a partly understood transformation, and up to three for an established target and transformation. Do not use branch evidence as live-state evidence or memory support.\n"
             if click_only_profile and discovery_tools else ""
         )
         + ("Use saved routes only as guidance for matching conditions. Check prior post-mortem guidance against current evidence. " if saved_route_guidance or post_mortem_guidance.strip() else "")
@@ -2222,6 +2224,7 @@ def _click_outcome_ledger_entry(
     transition: Mapping[str, Any],
     before: Mapping[str, Any],
     prediction: Mapping[str, Any] | None = None,
+    prediction_mismatch: str | None = None,
 ) -> dict[str, Any]:
     """Pair a click's first-action prediction, when present, with measured outcome."""
     measurements = transition.get("measurements")
@@ -2241,6 +2244,7 @@ def _click_outcome_ledger_entry(
         environment_outcome = "no_terminal"
     entry: dict[str, Any] = {
         "evidence_id": transition.get("evidence_id"),
+        "source_evidence_id": before.get("evidence_id"),
         "level_index": before_level,
         "levels_completed_before": before_completed,
         "reset_generation": transition.get("reset_generation"),
@@ -2249,6 +2253,7 @@ def _click_outcome_ledger_entry(
             "board_measurement_status": effect.get("board_measurement_status", "unavailable"),
             "board_changed_pixels": effect.get("board_changed_pixels"),
             "excluded_changed_pixels": effect.get("excluded_changed_pixels"),
+            "changed_box_yxyx": measurements.get("changed_box"),
             "environment_outcome": environment_outcome,
             "game_state": transition.get("game_state"),
             "levels_completed": after_completed,
@@ -2258,10 +2263,96 @@ def _click_outcome_ledger_entry(
     if isinstance(prediction, Mapping):
         entry["prediction"] = {
             key: prediction.get(key)
-            for key in ("board_change", "environment_outcome", "description")
+            for key in ("board_change", "environment_outcome", "description", "expected_cells")
             if prediction.get(key) is not None
         }
+        measurements = transition.get("measurements")
+        measurements = measurements if isinstance(measurements, Mapping) else {}
+        effect = measurements.get("click_effect")
+        effect = effect if isinstance(effect, Mapping) else {}
+        checkable = (
+            prediction.get("environment_outcome") in {"level_change", "GAME_OVER", "WIN", "no_terminal"}
+            or bool(prediction.get("expected_cells"))
+            or (prediction.get("board_change") in {"yes", "no"}
+                and effect.get("board_measurement_status") == "available")
+        )
+        entry["prediction_check"] = {
+            "status": "contradicted" if prediction_mismatch else "matched" if checkable else "inconclusive",
+            **({"detail": prediction_mismatch} if prediction_mismatch else {}),
+        }
     return entry
+
+
+def _click_history_context(
+    ledger: Sequence[Mapping[str, Any]],
+    discovery_events: Sequence[Mapping[str, Any]],
+    records: Sequence[Mapping[str, Any]],
+    current: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Bound recent click detail while retaining distinct older effects and failures."""
+    relevant = [
+        dict(row) for row in ledger
+        if row.get("level_index") == current.get("level")
+        and row.get("levels_completed_before") == current.get("levels_completed")
+    ]
+    latest = relevant[-20:]
+    older = relevant[:-20]
+    effects: dict[str, dict[str, Any]] = {}
+    ineffective = []
+    for row in older:
+        observed = row.get("observed", {})
+        observed = observed if isinstance(observed, Mapping) else {}
+        mask_status = observed.get("board_measurement_status", "unavailable")
+        board_changed = observed.get("board_changed_pixels")
+        ui_changed = observed.get("excluded_changed_pixels")
+        signature = json.dumps({
+            "mask": mask_status,
+            "board_changed": ("yes" if isinstance(board_changed, (int, float)) and board_changed > 0
+                              else "no" if isinstance(board_changed, (int, float)) else "unknown"),
+            "ui_changed": bool(isinstance(ui_changed, (int, float)) and ui_changed > 0),
+            "outcome": observed.get("environment_outcome"),
+        }, sort_keys=True, separators=(",", ":"))
+        group = effects.setdefault(signature, {
+            "board_measurement_status": mask_status,
+            "board_effect": "changed" if isinstance(board_changed, (int, float)) and board_changed > 0 else
+                           "unchanged" if isinstance(board_changed, (int, float)) else "unknown",
+            "ui_changed": bool(isinstance(ui_changed, (int, float)) and ui_changed > 0),
+            "environment_outcome": observed.get("environment_outcome"), "count": 0,
+            "example_click": row.get("click"), "example_evidence_id": row.get("evidence_id"),
+        })
+        group["count"] += 1
+        if mask_status == "available" and board_changed == 0:
+            ineffective.append({"click": row.get("click"), "source_evidence_id": row.get("source_evidence_id"),
+                                "evidence_id": row.get("evidence_id")})
+    evidence_levels = {
+        str(row.get("evidence_id")): row.get("level", row.get("post_level"))
+        for row in records if row.get("evidence_id") is not None
+    }
+    unresolved = []
+    for event in discovery_events:
+        if event.get("status") != "experiment_scored":
+            continue
+        base_id = str(event.get("base_evidence_id", ""))
+        if evidence_levels.get(base_id) != current.get("level"):
+            continue
+        for case in event.get("cases", []):
+            if case.get("status") != "completed":
+                continue
+            for hypothesis in case.get("hypotheses", []):
+                if hypothesis.get("verdict") in {"inconclusive", "unresolved"}:
+                    unresolved.append({
+                        "base_evidence_id": base_id, "case_id": case.get("case_id"),
+                        "hypothesis_id": hypothesis.get("id"),
+                        "prediction": hypothesis.get("prediction"),
+                        "reason": hypothesis.get("reason"),
+                    })
+    summary = {
+        "older_click_count": len(older),
+        "distinct_observed_effects": list(effects.values())[:12],
+        "ineffective_attempts": ineffective[-12:],
+        "unresolved_hypotheses": unresolved[-12:],
+    }
+    return latest, summary
 
 
 def _memory_revision_hash(memory_store_dir: Path, state_root: Path, profile_id: str) -> str:
@@ -2571,6 +2662,10 @@ def run_live(
     context_window_tokens = getattr(client, "context_window_tokens", None)
     tools = GameTools(env, destination, max_actions=max_actions, game_id=game_id)
     current = tools.observe()
+    initial_click_reference = {
+        **current,
+        "frame": np.asarray(current["frame"]).copy() if current.get("frame") is not None else None,
+    }
     initial_profile = resolve_action_profile(current.get("legal_actions", []))
     profile_memory = read_profile_memory(
         state_root, initial_profile.profile_id, max_characters=profile_memory_max_chars,
@@ -2787,7 +2882,7 @@ def run_live(
             "reasoning_supported": reasoning_supported,
             "reasoning_contradicted": reasoning_contradicted,
             "reasoning_inconclusive": reasoning_inconclusive,
-            "reasoning_comparison_scope": "first_executed_action_categorical_fields_only",
+            "reasoning_comparison_scope": "first_executed_action_categorical_predictions_and_exact_cell_assertions; hypotheses require semantic review",
             "perceptual_state_equivalence_candidates": len(perceptual_equivalence_records),
             "review_action_threshold": REVIEW_ACTION_THRESHOLD,
             "post_mortem_model_calls": post_mortem_model_calls,
@@ -2970,6 +3065,7 @@ def run_live(
             bootstrap_observations=bootstrap_observations_for_prompt,
             click_screen_transitions=click_screen_transitions,
             click_history_ledger=click_history_ledger,
+            click_discovery_events=discovery.events if discovery is not None else (),
             saved_route_guidance=_saved_route_guidance(solution_store, current),
             no_progress_actions=no_progress_actions,
             post_mortem_guidance=post_mortem_guidance,
@@ -3014,7 +3110,6 @@ def run_live(
         selection_budget.setdefault("completions", 0)
         selection_budget.setdefault("test_cases", 0)
         selection_budget.setdefault("planning_rounds", 0)
-        selection_budget.setdefault("force_tool_free_final", False)
         selection_budget.setdefault("test_signatures", set())
         request_messages = copy.deepcopy(list(initial_messages))
         click_only_selection = str(inputs.get("profile_id", "")) == "a6"
@@ -3056,11 +3151,15 @@ def run_live(
             remaining = request_budget - attempt
             tools_available = bool(
                 discovery_tools
-                and not selection_budget["force_tool_free_final"]
                 and selection_budget["planning_rounds"] < MAX_DISCOVERY_PLANNING_ROUNDS
-                and selection_budget["test_cases"] < discovery_case_limit
                 and remaining > 1
             )
+            tools_for_request = None
+            if tools_available:
+                tools_for_request = DISCOVERY_TOOLS
+                if int(selection_budget["test_cases"]) >= discovery_case_limit:
+                    tools_for_request = [tool for tool in DISCOVERY_TOOLS
+                                         if tool.get("function", {}).get("name") != "test_hypotheses"]
             if discovery_tools and not tools_available:
                 unavailable_reasons = []
                 if selection_budget["planning_rounds"] >= MAX_DISCOVERY_PLANNING_ROUNDS:
@@ -3069,8 +3168,6 @@ def run_live(
                     unavailable_reasons.append(f"the {discovery_case_limit} newly executed branch outcomes have been used")
                 if remaining <= 1:
                     unavailable_reasons.append("only one model completion remains")
-                if selection_budget["force_tool_free_final"]:
-                    unavailable_reasons.append("click decisions must be returned in a tool-free final call")
                 request_messages.append({
                     "role": "user",
                     "content": (
@@ -3089,7 +3186,7 @@ def run_live(
                     messages=request_messages,
                     conversation_reset_count=action_conversation_reset_count,
                     response_format=None if tools_available else "json_object",
-                    tools=DISCOVERY_TOOLS if tools_available else None,
+                    tools=tools_for_request,
                 )
                 _log_profile_request(tools, "action_selection", inputs, response)
             except StrataRequestError as exc:
@@ -3137,8 +3234,6 @@ def run_live(
                         print(f"[v11 tool] call: {tool_label} (id={call_label})", flush=True)
                         try:
                             repeated_provider_call = isinstance(call_id, str) and call_id in discovery.seen
-                            if int(selection_budget["test_cases"]) >= discovery_case_limit and not repeated_provider_call:
-                                raise ValueError("branch-test budget is exhausted; return an action decision")
                             args = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
                             if not isinstance(args, Mapping):
                                 raise ValueError("tool arguments must be a JSON object")
@@ -3151,9 +3246,30 @@ def run_live(
                                 else:
                                     case_rows = []
                                 new_branches = discovery.new_branch_count(args)
-                                if not case_rows or selection_budget["test_cases"] + new_branches > discovery_case_limit:
-                                    raise ValueError(f"test_hypotheses exceeds the remaining branch-test budget ({max(0, discovery_case_limit - int(selection_budget['test_cases']))} new branches)")
+                                remaining_cases = max(0, discovery_case_limit - int(selection_budget["test_cases"]))
+                                if case_rows and new_branches > remaining_cases and isinstance(args.get("cases"), list):
+                                    kept = []
+                                    for case in case_rows:
+                                        trial = {**args, "cases": [*kept, case]}
+                                        if discovery.new_branch_count(trial) > remaining_cases:
+                                            break
+                                        kept.append(case)
+                                    omitted = len(case_rows) - len(kept)
+                                    args = {**args, "cases": kept}
+                                    case_rows = kept
+                                    if not kept:
+                                        raise ValueError(f"no candidate fits the remaining branch budget ({remaining_cases})")
+                                elif new_branches > remaining_cases:
+                                    raise ValueError(f"test_hypotheses exceeds the remaining branch-test budget ({remaining_cases} new branches)")
+                                else:
+                                    omitted = 0
+                                if not case_rows:
+                                    raise ValueError("test_hypotheses requires at least one candidate case")
+                            else:
+                                omitted = 0
                             result = discovery.dispatch({"request_id": call_id, "tool": name, "arguments": dict(args)})
+                            if name == "test_hypotheses" and omitted:
+                                result["data"]["omitted_cases"] = omitted
                             proposal_data = result.get("data") if isinstance(result, Mapping) else None
                             proposal = proposal_data.get("proposal") if isinstance(proposal_data, Mapping) else None
                             if (isinstance(proposal_data, Mapping)
@@ -3162,6 +3278,9 @@ def run_live(
                                 profile_candidate_ids_queued.add(str(proposal["candidate_id"]))
                             if name == "test_hypotheses" and result.get("status") == "completed" and not repeated_provider_call:
                                 selection_budget["test_cases"] += int(result.get("data", {}).get("executed_branches", 0))
+                                result.setdefault("data", {})["remaining_selection_cases"] = max(
+                                    0, discovery_case_limit - int(selection_budget["test_cases"]),
+                                )
                         except Exception as exc:
                             result = {"request_id": call_id, "status": "rejected", "game_id": game_id,
                                       "run_id": run_id, "error": {"code": "invalid_request", "message": f"{type(exc).__name__}: {exc}"}}
@@ -3186,19 +3305,6 @@ def run_live(
                 if tool_calls and not tools_available:
                     validation_error = "model returned discovery tool calls after the discovery budget was exhausted"
                     break
-                click_only = {str(item.get("id")) for item in inputs.get("legal_action_specs", []) if str(item.get("id")) != "RESET"} == {"ACTION6"}
-                if click_only and tools_available:
-                    selection_budget["force_tool_free_final"] = True
-                    request_messages.append({"role": "assistant", "content": str(response.get("content", ""))})
-                    request_messages.append({
-                        "role": "user",
-                        "content": (
-                        "Discovery is complete. Return one final JSON object matching v11.click_action/3, "
-                        "with one prediction per click and no more than three live clicks. Keep one click when a later choice depends on observing an earlier result; "
-                        "batch only a short sequence that remains useful across the predicted outcomes. No tool calls or prose."
-                        ),
-                    })
-                    continue
                 parsed = _parse_content(response.get("content"))
                 ordinary_attempts += 1
                 validation_horizon = horizon
@@ -3206,7 +3312,7 @@ def run_live(
                     str(item.get("id")) == "ACTION6"
                     for item in inputs.get("legal_action_specs", [])
                 )
-                if click_only and isinstance(parsed, Mapping):
+                if click_only_selection and isinstance(parsed, Mapping):
                     validation_horizon = min(validation_horizon, 3)
                 elif click_profile and isinstance(parsed, Mapping):
                     if parsed.get("hypothesis") is not None:
@@ -3311,7 +3417,12 @@ def run_live(
             game_memory_max_chars=game_memory_max_chars,
             profile_memory_max_chars=profile_memory_max_chars,
             discovery_proposals=discovery.proposals if discovery is not None else (),
-            discovery_events=[row for row in discovery.events if row.get("status") == "experiment_scored"] if discovery is not None else (),
+            discovery_events=[{
+                "status": "experiment_scored", "base_evidence_id": row.get("base_evidence_id"),
+                "cases": [{key: case.get(key) for key in ("case_id", "status", "branch_id", "action", "actions", "evidence_id", "measurements", "hypotheses") if key in case}
+                          for case in row.get("cases", [])],
+            } for row in (discovery.events[-2:] if discovery is not None else [])
+                if row.get("status") == "experiment_scored"],
         )
         no_progress_actions = 0
         if discovery is not None and result["row"].get("status") == "saved" and discovery.proposals:
@@ -3438,6 +3549,27 @@ def run_live(
         nonlocal no_progress_actions
         result = tools.reset(justification)
         current = result["observation"]
+        if _is_click_only_action_set(current.get("legal_actions", [])):
+            first = np.asarray(initial_click_reference.get("frame"))
+            reset_frame = np.asarray(current.get("frame"))
+            matches = first.shape == reset_frame.shape and np.array_equal(
+                _frame_comparison_data(first, tools.click_ui_mask),
+                _frame_comparison_data(reset_frame, tools.click_ui_mask),
+            )
+            changed = int(np.count_nonzero(
+                _frame_comparison_data(first, tools.click_ui_mask)
+                != _frame_comparison_data(reset_frame, tools.click_ui_mask)
+            )) if first.shape == reset_frame.shape else None
+            current["reset_state_verification"] = {
+                "matches_initial_outside_ui": bool(matches),
+                "changed_pixels_outside_ui": changed,
+                "reference_evidence_id": initial_click_reference.get("evidence_id"),
+            }
+            append_jsonl(destination / "decisions.jsonl", {
+                "schema": "v11.click_reset_comparison/1",
+                "reset_evidence_id": current.get("evidence_id"),
+                **current["reset_state_verification"],
+            })
         click_only_start = _is_click_only_action_set(current.get("legal_actions", []))
         initial_routine_pending = bool(starting_routine and tools.supports_reset and not click_only_start)
         bootstrap_probe_active = initial_routine_pending
@@ -4126,11 +4258,19 @@ def run_live(
                     break
                 current = result["observation"]
                 observed_edge = learn_transition(before_observation, action, result)
+                click_prediction = None
+                click_prediction_mismatch = None
                 if action["action"] == "ACTION6":
                     predictions = reasoned_decision.get("action_predictions", []) if isinstance(reasoned_decision, Mapping) else []
                     click_prediction = predictions[action_index] if action_index < len(predictions) and isinstance(predictions[action_index], Mapping) else None
+                    if click_prediction is not None:
+                        click_prediction_mismatch = _click_prediction_mismatch(
+                            click_prediction, before_observation, current,
+                            result.get("measurements", {}) if isinstance(result.get("measurements"), Mapping) else {},
+                        )
                     click_history_ledger.append(_click_outcome_ledger_entry(
                         result["evidence"], before_observation, click_prediction,
+                        click_prediction_mismatch,
                     ))
                 if not bootstrap_probe_active:
                     actions_since_review += 1
@@ -4282,15 +4422,10 @@ def run_live(
                 elif (
                     action["action"] == "ACTION6"
                     and action_index + 1 < len(actions)
-                    and reasoned_decision is not None
-                    and action_index < len(reasoned_decision.get("action_predictions", []))
-                    and (mismatch := _click_prediction_mismatch(
-                        reasoned_decision["action_predictions"][action_index], before_observation, current,
-                        result.get("measurements", {}) if isinstance(result.get("measurements"), Mapping) else {},
-                    )) is not None
+                    and click_prediction_mismatch is not None
                 ):
                     interruption = "click_prediction_contradicted"
-                    progress(f"stopping click plan: {mismatch}; replanning from the observed screen")
+                    progress(f"stopping click plan: {click_prediction_mismatch}; replanning from the observed screen")
                 elif (
                     action["action"] == "ACTION6"
                     and action_index + 1 < len(actions)
@@ -4429,6 +4564,9 @@ def run_live(
             "model_returned_no_actions", "action_error",
         }:
             stop_reason = "action_budget_exhausted"
+        if (stop_reason == "action_budget_exhausted" and actions_since_review > 0
+                and str(active_profile.profile_id) == "a6"):
+            perform_triggered_review(["run_ended_action_budget"])
         return update_metrics()
     except _TerminationRequested:
         stop_reason = "terminated"

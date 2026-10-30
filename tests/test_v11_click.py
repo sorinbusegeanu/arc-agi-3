@@ -141,6 +141,13 @@ def test_click_prediction_comparison_ignores_raw_pixel_counts_without_board_meas
             "board_measurement_status": "available", "board_changed_pixels": 0,
         }},
     ) == "predicted a board change, but the configured board region was unchanged"
+    cell_prediction = {"environment_outcome": "unknown", "expected_cells": [{"x": 2, "y": 1, "value": 4}]}
+    before = {"frame": np.zeros((3, 4), dtype=np.uint8)}
+    after = {"frame": np.zeros((3, 4), dtype=np.uint8)}
+    after["frame"][1, 2] = 3
+    assert "observed 3" in _click_prediction_mismatch(cell_prediction, before, after, {})
+    after["frame"][1, 2] = 4
+    assert _click_prediction_mismatch(cell_prediction, before, after, {}) is None
 
 
 def test_ui_only_click_change_is_not_reported_as_board_effect_and_noop_matching_ignores_ui(tmp_path) -> None:
@@ -318,9 +325,13 @@ def test_click_only_contract_has_required_coordinates_and_no_assumed_player_or_o
         "predictions": [{"board_change": "unknown", "environment_outcome": "unknown", "description": "unknown"}],
     }
     from v11.analysis import validate_reasoned_action
+    valid["predictions"][0]["expected_cells"] = [{"x": 3, "y": 4, "value": 2}]
     assert validate_reasoned_action(valid, [click_spec])["actions"] == [
         {"action": "ACTION6", "args": {"x": 0, "y": 0}},
     ]
+    too_long = {**valid, "predictions": [{**valid["predictions"][0], "description": "x" * 181}]}
+    with pytest.raises(DecisionValidationError, match="description exceeds the 180-character limit"):
+        validate_reasoned_action(too_long, [click_spec])
     invalid = {**valid, "hypothesis": {"claim": "A claim", "evidence": "x" * 181}}
     with pytest.raises(DecisionValidationError, match="hypothesis.evidence exceeds the 180-character limit"):
         validate_reasoned_action(invalid, [click_spec])
@@ -428,8 +439,8 @@ def test_live_click_profile_with_reset_uses_click_contract_in_full_prompt(tmp_pa
     assert "state_assessment" not in contract
     profile_prompt = inputs["system_prompt"]
     for instruction in (
-        "Observe → Model → Compare → Click → Verify",
-        "Each candidate runs independently in a disposable fork",
+        "Observe → Infer goal → Build target state → Compare → Plan → Click → Verify",
+        "Discovery is optional",
         "one prediction per live click",
         "`click_candidates` are optional suggestions",
         "Empty and background-colored cells can be valid targets",

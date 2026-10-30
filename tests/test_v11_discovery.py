@@ -86,18 +86,39 @@ def test_inspection_region_history_and_invalid_region(tmp_path):
     assert transition["data"]["measurements"]["total_pixels"] == 400
     invalid = discovery.dispatch({"request_id":"D3", "tool":"inspect_region",
                                   "arguments":{"evidence_id":state["evidence_id"], "region":[0,0,21,20]}})
-    assert invalid["status"] == "rejected"
-    assert "at most 20 rows by 20 columns" in invalid["error"]["message"]
+    assert invalid["status"] == "completed"
+    assert invalid["data"]["region_clamped"] is True
     invalid_width = discovery.dispatch({"request_id":"D4", "tool":"inspect_region",
                                         "arguments":{"evidence_id":state["evidence_id"], "region":[0,0,20,21]}})
-    assert invalid_width["status"] == "rejected"
-    assert "at most 20 rows by 20 columns" in invalid_width["error"]["message"]
+    assert invalid_width["status"] == "completed"
+    assert invalid_width["data"]["region_clamped"] is True
     missing = discovery.dispatch({"request_id":"D5", "tool":"inspect_region",
                                   "arguments":{"evidence_id":state["evidence_id"]}})
     assert missing["status"] == "rejected"
     assert "region is required" in missing["error"]["message"]
     found = discovery.dispatch({"request_id":"D6", "tool":"search_history", "arguments":{"action":"up","limit":10}})
     assert found["data"]["count"] == 1
+
+
+def test_compare_regions_discovery_tool_uses_observed_native_grid_frame(tmp_path):
+    from v11.tools.discovery import DISCOVERY_TOOLS
+
+    assert "compare_regions" in {
+        item["function"]["name"] for item in DISCOVERY_TOOLS
+    }
+    env = Env()
+    env.frame[1:3, 1:3] = [[1, 2], [3, 4]]
+    env.frame[4:6, 4:6] = [[2, 1], [4, 3]]
+    game = GameTools(env, tmp_path, max_actions=3)
+    state = game.observe()
+    discovery = Discovery(game, "r", "g", tmp_path / "memory")
+    result = discovery.dispatch({"request_id": "compare", "tool": "compare_regions", "arguments": {
+        "evidence_id": state["evidence_id"], "first_region": [1, 1, 3, 3],
+        "second_region": [4, 4, 6, 6], "transformation": "mirror_horizontal",
+    }})
+    assert result["status"] == "completed"
+    assert result["data"]["transformed_match"] is True
+    assert result["data"]["frame_id"] == state["frame_id"]
 
 
 def test_experiment_runs_in_isolated_branch_and_retry_returns_scored_result(tmp_path):
@@ -270,6 +291,49 @@ def test_multiple_candidate_cases_use_independent_branches_from_same_base(tmp_pa
     assert repeated["data"]["cases"][0]["reused"] is True
 
 
+def test_short_click_candidate_sequence_reports_every_step(tmp_path):
+    class ClickEnv(Env):
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"] = [{"id": "ACTION6", "parameters": {
+                "type": "object", "properties": {
+                    "x": {"type": "integer", "minimum": 0, "maximum": 7},
+                    "y": {"type": "integer", "minimum": 0, "maximum": 7},
+                }, "required": ["x", "y"], "additionalProperties": False,
+            }}]
+            return result
+
+        def act(self, action, args):
+            self.actions.append((action, dict(args)))
+            self.frame[args["y"], args["x"]] = 1
+            return {}
+
+        def fork(self):
+            branch = ClickEnv()
+            branch.frame = self.frame.copy()
+            return branch
+
+    game = GameTools(ClickEnv(), tmp_path, max_actions=4)
+    state = game.observe()
+    discovery = Discovery(game, "r", "g", tmp_path / "memory")
+    result = discovery.dispatch({"request_id": "sequence", "tool": "test_hypotheses", "arguments": {
+        "base_evidence_id": state["evidence_id"],
+        "cases": [{"case_id": "two-step", "actions": [
+            {"action": "click", "args": {"x": 1, "y": 1}},
+            {"action": "click", "args": {"x": 2, "y": 2}},
+        ], "hypotheses": [{"prediction": {"all": [
+            {"path": "measurements.changed_pixels", "op": "gt", "value": 0},
+        ]}}]}],
+    }})
+    case = result["data"]["cases"][0]
+    assert case["status"] == "completed"
+    assert len(case["steps"]) == 2
+    assert [step["action"]["action"] for step in case["steps"]] == ["click", "click"]
+    assert all(step["evidence_id"] for step in case["steps"])
+    assert game.env.actions == []
+    assert discovery.branch_test_actions == 2
+
+
 def test_replay_mismatch_does_not_execute_candidate(tmp_path):
     class MismatchedEnv(Env):
         def fork(self):
@@ -361,6 +425,52 @@ def test_reads_are_not_count_limited_and_proposals_queue_for_review(tmp_path):
         "conditions":["level 1"], "supporting_evidence":[state["evidence_id"]],
     }})
     assert another["data"]["status"] == "queued"
+
+
+def test_click_live_action_is_accepted_while_discovery_tools_remain_available(tmp_path, monkeypatch):
+    monkeypatch.setenv("V11_STATE_DIR", str(tmp_path / "state"))
+
+    class ClickEnv(Env):
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"] = [{"id": "ACTION6", "parameters": {
+                "type": "object", "properties": {
+                    "x": {"type": "integer", "minimum": 0, "maximum": 7},
+                    "y": {"type": "integer", "minimum": 0, "maximum": 7},
+                }, "required": ["x", "y"], "additionalProperties": False,
+            }}]
+            return result
+
+        def act(self, action, args):
+            self.actions.append((action, dict(args)))
+            return {}
+
+    decision = {
+        "schema": "v11.click_action/3", "actions": [{"action": "click", "args": {"x": 1, "y": 1}}],
+        "hypothesis": None, "trajectory_rationale": "Test one candidate.",
+        "predictions": [{"board_change": "unknown", "environment_outcome": "unknown", "description": "Observe the effect."}],
+    }
+
+    class Client:
+        model = "test"
+
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, *args, **kwargs):
+            self.calls.append(kwargs)
+            return {"content": json.dumps(decision), "usage": {}, "latency_seconds": 0.0,
+                    "request_attempts": 1, "model": "test"}
+
+    env, client = ClickEnv(), Client()
+    metrics = run_live(env, tmp_path / "mandatory-click-branch", client, game_id="fixture",
+                       max_actions=1, starting_routine=False)
+    assert env.actions == [("ACTION6", {"x": 1, "y": 1})]
+    assert metrics["actions"] == 1
+    assert any(call.get("tools") for call in client.calls)
+    assert {tool["function"]["name"] for tool in client.calls[0]["tools"]} >= {
+        "test_hypotheses", "inspect_region", "compare_regions", "search_history", "game_memory",
+    }
 
 
 def test_live_tool_call_continues_to_normal_decision_and_shared_budget(tmp_path, monkeypatch):
@@ -553,9 +663,8 @@ def test_four_hypothesis_cases_force_action_completion(tmp_path, monkeypatch):
     run_dir = tmp_path / "four-tests"
     metrics = run_live(FourActionEnv(), run_dir, client, game_id="fixture", max_actions=1, starting_routine=False)
     assert client.calls[0]["tools"]
-    assert client.calls[1]["tools"] is None
-    assert any(message.get("role") == "user" and "ACTION DECISION REQUIRED" in message.get("content", "")
-               for message in client.calls[1]["messages"])
+    assert client.calls[1]["tools"] is not None  # Two illegal candidates did not consume the four-branch budget.
+    assert client.calls[1]["tools"] is not None  # The valid action is accepted without a duplicate tool-free call.
     assert metrics["discovery_test_actions"] == 4
     assert metrics["model_calls"] == 2
 
