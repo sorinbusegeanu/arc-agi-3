@@ -178,7 +178,7 @@ def test_hypothesis_prediction_contract_is_advertised_and_matches_runtime(tmp_pa
     parameters = tool["parameters"]["properties"]
     case_hypothesis = parameters["cases"]["items"]["properties"]["hypotheses"]["items"]
     assert "hypotheses" not in parameters and "action" not in parameters
-    assert parameters["cases"]["maxItems"] == 4
+    assert parameters["cases"]["maxItems"] == 10
     for hypothesis in (case_hypothesis,):
         prediction = hypothesis["properties"]["prediction"]
         assert prediction["required"] == ["all"]
@@ -186,7 +186,8 @@ def test_hypothesis_prediction_contract_is_advertised_and_matches_runtime(tmp_pa
         predicate = prediction["properties"]["all"]["items"]
         assert predicate["required"] == ["path", "op", "value"]
         assert predicate["properties"]["path"]["enum"] == [
-            "measurements.changed_pixels", "measurements.change_ratio", "game_state",
+            "measurements.changed_pixels", "measurements.change_ratio",
+            "measurements.click_effect.board_changed_pixels", "game_state",
             "terminal", "level", "levels_completed",
         ]
         assert predicate["properties"]["op"]["enum"] == [
@@ -621,15 +622,23 @@ def test_click_discovery_answers_use_click_label_and_preserve_canonical_branch_e
     game = GameTools(ClickEnv(), tmp_path, max_actions=3)
     state = game.observe()
     discovery = Discovery(game, "run", "fixture", tmp_path / "memory")
+    coordinates = [(index, 3) for index in range(8)] + [(0, 4), (1, 4)]
+    cases = [{
+        "case_id": f"click-site-{index}",
+        "action": {"action": "click", "args": {"x": x, "y": y}},
+        "hypotheses": [{"id": f"changed-{index}", "prediction": {"all": [
+            {"path": "measurements.changed_pixels", "op": "gt", "value": 0},
+        ]}}],
+    } for index, (x, y) in enumerate(coordinates)]
     result = discovery.dispatch({"request_id": "click-test", "tool": "test_hypotheses", "arguments": {
-        "base_evidence_id": state["evidence_id"], "cases": [{
-            "case_id": "click-site", "action": {"action": "click", "args": {"x": 2, "y": 3}},
-            "hypotheses": [{"id": "changed", "prediction": {"all": [
-                {"path": "measurements.changed_pixels", "op": "gt", "value": 0},
-            ]}}],
-        }],
+        "base_evidence_id": state["evidence_id"], "cases": cases,
     }})
-    case = result["data"]["cases"][0]
+    assert len(result["data"]["cases"]) == 10
+    assert result["data"]["executed_branches"] == 10
+    assert discovery.branch_test_actions == 10
+    assert game.action_count == 0
+    assert len({(case["action"]["args"]["x"], case["action"]["args"]["y"]) for case in result["data"]["cases"]}) == 10
+    case = result["data"]["cases"][2]
     assert case["action"] == {"action": "click", "args": {"x": 2, "y": 3}}
     assert case["display_action"] == "click(x=2,y=3)"
     assert case["actual"]["action"] == "click"

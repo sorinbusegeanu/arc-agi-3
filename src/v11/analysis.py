@@ -20,6 +20,8 @@ from .profiles import compose_profile_prompt, resolve_action_profile
 
 DECISION_SCHEMA = "v10.action_set/2"
 REASONED_ACTION_SCHEMA = "v10.reasoned_action/1"
+CLICK_ACTION_SCHEMA = "v11.click_action/3"
+LEGACY_CLICK_ACTION_SCHEMA = "v11.click_action/2"
 
 _DIRECTION_BY_ACTION = {
     "ACTION1": "up",
@@ -132,9 +134,63 @@ def validate_reasoned_action(
     payload: Any,
     legal_action_specs: Sequence[Mapping[str, Any]],
     max_actions: int = 8,
+    *,
+    allow_legacy_click: bool = False,
 ) -> dict[str, Any]:
     """Validate structured reasoning, then apply the unchanged legal-action validator."""
-    response = _require_keys(payload, _REASONED_TOP_LEVEL, "reasoned action")
+    non_reset_ids = {str(spec.get("id")) for spec in legal_action_specs if str(spec.get("id")) != "RESET"}
+    click_contract = False
+    if non_reset_ids == {"ACTION6"}:
+        if allow_legacy_click and isinstance(payload, Mapping) and "schema" not in payload:
+            pass
+        else:
+            click_contract = True
+            if not isinstance(payload, Mapping) or payload.get("schema") not in {
+                CLICK_ACTION_SCHEMA, LEGACY_CLICK_ACTION_SCHEMA,
+            }:
+                raise DecisionValidationError(f"click-only decisions must use schema {CLICK_ACTION_SCHEMA}")
+            is_legacy_click = payload.get("schema") == LEGACY_CLICK_ACTION_SCHEMA
+            expected_click_keys = (
+                {"schema", "actions", "hypothesis", "trajectory_rationale", "prediction"}
+                if is_legacy_click else
+                {"schema", "actions", "hypothesis", "trajectory_rationale", "predictions"}
+            )
+            if set(payload) != expected_click_keys:
+                raise DecisionValidationError("click-only decision has missing or unexpected fields")
+            actions = payload.get("actions")
+            if not isinstance(actions, list) or not actions or any(
+                not isinstance(action, Mapping)
+                or set(action) != {"action", "args"}
+                or action.get("action") not in {"click", "RESET"}
+                for action in actions
+            ):
+                raise DecisionValidationError("click-only actions must be clicks or a standalone RESET")
+            if any(action.get("action") == "RESET" for action in actions) and len(actions) != 1:
+                raise DecisionValidationError("RESET must be the only click-only action and include its justification")
+            if is_legacy_click:
+                if len(actions) != 1:
+                    raise DecisionValidationError("legacy click decisions may contain only one action")
+                predictions = [payload["prediction"]]
+            else:
+                predictions = payload["predictions"]
+                if not isinstance(predictions, list) or len(predictions) != len(actions):
+                    raise DecisionValidationError("click-only predictions must contain one prediction per action")
+            payload = {
+                "state_assessment": {
+                    "player": {"location": "unknown", "certainty": "unknown", "evidence": "not applicable to click-only action selection"},
+                    "target_candidates": [], "obstacles": [], "other_relevant_changes": [],
+                },
+                "hypothesis": payload["hypothesis"],
+                "trajectory_rationale": payload["trajectory_rationale"],
+                "prediction": predictions[0],
+                "action_predictions": predictions,
+                "actions": [dict(action) for action in actions],
+            }
+    response = _require_keys(
+        payload,
+        _REASONED_TOP_LEVEL | ({"action_predictions"} if click_contract else set()),
+        "reasoned action",
+    )
 
     assessment = _require_keys(
         response["state_assessment"],
@@ -182,14 +238,28 @@ def validate_reasoned_action(
         hypothesis = {"claim": hypothesis["claim"], "evidence": hypothesis["evidence"]}
 
     _bounded_text(response["trajectory_rationale"], "trajectory_rationale", 420)
-    prediction = _require_keys(
-        response["prediction"], {"visible_change", "environment_outcome", "description"}, "prediction",
-    )
-    if not isinstance(prediction["visible_change"], str) or prediction["visible_change"] not in _PREDICTED_VISUAL_CHANGE:
-        raise DecisionValidationError("prediction.visible_change must be yes, no, or unknown")
-    if not isinstance(prediction["environment_outcome"], str) or prediction["environment_outcome"] not in _PREDICTED_OUTCOMES:
-        raise DecisionValidationError("prediction.environment_outcome is not a supported outcome")
-    _bounded_text(prediction["description"], "prediction.description", 240)
+    change_key = "board_change" if click_contract else "visible_change"
+    raw_predictions = response.get("action_predictions", [response["prediction"]])
+    if click_contract and len(raw_predictions) != len(response["actions"]):
+        raise DecisionValidationError("click-only predictions must contain one prediction per action")
+    predictions = []
+    for index, raw_prediction in enumerate(raw_predictions, start=1):
+        prediction = _require_keys(
+            raw_prediction, {change_key, "environment_outcome", "description"},
+            "prediction" if index == 1 else f"predictions[{index - 1}]",
+        )
+        if not isinstance(prediction[change_key], str) or prediction[change_key] not in _PREDICTED_VISUAL_CHANGE:
+            raise DecisionValidationError(f"prediction.{change_key} must be yes, no, or unknown")
+        environment_outcome = prediction["environment_outcome"]
+        # The environment reports NOT_FINISHED as a game-state label, while the
+        # decision contract calls that prediction no_terminal. Accept that exact
+        # label as an alias so a correct action is not discarded.
+        if environment_outcome == "NOT_FINISHED":
+            environment_outcome = "no_terminal"
+        if not isinstance(environment_outcome, str) or environment_outcome not in _PREDICTED_OUTCOMES:
+            raise DecisionValidationError("prediction.environment_outcome is not a supported outcome")
+        _bounded_text(prediction["description"], f"predictions[{index - 1}].description", 240)
+        predictions.append({**prediction, "environment_outcome": environment_outcome})
 
     try:
         validated = validate_decision(
@@ -198,11 +268,14 @@ def validate_reasoned_action(
         )
     except ActionError as exc:
         raise DecisionValidationError(str(exc)) from exc
-    return {
+    normalized = {
         "state_assessment": dict(assessment), "hypothesis": dict(hypothesis) if hypothesis else None,
-        "trajectory_rationale": response["trajectory_rationale"],
-        "prediction": dict(prediction), "actions": validated["actions"],
+        "trajectory_rationale": response["trajectory_rationale"], "prediction": predictions[0],
+        "actions": validated["actions"],
     }
+    if click_contract:
+        normalized["action_predictions"] = predictions
+    return normalized
 
 
 def reasoned_action_contract_description(
@@ -233,6 +306,14 @@ def reasoned_action_contract_description(
                     example_args[name] = property_schema.get("minimum", 0)
     non_reset_ids = {str(spec.get("id")) for spec in faced_specs if str(spec.get("id")) != "RESET"}
     click_only = non_reset_ids == {"click"}
+    if click_only:
+        return {
+            "schema": CLICK_ACTION_SCHEMA,
+            "actions": [{"action": "click", "args": example_args}],
+            "hypothesis": None,
+            "trajectory_rationale": "brief reason for this click plan",
+            "predictions": [{"board_change": "unknown", "environment_outcome": "unknown", "description": "expected result of this click"}],
+        }
     assessment_example = {
         "player": (
             {"location": "unknown", "certainty": "unknown", "evidence": "unknown or not present"}
@@ -247,7 +328,7 @@ def reasoned_action_contract_description(
         "state_assessment": assessment_example,
         "hypothesis": None,
         "trajectory_rationale": "one to three concise sentences; no chain-of-thought",
-        "prediction": {"visible_change": "yes | no | unknown", "environment_outcome": "level_change | GAME_OVER | WIN | no_terminal | unknown", "description": "expected result of the first action only; do not describe later actions or the whole plan"},
+        "prediction": {"board_change": "yes | no | unknown", "environment_outcome": "level_change | GAME_OVER | WIN | no_terminal | unknown", "description": "expected board-area result of the first action only; do not describe raw HUD changes"},
         "actions": [{"action": example_action, "args": example_args}],
     }
 
@@ -258,7 +339,7 @@ def reasoned_action_limits_description() -> str:
         "String limits: player location 120/evidence 180; target description 100, location 100, relevance 140; "
         "obstacle description 100, location 100, evidence 160; each observed change 180; "
         "hypothesis claim 240/evidence 180; trajectory rationale 420; prediction description 240 characters. "
-        "Prediction fields apply only to the first action in actions and are compared only with that action's observed transition. "
+        "Prediction applies to the first action only (the first action in actions) and is compared only with that action's observed transition. "
         "Maximum lists: five targets, eight obstacles, five observed changes, and eight actions."
     )
 
@@ -430,18 +511,26 @@ def build_analysis_input(
     if not default_skill.exists():
         default_skill = shared_skill_path()
     skill_file = Path(skill_path) if skill_path is not None else default_skill
-    core_prompt = skill_file.read_text(encoding="utf-8").strip()
+    core_prompt = "" if profile.profile_id == "a6" else skill_file.read_text(encoding="utf-8").strip()
     system_prompt = "\n\n".join(part for part in (core_prompt, profile_prompt) if part)
     skill_digest = hashlib.sha256(skill_file.read_bytes()).hexdigest()
     prompt_revision = hashlib.sha256(
         (skill_digest + "\0" + profile_prompt_revision).encode("utf-8")
     ).hexdigest()
+    action_contract = reasoned_action_contract_description(context["current_state"]["legal_actions"])
+    action_schema = str(action_contract.get("schema", REASONED_ACTION_SCHEMA))
+    click_only = profile.profile_id == "a6"
+    action_limits = (
+        "String limits: hypothesis.claim 240 characters; hypothesis.evidence 180; trajectory_rationale 420; prediction.description 240. "
+        "Prediction uses board_change yes/no/unknown and an immediate environment_outcome; raw full-frame pixel changes do not indicate board effect."
+        if click_only else reasoned_action_limits_description()
+    )
     prompt = (
-        f"Choose up to {horizon} legal actions from the visible replay and return the structured reasoned-action JSON. "
+        f"Choose up to {horizon} legal {'clicks' if click_only else 'actions'} from the visible replay and return the required structured JSON. "
         "Do not provide chain-of-thought. Keep actions as the only action list. If RESET is listed, use it alone and include args.justification.\n\n"
-        "Required response shape (`v10.reasoned_action/1`):\n"
-        + json.dumps(reasoned_action_contract_description(context["current_state"]["legal_actions"]), ensure_ascii=False, indent=2)
-        + "\n\n" + reasoned_action_limits_description()
+        f"Required response shape (`{action_schema}`):\n"
+        + json.dumps(action_contract, ensure_ascii=False, indent=2)
+        + "\n\n" + action_limits
         + "\n\nVisible replay context:\n"
         + json.dumps(context, ensure_ascii=False, indent=2)
     )
@@ -570,6 +659,7 @@ def run_analysis(
             _parse_model_content(first["content"]),
             inputs["legal_action_specs"],
             max_actions=horizon,
+            allow_legacy_click=True,
         )
     except DecisionValidationError as exc:
         repair_error = str(exc)
@@ -584,6 +674,7 @@ def run_analysis(
             _parse_model_content(repaired["content"]),
             inputs["legal_action_specs"],
             max_actions=horizon,
+            allow_legacy_click=True,
         )
 
     # The future continuation is read and scored only after the model response is valid.
@@ -637,7 +728,7 @@ def _sum_usage(responses: Sequence[Mapping[str, Any]]) -> dict[str, int | None]:
 
 
 __all__ = [
-    "DECISION_SCHEMA", "REASONED_ACTION_SCHEMA", "DecisionValidationError", "build_analysis_input",
+    "DECISION_SCHEMA", "REASONED_ACTION_SCHEMA", "CLICK_ACTION_SCHEMA", "DecisionValidationError", "build_analysis_input",
     "reasoned_action_contract_description", "reasoned_action_limits_description", "reasoned_action_repair_prompt",
     "run_analysis", "score_recorded_plan", "validate_model_decision", "validate_reasoned_action",
 ]

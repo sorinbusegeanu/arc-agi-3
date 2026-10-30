@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import copy
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -28,12 +29,13 @@ def _display_action(action_id: Any, args: Any = None) -> tuple[Any, str | None]:
 
 # Keep the function schema aligned with the subset enforced by _experiment.
 _DISCOVERY_PREDICTION_PATHS = (
-    "measurements.changed_pixels", "measurements.change_ratio", "game_state",
+    "measurements.changed_pixels", "measurements.change_ratio",
+    "measurements.click_effect.board_changed_pixels", "game_state",
     "terminal", "level", "levels_completed",
 )
 _DISCOVERY_PREDICTION_SCHEMA = {
     "type": "object",
-    "description": "A measurable prediction uses all-of predicates: {all:[{path,op,value}]}. Example: {all:[{path:'measurements.changed_pixels',op:'gt',value:0}]}",
+            "description": "A measurable prediction uses all-of predicates. `measurements.changed_pixels` is raw full-frame change and does not establish board effect or progress. For click actions, use `measurements.click_effect.board_changed_pixels` only when a configured UI mask is available.",
     "properties": {
         "all": {
             "type": "array", "minItems": 1,
@@ -77,7 +79,7 @@ DISCOVERY_TOOLS = [
                     "evidence_id": {"type": "string"},
                     "branch_id": {"type": "string"},
                     "region": {
-                        "description": f"Required half-open [y0,x0,y1,x1] raw-grid crop, at most {MAX_INSPECTION_SIDE} rows by {MAX_INSPECTION_SIDE} columns.",
+                        "description": f"Required half-open [y0,x0,y1,x1] crop, at most {MAX_INSPECTION_SIDE} rows by {MAX_INSPECTION_SIDE} columns. Example: [20,20,40,40] is exactly 20x20.",
                         "type": "array", "items": {"type": "integer"},
                         "minItems": 4, "maxItems": 4,
                     },
@@ -108,13 +110,13 @@ DISCOVERY_TOOLS = [
         "type": "function",
         "function": {
             "name": "test_hypotheses",
-            "description": "Run isolated test cases from a reproducible state in this run. At most four candidate cases can be tested per action-selection cycle; after that, return an action decision. Each case may contain one or more hypotheses. Each prediction must use {\"all\":[{\"path\":\"measurements.changed_pixels\",\"op\":\"gt\",\"value\":0}]}; every predicate is an exact path/op/value comparison. Use cases to compare actions from the same base.",
+            "description": "Run independent click experiments from one reproducible live state. First compare up to ten one-click candidates. After reviewing them, you may extend only promising candidates with short action sequences (up to three clicks) to compare alternative trajectories; each case is still an isolated branch from the same base, and every step outcome is returned. Branches do not change the live board or consume its action budget. Each case uses either `action` for one click or `actions` for a sequence, never both. Predictions score the final state; `steps` reports every intermediate consequence. Other action profiles may test up to four one-action cases. Predictions use measurable path/op/value predicates. Raw full-frame pixel changes do not establish board effect or progress.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "base_evidence_id": {"type": "string"},
                     "cases": {
-                        "type": "array", "minItems": 1, "maxItems": 4,
+                        "type": "array", "minItems": 1, "maxItems": 10,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -122,12 +124,16 @@ DISCOVERY_TOOLS = [
                                 "action": {
                                     **_DISCOVERY_ACTION_SCHEMA,
                                 },
+                                "actions": {
+                                    "type": "array", "minItems": 1, "maxItems": 3,
+                                    "items": {**_DISCOVERY_ACTION_SCHEMA},
+                                },
                                 "hypotheses": {
                                     "type": "array", "minItems": 1,
                                     "items": {**_DISCOVERY_HYPOTHESIS_SCHEMA},
                                 },
                             },
-                            "required": ["action", "hypotheses"], "additionalProperties": False,
+                            "required": ["hypotheses"], "additionalProperties": False,
                         },
                     },
                 },
@@ -179,6 +185,10 @@ class Discovery:
         self.branch_test_actions = 0
         self.branch_reuses = sum(row.get("event") == "branch_reused" for row in self.events)
         self._outcomes: dict[str, dict[str, Any]] = {}
+        self._prepared_base_id: str | None = None
+        self._prepared_base_env: Any = None
+        self._prepared_base_observation: dict[str, Any] | None = None
+        self._prepared_base_replay_actions = 0
         self.seen: dict[str, tuple[str, dict[str, Any]]] = {}
         for row in self.events:
             if row.get("request_id") and row.get("status") in {"prepared", "completed", "rejected", "unknown_execution"}:
@@ -260,6 +270,7 @@ class Discovery:
                 frames = self.frames
                 if record is None: raise ActionError("unknown evidence_id")
             region = args.get("region")
+            requested_region = list(region) if isinstance(region, Sequence) and not isinstance(region, (str, bytes)) else None
             if record.get("type") == "transition":
                 before = frames.get(record["pre_frame_id"]); after = frames.get(record["post_frame_id"])
                 y0,x0,y1,x1 = _region(region, before.shape)
@@ -268,12 +279,20 @@ class Discovery:
                 measurements["total_pixels"] = int((y1-y0)*(x1-x0))
                 measurements["change_ratio"] = round(measurements["changed_pixels"] / measurements["total_pixels"], 6)
                 measurements["candidate_displacement"] = candidate_displacement(before, after, [y0,x0,y1,x1])
-                return {"evidence_id": eid, "measurements": measurements,
-                        "region":[y0,x0,y1,x1], "before": crop_before.tolist(), "after": crop_after.tolist()}
+                result = {"evidence_id": eid, "measurements": measurements,
+                          "region":[y0,x0,y1,x1], "before": crop_before.tolist(), "after": crop_after.tolist()}
+                if requested_region != [y0, x0, y1, x1]:
+                    result["requested_region"] = requested_region
+                    result["region_clamped"] = True
+                return result
             frame_id = record.get("frame_id")
             frame = frames.get(frame_id)
             y0,x0,y1,x1 = _region(region, frame.shape)
-            return {"evidence_id": eid, "region": [y0,x0,y1,x1], "pixels": frame[y0:y1,x0:x1].tolist()}
+            result = {"evidence_id": eid, "region": [y0,x0,y1,x1], "pixels": frame[y0:y1,x0:x1].tolist()}
+            if requested_region != [y0, x0, y1, x1]:
+                result["requested_region"] = requested_region
+                result["region_clamped"] = True
+            return result
         if tool == "search_history":
             allowed = {"action", "level", "reset_generation", "limit", "evidence_ids", "since_step"}
             if set(args) - allowed: raise ActionError("unsupported search_history filter")
@@ -480,6 +499,7 @@ class Discovery:
                 branch_game = GameTools(
                     branch_env, branch_dir, max_actions=branch_budget.max_actions,
                     action_budget=branch_budget, action_budget_category="discovery_replay",
+                    game_id=self.game.game_id,
                 )
                 initial_observation = branch_game.observe()
                 if self._observation_fingerprint(initial_observation) != self._row_fingerprint(initial_target):
@@ -592,8 +612,16 @@ def _region(region: Any, shape: Sequence[int]) -> tuple[int,int,int,int]:
         raise ActionError("region must be four integer grid coordinates")
     y0,x0,y1,x1=region
     if y0<0 or x0<0 or y1>height or x1>width or y1<=y0 or x1<=x0: raise ActionError("region outside frame or empty")
-    if y1-y0 > MAX_INSPECTION_SIDE or x1-x0 > MAX_INSPECTION_SIDE:
-        raise ActionError(f"region must be at most {MAX_INSPECTION_SIDE} rows by {MAX_INSPECTION_SIDE} columns")
+    if y1-y0 > MAX_INSPECTION_SIDE:
+        size = min(MAX_INSPECTION_SIDE, height)
+        center = (y0 + y1) // 2
+        y0 = max(0, min(height - size, center - size // 2))
+        y1 = y0 + size
+    if x1-x0 > MAX_INSPECTION_SIDE:
+        size = min(MAX_INSPECTION_SIDE, width)
+        center = (x0 + x1) // 2
+        x0 = max(0, min(width - size, center - size // 2))
+        x1 = x0 + size
     return y0,x0,y1,x1
 
 

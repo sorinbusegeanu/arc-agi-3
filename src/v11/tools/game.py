@@ -46,6 +46,9 @@ PREDICTION_PATHS: dict[str, str] = {
     "measurements.click_effect.local_changed_pixels": "number",
     "measurements.click_effect.remote_changed_pixels": "number",
     "measurements.click_effect.total_changed_pixels": "number",
+    "measurements.click_effect.board_changed_pixels": "number",
+    "measurements.click_effect.excluded_changed_pixels": "number",
+    "measurements.click_effect.board_measurement_status": "string",
     "measurements.click_effect.level_changed": "boolean",
     "measurements.click_effect.terminal_changed": "boolean",
     "game_state": "string",
@@ -406,10 +409,14 @@ class GameTools:
         *,
         action_budget: ActionBudget | None = None,
         action_budget_category: str = "live",
+        game_id: str | None = None,
     ) -> None:
         if not callable(getattr(env, "observe", None)) or not callable(getattr(env, "act", None)):
             raise TypeError("env must implement observe() and act(action, args)")
         self.env = env
+        self.game_id = str(game_id) if game_id else None
+        from .vision import load_click_ui_mask
+        self.click_ui_mask = load_click_ui_mask(self.game_id)
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.frames = FrameStore(self.run_dir)
@@ -526,6 +533,7 @@ class GameTools:
                 before_frame, after_frame, safe_args["x"], safe_args["y"],
                 level_changed=(before.get("level") != after.get("level") or before.get("levels_completed") != after.get("levels_completed")),
                 terminal_changed=(bool(before.get("terminal")) != bool(after.get("terminal"))),
+                ui_mask=self.click_ui_mask,
             )
         from PIL import Image
         from .vision import delta_image

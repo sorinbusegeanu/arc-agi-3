@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Callable, Mapping
 
 import numpy as np
@@ -125,6 +126,17 @@ class ArcadeGameEnv:
             self.game_id, seed=self._seed, env_root=self._env_root,
             env_factory=self._env_factory,
         )
+
+    def fork_current(self) -> "ArcadeGameEnv":
+        """Clone this exact live state for an isolated discovery branch."""
+        clone = object.__new__(ArcadeGameEnv)
+        clone.game_id = self.game_id
+        clone._seed = self._seed
+        clone._env_root = self._env_root
+        clone._env_factory = self._env_factory
+        clone._env = copy.deepcopy(self._env)
+        clone._raw_observation = copy.deepcopy(self._raw_observation)
+        return clone
 
     def close(self) -> None:
         close = getattr(self._env, "close", None)

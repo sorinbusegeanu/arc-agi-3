@@ -98,8 +98,15 @@ def compose_profile_prompt(
     profile: ActionProfile,
     capability_dir: Path | str,
 ) -> tuple[str, str]:
-    """Return active capability instructions and a revision hash for their exact composition."""
+    """Return active profile instructions and a revision hash for their exact composition."""
     root = Path(capability_dir)
+    if profile.profile_id == "a6":
+        path = root / "a6_click_only.md"
+        if not path.is_file():
+            raise FileNotFoundError(f"missing v11 click-only skill: {path}")
+        prompt = path.read_text(encoding="utf-8").strip()
+        revision = hashlib.sha256((profile.profile_id + "\0" + prompt).encode("utf-8")).hexdigest()
+        return prompt, revision
     components: list[tuple[str, str]] = []
     for capability in profile.capabilities:
         filename = "cross_action_dependency" if capability == "cross_action_dependency" else capability

@@ -4,6 +4,7 @@ import json
 import copy
 import random
 import re
+import signal
 import sys
 import types
 from pathlib import Path
@@ -20,7 +21,7 @@ from v11.live import (
     _perceptual_state_equivalence, _review_events,
     _verified_route_summaries, run_live,
 )
-from v11.analysis import DecisionValidationError
+from v11.analysis import CLICK_ACTION_SCHEMA, DecisionValidationError, reasoned_action_contract_description, validate_reasoned_action
 from v11.tools.game import GameTools
 from v11.tools.game import ActionError
 from v11.tools.history import History
@@ -68,6 +69,57 @@ def test_click_fallback_samples_all_valid_candidates() -> None:
         for seed in range(20)
     }
     assert selected == {(12, 8), (31, 4), (5, 29)}
+
+
+def test_click_only_contract_is_concise_and_normalizes_to_internal_decision() -> None:
+    legal = [{"id": "ACTION6", "parameters": {
+        "type": "object", "properties": {
+            "x": {"type": "integer", "minimum": 0, "maximum": 7},
+            "y": {"type": "integer", "minimum": 0, "maximum": 7},
+        }, "required": ["x", "y"], "additionalProperties": False,
+    }}]
+    contract = reasoned_action_contract_description(legal)
+    assert contract["schema"] == CLICK_ACTION_SCHEMA
+    assert set(contract) == {"schema", "actions", "hypothesis", "trajectory_rationale", "predictions"}
+    payload = {**contract, "actions": [{"action": "click", "args": {"x": 3, "y": 4}}]}
+    decision = validate_reasoned_action(payload, legal, max_actions=1)
+    assert decision["actions"] == [{"action": "ACTION6", "args": {"x": 3, "y": 4}}]
+    assert decision["state_assessment"]["target_candidates"] == []
+
+
+def test_invalid_click_decision_stops_without_fallback_or_reset(tmp_path: Path) -> None:
+    class ClickOnlyEnv(_FakeEnv):
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"] = [{"id": "ACTION6", "parameters": {
+                "type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}},
+                "required": ["x", "y"], "additionalProperties": False,
+            }}]
+            return result
+
+    env = ClickOnlyEnv()
+    client = _FakeClient([{"schema": "wrong", "actions": []}, {"schema": "wrong", "actions": []}])
+    metrics = _run_live_without_starting_routine(
+        env, tmp_path / "invalid-click", client, game_id="fixture", max_actions=2,
+    )
+    assert metrics["actions"] == 0
+    assert env.actions == []
+    assert env.resets == 0
+    assert metrics["stop_reason"] == "invalid_decision"
+
+
+def test_sigterm_runs_live_metrics_finalization(tmp_path: Path) -> None:
+    class TerminatingClient(_FakeClient):
+        def complete(self, *args, **kwargs):
+            signal.raise_signal(signal.SIGTERM)
+
+    metrics = _run_live_without_starting_routine(
+        _FakeEnv(), tmp_path / "sigterm", TerminatingClient([]),
+        game_id="fixture", max_actions=2,
+    )
+    assert metrics["stop_reason"] == "terminated"
+    rows = [json.loads(line) for line in (tmp_path / "sigterm" / "decisions.jsonl").read_text().splitlines()]
+    assert any(row.get("stop_reason") == "terminated" for row in rows)
 
 
 def test_action_screen_caption_shows_click_alias_and_coordinates(tmp_path: Path) -> None:
@@ -134,7 +186,14 @@ def _run_live_without_starting_routine(*args, **kwargs):
 def _decision(actions=None, *, reset: bool = False) -> dict:
     if reset:
         return {"actions": [{"action": "RESET", "args": {"justification": "A controlled restart is required."}}]}
-    return {"actions": list(actions or [])}
+    action_rows = list(actions or [])
+    if action_rows and all(item.get("action") == "click" for item in action_rows):
+        return {
+            "schema": "v11.click_action/3", "actions": action_rows,
+            "hypothesis": None, "trajectory_rationale": "Test a click.",
+            "predictions": [{"board_change": "unknown", "environment_outcome": "unknown", "description": "unknown"} for _ in action_rows],
+        }
+    return {"actions": action_rows}
 
 
 def _action(action="up"):
@@ -142,6 +201,17 @@ def _action(action="up"):
 
 
 def _reasoned(decision, *, hypothesis=None, prediction=None):
+    actions = list(decision.get("actions", []))
+    if actions and all(item.get("action") == "click" for item in actions):
+        return {
+            "schema": "v11.click_action/3",
+            "hypothesis": hypothesis,
+            "trajectory_rationale": "Test one legal click from the current screen.",
+            "predictions": [prediction or {
+                "board_change": "unknown", "environment_outcome": "unknown", "description": "unknown",
+            } for _ in actions],
+            "actions": actions,
+        }
     return {
         "state_assessment": {
             "player": {"location": "center", "certainty": "inferred", "evidence": "visible in CURRENT SCREEN"},
@@ -152,6 +222,18 @@ def _reasoned(decision, *, hypothesis=None, prediction=None):
         "prediction": prediction or {
             "visible_change": "unknown", "environment_outcome": "unknown", "description": "unknown",
         },
+        "actions": actions,
+    }
+
+
+def _reasoned_generic(decision):
+    return {
+        "state_assessment": {
+            "player": {"location": "center", "certainty": "inferred", "evidence": "visible in CURRENT SCREEN"},
+            "target_candidates": [], "obstacles": [], "other_relevant_changes": [],
+        },
+        "hypothesis": None, "trajectory_rationale": "Test one legal action from the current screen.",
+        "prediction": {"visible_change": "unknown", "environment_outcome": "unknown", "description": "unknown"},
         "actions": list(decision.get("actions", [])),
     }
 
@@ -1253,7 +1335,8 @@ def test_known_ineffective_action_is_rejected_and_plan_reasks_after_noop(tmp_pat
     assert repair_context["state"]["ineffective_attempts_at_current_screen"] == [
         {"action": "up", "args": {}}
     ]
-    assert "first action 'up' already caused no visible change" in client.message_calls[2]["messages"][-1]["content"][0]["text"]
+    decision_rows = [json.loads(line) for line in (tmp_path / "ineffective-action" / "decisions.jsonl").read_text().splitlines()]
+    assert any(row.get("interrupt_reason") == "known_ineffective_action" for row in decision_rows)
 
 
 def test_all_ineffective_legal_actions_trigger_unbudgeted_reset(tmp_path: Path) -> None:
@@ -2252,13 +2335,9 @@ def test_active_level_review_attaches_every_intermediate_screen_in_order(tmp_pat
 
     assert result["row"]["status"] == "saved"
     _prompt, image_paths, image_labels = client.calls[0]
-    assert len(image_paths) == 5  # Initial, intermediate/after for both actions; current is the last screen.
-    assert len(image_labels) == 5
-    assert "initial state before Action 1 (up)" in image_labels[0]
-    assert "intermediate 1/1 during Action 1 (up)" in image_labels[1]
-    assert "result of Action 1 (up)" in image_labels[2]
-    assert "intermediate 1/1 during Action 2 (down)" in image_labels[3]
-    assert "result of Action 2 (down)" in image_labels[4] and "[CURRENT SCREEN]" in image_labels[4]
+    assert len(image_paths) == 3  # The recent ordered sample includes the current screen.
+    assert len(image_labels) == 3
+    assert "result of Action 2 (down)" in image_labels[-1] and "[CURRENT SCREEN]" in image_labels[-1]
 
 
 def test_level_completion_review_attaches_the_complete_solved_level(tmp_path: Path) -> None:
@@ -2284,14 +2363,13 @@ def test_level_completion_review_attaches_the_complete_solved_level(tmp_path: Pa
 
     assert result["row"]["status"] == "saved"
     _prompt, image_paths, image_labels = client.calls[0]
-    assert len(image_paths) == 11  # Starting screen, every post-action screen, current screen deduplicated.
-    assert "initial state before Action 1 (up)" in image_labels[0]
+    assert len(image_paths) == 3  # Review image payload remains bounded on long episodes.
     assert "result of Action 10 (down)" in image_labels[-1] and "[CURRENT SCREEN]" in image_labels[-1]
     history_text = client.calls[0][0].split(
         "Complete ordered action history for the level that just completed. "
         "Use this full sequence to identify its demonstrated strategy and observed outcomes. "
         "Screens are numbered chronologically. The full action history below names each source screen and every screen produced. "
-        "Attachments contain at most the latest 20 screens, in chronological order; older screens may appear in the history without an attached image. "
+        "Attachments contain at most the latest 3 screens, in chronological order; older screens may appear in the history without an attached image. "
         "The current screen is included when available. The next action starts from the preceding action's final produced screen.\n", 1,
     )[1].split("\n\nReview constraint:", 1)[0]
     history = json.loads(history_text)
@@ -2903,9 +2981,14 @@ def test_native_adapter_preserves_temporal_frames_and_validates_click_coordinate
     assert len(result["result"]["intermediate_frame_ids"]) == 2
     assert [int(tools.frames.get(frame)[0, 0]) for frame in result["result"]["intermediate_frame_ids"]] == [1, 2]
     assert int(result["observation"]["frame"][0, 0]) == 3
-    inputs = _live_context(tools, result["observation"], "fixture", 8, shared_skill_path(),
-                           tmp_path / "state/games/fixture", "r", 5)
-    assert len(inputs["image_paths"]) == 4  # Initial, two intermediate, and current result screens.
+    inputs = _live_context(
+        tools, result["observation"], "fixture", 8, shared_skill_path(),
+        tmp_path / "state/games/fixture", "r", 5,
+        click_screen_transitions=_active_level_transitions(
+            tools.history.records(), result["observation"], tools.reset_generation, limit=None,
+        ),
+    )
+    assert len(inputs["image_paths"]) == 2  # Source and result; intermediate frames stay in evidence.
     assert "CURRENT SCREEN" in inputs["image_labels"][-1]
 
 
@@ -2950,7 +3033,7 @@ def test_diverged_route_at_same_screen_is_suspended_and_model_runs(tmp_path):
     assert [action for action, _ in env.actions] == ["ACTION1", "ACTION2"]
 
 
-def test_failed_click_does_not_block_other_coordinates(tmp_path, capsys):
+def test_missing_ui_mask_keeps_board_effect_unknown(tmp_path, capsys):
     class ClickEnv(_FakeEnv):
         def observe(self):
             result = super().observe()
@@ -2965,35 +3048,34 @@ def test_failed_click_does_not_block_other_coordinates(tmp_path, capsys):
                 self.frame[0, 0] = 1
             return {}
 
-    client = _FakeClient([_decision([{"action": "click", "args": {"x": x, "y": 0}}]) for x in (0, 1)])
+    client = _FakeClient([_reasoned(_decision([{"action": "click", "args": {"x": x, "y": 0}}])) for x in (1, 2)])
     env = ClickEnv()
-    metrics = run_live(env, tmp_path / "clicks", client, game_id="fixture", max_actions=2, starting_routine=False)
-    assert [args["x"] for _, args in env.actions] == [0, 1]
-    assert metrics["model_calls"] == 2
+    metrics = run_live(env, tmp_path / "clicks", client, game_id="fixture", max_actions=2,
+                       starting_routine=False, state_dir=tmp_path / "state")
+    assert metrics["actions"] == len(env.actions) == 1
+    transition = next(row for row in History(tmp_path / "clicks").records() if row.get("type") == "transition")
+    assert transition["measurements"]["click_effect"]["board_measurement_status"] == "mask_unavailable"
+    assert transition["measurements"]["click_effect"]["board_changed_pixels"] is None
     assert "Refer to an attempted click as `click(x=12,y=8)`" in client.system_prompts[0]
     assert "the legal action name `click`" in client.system_prompts[0]
     assert "ACTION6" not in client.system_prompts[0]
     assert "ACTION6" not in client.calls[0][0]
     assert '"id":"click"' in client.calls[0][0]
-    context = _continued_context(_message_user_text(client, 1))
-    assert context["state"]["ineffective_attempts_at_current_screen"] == [
-        {"action": "click(x=0,y=0)"}
-    ]
     output = capsys.readouterr().err
-    assert "planned=['click(x=0,y=0)']" in output
-    assert "taking action 1: click(x=0,y=0)" in output
-    assert "action 1: click(x=0,y=0) ->" in output
+    assert "planned=['click(x=2,y=0)']" in output
+    assert "taking action 1: click(x=2,y=0)" in output
+    assert "action 1: click(x=2,y=0) ->" in output
     assert "ACTION6" not in output
     evidence = [row for row in History(tmp_path / "clicks").records() if row.get("type") == "transition"]
     assert evidence[0]["action"] == "ACTION6"
-    assert evidence[0]["args"] == {"x": 0, "y": 0}
-    assert evidence[0]["display_action"] == "click(x=0,y=0)"
+    assert evidence[0]["args"] == {"x": 2, "y": 0}
+    assert evidence[0]["display_action"] == "click(x=2,y=0)"
     accepted = next(
         row for row in (json.loads(line) for line in (tmp_path / "clicks" / "decisions.jsonl").read_text().splitlines())
         if row.get("status") == "accepted"
     )
-    assert accepted["decision"]["actions"] == [{"action": "click", "args": {"x": 0, "y": 0}}]
-    assert accepted["display_actions"] == ["click(x=0,y=0)"]
+    assert accepted["decision"]["actions"] == [{"action": "click", "args": {"x": 2, "y": 0}}]
+    assert accepted["display_actions"] == ["click(x=2,y=0)"]
 
 
 def test_click_plan_horizon_grows_only_after_consistent_observed_effects():
@@ -3003,6 +3085,8 @@ def test_click_plan_horizon_grows_only_after_consistent_observed_effects():
             "measurements": {
                 "changed_pixels": local + remote,
                 "click_effect": {
+                    "board_measurement_status": "available",
+                    "board_changed_pixels": local + remote,
                     "local_changed_pixels": local,
                     "remote_changed_pixels": remote,
                     "level_changed": False,
@@ -3013,11 +3097,11 @@ def test_click_plan_horizon_grows_only_after_consistent_observed_effects():
 
     assert _adaptive_click_plan_horizon(8, []) == 1
     assert _adaptive_click_plan_horizon(8, [transition(4, 0)]) == 2
-    assert _adaptive_click_plan_horizon(8, [transition(4, 0), transition(5, 0)]) == 5
+    assert _adaptive_click_plan_horizon(8, [transition(4, 0), transition(4, 0)]) == 3
     assert _adaptive_click_plan_horizon(8, [transition(4, 0), transition(0, 5)]) == 2
 
 
-def test_click_plans_execute_predictable_actions_without_intermediate_model_calls(tmp_path):
+def test_click_plan_rejected_at_current_horizon_stops_without_fallback(tmp_path):
     class ClickEnv:
         legal_actions = [{"id": "ACTION6", "parameters": {
             "type": "object", "properties": {
@@ -3042,49 +3126,33 @@ def test_click_plans_execute_predictable_actions_without_intermediate_model_call
             self.frame[args["y"], args["x"]] = 1
             return {}
 
-    first = _reasoned(_decision([{"action": "click", "args": {"x": 0, "y": 0}}]), prediction={
-        "visible_change": "yes", "environment_outcome": "no_terminal", "description": "One cell changes."
+    first = _reasoned(_decision([{"action": "click", "args": {"x": 7, "y": 0}}]), prediction={
+        "board_change": "yes", "environment_outcome": "no_terminal", "description": "One board cell changes."
     })
     partial_invalid = _reasoned(_decision([
         {"action": "click", "args": {"x": x, "y": 0}} for x in (7, 6, 5)
     ]), prediction={
-        "visible_change": "yes", "environment_outcome": "no_terminal", "description": "The next cells change."
+        "board_change": "yes", "environment_outcome": "no_terminal", "description": "The next board cells change."
     })
     partial = _reasoned(_decision([
         {"action": "click", "args": {"x": x, "y": 0}} for x in (7, 6)
     ]), prediction={
-        "visible_change": "yes", "environment_outcome": "no_terminal", "description": "Two cells change."
+        "board_change": "yes", "environment_outcome": "no_terminal", "description": "Two board cells change."
     })
-    followup = _reasoned(_decision([
-        {"action": "click", "args": {"x": x, "y": 1}} for x in range(1, 6)
-    ]), prediction={
-        "visible_change": "yes", "environment_outcome": "no_terminal", "description": "The pattern advances."
-    })
-    followup["state_assessment"]["target_candidates"] = [{
-        "description": "The established target pattern", "location": "row 1",
-        "relevance": "Two matching click outcomes support this target class.", "certainty": "observed",
-    }]
     env = ClickEnv()
-    client = _FakeClient([first, partial_invalid, partial, followup])
+    client = _FakeClient([first, partial_invalid, partial])
     metrics = _run_live_without_starting_routine(
-        env, tmp_path / "multi-click", client, game_id="fixture", max_actions=8, plan_horizon=8,
+        env, tmp_path / "multi-click", client, game_id="fixture", max_actions=3, plan_horizon=8,
     )
 
-    assert metrics["actions"] == 8
-    assert len(env.actions) == 8
+    assert metrics["actions"] == 0
+    assert env.actions == []
+    assert metrics["stop_reason"] == "invalid_decision"
     assert env.observe_calls == len(env.actions) + 1
-    assert len(client.calls) == 4
-    first_context = json.loads(client.calls[0][0].split("Visible context:\n", 1)[1])
-    second_context = _continued_context(_message_user_text(client, 1))
-    final_context = _continued_context(_message_user_text(client, 3))
-    repair_text = _message_user_text(client, 2)
-    assert first_context["budgets"]["plan_horizon"] == 1
-    assert second_context["state"]["plan_horizon"] == 2
-    assert "0 to 2 actions" in repair_text
-    assert final_context["state"]["plan_horizon"] == 5
+    assert any("actions" in prompt for prompt, _paths, _labels in client.calls)
 
 
-def test_click_plan_stops_when_first_click_prediction_is_contradicted(tmp_path):
+def test_click_invalid_plan_does_not_execute_unvalidated_actions(tmp_path):
     class ClickEnv:
         legal_actions = [{"id": "ACTION6", "parameters": {
             "type": "object", "properties": {
@@ -3110,20 +3178,20 @@ def test_click_plan_stops_when_first_click_prediction_is_contradicted(tmp_path):
 
     def decision(xs):
         return _reasoned(_decision([{"action": "click", "args": {"x": x, "y": 0}} for x in xs]), prediction={
-            "visible_change": "yes", "environment_outcome": "no_terminal", "description": "The selected cell changes."
+            "board_change": "yes", "environment_outcome": "no_terminal", "description": "The selected board cell changes."
         })
 
     env = ClickEnv()
-    client = _FakeClient([decision([0]), decision([1, 2]), decision([3])])
+    client = _FakeClient([decision([7]), decision([1, 2]), decision([3])])
     metrics = _run_live_without_starting_routine(
         env, tmp_path / "contradicted-click", client, game_id="fixture", max_actions=3, plan_horizon=8,
     )
     plans = [json.loads(line) for line in (tmp_path / "contradicted-click" / "decisions.jsonl").read_text().splitlines()]
 
-    assert [args["x"] for _, args in env.actions] == [0, 1, 3]
-    assert metrics["actions"] == 3
-    assert len(client.calls) == 3
-    assert any(row.get("interrupt_reason") == "click_prediction_contradicted" for row in plans)
+    assert [args["x"] for _, args in env.actions] == [3]
+    assert metrics["actions"] == 1
+    assert metrics["stop_reason"] == "invalid_decision"
+    assert any(row.get("status") == "unavailable" for row in plans)
 
 
 def test_uncertain_click_hypothesis_limits_model_plan_to_one_action(tmp_path):
@@ -3152,13 +3220,13 @@ def test_uncertain_click_hypothesis_limits_model_plan_to_one_action(tmp_path):
     def decision(xs, *, hypothesis=None):
         return _reasoned(_decision([{"action": "click", "args": {"x": x, "y": 0}} for x in xs]),
                          hypothesis=hypothesis, prediction={
-            "visible_change": "yes", "environment_outcome": "no_terminal", "description": "The target changes."
+            "board_change": "yes", "environment_outcome": "no_terminal", "description": "The board target changes."
         })
 
     uncertain = {"claim": "The next blue target behaves the same way.", "evidence": "Only one target has been tested."}
     env = ClickEnv()
     client = _FakeClient([
-        decision([0]),
+            decision([7]),
         decision([1, 2], hypothesis=uncertain),
         decision([1], hypothesis=uncertain),
     ])
@@ -3166,11 +3234,13 @@ def test_uncertain_click_hypothesis_limits_model_plan_to_one_action(tmp_path):
         env, tmp_path / "uncertain-click", client, game_id="fixture", max_actions=2, plan_horizon=8,
     )
 
-    assert metrics["actions"] == 2
-    assert [args["x"] for _, args in env.actions] == [0, 1]
-    assert len(client.calls) == 3
-    repair_text = _message_user_text(client, 2)
-    assert "0 to 1 actions" in repair_text
+    assert metrics["actions"] == 1
+    assert metrics["stop_reason"] == "invalid_decision"
+    assert [args["x"] for _, args in env.actions] == [1]
+    assert len(client.calls) >= 3
+    assert client.response_formats[0] is None
+    assert client.response_formats[1] == "json_object"
+    assert "v11.click_action/3" in client.calls[1][0]
 
 
 def test_reset_memory_cli_does_not_reimport_historical_route_or_ledger(tmp_path, monkeypatch):
@@ -3298,18 +3368,18 @@ def test_single_action_experiment_can_discover_hidden_effect_after_repeated_inpu
     assert env.resets == 0
 
 
-def test_click_capable_startup_uses_one_model_guided_native_click_per_turn(tmp_path: Path) -> None:
-    class ClickBootstrapEnv(_FakeEnv):
+def test_click_only_startup_skips_automatic_bootstrap_and_uses_latest_click_batch(tmp_path: Path) -> None:
+    class ClickOnlyStartupEnv(_FakeEnv):
         def observe(self):
             result = super().observe()
-            result["legal_actions"].append({
+            result["legal_actions"] = [{
                 "id": "ACTION6", "parameters": {
                     "type": "object", "properties": {
                         "x": {"type": "integer", "minimum": 0, "maximum": 3},
                         "y": {"type": "integer", "minimum": 0, "maximum": 2},
                     }, "required": ["x", "y"], "additionalProperties": False,
                 },
-            })
+            }]
             return result
 
         def act(self, action, args):
@@ -3317,22 +3387,216 @@ def test_click_capable_startup_uses_one_model_guided_native_click_per_turn(tmp_p
             self.frame[args["y"], args["x"]] += 1
             return {}
 
-    env = ClickBootstrapEnv()
+    env = ClickOnlyStartupEnv()
     client = _FakeClient([
         _decision([{"action": "click", "args": {"x": 2, "y": 1}}]),
         _decision([{"action": "click", "args": {"x": 1, "y": 1}}]),
     ])
-    metrics = run_live(env, tmp_path / "click-bootstrap", client, game_id="fixture", max_actions=2)
+    metrics = run_live(
+        env, tmp_path / "click-direct", client, game_id="fixture", max_actions=2,
+        discovery_tools=False,
+    )
 
     assert env.actions == [("ACTION6", {"x": 2, "y": 1}), ("ACTION6", {"x": 1, "y": 1})]
     assert metrics["click_actions_executed"] == 2
     assert metrics["movement_actions_executed"] == 0
-    assert metrics["bootstrap_actions_by_type"]["click"] == 2
-    assert env.resets == 0  # The four-action probe cap was not reached.
+    assert metrics["bootstrap_actions_by_type"]["click"] == 0
+    assert env.resets == 0
+    manifest = json.loads((tmp_path / "click-direct/run_manifest.json").read_text())
+    assert manifest["configuration"]["click_only_startup"] == "direct_live_observation"
     first_context_text = client.calls[0][0]
     assert '"coordinate_system":"native_zero_based_xy"' in first_context_text
     assert "click_candidates" in first_context_text
-    assert "choose an informative legal action" in first_context_text.lower()
+    assert "bootstrap_observations" not in first_context_text
+    assert len(client.calls[0][1]) == 1
+
+    second_prompt, second_images, second_labels = client.calls[1]
+    second_context = json.JSONDecoder().raw_decode(second_prompt.split("Visible context:\n", 1)[1])[0]
+    assert len(second_images) == 2
+    assert "Latest click batch" in " ".join(second_labels)
+    assert len(second_context["click_history_ledger"]) == 1
+    observation = second_context["click_history_ledger"][0]
+    assert observation["prediction"]["board_change"] == "unknown"
+    assert observation["observed"]["board_measurement_status"] == "mask_unavailable"
+
+
+def test_click_batch_stops_before_next_action_when_prediction_is_contradicted(tmp_path: Path, monkeypatch) -> None:
+    class ClickBatchEnv(_FakeEnv):
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"] = [{"id": "ACTION6", "parameters": {
+                "type": "object", "properties": {
+                    "x": {"type": "integer", "minimum": 0, "maximum": 3},
+                    "y": {"type": "integer", "minimum": 0, "maximum": 2},
+                }, "required": ["x", "y"], "additionalProperties": False,
+            }}]
+            return result
+
+        def act(self, action, args):
+            self.actions.append((action, dict(args)))
+            self.frame[args["y"], args["x"]] += 1
+            return {}
+
+    monkeypatch.setattr("v11.live._adaptive_click_plan_horizon", lambda requested, transitions: min(requested, 3))
+    contradicted_batch = {
+        "schema": "v11.click_action/3",
+        "actions": [
+            {"action": "click", "args": {"x": 1, "y": 1}},
+            {"action": "click", "args": {"x": 2, "y": 1}},
+        ],
+        "hypothesis": None,
+        "trajectory_rationale": "Test two predicted outcomes in sequence.",
+        "predictions": [
+            {"board_change": "unknown", "environment_outcome": "GAME_OVER", "description": "the first click ends play"},
+            {"board_change": "unknown", "environment_outcome": "unknown", "description": "second click"},
+        ],
+    }
+    env = ClickBatchEnv()
+    client = _FakeClient([
+        _decision([{"action": "click", "args": {"x": 0, "y": 1}}]),
+        contradicted_batch,
+    ])
+    metrics = run_live(
+        env, tmp_path / "click-batch-stop", client, game_id="fixture", max_actions=4,
+        plan_horizon=3, discovery_tools=False, starting_routine=False,
+    )
+
+    assert env.actions == [
+        ("ACTION6", {"x": 0, "y": 1}),
+        ("ACTION6", {"x": 1, "y": 1}),
+    ]
+    plan_rows = [json.loads(line) for line in (tmp_path / "click-batch-stop/decisions.jsonl").read_text().splitlines()]
+    assert any(row.get("interrupt_reason") == "click_prediction_contradicted" for row in plan_rows)
+    assert metrics["actions"] == 2
+
+
+def test_click_only_model_reset_returns_directly_to_live_click_planning(tmp_path: Path) -> None:
+    class ClickOnlyResetEnv(_FakeEnv):
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"] = [{"id": "ACTION6", "parameters": {
+                "type": "object", "properties": {
+                    "x": {"type": "integer", "minimum": 0, "maximum": 3},
+                    "y": {"type": "integer", "minimum": 0, "maximum": 2},
+                }, "required": ["x", "y"], "additionalProperties": False,
+            }}]
+            return result
+
+        def act(self, action, args):
+            self.actions.append((action, dict(args)))
+            self.frame[args["y"], args["x"]] += 1
+            return {}
+
+    reset = {
+        "schema": "v11.click_action/2",
+        "actions": [{"action": "RESET", "args": {"justification": "Restart after the current experiment."}}],
+        "hypothesis": None, "trajectory_rationale": "Restart from the initial screen.",
+        "prediction": {"board_change": "unknown", "environment_outcome": "unknown", "description": "unknown"},
+    }
+    env = ClickOnlyResetEnv()
+    client = _FakeClient([reset, _decision([{"action": "click", "args": {"x": 1, "y": 1}}])])
+    metrics = run_live(
+        env, tmp_path / "click-reset", client, game_id="fixture", max_actions=1,
+        discovery_tools=False,
+    )
+
+    assert env.resets == 1
+    assert env.actions == [("ACTION6", {"x": 1, "y": 1})]
+    assert metrics["bootstrap_actions_by_type"]["click"] == 0
+    assert "bootstrap_observations" not in client.calls[1][0]
+    assert len(client.calls[1][1]) == 1
+
+
+def test_new_click_only_level_starts_directly_without_bootstrap(tmp_path: Path) -> None:
+    class ClickLevelEnv(_FakeEnv):
+        def __init__(self):
+            super().__init__()
+            self.level = 0
+            self.levels_completed = 0
+
+        def observe(self):
+            result = super().observe()
+            result["legal_actions"] = [{"id": "ACTION6", "parameters": {
+                "type": "object", "properties": {
+                    "x": {"type": "integer", "minimum": 0, "maximum": 3},
+                    "y": {"type": "integer", "minimum": 0, "maximum": 2},
+                }, "required": ["x", "y"], "additionalProperties": False,
+            }}]
+            result["level"] = self.level
+            result["levels_completed"] = self.levels_completed
+            return result
+
+        def act(self, action, args):
+            self.actions.append((action, dict(args)))
+            self.frame[args["y"], args["x"]] += 1
+            if not self.levels_completed:
+                self.level = 1
+                self.levels_completed = 1
+            return {}
+
+    env = ClickLevelEnv()
+    client = _FakeClient([
+        _decision([{"action": "click", "args": {"x": 2, "y": 1}}]),
+        _decision([{"action": "click", "args": {"x": 1, "y": 1}}]),
+    ])
+    metrics = run_live(
+        env, tmp_path / "click-next-level", client, game_id="fixture", max_actions=2,
+        discovery_tools=False,
+    )
+
+    assert env.resets == 0
+    assert len(env.actions) == 2
+    assert metrics["bootstrap_actions_by_type"]["click"] == 0
+    action_calls = [
+        call for call, system_prompt in zip(client.calls, client.system_prompts)
+        if not system_prompt.startswith("# V11 game memory and profile candidate review")
+    ]
+    assert "bootstrap_observations" not in action_calls[1][0]
+    assert len(action_calls[1][1]) == 1
+
+
+def test_click_only_can_use_a_batch_after_adaptive_horizon_grows(tmp_path: Path) -> None:
+    class StableClickEffectEnv:
+        def __init__(self):
+            self.frame = np.zeros((64, 64), dtype=np.uint8)
+            self.actions = []
+
+        def observe(self):
+            return {
+                "frame": self.frame.copy(), "legal_actions": [{"id": "ACTION6", "parameters": {
+                    "type": "object", "properties": {
+                        "x": {"type": "integer", "minimum": 0, "maximum": 63},
+                        "y": {"type": "integer", "minimum": 0, "maximum": 63},
+                    }, "required": ["x", "y"], "additionalProperties": False,
+                }}],
+                "game_state": "NOT_FINISHED", "level": 0, "levels_completed": 0,
+                "win_levels": 1, "terminal": False,
+            }
+
+        def act(self, action, args):
+            self.actions.append((action, dict(args)))
+            self.frame[args["y"], args["x"]:args["x"] + 5] = 1
+            return {}
+
+    click = lambda x, y: {"action": "click", "args": {"x": x, "y": y}}
+    client = _FakeClient([
+        _decision([click(10, 10)]),
+        _decision([click(20, 20)]),
+        _decision([click(30, 30), click(40, 40), click(50, 50)]),
+    ])
+    env = StableClickEffectEnv()
+    metrics = run_live(
+        env, tmp_path / "click-adaptive-batch", client, game_id="sy01", max_actions=5,
+        plan_horizon=8, discovery_tools=False,
+    )
+
+    accepted = [
+        row for row in (json.loads(line) for line in (tmp_path / "click-adaptive-batch/decisions.jsonl").read_text().splitlines())
+        if row.get("status") == "accepted"
+    ]
+    assert metrics["actions"] == 5
+    assert len(env.actions) == 5
+    assert [len(row["decision"]["actions"]) for row in accepted] == [1, 1, 3]
 
 
 def test_game_and_profile_memory_persist_in_separate_scopes(tmp_path: Path) -> None:

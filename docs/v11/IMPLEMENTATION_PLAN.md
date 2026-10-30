@@ -5,6 +5,10 @@ The normative behavior and acceptance criteria are in [`DESIGN.md`](DESIGN.md). 
 ## Implementation status
 
 - The v10.0.29 source fork, v11 CLI/runtime identity, and isolated `skills/v11` state defaults are in place. Version `11.1.0` adds exact action-set profiles and scoped profile learning.
+- Version `11.1.1` adds a concise click-only decision contract, safe stop after invalid click decisions, bounded review context, failed-review backoff, and SIGTERM finalization.
+- Version `11.1.2` selects a standalone skill for ACTION6-only games, includes exact click-field limits in the prompt, and measures board changes outside a versioned per-game UI mask. Raw full-frame changes remain telemetry and cannot establish board effect or progress.
+- Version `11.1.3` starts click-only games from direct observation, attaches only the latest executed click batch with a compact outcome ledger, and normalizes the environment's `NOT_FINISHED` status to the prediction contract's `no_terminal` label.
+- Version `11.1.4` explores up to ten independent click branches per current state, then advances hypotheses click by click as the live state changes. Click-only live batches carry per-click predictions and stop on a contradicted prediction; fresh batch contexts retain the latest screens and compact click history.
 - Click alias validation, native-grid candidate proposals, local/remote click-effect measurements, capability-aware bootstrap, click-aware stagnation, and click metrics are implemented.
 - Regression coverage includes click-only startup, click argument preservation, both click/movement route orders, remote effects, and the existing movement behavior suite.
 - Profile implementation adds a focused suite in `tests/test_v11_profiles.py`; the full v11 suite passes **239 tests** with CUDA 13 Python.

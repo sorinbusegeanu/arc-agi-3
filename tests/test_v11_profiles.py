@@ -37,6 +37,9 @@ def test_profile_prompt_contains_only_active_capabilities():
     profile = resolve_action_profile([{"id": "ACTION6"}])
     prompt, digest = compose_profile_prompt(profile, "skills/v11/profile_capabilities")
     assert "coordinate" in prompt.casefold() or "click" in prompt.casefold()
+    assert "movement" not in prompt.casefold()
+    assert "hypothesis.evidence 180 characters" in prompt
+    assert "changed_pixels` is a raw full-frame difference" in prompt
     assert "action1" not in prompt.casefold()
     assert digest == compose_profile_prompt(profile, "skills/v11/profile_capabilities")[1]
 

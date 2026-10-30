@@ -1,0 +1,22 @@
+## Click-only skill
+
+Use the current labeled screen, recorded click outcomes, scoped game memory, and legal click coordinates to reason about the puzzle. Treat click as the only available control. Identify candidate objects, regions, rules, and goals only from visual evidence; keep hypotheses distinct from observed facts.
+
+Use Observe → Model → Compare → Click → Verify. Coordinates are native-grid, zero-based `x` (column), `y` (row). Treat discovery branches as click-game exploration: propose up to ten distinct candidate clicks from the same current live evidence state in one `test_hypotheses` call. Each candidate runs independently in a disposable fork from that same state, equivalent to click → reset → click → reset; compare all returned consequences before choosing a live action. The branch results do not change the live board. Once those outcomes are available, form a new hypothesis set of up to ten candidates from the current live screen. Repeat this cycle as live trajectories advance, so alternatives are explored click by click from each resulting state. Never use a branch evidence ID as live-state evidence or as support for persistent game memory.
+
+The live decision may contain up to three clicks, each with its own prediction in action order. Prefer one live click when the next choice depends on seeing its result. Batch a short sequence only when every later click remains sensible across the plausible earlier outcomes. The runtime compares each observed click with its corresponding prediction and stops before the next click when a prediction is contradicted. Never exceed the supplied `plan_horizon` or action budget. `click_candidates` are optional suggestions; use other visually supported coordinates when they better test a hypothesis. Empty and background-colored cells can be valid targets.
+
+Refer to an attempted click as `click(x=12,y=8)` in explanations. In JSON, use the legal action name `click` with integer `args.x` and `args.y`.
+
+Keep these observations separate:
+- `changed_pixels` is a raw full-frame difference. HUD, lives, counters, progress bars, animation, and board pixels can all change it. It is not a measure of board effect or progress.
+- `click_effect.local_changed_pixels` and `remote_changed_pixels` are spatial counts from the raw frame and may include UI pixels. They describe where a change occurred, not whether it affected the puzzle.
+- `board_changed_pixels` measures changed pixels outside this game's configured UI mask. Use it only when `board_measurement_status` is `available`; otherwise board effect is unknown. A board change is an observed effect, not proof of objective progress.
+- `excluded_changed_pixels` records changes inside configured UI regions. Do not treat these as board effects. Call a UI change objective progress only when its meaning is supported by repeated observations or environment metadata.
+- Confirm level/game completion from environment state. Do not infer it from pixel counts, an apparent bar, or a single visual change.
+
+Treat an action as a board no-op only when a valid game mask exists and `board_changed_pixels` is zero. A change confined to excluded UI regions is not a board effect. If the mask is missing or does not match the frame dimensions, report the board effect as unknown and do not classify the click as a board no-op from raw counts.
+
+For each click, compare the before and after screens and report its observed local/remote effect. A remote change does not by itself establish a mechanic. Avoid repeating the same click from the same board state after a measured board no-op; a different state or coordinate is a separate experiment. Use discovery tools to test measurable, narrow claims when useful; `measurements.changed_pixels > 0` tests only raw frame change and must never stand for board effect or progress. Use `measurements.click_effect.board_changed_pixels` only when the mask is available.
+
+Return only the required click-action JSON contract. Keep the hypothesis null when no hypothesis is being tested. A legal `RESET` may be selected alone with `args.justification`; it is never combined with clicks. Respect these exact string limits: hypothesis.claim 240 characters; hypothesis.evidence 180 characters; trajectory_rationale 420 characters; each predictions[i].description 240 characters. Supply exactly one prediction per live click, ordered to match `actions`. Keep detailed chain-of-thought internal.

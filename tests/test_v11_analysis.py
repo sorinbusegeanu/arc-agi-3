@@ -314,6 +314,10 @@ def test_reasoned_action_contract_requires_categorical_assessment_and_single_act
         "claim": "Moving down may affect the boundary-like element.",
         "evidence": "the current screen shows it beside the player",
     }
+    payload["prediction"]["environment_outcome"] = "NOT_FINISHED"
+    normalized = validate_reasoned_action(payload, context["legal_action_specs"], max_actions=1)
+    assert normalized["prediction"]["environment_outcome"] == "no_terminal"
+    payload["prediction"]["environment_outcome"] = "no_terminal"
     payload["hypothesis"]["uncertainty"] = "unknown"
     with pytest.raises(DecisionValidationError, match="hypothesis must contain claim and evidence"):
         validate_reasoned_action(payload, context["legal_action_specs"], max_actions=1)
@@ -704,7 +708,7 @@ def test_cli_reports_v10_patch_version_and_context_override(capsys) -> None:
     with pytest.raises(SystemExit) as version_exit:
         parser.parse_args(["--version"])
     assert version_exit.value.code == 0
-    assert capsys.readouterr().out.strip() == "v11 11.1.0"
+    assert capsys.readouterr().out.strip() == "v11 11.1.4"
 
     configured = parser.parse_args([
         "live", "--game-id", "ez01", "--run-dir", "run", "--context-window-tokens", "32768",
@@ -1037,10 +1041,14 @@ def test_offline_profile_prompt_matches_live_capability_composition(tmp_path: Pa
         tools, current, "click-fixture", 2, shared_skill_path(),
         game_memory_dir(tmp_path / "state", "click-fixture"), "live", 5,
     )
-    capability = (Path(__file__).parents[1] / "skills/v11/profile_capabilities/coordinate_action6.md").read_text().strip()
+    capability = (Path(__file__).parents[1] / "skills/v11/profile_capabilities/a6_click_only.md").read_text().strip()
     discrete = (Path(__file__).parents[1] / "skills/v11/profile_capabilities/discrete_control.md").read_text().strip()
     assert offline["profile_id"] == live["context"]["action_profile"]["profile_id"] == "a6"
     assert capability in offline["system_prompt"] and capability in live["system_prompt"]
+    assert "Keep these observations separate" in live["system_prompt"]
+    assert "hypothesis.evidence 180 characters" in live["system_prompt"]
+    assert "movement" not in offline["system_prompt"].casefold()
+    assert "movement" not in live["system_prompt"].casefold()
     assert discrete not in offline["system_prompt"] and discrete not in live["system_prompt"]
     assert offline["system_prompt"] == live["system_prompt"]
 

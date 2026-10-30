@@ -6,7 +6,10 @@ Tools report measurements only. They never label a region as player, goal or HUD
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Sequence
+from urllib.parse import quote
 
 import numpy as np
 
@@ -335,6 +338,7 @@ def propose_click_candidates(
 def click_effect(
     before: Any, after: Any, x: int, y: int, *, radius: int = 2,
     level_changed: bool = False, terminal_changed: bool = False,
+    ui_mask: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Measure pixel changes near and away from a native-grid click point."""
     first, second = to_frame_array(before, "before"), to_frame_array(after, "after")
@@ -347,11 +351,68 @@ def click_effect(
     local[max(0, y-r):min(height, y+r+1), max(0, x-r):min(width, x+r+1)] = True
     local_count = int(np.count_nonzero(changed & local))
     total = int(np.count_nonzero(changed))
+    board_changed_pixels: int | None = None
+    excluded_changed_pixels: int | None = None
+    board_measurement_status = "mask_unavailable"
+    if isinstance(ui_mask, dict):
+        expected_shape = ui_mask.get("frame_shape")
+        regions = ui_mask.get("excluded_regions")
+        if expected_shape != [height, width]:
+            board_measurement_status = "frame_shape_mismatch"
+        elif isinstance(regions, list):
+            excluded = np.zeros(first.shape, dtype=bool)
+            valid = True
+            for item in regions:
+                bounds = item.get("bounds") if isinstance(item, dict) else None
+                if (
+                    not isinstance(bounds, list) or len(bounds) != 4
+                    or any(not isinstance(value, int) or isinstance(value, bool) for value in bounds)
+                ):
+                    valid = False
+                    break
+                y0, x0, y1, x1 = bounds
+                if not (0 <= y0 < y1 <= height and 0 <= x0 < x1 <= width):
+                    valid = False
+                    break
+                excluded[y0:y1, x0:x1] = True
+            if valid:
+                board_changed_pixels = int(np.count_nonzero(changed & ~excluded))
+                excluded_changed_pixels = int(np.count_nonzero(changed & excluded))
+                board_measurement_status = "available"
+            else:
+                board_measurement_status = "invalid_mask"
+        else:
+            board_measurement_status = "invalid_mask"
     return {
         "schema": CLICK_EFFECT_SCHEMA, "x": x, "y": y, "radius": r,
         "local_changed_pixels": local_count, "remote_changed_pixels": total-local_count,
         "total_changed_pixels": total, "level_changed": bool(level_changed),
         "terminal_changed": bool(terminal_changed),
+        "board_measurement_status": board_measurement_status,
+        "board_changed_pixels": board_changed_pixels,
+        "excluded_changed_pixels": excluded_changed_pixels,
+    }
+
+
+def load_click_ui_mask(game_id: str | None) -> dict[str, Any] | None:
+    """Load a versioned native-grid UI exclusion mask for one game, if authored."""
+    if not isinstance(game_id, str) or not game_id.strip():
+        return None
+    safe_id = quote(game_id.strip(), safe="-_.")
+    path = Path(__file__).resolve().parents[3] / "skills" / "v11" / "game_masks" / f"{safe_id}.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"frame_shape": None, "excluded_regions": None}
+    if not isinstance(payload, dict) or payload.get("schema") != "v11.click_ui_mask/1":
+        return {"frame_shape": None, "excluded_regions": None}
+    return {
+        "schema": payload.get("schema"),
+        "game_id": payload.get("game_id"),
+        "frame_shape": payload.get("frame_shape"),
+        "excluded_regions": payload.get("excluded_regions"),
     }
 
 
@@ -363,7 +424,9 @@ __all__ = [
     "DISPLACEMENT_SCHEMA",
     "appearance_masks",
     "candidate_displacement",
+    "click_effect",
     "delta_image",
+    "load_click_ui_mask",
     "pixel_diff",
     "png_bytes",
 ]
